@@ -29,6 +29,21 @@ def async_setup_api(hass: HomeAssistant) -> None:
     hass.http.register_view(WindowGatewayHubBindCodeView())
     hass.http.register_view(WindowGatewayHubMembersView())
     hass.http.register_view(WindowGatewayHubMemberRemoveView())
+    hass.http.register_view(WindowGatewayHubMemberRenameView())
+
+
+def _member_op_view(client, **flags) -> dict:
+    """成员写操作（踢人/改名）的回包＝完整状态视图 + 操作结果位。
+
+    为什么不给一个窄包（只回 members）：面板唯一的渲染出口 applyHubStatus 吃的是
+    完整视图，喂窄包会让它把 `connected`/`bindCode`/`memberCode` 当成缺失——
+    用户点完「移除」，面板就在一张刚还在倒计时的有效码旁边显示"未连接 / ------"，
+    直到下次手动刷新。
+    """
+    view = client.status_view()
+    view["enabled"] = True
+    view.update(flags)
+    return view
 
 
 class WindowGatewaySecurityView(http.HomeAssistantView):
@@ -265,15 +280,31 @@ class WindowGatewayHubMemberRemoveView(http.HomeAssistantView):
         removed = bool(mid) and await client.remove_member(mid)
         if mid:
             await client.list_members()      # 踢完刷新，否则面板还显示被踢的人
-        view = client.status_view()
-        return self.json({
-            "enabled": True,
-            "removedOk": bool(removed),
-            "ownerMasked": view.get("ownerMasked"),
-            "members": view.get("members") or [],
-            "membersCount": view.get("membersCount"),
-            "membersMax": view.get("membersMax"),
-            "membersSupported": bool(view.get("membersSupported")),
-            "lastError": view.get("lastError"),
-            "lastOpError": view.get("lastOpError"),
-        })
+        return self.json(_member_op_view(client, removedOk=bool(removed)))
+
+
+class WindowGatewayHubMemberRenameView(http.HomeAssistantView):
+    """v1.7.54: 给一位家庭成员起本机称呼（面板「改名」）。
+
+    只写本机文件，**不打云端**：hub 的成员记录没有名称字段，所以这条路由不产生
+    任何对 hub 的调用（不占限流、不在付费端点上多打一下）。
+    名称随 mid 存：人被踢掉再扫回来还是同一个微信账号 ⇒ 称呼对得上人。
+    留空＝清掉称呼、恢复显示云端掩码（不是错误，回 renameOk=True）。
+    """
+
+    url = "/api/window_controller_gateway/hub/members/rename"
+    name = "api:window_controller_gateway:hub:members:rename"
+
+    async def post(self, request):
+        hass = request.app["hass"]
+        client = _hub_client(hass)
+        if client is None:
+            return self.json({"enabled": False, "renameOk": False})
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            payload = {}
+        mid = str((payload or {}).get("mid") or "")
+        name = (payload or {}).get("name")
+        ok = await client.set_member_alias(mid, name)
+        return self.json(_member_op_view(client, renameOk=bool(ok)))

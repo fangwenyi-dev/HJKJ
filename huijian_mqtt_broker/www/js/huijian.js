@@ -68,6 +68,9 @@
         // 二维码载荷：HUJIAN-BIND:<载荷版本>:<6 位码>——小程序侧解析同一格式（对不认识的
         // 版本只提示不绑定），所以版本位以后换协议时老版本不会误解。
         const BIND_PAYLOAD_PREFIX = 'HUJIAN-BIND:1:';
+        // 成员称呼长度上限，与 hub_client.MEMBER_ALIAS_MAX_LEN 同值（两份，pytest 对账）。
+        // 面板先截一次、加载项再截一次：两侧口径不一致时用户会看到"存进去的名字比填的短"。
+        const MEMBER_ALIAS_MAX = 12;
         let _bindCode = '';
         let _copyTimer = null;
 
@@ -179,6 +182,10 @@
                     return '移除家人失败（云端暂不可达），请稍后重试';
                 case 'member_remove_rejected':
                     return '云端拒绝移除这位家人';
+                case 'member_rename_rejected':
+                    return '这位家人已不在成员列表里（可能刚被移除），改名没保存';
+                case 'member_rename_failed':
+                    return '改名没保存（本机文件写入失败），详情看 HA 日志';
                 default:
                     return '';
             }
@@ -274,7 +281,18 @@
                 if (!m || !m.mid) continue;
                 const li = document.createElement('li');
                 const who = document.createElement('span');
-                who.textContent = m.openidMasked || '—';   // 只有掩码：hub 从不回完整 openid
+                const masked = m.openidMasked || '—';   // 只有掩码：hub 从不回完整 openid
+                const alias = (typeof m.alias === 'string' && m.alias) ? m.alias : '';
+                // 一律按文本渲染：称呼是用户在面板上手打的自由文本，绝不能当标记语言解析
+                who.textContent = alias || masked;
+                who.className = 'hub-member-name';
+                who.title = alias ? ('云端掩码 ' + masked) : '点「改名」给这位家人起个称呼';
+                const rename = document.createElement('button');
+                rename.type = 'button';
+                rename.className = 'btn btn-ghost btn-mini';
+                rename.textContent = '改名';
+                rename.setAttribute('data-mid', String(m.mid));
+                rename.onclick = function () { renameMember(String(m.mid), alias); };
                 const kick = document.createElement('button');
                 kick.type = 'button';
                 kick.className = 'btn btn-ghost btn-mini';
@@ -282,9 +300,44 @@
                 kick.setAttribute('data-mid', String(m.mid));
                 kick.onclick = function () { removeMember(String(m.mid)); };
                 li.appendChild(who);
+                li.appendChild(rename);
                 li.appendChild(kick);
                 ul.appendChild(li);
             }
+        }
+
+        /** 称呼规范化：控制符换空格、去首尾空白、截到上限。
+         *  与 hub_client.clean_member_alias 同口径（跨语言两份实现，
+         *  tests/test_v1754_member_alias.py 用同一批用例逐条对账）。*/
+        function cleanMemberAlias(raw) {
+            if (typeof raw !== 'string') return '';
+            return raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, MEMBER_ALIAS_MAX);
+        }
+
+        /** 改一位家人的本机称呼（v1.7.54）。留空＝清掉称呼、恢复显示云端掩码。
+         *  名称只存这台 HA，不上云——hub 的成员记录根本没有名称字段。*/
+        async function renameMember(mid, current) {
+            if (!mid) return;
+            const tip = '给这位家人起个称呼（最多 ' + MEMBER_ALIAS_MAX + ' 个字，留空则显示云端掩码）';
+            let raw;
+            try {
+                raw = window.prompt(tip, current || '');
+            } catch (e) {
+                console.log('改名输入框打不开:', e);
+                return;
+            }
+            if (raw === null) return;          // 取消＝什么都没发生
+            const name = cleanMemberAlias(raw);
+            try {
+                const resp = await haApi('/window_controller_gateway/hub/members/rename',
+                                         'POST', { mid: mid, name: name });
+                if (!resp.ok) throw new Error('HA API ' + resp.status);
+                applyHubStatus(await resp.json());
+                return;
+            } catch (e) {
+                console.log('成员改名失败:', e);
+            }
+            await loadRemoteControl();
         }
 
         /** 显式签发成员码（不受自动轮换与节流影响：这是主人的显式意图，

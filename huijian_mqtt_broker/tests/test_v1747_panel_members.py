@@ -149,17 +149,19 @@ want(els.hubMembersEmpty.hidden === false, '空态提示应可见');
 want(els.addMemberBtn.disabled === false, '未满员应可点');
 want(els.hubMembers.children.length === 0, '没有成员就不该有行');
 
-// ② 一个成员：行里有掩码 + 移除按钮（带 data-mid）
+// ② 一个成员：行里有掩码 + 「改名」+「移除」（v1.7.54 起 3 个子元素）
 reset();
 renderMembers({ enabled: true, membersSupported: true, membersMax: 8,
                 members: [{ mid: 'a'.repeat(12), openidMasked: 'oFa…02', at: 1 }] });
 want(els.hubMembers.children.length === 1, '应渲染 1 行，实得 ' + els.hubMembers.children.length);
 const row = els.hubMembers.children[0];
-want(row.children.length === 2, '一行应有 掩码 + 移除按钮');
+want(row.children.length === 3, '一行应有 名称 + 改名 + 移除，实得 ' + row.children.length);
 want(row.children[0].textContent === 'oFa…02', '掩码没渲染: ' + row.children[0].textContent);
-want(row.children[1].textContent === '移除', '按钮文案: ' + row.children[1].textContent);
-want(row.children[1].attrs['data-mid'] === 'a'.repeat(12), 'data-mid 缺失（点了没法踢）');
-want(typeof row.children[1].onclick === 'function', '移除按钮没接 onclick');
+want(row.children[1].textContent === '改名', '改名按钮文案: ' + row.children[1].textContent);
+want(row.children[2].textContent === '移除', '按钮文案: ' + row.children[2].textContent);
+want(row.children[2].attrs['data-mid'] === 'a'.repeat(12), 'data-mid 缺失（点了没法踢）');
+want(typeof row.children[2].onclick === 'function', '移除按钮没接 onclick');
+want(typeof row.children[1].onclick === 'function', '改名按钮没接 onclick');
 want(els.hubMembersEmpty.hidden === true, '有成员时空态提示应隐藏');
 
 // ③ 满员：按钮禁用且说清上限

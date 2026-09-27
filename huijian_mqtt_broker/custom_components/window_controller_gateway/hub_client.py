@@ -100,6 +100,13 @@ HUB_HTTP_TIMEOUT_S = 15.0
 # 并在下个节流窗重试，别把 HA 的 REST 请求吊在那里。
 HUB_PANEL_HTTP_TIMEOUT_S = 5.0
 HUB_IDENTITY_FILE = "huijian_hub_identity.json"
+# 成员称呼表（v1.7.54）：hub 的成员记录只有 {openid, at}，**云端没有名称字段**，
+# 所以"爸爸/妈妈"这类称呼只能存在本机面板侧（键＝hub 给的 mid）。
+HUB_MEMBER_ALIAS_FILE = "huijian_member_aliases.json"
+# 称呼长度上限。面板 huijian.js 里的 MEMBER_ALIAS_MAX 是同一值的第二份，
+# 由 tests/test_v1754_member_alias.py 对账（改一边必须改另一边，否则
+# 面板允许输入 13 个字而加载项静默截成 12 个＝对用户说谎）。
+MEMBER_ALIAS_MAX_LEN = 12
 # 长连凭据走请求头，不进 URL query：任何记 request line 的中间层（云托管访问日志、
 # 反代、错误上报）都会把明文 secret 留档。hub 侧先读头、缺失回落 query（发版必须 hub 先）。
 WS_HEADER_INSTANCE_ID = "x-hub-instance-id"
@@ -120,6 +127,9 @@ HUB_MEMBERS_MAX = 8
 OP_BINDCODE = "bindcode"
 OP_MEMBERS = "members"
 OP_MEMBER_REMOVE = "member_remove"
+OP_MEMBER_RENAME = "member_rename"
+
+_ALIAS_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 _VALUE_RE = re.compile(r"-?\d+(\.\d+)?")
 
@@ -236,6 +246,63 @@ def save_identity(config_dir: str, data: Dict[str, Any]) -> None:
         raise
 
 
+def member_alias_path(config_dir: str) -> str:
+    return os.path.join(config_dir, HUB_MEMBER_ALIAS_FILE)
+
+
+def clean_member_alias(raw: Any) -> str:
+    """规范化成员称呼：控制符换空格、去首尾空白、截到 MEMBER_ALIAS_MAX_LEN。
+
+    截断而不是拒绝：面板 JS 用同一个上限先截过一遍，两侧同口径 ⇒ 用户看到的就是存下来的。
+    """
+    if not isinstance(raw, str):
+        return ""
+    return _ALIAS_CTRL_RE.sub(" ", raw).strip()[:MEMBER_ALIAS_MAX_LEN]
+
+
+def load_member_aliases(config_dir: str) -> Dict[str, str]:
+    """读成员称呼表；缺失/损坏/内容畸形一律回空表。
+
+    称呼只是本机面板上"怎么看这个人"，丢了不影响成员关系（关系真相在 hub），
+    所以这里不像身份文件那样改名留证——一句告警足够，别把排障预算花在小装饰上。
+    """
+    path = member_alias_path(config_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001 - 读不出来就当没起过名字，不能拖垮面板
+        _LOGGER.warning("成员称呼文件读取失败（%s），按无称呼处理", type(e).__name__)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for mid, raw in data.items():
+        if not isinstance(mid, str) or not mid:
+            continue
+        name = clean_member_alias(raw)
+        if name:
+            out[mid] = name
+    return out
+
+
+def save_member_aliases(config_dir: str, mapping: Dict[str, str]) -> None:
+    """原子写成员称呼表（唯一 tmp 名 + replace，同 save_identity 的纪律）。"""
+    path = member_alias_path(config_dir)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=config_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(mapping, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def validate_control_params(attribute: Any, value: Any) -> Optional[str]:
     """命令参数校验——与 LAN `_cmd_control` 同口径。
 
@@ -311,6 +378,10 @@ class HubClient:
         self.members_supported: bool = True       # 老 hub 无成员端点时置 False，面板据此禁用成员区
         self.members_max: Optional[int] = None    # hub 回的成员上限（None＝没拿到，回落常量）
         self._members_refresh_at: float = 0.0     # 上一次"GET /hub 顺带刷成员"时刻（节流基准）
+        # 成员称呼（v1.7.54）：本机面板侧的标签，键＝hub 的 mid，落 HUB_MEMBER_ALIAS_FILE。
+        # 与上面那条"成员关系本地不留副本"不冲突——**关系**仍以 hub 为准，这里存的不是关系。
+        self.member_aliases: Dict[str, str] = {}
+        self._aliases_loaded = False
         self._bind_renew_at: float = 0.0     # 上一次"换码尝试"时刻（成功失败都记，用于节流）
         self._rereg_streak: int = 0        # 连续【被拒 - 重注册】计数（见 HUB_REREGISTER_FUSE）
         self.connected = False
@@ -329,6 +400,8 @@ class HubClient:
         self._send_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._identity_lock: Optional[asyncio.Lock] = None
         self._identity_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._alias_lock: Optional[asyncio.Lock] = None
+        self._alias_lock_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ── 错误槽（连接类 / 操作类）───────────────────────────────────
     def _set_op_error(self, family: str, value: Optional[str]) -> None:
@@ -361,6 +434,14 @@ class HubClient:
             self._identity_lock = asyncio.Lock()
             self._identity_lock_loop = loop
         return self._identity_lock
+
+    def _alias_write_lock(self) -> asyncio.Lock:
+        """成员称呼写入锁（同款按循环懒建）。面板连点两行「改名」＝两次并发写同一文件。"""
+        loop = asyncio.get_running_loop()
+        if self._alias_lock is None or self._alias_lock_loop is not loop:
+            self._alias_lock = asyncio.Lock()
+            self._alias_lock_loop = loop
+        return self._alias_lock
 
     # ── 网关集合（条目增删/重载时由 __init__.py 重新聚合）───────────
     @property
@@ -395,6 +476,7 @@ class HubClient:
             return
         self._stopping = False
         await self._load_identity()
+        await self._load_aliases()
         self.attach_managers(self._managers)
         self._task = asyncio.ensure_future(self._run_forever())
 
@@ -517,6 +599,48 @@ class HubClient:
         # 老身份文件没有 bindCodeTtl ⇒ 0 ⇒ 有效期回落 BIND_CODE_TTL_S（向后兼容读取）
         if not self._bind_code_ttl_s:
             self._bind_code_ttl_s = _positive_int(ident.get("bindCodeTtl"))
+
+    async def _load_aliases(self) -> None:
+        """读本机成员称呼表（幂等：面板路由不经过 async_start，改名前自己补一次）。"""
+        if self._aliases_loaded:
+            return
+        self.member_aliases = await asyncio.to_thread(load_member_aliases, self.config_dir)
+        self._aliases_loaded = True
+
+    async def set_member_alias(self, mid: str, name: Any) -> bool:
+        """给一位家人起本机称呼（面板「改名」）。留空＝恢复显示云端掩码。
+
+        为什么存本地而不是云端：hub 的成员记录只有 {openid, at} 两个字段，没有任何
+        名称/头像概念，小程序侧也从来没有成员列表可显示——为一句称呼去加一条云端
+        写端点，代价是发版顺序 + 注册表镜像文档体积，收益是零。
+        键取 hub 的 mid（= sha256(openid) 前 12 位，只随微信账号走）：人被踢掉再扫
+        回来，称呼仍然对得上同一个人。
+        只认当前列表里的 mid：面板只会给看得见的行挂「改名」，凭一个不存在的 mid
+        往文件里写名字没有任何正当调用方，而 HTTP 边界要自己把关。
+        """
+        await self._load_aliases()
+        mid = str(mid or "")
+        if not mid or not any(
+            isinstance(m, dict) and str(m.get("mid") or "") == mid for m in self.members
+        ):
+            self._set_op_error(OP_MEMBER_RENAME, "member_rename_rejected")
+            return False
+        cleaned = clean_member_alias(name)
+        table = dict(self.member_aliases)
+        if cleaned:
+            table[mid] = cleaned
+        else:
+            table.pop(mid, None)
+        try:
+            async with self._alias_write_lock():
+                await asyncio.to_thread(save_member_aliases, self.config_dir, table)
+        except Exception as e:  # noqa: BLE001 - 写不进去就别在内存里假装记住了
+            self._set_op_error(OP_MEMBER_RENAME, "member_rename_failed")
+            self._logger.warning("成员称呼落盘失败（%s），本次改名未保存", type(e).__name__)
+            return False
+        self.member_aliases = table
+        self._clear_op_error(OP_MEMBER_RENAME)
+        return True
 
     async def _ensure_registered(self) -> None:
         """有身份则直接连；无身份（或上次被拒）则注册一次拿 instanceId/secret/绑定码。"""
@@ -1003,11 +1127,25 @@ class HubClient:
                 return sn
         return ""
 
+    def _members_with_alias(self) -> List[Dict[str, Any]]:
+        """把本机称呼并进成员行（**不改 self.members**——那份是 hub 原样透传的关系真相）。"""
+        out: List[Dict[str, Any]] = []
+        for m in self.members:
+            if not isinstance(m, dict):
+                continue
+            row = dict(m)
+            alias = self.member_aliases.get(str(m.get("mid") or ""))
+            if alias:
+                row["alias"] = alias
+            out.append(row)
+        return out
+
     def status_view(self) -> Dict[str, Any]:
         """给插件页/排障用：**不回显 secret**；绑定码本就是给用户看的，可回显。"""
         gateways = self.gateway_summary()
         gateway_sn = gateways[0]["sn"] if gateways else ""
         expires_in = self.bind_code_expires_in()
+        members = self._members_with_alias()
         return {
             "connected": bool(self.connected),
             "instanceId": self.instance_id,
@@ -1021,13 +1159,14 @@ class HubClient:
             "hub": self.base,
             "lastError": self.last_error,
             "lastOpError": self.last_op_error,
-            # 家庭成员（v1.7.47）：members 里只有掩码与 mid（hub 从不回完整 openid）
+            # 家庭成员（v1.7.47）：members 里只有掩码与 mid（hub 从不回完整 openid）；
+            # alias 是 v1.7.54 本机面板侧起的称呼，云端没有这个字段
             "memberCode": self.member_code,
             "memberCodeExpiresIn": self.member_code_expires_in(),
             "memberCodeExpired": bool(self.member_code) and self.member_code_expires_in() <= 0,
             "memberCodeTtlS": self.member_code_ttl_s(),
-            "members": list(self.members),
-            "membersCount": len(self.members),
+            "members": members,
+            "membersCount": len(members),
             "membersMax": self.members_max or HUB_MEMBERS_MAX,
             "membersSupported": bool(self.members_supported),
             "ownerMasked": self.owner_masked,
