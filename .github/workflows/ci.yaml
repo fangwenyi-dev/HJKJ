@@ -85,6 +85,48 @@ jobs:
           ruff check --select F,E9,B --ignore B008,B905               huijian_mqtt_broker/custom_components               huijian_mqtt_broker/tests               huijian_mqtt_broker/mdns_publisher.py               huijian_mqtt_broker/gateway_discovery_proxy.py
           python3 -m pytest huijian_mqtt_broker/tests -q
 
+      - name: Clone peer repos when read-only deploy keys are configured
+        id: peer-sync
+        # 私有仓在公共 runner 里默认不可见 ⇒ 契约钉只能跳过。给了只读 deploy key 就真跑，
+        # 没给就把"没跑"交给下一步的 ::warning:: 说出去（不假装绿）。
+        env:
+          HUB_REPO_DEPLOY_KEY: ${{ secrets.HUB_REPO_DEPLOY_KEY }}
+          MINIPROGRAM_REPO_DEPLOY_KEY: ${{ secrets.MINIPROGRAM_REPO_DEPLOY_KEY }}
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/peers"
+          for pair in "HUB_REPO_DEPLOY_KEY:huijian-cloud-hub" \
+                      "MINIPROGRAM_REPO_DEPLOY_KEY:xiaochengxu-mqtt"; do
+            var="${pair%%:*}"; name="${pair##*:}"
+            key="${!var:-}"
+            [ -z "$key" ] && { echo "::notice title=对端仓未配置::$name 无只读 deploy key，契约钉将走「响亮跳过」分支"; continue; }
+            printf '%s\n' "$key" > "$RUNNER_TEMP/$name.key"
+            chmod 600 "$RUNNER_TEMP/$name.key"
+            GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/$name.key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+              git clone --depth 1 "git@github.com:fangwenyi-dev/$name.git" "$RUNNER_TEMP/peers/$name" \
+              || { echo "::warning title=对端仓 clone 失败::$name 拉不下来，契约钉按不可见处理"; continue; }
+            case "$name" in
+              huijian-cloud-hub) echo "hub=$RUNNER_TEMP/peers/$name" >> "$GITHUB_OUTPUT" ;;
+              xiaochengxu-mqtt)  echo "mp=$RUNNER_TEMP/peers/$name"  >> "$GITHUB_OUTPUT" ;;
+            esac
+          done
+
+      - name: Cross-repo contract pins (跳过必须响亮，可见就真跑)
+        # 这三仓有 110 条「两边各写一份」的契约，编译器与单测都抓不到。v1.7.52 之前它们
+        # 在 CI 里从没跑过：脚本 exit 3、pytest 记 skipped、job 照绿，于是"CI 9/9 success"
+        # 把"没跑"说成了"跑过并通过"。本步把两种形态彻底分开：
+        #   · 两个只读 deploy key 都配了 ⇒ clone 对端仓后**真跑**，并自己复核 PASS 计数
+        #     ≥ 下限（子脚本被改瘪也要红）；
+        #   · 没配 ⇒ 退出 0（跳过不该阻断发版）但打 ::warning:: + 写进 step summary。
+        # 两条分支的行为由 tests/test_v1753_ci_contract_pins.py 真跑钉住。
+        # 这里**故意不写** continue-on-error——它本就是 false，而 tests/test_audit_round8.py
+        # 有一条"全文件只允许 warm-mirrors 出现一次 continue-on-error"的硬门钉；
+        # 写冗余的 false 会把那条钉判红。
+        env:
+          HUB_REPO: ${{ steps.peer-sync.outputs.hub }}
+          MINIPROGRAM_REPO: ${{ steps.peer-sync.outputs.mp }}
+        run: bash huijian_mqtt_broker/tests/e2e/ci_contract_pins.sh
+
       - name: JS syntax gate
         run: |
           # v1.7.33（全量审计）：79KB 手写前端此前无机械语法门——一个花括号
