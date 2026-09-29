@@ -870,8 +870,11 @@
         // 无感刷新：获取最新设备数据，只更新状态值，不重建 DOM
         // 与 loadGatewayDevices 的区别：不 innerHTML 重建，只 loadDeviceState 更新
         async function updateGatewayDevices(entryId, gatewaySn) {
-            const deviceListEl = document.getElementById('devices-' + entryId);
-            const statusEl = document.getElementById('gw-status-' + entryId);
+            // v1.7.55：let + await 后重取——与 loadGatewayDevices（:780-781）同款。
+            // 此处原为 const，:926-927 给 const 重赋值抛 TypeError，被 :943 的 catch
+            // 静默吞掉 ⇒ 网关徽标与逐设备状态更新永久执行不到（面板值冻结到手动 F5）。
+            let deviceListEl = document.getElementById('devices-' + entryId);
+            let statusEl = document.getElementById('gw-status-' + entryId);
             if (!deviceListEl) return;
             try {
                 const resp = await haApi('/window_controller_gateway/devices?config_entry_id=' + entryId);

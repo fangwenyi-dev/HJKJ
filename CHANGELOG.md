@@ -3,6 +3,20 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.7.55] - 2026-09-29
+
+面板「无感刷新」被一个 `const` 永久冻死。配套 hub / 小程序 **零改动**。**本批无发版顺序约束**：只改 `www/js/huijian.js` 一处声明关键字，是纯浏览器侧修复，线协议零字段变更（无新端点、无新字段、无字段改名）⇒ 任一端先上都不会把另一端断开。
+
+**一、无感刷新跑不完：`deviceListEl`/`statusEl` 声明成 `const`，`await` 之后又重取，赋值即抛 `TypeError` 被 `catch` 静默吞掉（P0）**。`updateGatewayDevices`（无感刷新，:869 起）在第二个 `await haApi('/states')` **之后**按 id **重新取值**（防容器被整体重建后写回孤儿节点），但这两行是 `const` ⇒ `TypeError: Assignment to constant variable.`，被同函数内层 `catch` 吞 ⇒ 网关徽标 `updateGatewayStatus` 与逐设备 `loadDeviceState` **永久执行不到**。用户可见后果：首屏正常，之后在 HA 里开/关、拖滑块、改状态，面板一律停在初始值，直到**手动 F5**，且无报错、无提示。**三条调用路径全中**：每 30s `silentRefresh`、控制命令后 2s、点「状态」按钮检查后 2s——用户以为"刷新在跑"，实际一次都没跑成。
+
+**二、修法**：把这两行改回 `let`，与同段逻辑 `loadGatewayDevices:780-781` 对齐（那里一直是 `let`，本处是漏改），并加三行 v1.7.55 说明注释把因果钉在原地，防将来又被"顺手 const 化"。
+
+**三、新增行为钉 `test_v1755_silent_refresh_behavior.py`（3 用例，node 真跑假 DOM）**：把**真实函数体**按大括号配平从源码里抽出来（不 `eval` 整个文件），配一个最小假 DOM，用 node **真跑**它，探针记录 `loadDeviceState` 调用次数——无感刷新真的刷新了，这个数就必须 ≥ 1。① 元钉 `test_extracted_function_is_real`：抽取锚点一漂移就红（防守卫抽到 0 个函数后静默假绿）；② 主行为钉 `test_silent_refresh_really_updates_device_states`：新旧两条 API 分支各自断言状态真的刷上去；③ 自变异钉 `test_probe_catches_the_const_regression`：把抽出的 `let` 改回 `const` 再跑必须红——钉子自证不是假绿钉（变异只在临时目录，仓库不动）。**四向核验**：基线 `let` 绿 / 目标变异 `const` 红 / 反向变异 `var` 绿（证判据有区分度，不是见改就红）/ `git show HEAD:` 真实缺陷版 `const` 红。
+
+**四、这条没覆盖什么（如实记，别当成已闭环）**：新测试只钉 `updateGatewayDevices` 一个函数，**不覆盖** `loadGatewayDevices`——后者本来就是对的 `let`，但同段没有行为钉。另外假 DOM 有两个会致假的坑：`getElementById('dev-<id>')` 必须返回真实元素（否则 `if (devEl)` 本就跳过）、服务端 `subDevices` 的 id 集合必须与 `querySelectorAll('.device-item')` 逐字相等，两条都写进文件头维护提醒并用 `probe.rebuild === 0` 兜住。`node --check` 只查语法、`test_mobile_v175.py` 对该函数只做源码文本扫描（结构钉），**都抓不到这条运行时缺陷**——这正是要补一条行为钉的理由。
+
+门禁：本地回归子集 **8 个文件 44 passed**（`test_v1755` + `test_mobile_v175` + `test_v1746_panel_render` + `test_v1746_panel_unique_funcs` + `test_v1737_hub_ui` + `test_v1738_hub_qr_ui` + `test_const` + `test_v1716_store_schema`）；版本四源结构钉 `test_audit_round6` / `test_audit_round8` / `test_webui_split_v1625` **83 passed**；`node --check` ×3、`bash -n run.sh`、`compileall` 全绿；版本四源＝**1.7.55**、5 处 cache-buster＝**1.7.55** 全绿。
+
 ## [1.7.54] - 2026-09-27
 
 面板「家庭成员」那一行终于可读：每行加「改名」，称呼存在本机。配套 hub / 小程序 **零改动**。**本批无发版顺序约束**：改名是**纯本机操作**，新路由一次都不打云端（`set_member_alias` 只写 `config_dir` 下的一个 JSON，`_http` 不在调用路径上），线协议零字段变更 ⇒ 任一端先上都不会把另一端断开。
