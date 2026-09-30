@@ -48,6 +48,15 @@ class _ProtocolMixin:
                 return int(raw.strip())
             except ValueError:
                 return raw
+        # 审计 2026-09-30 A-4：兜底原样返回会让**不可哈希**的 id（网关/桥接
+        # 侧塞进 JSON 的 list/dict）一路走到 _ctypes 的
+        # `self._bind_ops.pop(self._norm_cmd_id(...))` ⇒ TypeError: unhashable
+        # type，绑定/解绑确认整帧丢弃（设备不入库、配对窗要等 60s 超时才关），
+        # 异常还逃逸成 HA「Task exception was never retrieved」。
+        # 本函数 docstring 自陈未识别类型应"退回 miss/旁路分支"——None 才是
+        # 那个形态（None 可哈希、pop(None) 必 miss），不可哈希的一律收敛为它。
+        if isinstance(raw, (list, dict, set, bytearray)):
+            return None
         return raw
 
     async def _subscribe_topics(self) -> bool:
@@ -344,7 +353,14 @@ class _ProtocolMixin:
                         device_sn = str(raw_sn)
                         if not device_sn:
                             continue
-                        device_name = device_info.get(ATTR_DEVICE_NAME, f"设备 {device_sn[-6:]}")
+                        # 审计 2026-09-30 A-5：上方对 raw_sn 有逐条守卫，name 是
+                        # 同一纪律的漏项。`device_info.get(ATTR_DEVICE_NAME, 默认)`
+                        # 在"键存在但值为 null"时返回的是 **None 而不是默认值**，
+                        # 交给 add_device 的 device_name.lower() 即 AttributeError，
+                        # 一条脏 name 打断整批设备入库（与 B-12 修的同一形态）。
+                        device_name = device_info.get(ATTR_DEVICE_NAME)
+                        if not isinstance(device_name, str) or not device_name:
+                            device_name = f"设备 {device_sn[-6:]}"
                         device_type = device_info.get("device_type", DEVICE_TYPE_WINDOW_OPENER)
                         
                         # v1.7.18（第 7 轮审计 BUG-15）：B-6 同型门禁补齐——

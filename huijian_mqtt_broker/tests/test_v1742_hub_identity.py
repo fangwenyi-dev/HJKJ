@@ -12,6 +12,7 @@
   2) e2e 在拿不到 hub 仓时"静默通过"（skip 不响亮＝门禁不存在）→ 红。
 """
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,6 +21,8 @@ E2E = ROOT / "tests" / "e2e"
 DRIVER = E2E / "hub_lifecycle_driver.py"
 SH = E2E / "hub_lifecycle_e2e.sh"
 HARNESS = E2E / "hub_lifecycle_harness.js"
+WRAPPER = E2E / "ci_hub_lifecycle.sh"
+CI = ROOT.parent / ".github" / "workflows" / "ci.yaml"
 
 SRC = DRIVER.read_text(encoding="utf-8")
 SH_SRC = SH.read_text(encoding="utf-8")
@@ -84,3 +87,59 @@ def test_harness_uses_the_real_hub_source():
     js = HARNESS.read_text(encoding="utf-8")
     assert "require(path.join(repo, 'src', 'server.js'))" in js, "harness 不再引用真 hub 源码"
     assert "createHub(" in js
+
+
+# ---- 审计 2026-09-30 H-4 复核：真栈要在 CI 里被调用，且跳过/真跑两条分支可辨 ----
+
+
+def test_ci_runs_the_hub_lifecycle_stack():
+    """H-4 复核：此前 hub_lifecycle_e2e.sh 无任何 CI step——35 条真栈断言
+    "本地全跑、CI 一条不跑"，本组钉在 CI 里等于不存在。
+
+    判据按 YAML 字段路径解析（同 test_v1753 的反假绿口径）：step 的 run 里
+    必须真出现入口调用；缺 pyyaml 时响亮 skip（CI 里 pyyaml 有专钉保证先装）。
+    """
+    try:
+        import yaml
+    except ImportError:
+        import pytest
+        pytest.skip("无 pyyaml，无法按字段解析 workflow（CI 侧有专钉保证它先装）")
+    doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    steps = [st for job in (doc.get("jobs") or {}).values()
+             for st in (job.get("steps") or [])
+             if isinstance(st.get("run"), str) and "ci_hub_lifecycle.sh" in st["run"]]
+    assert steps, "没有哪个 step 真调用 hub 生命周期入口（H-4 回潮）"
+    for st in steps:
+        assert st.get("continue-on-error") is not True, \
+            "真栈 step 不许 continue-on-error（红会被压成绿）"
+        assert "|| true" not in st["run"] and "|| exit 0" not in st["run"], \
+            "真栈 step 不许把失败吞成 0"
+        env = st.get("env") or {}
+        assert any("HUB_REPO" in str(k) + str(v) for k, v in env.items()), \
+            "入口必须拿到 HUB_REPO（否则永远走跳过分支＝又一个假绿）"
+
+
+def test_ci_wrapper_skip_is_loud_and_nonblocking():
+    """行为钉：对端仓不可见 ⇒ exit 0 但必须响亮（::warning + 条数 + 变量名），
+    且**不得**打印真栈汇总行——那在日志里就是"跑过了"的形态。"""
+    env = dict(os.environ, HUB_REPO="", PYTHONIOENCODING="utf-8")
+    r = subprocess.run(["bash", str(WRAPPER)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env, timeout=120)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, \
+        "缺仓时入口必须 exit 0（跳过不阻断发版），实得 %s：%s" % (r.returncode, out[-300:])
+    assert "::warning" in out and "未执行" in out, "跳过必须响亮：%s" % out[-300:]
+    assert "HUB_REPO" in out, "要点名缺哪个变量，否则没人知道怎么补"
+    assert not re.search(r"真栈: \d+ passed", out), \
+        "跳过路径不许打印真栈汇总行（那是「跑过了」的形态）"
+
+
+def test_ci_wrapper_real_run_branch_is_faithful():
+    """结构钉（可见分支）：真跑 + rc 透传 + PASS 计数下限——缺一即假绿。"""
+    code = "\n".join(l for l in WRAPPER.read_text(encoding="utf-8").splitlines()
+                     if not l.strip().startswith("#"))
+    assert re.search(r"\bbash\b[^\n]*hub_lifecycle_e2e\.sh", code), \
+        "入口没有真调真栈脚本（只剩注释提到名字也算假绿）"
+    assert re.search(r"\bexit\s+\"?\$rc\"?", code), "真跑失败必须透传 rc（不许吞）"
+    assert "FLOOR" in code and "-lt" in code, \
+        "缺 PASS 计数下限自检（驱程被砍臂会静默绿）"

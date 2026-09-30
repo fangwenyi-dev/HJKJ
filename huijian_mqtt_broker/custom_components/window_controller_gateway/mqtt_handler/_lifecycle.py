@@ -412,25 +412,24 @@ class _LifecycleMixin:
         self._bind_ops.clear()
 
         # 取消后台任务
+        # 审计 2026-09-30 C-6：三处"取消子任务再 await 收尾"统一改
+        # gather(return_exceptions=True)（照 hub_client.async_stop:493-497 的定案，
+        # 那里的注释就是本处的判据）。裸 await 的两个毛病：①子任务必然回
+        # CancelledError，裸 await 把它当"本协程被取消"往上传（要靠 except 分支
+        # 吞掉，于是真被取消时也一起被吞）；②写成 `except (CancelledError, Exception)`
+        # 更是明着吞掉 HA 停机路径的取消信号。gather 两者都对：子任务的取消不转抛，
+        # 本协程真被取消时照样上传。
         if self._check_task:
             self._check_task.cancel()
-            try:
-                await self._check_task
-            except asyncio.CancelledError:
-                _LOGGER.debug("MQTT检查任务已取消")
-            except Exception as e:
-                _LOGGER.debug("MQTT检查任务异常: %s", e)
+            await asyncio.gather(self._check_task, return_exceptions=True)
+            _LOGGER.debug("MQTT检查任务已收尾")
             self._check_task = None
 
         # 取消 MQTT 重连任务（若正在运行）
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
-            try:
-                await self._reconnect_task
-            except asyncio.CancelledError:
-                _LOGGER.debug("MQTT重连任务已取消")
-            except Exception as e:
-                _LOGGER.debug("MQTT重连任务异常: %s", e)
+            await asyncio.gather(self._reconnect_task, return_exceptions=True)
+            _LOGGER.debug("MQTT重连任务已收尾")
             self._reconnect_task = None
 
         # v1.7.12（审计 B-4 尾检兜底）：重连任务可能吞掉本次取消并完成
@@ -438,10 +437,8 @@ class _LifecycleMixin:
         # 在 unload 收口前取消，不留泄漏
         if self._check_task and not self._check_task.done():
             self._check_task.cancel()
-            try:
-                await self._check_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                _LOGGER.debug("cleanup 尾检取消残留超时检查任务")
+            await asyncio.gather(self._check_task, return_exceptions=True)
+            _LOGGER.debug("cleanup 尾检取消残留超时检查任务")
             self._check_task = None
         
         # v1.7.33：订阅已在 cleanup 首部（首个 await 之前）退订，此处不再重复。

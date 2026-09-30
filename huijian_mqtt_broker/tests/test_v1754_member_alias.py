@@ -14,6 +14,8 @@
   · 结构钉只证明"调用了" ⇒ 渲染与规范化都在 node 里真跑，不打桩被测函数。
 """
 import asyncio
+
+from homeassistant.core import full_status_view
 import json
 import re
 import shutil
@@ -267,15 +269,17 @@ class _FakeClient:
         return True
 
     def status_view(self):
-        return {
-            "connected": True, "instanceId": "inst-1", "bindCode": "162193",
-            "bindCodeExpiresIn": 120, "bindCodeExpired": False, "gatewaySn": "GW1",
-            "gateways": [{"sn": "GW1", "deviceCount": 2}], "hub": "https://hub",
-            "lastError": None, "lastOpError": None, "memberCode": "654321",
-            "members": [{"mid": MID_A, "openidMasked": "oeh…zS", "at": 1, "alias": "爸爸"}],
-            "membersCount": 1, "membersMax": 8, "membersSupported": True,
-            "ownerMasked": "oFa…01",
-        }
+        # 审计 2026-09-30 H-6：改由真实现派生（键集不可能再比真的窄），只覆盖
+        # 本文件要验的成员区字段。
+        return full_status_view(
+            connected=True, instanceId="inst-1", bindCode="162193",
+            bindCodeExpiresIn=120, bindCodeExpired=False, bindCodeTtlS=600,
+            gatewaySn="GW1", gateways=[{"sn": "GW1", "deviceCount": 2}],
+            hub="https://hub", lastError=None, lastOpError=None,
+            memberCode="654321", memberCodeTtlS=600, memberCodeExpiresIn=480,
+            memberCodeExpired=False,
+            members=[{"mid": MID_A, "openidMasked": "oeh…zS", "at": 1, "alias": "爸爸"}],
+            membersCount=1, membersMax=8, membersSupported=True, ownerMasked="oFa…01")
 
 
 class _FakeHass:
@@ -353,12 +357,37 @@ def test_member_op_views_return_the_full_status_view(cls, post_body):
 
     喂窄包（只回 members）时，面板唯一渲染出口会把 connected/bindCode/memberCode 当缺失
     ⇒ 用户点完「移除」，面板就在一张刚还在倒计时的有效码旁边显示"未连接 / ------"。
+
+    审计 2026-09-30 H-6 改钉：旧写法只查 5 个**恰好在假件里存在**的键
+    （bindCodeTtlS / memberCodeTtlS / memberCodeExpiresIn / memberCodeExpired 都不在
+    假件的 dict 里）⇒ 真 status_view 停发任一 TTL 字段照样绿。判据现在取自
+    **真实现的键集**，假件少给一键就红（见 test_fake_client_is_wide_as_real）。
     """
     client = _FakeClient()
     out = {}
     asyncio.run(_view(cls, out).post(_FakeRequest(_FakeHass(client), post_body)))
-    for key in ("connected", "bindCode", "bindCodeExpiresIn", "memberCode", "gateways"):
-        assert key in out, "回包缺 %s：面板会把它渲染成「未连接 / 无码」（%s）" % (key, cls.__name__)
+    required = _real_status_view_keys()
+    missing = required - set(out)
+    assert not missing, \
+        "回包缺 %s（面板会渲染成「未连接 / 无码 / 硬编倒计时」）" % sorted(missing)
+
+
+def _real_status_view_keys() -> set:
+    """真 HubClient.status_view() 的键集——判据的唯一权威来源。"""
+    from custom_components.window_controller_gateway import hub_client as hc
+    real = hc.HubClient([], config_dir=".")
+    return set(real.status_view().keys())
+
+
+def test_fake_client_is_wide_as_real():
+    """反向核验：假件的视图必须不窄于真实现（本仓纪律，已四次实锤）。
+
+    没有这条，上一条钉的"判据来自真实现"会在假件缺键时直接红到底——那才是
+    真正的进展；本条把它变成**先红在桩上**而不是红在生产判据上。
+    """
+    assert _real_status_view_keys() <= set(_FakeClient().status_view()), \
+        "假件 status_view 少键：%s" % sorted(
+            _real_status_view_keys() - set(_FakeClient().status_view()))
 
 
 def test_member_op_views_read_the_singleton_not_entries():

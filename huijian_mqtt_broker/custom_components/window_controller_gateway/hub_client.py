@@ -384,6 +384,9 @@ class HubClient:
         self._aliases_loaded = False
         self._bind_renew_at: float = 0.0     # 上一次"换码尝试"时刻（成功失败都记，用于节流）
         self._rereg_streak: int = 0        # 连续【被拒 - 重注册】计数（见 HUB_REREGISTER_FUSE）
+        # 审计 2026-09-30 D-2：本机刚被云端拒过身份 ⇒ 磁盘凭据不可信，
+        # _ensure_registered 必须跳过"读回旧凭据即复用"的短路（见该方法注释）。
+        self._identity_rejected: bool = False
         self.connected = False
         # 两个错误槽必须分开：连接类（长连/身份）与操作类（换码/成员/踢人）混在一个槽里，
         # 一次瞬时操作失败就会长期盖住 identity_rejected_loop 这条最有诊断价值的信息，
@@ -510,13 +513,32 @@ class HubClient:
         while not self._stopping:
             try:
                 connected = False
+                # 审计 2026-09-30 B-2 配套：每次尝试开头清空连接类错误槽。
+                # 只在本轮没人写过语义值时才用异常类名兜底（见下方 except），
+                # 否则上一轮残留的 identity_rejected 会把这一轮真实的异常藏起来。
+                self.last_error = None
                 try:
                     connected = await self._session_once()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001 - 任何异常都只降级重连
-                    self.last_error = type(e).__name__
-                    self._logger.warning("hub 连接异常（%s），准备重连", type(e).__name__)
+                    # 审计 2026-09-30 B-2：旧写法在这里**无差别覆写** last_error。
+                    # 而 :927/:954 两处语义值（identity_rejected_loop /
+                    # identity_rejected）写完必然 raise，异常一到本行就被改成异常
+                    # 类名——面板 hubErrorText（huijian.js:133-141）只认那两个值，
+                    # 其余一律回 ''，于是唯一能指路的文案（/healthz mirror.enabled、
+                    # 实例数必须为 1）永久丢失，用户只看到"未连接"。
+                    # 本行上方的 :388-390 注释早就写明"不得让瞬时失败盖住这条最有
+                    # 诊断价值的信息"，实装却正好盖住了——按该口径改为只在空槽时兜底。
+                    # 同时 :519 只打类名把 HubHttpError.status/err（:39-51 专为此设计）
+                    # 与消息一起丢掉；:723-731 已为同一课定下 `why = str(e) or 类名`
+                    # 的口径并做凭据降级，这里对齐（WS URL 已不带凭据，:880-893）。
+                    why = str(e) or type(e).__name__
+                    if self._secret and self._secret in why:
+                        why = type(e).__name__    # 万一消息里带上密钥，降级为类名
+                    if not self.last_error:
+                        self.last_error = why
+                    self._logger.warning("hub 连接异常（%s），准备重连", why)
                 finally:
                     self.connected = False
                 if self._stopping:
@@ -644,9 +666,14 @@ class HubClient:
 
     async def _ensure_registered(self) -> None:
         """有身份则直接连；无身份（或上次被拒）则注册一次拿 instanceId/secret/绑定码。"""
-        if self.instance_id is None:
+        # 审计 2026-09-30 D-2：_invalidate_identity 的落盘可能失败（盘满/只读），
+        # 那时磁盘仍是刚被 401 拒掉的那张凭据。不加这道闸的话 _load_identity 把
+        # 死身份读回来、下方判"有身份"直接 return 跳过注册 ⇒ 再 401 → 三次熔断，
+        # 而且 HA 重启也读回同一份死身份，永不自愈。被拒标记只在**本机刚被拒过**
+        # 时为真，正常重启复用凭据的行为不变。
+        if self.instance_id is None and not self._identity_rejected:
             await self._load_identity()
-        if self.instance_id and self._secret:
+        if self.instance_id and self._secret and not self._identity_rejected:
             return
         # 注册载荷的 sn 只是 hub 侧展示字段（协议不变）：取首个网关，
         # 完整网关列表靠状态上行的 gwSn 体现——不让 hub 变成网关拓扑的权威。
@@ -667,7 +694,20 @@ class HubClient:
         self._bind_code_at = time.time()
         # 注册回的是**绝对**到期时刻（ms），换算成 TTL；缺失＝老 hub，回落本地常量
         self._bind_code_ttl_s = _ttl_from_expire_ms(data.get("bindExpire"))
-        await self._save_identity()
+        self._identity_rejected = False   # 拿到新身份即解除强制重注册闸
+        # 审计 2026-09-30 D-1 第三处：云端这一步**已经成功**（instanceId/secret/绑定码
+        # 都已签发），只有本地落盘失败（盘满/只读/tmp 竞态）。裸 await 会把异常抛给
+        # _run_forever ⇒ 本轮作废，下一轮 _ensure_registered 见内存里有身份直接 return
+        # ⇒ 一切"看起来正常"，直到 HA 重启才暴露：磁盘没凭据 ⇒ 重新注册 ⇒ 换
+        # instanceId ⇒ 作废所有人手上的绑定码 + hub 侧留一条孤儿实例。身份只在内存里
+        # 活着是可继续工作的状态，但必须让人看得见，所以记 last_error 而非静默。
+        try:
+            await self._save_identity()
+        except Exception as e:  # noqa: BLE001 - 落盘失败不许掐断刚签发的身份
+            self.last_error = "identity_persist_failed:%s" % type(e).__name__
+            self._logger.warning(
+                "hub 身份落盘失败（%s），本次凭据仅存内存：HA 重启后会重新注册并作废绑定码",
+                type(e).__name__)
         # 绑定码要让用户看得到，但日志只记摘要（凭据不回显纪律）
         self._logger.info("hub 注册成功 instance=%s 绑定码=%s（请在插件页查看完整码）",
                           self.instance_id, cred_brief(self.bind_code))
@@ -757,7 +797,24 @@ class HubClient:
         self._bind_code_at = time.time()
         self._bind_code_ttl_s = ttl
         self._clear_op_error(OP_BINDCODE)
-        await self._save_identity()
+        # 审计 2026-09-30 D-1：`_save_identity` 此前裸奔。抛 OSError（盘满 /
+        # config_dir 不可写）时三件后果一起发生：①api.py 的换码视图未包异常
+        # ⇒ 面板收 500；②本方法由 _keepalive_loop:1015/1020 调用时保活 task
+        # 静默死亡，_session_once 的 gather(return_exceptions=True) 把异常吞掉
+        # ⇒ 无日志、last_error 不变，本会话期内自动换码与"标脏重推"全部停摆
+        # （正是 :1008-1013 说要避免的"updatedAt 越来越旧"）；③hub 已当场作废
+        # 旧码，磁盘仍留旧码 ⇒ 重启后 status_view 回显一张死码，用户扫它必失败。
+        # 与同文件 set_member_alias 的落盘闸同口径：捕获、如实标错、不假装没发生。
+        # 不回滚内存值——新码才是云端当前认的那张，回滚成旧码等于确定性地发一张死码。
+        try:
+            await self._save_identity()
+        except Exception as e:  # noqa: BLE001 - 落盘失败不得拖垮换码与保活
+            self._set_op_error(OP_BINDCODE, "bindcode_persist_failed")
+            self._logger.warning(
+                "hub 绑定码已换发但本机落盘失败（%s）：本会话内这张码有效，"
+                "但 HA 重启后会回显旧码（已被云端作废）——请重新点二维码换码并扫码",
+                type(e).__name__)
+            return True
         self._logger.info("hub 绑定码已更新（%s）", cred_brief(self.bind_code))
         return True
 
@@ -949,7 +1006,27 @@ class HubClient:
         self._secret = None
         self.bind_code = None
         self._bind_code_at = 0.0
-        await self._save_identity()
+        # 审计 2026-09-30 D-2：member 侧字段同样属于**当前这个 instance**。
+        # status_view 无条件回显 memberCode/members/ownerMasked，不清就会在换发
+        # 新 instanceId 之后继续把旧实例的成员码推给面板——家人扫的是一张新 hub
+        # 从未签发过的码，hub 只能回 code_invalid，而它永不自愈。
+        # 与 :373"不落盘以免与 hub 真相分叉"是同一口径的另一半。
+        self.member_code = None
+        self._member_code_at = 0.0
+        self.members = []
+        self.owner_masked = None
+        # 落盘失败不得让"内存已清空"半途而废：旧写法 _save_identity 抛出 ⇒ 后面的
+        # _rereg_streak/last_error 全不执行，且磁盘仍是刚被 401 拒掉的那张凭据，
+        # 下一轮 _ensure_registered 的 _load_identity 把它读回来并直接 return 跳过
+        # 注册 ⇒ 再 401 → 三次熔断 → **连 HA 重启都读回同一份死身份**，与本函数
+        # docstring 承诺的"下次连接必然重新注册"相反。
+        self._identity_rejected = True    # 强制下一轮一定重注册（不看磁盘身份）
+        try:
+            await self._save_identity()
+        except Exception as e:  # noqa: BLE001 - 清档失败只降级，不吞掉熔断计数
+            self._logger.warning(
+                "身份失效后本地清档失败（%s）：本机内存已清，下次连接将强制重新注册"
+                "（忽略磁盘上的旧身份）", type(e).__name__)
         self._rereg_streak += 1
         self.last_error = "identity_rejected"
         self._logger.warning(
@@ -1089,14 +1166,23 @@ class HubClient:
         if msg.get("action") != "control":
             return {"ok": False, "err": "unknown_action"}
         dev_sn = msg.get("sn")
-        params = msg.get("params") or {}
+        # 审计 2026-09-30 A-2：`or {}` 只挡假值——hub/小程序发来 `"params":[]`
+        # /`"params":"x"`/`"params":123` 这类**真值非 dict** 时原样透传，
+        # params.get 抛 AttributeError 冒泡出 _session_once（接收循环 :984 无 try）
+        # ⇒ 被外层当"连接异常"，整条云长连断开重连（会话状态与 _rereg_streak 随
+        # 重连重置），且 cmd_result 永不回，小程序干等。LAN 同款入口有闸
+        # （ws_gateway.handle_json_message 的 isinstance(msg, dict)），云通道此前
+        # 只校验了 data 是 dict（:982）——两条通道判据必须一致（本仓纪律）。
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            return {"ok": False, "err": "invalid_params"}
         value_s = validate_control_params(params.get("attribute"), params.get("value"))
         if not isinstance(dev_sn, str) or not dev_sn or value_s is None:
             return {"ok": False, "err": "invalid_params"}
         if self.control_fn is None:
             return {"ok": False, "err": "control_unavailable"}
         try:
-            ok = await self.control_fn(dev_sn, params["attribute"], value_s)
+            ok = await self.control_fn(dev_sn, params.get("attribute"), value_s)
         except Exception as e:  # noqa: BLE001
             self._logger.warning("hub 命令执行异常：%s", type(e).__name__)
             return {"ok": False, "err": "control_failed"}

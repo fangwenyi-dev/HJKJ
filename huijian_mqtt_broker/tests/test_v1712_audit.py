@@ -121,8 +121,13 @@ class TestRunShCredentialRestoreAndWatchdog:
         assert 'FIRMWARE_MQTT_USER="huijian"' in sh, "凭据恢复常量丢失"
         assert 'FIRMWARE_MQTT_PASS="huijian2022"' in sh
         # 恢复块必须在 mosquitto 口令文件生成之前（先恢复后使用）
-        i_restore = sh.index("凭据自动恢复")
-        assert sh.index("mosquitto_passwd -c -b") > i_restore, \
+        # 审计 2026-09-30 H-5/A7 改钉：旧写法 `sh.index("凭据自动恢复")` 命中的是
+        # run.sh:21 的**注释**（那句"整体上移到「凭据自动恢复」之前"），而真恢复块在
+        # 32-45 行、mosquitto_passwd -c -b 在 74 行——把恢复块整体挪到口令生成之后
+        # （正是本钉要防的缺陷）断言照样成立。顺序钉必须锚在代码行上，并先去注释。
+        _code = "\n".join(l for l in sh.splitlines() if not l.strip().startswith("#"))
+        i_restore = _code.index('USERNAME="${FIRMWARE_MQTT_USER}"')
+        assert 0 <= i_restore < _code.index("mosquitto_passwd -c -b"), \
             "口令文件生成先于凭据恢复：漂移值照样落盘（顺序错误）"
         # 两个方向都要恢复（用户名 + 密码），且不回显密码本身
         assert 'if [ "${USERNAME}" != ' in sh or sh.count('if [ "${USERNAME}" != ') >= 1

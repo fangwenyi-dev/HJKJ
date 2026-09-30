@@ -359,6 +359,30 @@ if ! host supervisor >/dev/null 2>&1; then
     SUPERVISOR_HOST="172.30.32.2"
 fi
 
+# 审计 2026-09-30 F-1：https 反代必须校验上游证书。
+# nginx 的 proxy_ssl_verify 默认 **off**：本文件与 ingress.conf 的
+# /api/github/、/api/gitee/ 两条只开了 proxy_ssl_server_name（SNI）却没开校验，
+# 于是同网段 MITM / DNS 劫持可以伪造一份 release JSON，Web UI 的"最新发布版"
+# 徽章与更新说明（changelog 正文直显）被攻击者任意支配。两处 conf 对此无一句
+# 理由，而纯 http 上游的 /api/ha/ 反倒显式写了 proxy_ssl_verify off（对 http
+# 是无意义指令）——说明这个默认值从未进入考虑。
+# CA 束由 Dockerfile 显式列装（v1.7.55 起 `apk add ca-certificates`），不再赌
+# base 镜像"恰好有"——文件缺失时 nginx -t 是 [emerg] 级失败，整个 Web UI 起不来，
+# 比徽章拿不到 release JSON 严重得多。这里的警告只作运行期兜底核对。
+# 这里**只留警告、不改配置**：把校验写成 shell 变量会让"两拷贝机械对账"
+# （tests/test_v1712_audit.py::TestIngressMechanicalDiff）失去可比的字面形态，
+# 而那份漂移门禁正是 v1.7.12 为"三次漂移全靠人工"立的。真缺 CA 束时 nginx -t
+# 会在下面的失败分支里把原因打出来，看门狗(:533) 也会持续报"10998 无监听"。
+# verify_depth 2（nginx 默认 1）：gitee 实测链是 *.gitee.com → TrustAsia DV TLS
+# RSA CA 2024 → TrustAsia TLS RSA Root CA（再由 Certum 根交叉签名，服务端不发），
+# 中间 CA 就有两层，按默认 1 会判 depth 超限而 502。GitHub 真链只一层，取 2 是
+# 对侧兼容，不是放宽到"任意深"。
+if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
+    echo "[Ingress] 错误：未找到 /etc/ssl/certs/ca-certificates.crt，" \
+         "github/gitee 反代的证书校验会让 nginx 起不来——镜像缺 ca-certificates 包" \
+         "（Dockerfile 已显式列装，命中这条说明基础镜像换了）" >&2
+fi
+
 cat > /etc/nginx/http.d/ingress.conf <<NGINXEOF
 server {
     listen 10998;
@@ -440,6 +464,9 @@ server {
         proxy_pass https://api.github.com/;
         proxy_set_header Host api.github.com;
         proxy_ssl_server_name on;
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify_depth 2;
         proxy_read_timeout 15s;
         proxy_connect_timeout 10s;
         proxy_hide_header Cache-Control;
@@ -451,6 +478,9 @@ server {
         proxy_pass https://gitee.com/api/v5/;
         proxy_set_header Host gitee.com;
         proxy_ssl_server_name on;
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify_depth 2;
         proxy_read_timeout 15s;
         proxy_connect_timeout 10s;
         proxy_hide_header Cache-Control;
@@ -510,6 +540,76 @@ nginx || {
     }
 }
 
+# ---------- 3a. nginx 存活看门狗 ----------
+# 审计 2026-09-30 F-2：上面那段只管**首启**失败重试一次，此后整个容器生命周期
+# 再无一次探活；而 config.yaml 的 `watchdog: tcp://[HOST]:2022` 只探 broker ⇒
+# nginx master 中途退出/OOM、或宿主 10998 事后被抢占时：Web UI 永久不可用、
+# Supervisor 判健康不重启容器、§7b 巡检还在每 5s 写没人取得到的 status.json。
+# 同文件对 mosquitto(:1071)、mDNS(:567)、发现代理(:1033) 各配了看门狗，唯独
+# nginx 漏——:515 的"不 abort 整脚本"是刻意的，"终身不再管"没有任何认领。
+# 判据 = "10998 有 LISTEN" **且** "本容器 nginx 进程在"（探活走 /proc，
+#   与 §7b 同源；base 镜像没有 netstat/pgrep）：
+#   宿主网络下 /proc/net/tcp 是宿主的表，只看端口会被"端口被其它进程占用"
+#   骗成健康；只看进程又会漏掉"进程在但没监听"。两者都要（F-2 复核补口）。
+# 探活拆成纯函数：行为钉"抽出真实现 + 喂假 /proc 真跑"（F-2 复核要求），
+# 不在测试里重抄一份判据。路径可用环境变量替换——宿主端口表与 /proc 根
+# 是测试杠杆（同 HUIJIAN_HUB_BASE 的黑洞杠杆先例），生产不设置即真路径。
+nginx_probe_listen() {
+    # 10998（十六进制 2AF6）LISTEN 计数。逐文件容错：/proc/net/tcp6 缺失
+    # （内核未编 IPv6）只跳过该文件——两文件一起喂给 awk 时，缺失的那个是
+    # 致命错误，会把另一个文件里已经数到的命中一起吞掉（判成 0 ⇒ 误拉起）。
+    # 读取异常统一归一成 0 并**不**以非零退出：set -e 下 `X=$(awk …)` 的失败
+    # 会原样杀掉整个看门狗子 shell（复核缺口 B：旧注释只防了比较、没防退出码）。
+    _n=0
+    for _f in "${NGINX_PROC_TCP:-/proc/net/tcp}" "${NGINX_PROC_TCP6:-/proc/net/tcp6}"; do
+        [ -r "$_f" ] || continue
+        _c=$(awk -v pat=':2AF6$' 'FNR>1 && $2 ~ pat && $4=="0A" {c++} END {print c+0}' "$_f" 2>/dev/null) || _c=""
+        [ -n "$_c" ] && _n=$((_n + _c))
+    done
+    echo "${_n}"
+}
+nginx_probe_procs() {
+    # 本容器内 nginx 进程数（/proc/PID/comm 逐行比对；base 镜像无 pgrep）。
+    # host_network 下 /proc/net/tcp 是**宿主**的 socket 表：只看端口，会把
+    # "端口被宿主其它进程占用"判成健康（审计 F-2 第二场景），必须配进程侧判据。
+    local _root="${NGINX_PROC_ROOT:-/proc}" _n=0 _p
+    for _p in $(ls "$_root" 2>/dev/null); do
+        case "${_p}" in *[!0-9]*) continue ;; esac
+        if [ "$(cat "${_root}/${_p}/comm" 2>/dev/null)" = "nginx" ]; then
+            _n=$((_n + 1))
+        fi
+    done
+    echo "${_n}"
+}
+(
+    NGINX_RESTART_COUNT=0
+    MAX_NGINX_RESTARTS=5
+    while true; do
+        sleep 20
+        NGINX_LISTEN=$(nginx_probe_listen)
+        NGINX_PROCS=$(nginx_probe_procs)
+        # 判据必须是"数值比较成功且 > 0"：awk 输出异常时 [ "" -gt 0 ] 会报错，
+        # 在 set -e 的后台子 shell 里把整个看门狗静默杀死（同文件 :946 的
+        # "必须 if 形"是同一条教训）；探针函数已把读取失败归一成 0。
+        if [ "${NGINX_LISTEN}" -gt 0 ] 2>/dev/null && [ "${NGINX_PROCS}" -gt 0 ] 2>/dev/null; then
+            # 端口在 + 本容器 nginx 在 = 服务在；"连续"语义清零（与 mosquitto 看门狗同规）
+            NGINX_RESTART_COUNT=0
+            continue
+        fi
+        if [ "${NGINX_LISTEN}" -gt 0 ] 2>/dev/null; then
+            echo "[Ingress] 10998 有监听但容器内无 nginx 进程：端口疑似被宿主其它进程占用（host_network 下 /proc/net/tcp 是宿主的表），仍尝试拉起 nginx"
+        fi
+        if [ "${NGINX_RESTART_COUNT}" -ge "${MAX_NGINX_RESTARTS}" ]; then
+            echo "[Ingress] nginx 连续 ${MAX_NGINX_RESTARTS} 次拉起后仍无 10998 监听（或端口被他人占用），停止重启（Web UI 需人工介入）"
+            exit 0
+        fi
+        NGINX_RESTART_COUNT=$((NGINX_RESTART_COUNT + 1))
+        echo "[Ingress] 10998 无监听，nginx 疑似退出，第 ${NGINX_RESTART_COUNT}/${MAX_NGINX_RESTARTS} 次拉起"
+        nginx || echo "[Ingress] nginx 拉起失败（见上方错误）"
+    done
+) &
+echo "[Ingress] nginx 存活看门狗已启动（20s 节拍，连续 5 次无监听即放弃）"
+
 # ---------- 3b. 配置并启动 mDNS 广播 ----------
 echo "[mDNS] 配置 mDNS 广播..."
 
@@ -518,14 +618,35 @@ set +e
 
 # 清理函数：mosquitto 退出时同时清理 mDNS 后台进程
 # v1.6.3：mDNS 现在是看门狗子 shell（MDNS_PID）+ 其 python 子进程，
-# kill 子 shell 不会带走 python，须一并 pkill，否则残留进程继续占用 5353
+# kill 子 shell 不会带走 python ⇒ 必须把 python 那一条也一起杀掉，否则残留进程
+# 继续占用 5353 并广播一个已死的 broker。（v1.6.3 当时用 pkill 实现，本镜像里
+# 并不存在该命令，2026-09-30 C-7 改为 /proc 扫描——目标不变，手段换成 base
+# 镜像必有的东西，见 cleanup_mdns 内注释。）
 MDNS_PID=""
 MOSQUITTO_PID=""
 cleanup_mdns() {
     if [ -n "${MDNS_PID}" ]; then
         kill "${MDNS_PID}" 2>/dev/null || true
     fi
-    pkill -f mdns_publisher.py 2>/dev/null || true
+    # 审计 2026-09-30 C-7：本行原本是 `pkill -f mdns_publisher.py`——**镜像里没有
+    # pkill**（HA alpine base 的 apk 只有 bash/bind-tools/ca-certificates/curl/jq/
+    # libstdc++/tzdata/xz，procps 不在其中；busybox 只给了 killall，没有 pkill。
+    # 与本文件 :768-772 记实过的 netstat 是同族第三次事故），而
+    # `2>/dev/null || true` 把 "command not found" 一起吃掉 ⇒ :520-521 立的目标
+    # （"须一并 pkill，否则残留进程继续占用 5353"）从未达成：mosquitto 退出后
+    # python 仍活着，huijian.local 继续广播一个已死/已降权的 broker，网关连上即被拒。
+    # 改用 base 镜像必有的 /proc 扫描（与 §7b 判活同源）：按 cmdline 匹配，
+    # 跳过自身 PID；找不到就什么也不做，但绝不再依赖不存在的命令。
+    for _mdns_pid in $(ls /proc 2>/dev/null); do
+        case "${_mdns_pid}" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "${_mdns_pid}" = "$$" ] && continue
+        if tr '\0' ' ' < "/proc/${_mdns_pid}/cmdline" 2>/dev/null \
+           | grep -q 'mdns_publisher\.py'; then
+            kill "${_mdns_pid}" 2>/dev/null || true
+        fi
+    done
 }
 # v1.6.4 停机路径根修：旧写法 trap cleanup_mdns EXIT INT TERM 的处理函数
 # 只清理不退出——SIGTERM 到达后 bash 跑完 handler 从被中断的 wait 返回
@@ -848,7 +969,7 @@ topic zigbee2mqtt/# out 1
 topic zigbee2mqtt/# in 1
 topic homeassistant/# in 1
 # v1.7.19（方案一）：coexist_bridge_topics 追加树（1a+ 净化器渲染，逐条对齐
-# ha_mqtt ACL；gateway/test/$SYS/全匹配形态已在写入门上代码级拒绝）。
+# ha_mqtt ACL；gateway/test/\$SYS/全匹配形态已在写入门上代码级拒绝）。
 ${BRIDGE_TOPICS_EXTRA}
 # 禁 gateway/# 跨桥（v1.6.24 安全评审定案，实测取证）：in 腿等于把对端
 # 信任域直连慧尖执行器——匿名@1883 publish gateway/{sn}/req 可穿桥达固件

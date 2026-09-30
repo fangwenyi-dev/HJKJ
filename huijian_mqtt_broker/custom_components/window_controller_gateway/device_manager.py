@@ -478,6 +478,12 @@ class WindowControllerDeviceManager:
             return None
         
         # 保留原有检查逻辑作为备份
+        # 审计 2026-09-30 A-5（消费侧兜底）：device_name 来自网关上报，生产侧
+        # (_protocol legacy 分支) 已补守卫，但 add_device 还有 services/绑定/
+        # 迁移等多个调用方。非 str 时 .lower() 抛 AttributeError，异常落在
+        # _schedule_async_task 的通用日志里 ⇒ 设备静默不入库、无从排查。
+        if not isinstance(device_name, str):
+            device_name = f"设备 {str(device_sn)[-6:]}"
         device_name_lower = device_name.lower()
         if "gateway" in device_name_lower or "网关" in device_name_lower:
             _LOGGER.debug("发现网关设备，跳过添加为子设备: %s", device_sn)
@@ -569,14 +575,20 @@ class WindowControllerDeviceManager:
                     _LOGGER.info("迁移模式：设备 %s 已从手动删除列表中移除", device_sn)
                 
                 # 更新设备在 self.devices 中的信息
-                # P2 修复：使用与正常添加路径一致的设备结构（status/attributes），
-                # 而非 online/last_update，避免其他代码访问不存在的键
+                # 审计 2026-09-30 B-1（DM-F1 同族收口，本仓第四次为同一缺陷打补丁）：
+                # 旧注释"与正常添加路径一致"已经失真——正常路径（:667-677）在 v1.7.12
+                # 起带 last_update，本分支没跟上。缺 last_update 会被 cover/sensor 的
+                # "None=新鲜"判据**永久豁免**时效契约（cover.py:153/263/294、
+                # sensor.py:92/171），叠加 attributes 被清空后 sensor 取到 None 直接
+                # return（不重置 _attr_native_value）⇒ 迁移过来的设备"状态/电池电压"
+                # 永久冻结在迁移前的值，网关后续彻底失联也不转 unknown。
                 self.devices[device_sn] = {
                     "sn": device_sn,
                     "name": device_name_with_sn,
                     "type": device_type,
                     "status": "connected",
-                    "attributes": {}
+                    "attributes": {},
+                    "last_update": time.time()
                 }
                 _LOGGER.info("已更新设备 %s 在设备管理器中的信息", device_sn)
                 
@@ -1558,6 +1570,26 @@ class WindowControllerDeviceManager:
         _LOGGER.info("网关 %s 共找到 %d 个设备", gateway_sn, len(gateway_devices))
         return gateway_devices
     
+    def _find_device_record(self, device_sn: str):
+        """跨所有已加载条目的 manager 缓存查一条设备记录（找不到返回 None）。
+
+        审计 2026-09-30 B-3 配套：迁移校验读的是"归属旧网关"的设备，而校验跑在
+        新网关 manager 上——`self.devices` 里没有它们，必须有聚合入口。
+        """
+        for _entry_id, data in list(self.hass.data.get(DOMAIN, {}).items()):
+            if not isinstance(data, dict):
+                continue
+            other = data.get("device_manager")
+            if other is None:
+                continue
+            try:
+                rec = other.devices.get(device_sn)
+            except Exception:  # noqa: BLE001 - 校验绝不因查表抛错
+                continue
+            if rec:
+                return rec
+        return None
+
     async def _validate_migration(self, old_gateway_devices, new_gateway_sn):
         """验证设备兼容性和容量"""
         validation_result = {
@@ -1567,14 +1599,22 @@ class WindowControllerDeviceManager:
         }
         
         # 1. 验证设备类型兼容性
+        # 审计 2026-09-30 B-3（v1.6.12 审计 #6"恒 None 死分支"同族）：本函数跑在
+        # **新**网关的 manager 上（services.py:397 new_manager.safe_migrate_devices），
+        # 而 old_gateway_devices 来自 _get_gateway_devices_from_registry(旧 SN)——
+        # 这些 SN 按定义不在 self.devices 里，`self.devices.get(...)` 恒 None，
+        # ⇒ 整条"仅支持开窗器"校验从未生效（容量/SN 格式两项仍生效，只有这条静默失效）。
+        # 改为跨条目聚合查（谁缓存了这个 SN 就问谁），查不到仍按放行处理——
+        # 旧网关条目可能已卸载，把它升级成硬错误会新拦掉本来能成的迁移。
         for device_sn in old_gateway_devices:
-            # 检查设备是否为开窗器类型
-            device_info = self.devices.get(device_sn)
+            device_info = self._find_device_record(device_sn)
             if device_info and device_info.get("type") != DEVICE_TYPE_WINDOW_OPENER:
                 error = f"设备 {device_sn} 类型不兼容，仅支持开窗器"
                 _LOGGER.error(error)
                 validation_result["errors"].append(error)
                 validation_result["valid"] = False
+            elif device_info is None:
+                _LOGGER.debug("设备 %s 不在任何网关缓存中，类型校验按放行处理", device_sn)
         
         # 2. 验证新网关容量
         new_gateway_devices_count = self._count_gateway_devices(new_gateway_sn)

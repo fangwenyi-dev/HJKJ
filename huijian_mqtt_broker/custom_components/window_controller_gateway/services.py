@@ -630,8 +630,17 @@ async def handle_unignore_gateway(hass: HomeAssistant, call: ServiceCall) -> Non
     gateway_sn = str(call.data.get("gateway_sn", "")).strip()
     if not gateway_sn:
         raise ServiceValidationError("取消忽略：gateway_sn 不可为空")
-    await async_unignore_gateway(hass, gateway_sn)
-    _LOGGER.info("已取消忽略网关 %s（下次上报将重新出发现卡片）", gateway_sn)
+    # 审计 2026-09-30 B-5：返回值必须接住。旧写法无条件打"已取消忽略"，
+    # 而 async_unignore_gateway 在 "discovery" 键缺失时曾是整体 no-op ⇒
+    # 唯一自救入口失效却留下成功痕迹（假成功比失败更难归因）。
+    unignored = await async_unignore_gateway(hass, gateway_sn)
+    if unignored:
+        _LOGGER.info("已取消忽略网关 %s（下次上报将重新出发现卡片）", gateway_sn)
+    else:
+        _LOGGER.warning(
+            "网关 %s 本来就不在忽略列表里（可能已被清理，或 SN 大小写/拼写不符）"
+            "——本次没有取消任何忽略；若该网关仍不出发现卡片，请检查它是否已被添加为集成条目",
+            gateway_sn)
 
 
 def register_services(hass: HomeAssistant) -> bool:

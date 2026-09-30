@@ -36,15 +36,54 @@ class TestHandshakeCryptoSafety:
         assert wg.handshake_token_ok("tok12345\nx", "tok12345") is False
 
     def test_no_plain_equality_on_secret(self):
+        """时序判据必须是**语法树级**的，不是"源码里出现过这个词"。
+
+        对抗复核 2026-09-30 实锤：本函数上方新写的注释里就含
+        `hmac.compare_digest` 字样，`inspect.getsource` 把它一起读进来 ⇒
+        把实现退回 `return token in offered_subprotocols(header_value)`
+        （TypeError 与时序预言机双双回潮）两条文本断言都不红。
+        现在按 AST 判：①必须有 `compare_digest(...)` 的**调用节点**；
+        ②不得出现把涉密名字用 == 或 in 直接比对的节点。
+        """
+        import ast
         import inspect
-        src = inspect.getsource(wg.handshake_token_ok)
-        assert "compare_digest" in src, "握手比较必须 hmac.compare_digest"
-        assert "token in offered_subprotocols" not in src,             "回潮：`token in list` 短路比较非时序安全"
+
+        tree = ast.parse(inspect.getsource(wg.handshake_token_ok))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        last = fn.body[-1]
+        assert isinstance(last, ast.Return) and last.value is not None, \
+            "handshake_token_ok 末句不再是 return（本钉需重写）"
+        gens = [n for n in ast.walk(last.value) if isinstance(n, ast.GeneratorExp)]
+        assert gens, "末句 return 必须是 any(生成器) 形态（A-1 判据位）"
+        elt_calls = [c for g in gens for c in ast.walk(g.elt) if isinstance(c, ast.Call)]
+        assert any("compare_digest" in ast.unparse(c) for c in elt_calls), \
+            "生成器元素必须真调 compare_digest（改名+死代码不再能绕：2026-09-30 复核第二轮）"
+        secrets = {"token", "cand", "old_token", "current_token"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare) and \
+                    any(isinstance(op, (ast.Eq, ast.In)) for op in node.ops):
+                names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+                assert not (names & secrets), \
+                    "涉密值出现 ==/in 短路比对（时序预言机）：%s" % ast.unparse(node)
 
     def test_old_token_compare_is_constant_time(self):
+        import ast
         import inspect
-        src = inspect.getsource(wg.validate_new_token)
-        assert "compare_digest" in src, "oldToken 比较同样涉密，须时序安全"
+
+        tree = ast.parse(inspect.getsource(wg.validate_new_token))
+        conds = [node.test for node in ast.walk(tree)
+                 if isinstance(node, ast.If)
+                 and "_MSG_OLD_MISMATCH" in "".join(ast.unparse(x) for x in node.body)]
+        assert conds, "旧令牌不匹配分支形态变了（本钉需重写）"
+        blob = " ".join(ast.unparse(x) for x in conds)
+        assert "compare_digest" in blob, \
+            "oldToken 比较必须真调 compare_digest（文本版被注释即可满足，已废）"
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare) and \
+                    any(isinstance(op, (ast.Eq, ast.In)) for op in node.ops):
+                names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+                assert not (names & {"old_token", "current_token"}), \
+                    "oldToken 出现 ==/in 短路比对：%s" % ast.unparse(node)
 
     def test_validate_still_works(self):
         assert wg.validate_new_token("newtoken1", "oldtoken1", "oldtoken1") is None

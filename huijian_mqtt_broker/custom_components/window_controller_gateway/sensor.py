@@ -85,16 +85,21 @@ class WindowControllerBatterySensor(WindowControllerBaseEntity, SensorEntity):
         device = self.device_manager.get_device(self.device_sn)
         if not device:
             return
-        attributes = device.get("attributes", {})
-        voltage = attributes.get("voltage")
-        if voltage is None:
-            return
+        # 审计 2026-09-30 B-1 配套（复核指出我只补了一半）：时效闸必须排在
+        # "取不到 voltage 就早退"**之前**。force 迁移会把 attributes 清空，
+        # 旧顺序下属性一空就直接 return ⇒ _attr_native_value 永不更新，
+        # 补了 last_update 也照样冻结在迁移前的值、失联不转 unknown。
+        # 与同文件状态传感器（:170 起的"先做陈旧判定"）同口径。
         last_update = device.get("last_update")
         if last_update is not None and \
                 (time.time() - last_update) > SENSOR_TIMEOUT_MINUTES * 60:
             self._attr_native_value = None
             _LOGGER.debug("设备 %s 电池电压数据超时（超过 %d 分钟无上报）",
                           self.device_sn, SENSOR_TIMEOUT_MINUTES)
+            return
+        attributes = device.get("attributes", {})
+        voltage = attributes.get("voltage")
+        if voltage is None:
             return
         self._attr_native_value = voltage
         _LOGGER.debug("设备 %s 电池电压更新: %.1fV", self.device_sn, voltage)

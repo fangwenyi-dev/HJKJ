@@ -16,6 +16,18 @@
         // 徽标覆写回 online/offline——60s 内用户看到"离线"会误判配对失败。
         // 窗口内 updateGatewayStatus 跳过非配对状态覆写。
         const PAIRING_UNTIL = {};
+        // 审计 2026-09-30 B-7 配套：本轮渲染里被判"禁用/未 loaded"的条目集合。
+        // 设备侧的三条入口（loadGateways 的重建循环、30s silentRefresh、配对/状态
+        // 按钮的延时刷新）都会按 entryId 回头覆写 devices-<entryId>，只看 entry 对象
+        // 的那份判据覆盖不到它们——卡片是 renderGatewayDisabled 建的，后续刷新并不知道
+        // 它是禁用条目，于是照样长出一排点下去恒 4xx 的按钮。渲染与刷新共用这一份。
+        const DISABLED_ENTRIES = {};
+        // 审计 2026-09-30 G-1：配对收尾定时器的句柄必须存下来。旧写法两处
+        // setTimeout 都不接句柄、startPairing 也没有重入闸，于是 30s 后再点一次
+        // 「配对」时，**前一次**的 60s 回调会把新窗口（应到 t=95s）的 PAIRING_UNTIL
+        // delete 掉并立刻重建列表 ⇒ 配对在服务端仍生效的 30 多秒里徽标显示"在线"，
+        // 用户误判失败反复点击——正是 PAIRING_UNTIL 注释要防的场景。
+        const PAIRING_TIMERS = {};
 
         // ========== 初始化 ==========
         async function init() {
@@ -172,6 +184,9 @@
                     return '换绑定码失败（云端暂不可达），页面上的码可能已过期';
                 case 'bindcode_rejected':
                     return '云端拒绝换绑定码请求，稍后再试或点二维码重试';
+                case 'bindcode_persist_failed':
+                    return '新绑定码已生效但本机没能保存下来（磁盘写入失败）——HA 重启后这张码会失效，'
+                        + '请确认二维码能刷新，并尽快让家人扫码';
                 case 'hub_too_old_for_member_code':
                     return '云端 hub 版本过旧，暂不支持成员码';
                 case 'members_unavailable':
@@ -687,12 +702,20 @@
                     return;
                 }
                 let html = '';
+                // v1.7.12（第 6 轮审计 L-10）：全量重建前清空 SN 映射——
+                // 条目被删除后旧 key 永不清理，同 entryId 复用（HA reload
+                // 偶发复用不回来，但残留脏映射会让静默刷新拿旧 SN 发控制）。
+                // 审计 2026-09-30 B-7：禁用集合同一处在重建前清空——必须在这里清
+                // 而不是在下面的填充循环之后，否则本轮的判定会被下一轮抹掉。
+                for (const k of Object.keys(GATEWAY_SN_BY_ENTRY)) delete GATEWAY_SN_BY_ENTRY[k];
+                for (const k of Object.keys(DISABLED_ENTRIES)) delete DISABLED_ENTRIES[k];
                 for (const entry of entries) {
                     // v1.7.33：与 :176-177 的 MQTT 条目同口径——禁用条目不再当
                     // 正常网关渲染（旧版照常配控制按钮，点下去只会 HA 4xx，
                     // 徽标恒"未知"而用户无从知道是条目被禁用）。
                     if (entry.disabled_by || (entry.state && entry.state !== 'loaded')) {
                         const gwSn0 = (entry.data && entry.data.gateway_sn) || '未知';
+                        DISABLED_ENTRIES[entry.entry_id] = true;
                         html += renderGatewayDisabled(entry.title || '慧尖网关', gwSn0,
                                                       entry.entry_id, entry.state,
                                                       entry.disabled_by);
@@ -703,12 +726,15 @@
                     html += renderGateway(gwName, gwSn, entry.entry_id);
                 }
                 container.innerHTML = html;
-                // v1.7.12（第 6 轮审计 L-10）：全量重建前清空 SN 映射——
-                // 条目被删除后旧 key 永不清理，同 entryId 复用（HA reload
-                // 偶发复用不回来，但残留脏映射会让静默刷新拿旧 SN 发控制）
-                for (const k of Object.keys(GATEWAY_SN_BY_ENTRY)) delete GATEWAY_SN_BY_ENTRY[k];
                 for (const entry of entries) {
+                    // 审计 2026-09-30 B-7：本循环原先遍历**全部** entries，把
+                    // 上面判为禁用的条目也喂进 loadGatewayDevices——它按 id 覆写
+                    // devices-<entryId>（renderGatewayDisabled 也建了这个容器），
+                    // 于是"条目未启用，暂不可用"整块被换成 8 颗可点按钮（/devices
+                    // 读设备注册表，条目禁用不影响注册表 ⇒ 必有数据）。同一张卡于是
+                    // 灰徽标"已被用户禁用"配一排活按钮，点下去恒 4xx。
                     GATEWAY_SN_BY_ENTRY[entry.entry_id] = (entry.data && entry.data.gateway_sn) || '';
+                    if (DISABLED_ENTRIES[entry.entry_id]) continue;
                     await loadGatewayDevices(entry.entry_id, GATEWAY_SN_BY_ENTRY[entry.entry_id]);
                 }
             } catch (e) {
@@ -774,6 +800,11 @@
         }
 
         async function loadGatewayDevices(entryId, gatewaySn) {
+            // 审计 2026-09-30 B-7：真正拦住三条路径的闸必须落在本函数入口——
+            // 除 loadGateways 的重建循环外，30s silentRefresh（按已渲染卡片调
+            // updateGatewayDevices，设备集合一变即升级为完整重建）与配对/状态的
+            // 延时刷新都汇聚到这里，而它们手上只有 entryId、拿不到 entry 对象。
+            if (DISABLED_ENTRIES[entryId]) return;
             // v1.7.33：let + await 后重取——手动刷新/静默刷新/配对后重建会在
             // 让出点整体重建容器，旧引用写回落在孤儿节点上（列表停在 spinner
             // 直到下一轮 30s 自愈）。每次 await 后按 id 重取，取不到即放弃本轮。
@@ -870,6 +901,11 @@
         // 无感刷新：获取最新设备数据，只更新状态值，不重建 DOM
         // 与 loadGatewayDevices 的区别：不 innerHTML 重建，只 loadDeviceState 更新
         async function updateGatewayDevices(entryId, gatewaySn) {
+            // 审计 2026-09-30 B-7：silentRefresh 是按**已渲染的卡片**遍历的，
+            // 禁用卡片也在其中；不在此拦则每轮都为禁用条目白打 /devices（+ /states），
+            // 且设备集合一旦变化就升级为重建——虽被 loadGatewayDevices 的闸挡回，
+            // 请求已经发出去了。同一判据在两个入口都要生效。
+            if (DISABLED_ENTRIES[entryId]) return;
             // v1.7.55：let + await 后重取——与 loadGatewayDevices（:780-781）同款。
             // 此处原为 const，:926-927 给 const 重赋值抛 TypeError，被 :943 的 catch
             // 静默吞掉 ⇒ 网关徽标与逐设备状态更新永久执行不到（面板值冻结到手动 F5）。
@@ -1173,12 +1209,38 @@
             updateGatewayStatus(statusEl, 'pairing');
             // v1.6.3：SN 实时读 map，不再用渲染时烘焙的旧值/占位符
             const gatewaySn = GATEWAY_SN_BY_ENTRY[entryId] || '';
+            // 审计 2026-09-30 G-1：进场时是否已有一个**未过期**的配对窗口。
+            // 失败分支原本无条件 delete PAIRING_UNTIL：30s 后重复点「配对」而这次
+            // HA 调用失败时，它删的是**上一个仍在生效**的窗口 ⇒ 服务端还在配对，
+            // 徽标却回到"在线/未知"，与 G-1 要防的误判同源。有活窗口就保留它和它的
+            // 定时器，照常显示"配对中"；没有才按失败清理。
+            const prevLive = PAIRING_UNTIL[entryId] && Date.now() < PAIRING_UNTIL[entryId];
+            // 与上面同一目的：让出点之前先记下，失败时决定"清"还是"留"。
+            const abortPairing = () => {
+                if (prevLive) { paintStatus('pairing'); return; }
+                delete PAIRING_UNTIL[entryId];
+                if (PAIRING_TIMERS[entryId]) {
+                    clearTimeout(PAIRING_TIMERS[entryId].quick);
+                    clearTimeout(PAIRING_TIMERS[entryId].close);
+                    delete PAIRING_TIMERS[entryId];
+                }
+                // v1.6.3：失败不硬标 online（设备可能确实离线），回到未知由下次刷新判定
+                paintStatus('unknown');
+            };
+            // 审计 2026-09-30 G-2：徽标一律**按 id 重取**后再写。上方 :1202 抓的
+            // statusEl 是两次 await 之前的引用，容器一旦在往返期间被整体重建
+            // （30s 静默刷新/手动刷新/needRebuild），写回就落在孤儿节点上——
+            // 而 updateGatewayStatus 的守卫只护 badge-warn，此时页面是 badge-ok，
+            // 于是"配对成功了却恒显示在线"，要等下一轮刷新才纠正。
+            // 与 loadGatewayDevices/updateGatewayDevices 的 await 后重取同口径。
+            const paintStatus = (kind) =>
+                updateGatewayStatus(document.getElementById('gw-status-' + entryId), kind);
             try {
                 const resp = await haApi('/window_controller_gateway/devices?config_entry_id=' + entryId);
                 if (!resp.ok) throw new Error('HA API ' + resp.status);
                 const devices = await resp.json();
                 const gwDevice = devices.find(d => !d.via_device_id);
-                if (!gwDevice) { delete PAIRING_UNTIL[entryId]; showToast('未找到网关设备', 'err'); updateGatewayStatus(statusEl, 'unknown'); return; }
+                if (!gwDevice) { showToast('未找到网关设备', 'err'); abortPairing(); return; }
                 const pairResp = await haApi('/services/window_controller_gateway/start_pairing', 'POST', {
                     device_id: gwDevice.id, duration: 60
                 });
@@ -1186,17 +1248,31 @@
                 // v1.7.12（L-3）：配对服务确认受理后才开窗（60s 配对 + 5s 收尾），
                 // 窗口结束时主动刷新一次恢复正常徽标判定
                 PAIRING_UNTIL[entryId] = Date.now() + 65000;
+                // 受理成功后立刻用**新引用**补写一次：若上方两次 await 期间发生过
+                // 重建，此刻把徽标从"在线/检测中"纠正回"配对中"（此后窗口内的重建
+                // 由 :746 的 PAIRING_UNTIL 判据自己渲染对）。
+                paintStatus('pairing');
                 showToast('配对模式已启动（60秒），请操作子设备', 'ok');
-                setTimeout(() => loadGatewayDevices(entryId, gatewaySn), 10000);
-                setTimeout(() => {
-                    delete PAIRING_UNTIL[entryId];
-                    loadGatewayDevices(entryId, gatewaySn);
-                }, 60000);
+                // 审计 2026-09-30 G-1：两个 setTimeout 的句柄必须存下来并在重入时清。
+                // 旧写法句柄一丢、startPairing 又没有重入闸：30s 后再点一次「配对」
+                // （新窗口应到 t=95s），t=60s 时**上一次的**回调照样执行，把新窗口
+                // delete 掉并重建列表 ⇒ 配对服务端仍生效的 30 多秒里徽标显示"在线"，
+                // 用户误判失败反复点击——正是 :14-18 注释要防的场景。
+                if (PAIRING_TIMERS[entryId]) {
+                    clearTimeout(PAIRING_TIMERS[entryId].quick);
+                    clearTimeout(PAIRING_TIMERS[entryId].close);
+                }
+                PAIRING_TIMERS[entryId] = {
+                    quick: setTimeout(() => loadGatewayDevices(entryId, gatewaySn), 10000),
+                    close: setTimeout(() => {
+                        delete PAIRING_UNTIL[entryId];
+                        delete PAIRING_TIMERS[entryId];
+                        loadGatewayDevices(entryId, gatewaySn);
+                    }, 60000)
+                };
             } catch (e) {
-                delete PAIRING_UNTIL[entryId];
                 showToast('配对启动失败: ' + e.message, 'err');
-                // v1.6.3：失败不硬标 online（设备可能确实离线），回到未知由下次刷新判定
-                updateGatewayStatus(statusEl, 'unknown');
+                abortPairing();
             }
         }
 

@@ -12,6 +12,8 @@ import re
 import time
 from pathlib import Path
 
+from homeassistant.core import full_status_view
+
 from custom_components.window_controller_gateway import api
 from custom_components.window_controller_gateway import hub_client as hc
 from custom_components.window_controller_gateway.const import DOMAIN, HUB_DATA_KEY
@@ -105,9 +107,12 @@ class _FakeClient:
         return True
 
     def status_view(self):
-        return {"connected": True, "lastError": None, "lastOpError": "no_owner",
-                "members": [], "membersCount": 0, "membersMax": 8, "membersSupported": True,
-                "ownerMasked": "oFa…01", "bindCodeTtlS": 300, "memberCodeTtlS": 300}
+        # 审计 2026-09-30 H-6：键集由真实现单向决定（本假件此前只有 9 个键，
+        # 真 status_view 的 20 键里少掉的 11 键正是面板会退回兜底的那批）
+        return full_status_view(
+            connected=True, lastError=None, lastOpError="no_owner",
+            members=[], membersCount=0, membersMax=8, membersSupported=True,
+            ownerMasked="oFa…01", bindCodeTtlS=300, memberCodeTtlS=300)
 
 
 class _FakeHass:

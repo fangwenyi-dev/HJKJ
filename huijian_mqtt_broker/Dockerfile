@@ -10,6 +10,10 @@ FROM ghcr.io/home-assistant/${BUILD_ARCH}-base:latest
 # - mosquitto/mosquitto-clients: MQTT broker + 客户端工具
 # - curl/jq: HA API 调用
 # - nginx: Ingress Web UI
+# - ca-certificates: nginx proxy_ssl_trusted_certificate 指向的就是这份束（F-1）。
+#   base 镜像"恰好有"不是保证：proxy_ssl_verify on + 缺失的 CA 文件会让
+#   nginx -t 直接 [emerg]，整个 Web UI 起不来（run.sh 那段只警告不改配置的取舍
+#   只有在这里成立才有意义）。显式列装比继承便宜。
 # - python3/py3-pip: 运行 zeroconf mDNS 广播脚本
 # - openssl: base 镜像只有 libssl 库没有 CLI，run.sh 密码哈希兜底需要
 RUN apk add --no-cache \
@@ -18,6 +22,7 @@ RUN apk add --no-cache \
     curl \
     jq \
     nginx \
+    ca-certificates \
     python3 \
     py3-pip \
     openssl

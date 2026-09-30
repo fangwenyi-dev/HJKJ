@@ -67,6 +67,13 @@
   },
   "options": {
     "step": {
+      "init": {
+        "title": "慧尖网关设置",
+        "menu_options": {
+          "add_gateway": "添加 LoRa 网关（绑定网关序列号）",
+          "options": "高级选项（小程序直连令牌/端口、发现间隔、调试日志）"
+        }
+      },
       "options": {
         "title": "配置选项",
         "description": "配置网关的高级选项",

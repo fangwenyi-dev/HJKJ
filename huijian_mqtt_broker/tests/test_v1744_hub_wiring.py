@@ -30,6 +30,7 @@ import custom_components.window_controller_gateway.device_manager as dm_mod
 import custom_components.window_controller_gateway.mqtt_bootstrap as mb
 import custom_components.window_controller_gateway.mqtt_handler as mh_mod
 import custom_components.window_controller_gateway.ws_gateway as wsg
+from homeassistant.core import FakeServices
 from custom_components.window_controller_gateway import HUB_DATA_KEY
 from custom_components.window_controller_gateway.const import (
     CONF_GATEWAY_SN, DOMAIN)
@@ -125,6 +126,10 @@ class _Hass:
     def __init__(self, tmp_path):
         self.data = {DOMAIN: {}}
         self.config = types.SimpleNamespace(config_dir=str(tmp_path))
+        # 审计 2026-09-30 C-1 配套：真 HA 恒有 hass.services（域级服务注册面），
+        # 本替身此前没有这一面。async_setup_entry 补上"服务重注册"后，桩比
+        # 真实现窄直接把条目 setup 判成失败——补桩而不是弱化生产判据。
+        self.services = FakeServices()
         self.bus = types.SimpleNamespace(
             async_listen_once=lambda *a, **k: (lambda: None))
         self.config_entries = types.SimpleNamespace(

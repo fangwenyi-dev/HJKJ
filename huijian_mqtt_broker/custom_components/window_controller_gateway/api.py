@@ -59,9 +59,16 @@ class WindowGatewaySecurityView(http.HomeAssistantView):
     name = "api:window_controller_gateway:security"
 
     async def get(self, request):
-        """任一网关注项仍是默认令牌 → true；无网关条目 → None（无从判定）。"""
+        """任一**有效**网关注项仍是默认令牌 → true；无有效条目 → None（无从判定）。
+
+        审计 2026-09-30 E-2：按本仓单一真源口径（utils.entry_state_for_sn 自过滤
+        disabled_by，"被禁用的条目不算有效配置"）先滤掉禁用条目再判定。不禁用条目
+        的令牌并不在监听面上（ws_gateway_wanted 已跳过），把它算进来会让面板就一个
+        根本没跑的网关报"仍是默认令牌"——警告不可执行即噪声。
+        """
         hass = request.app["hass"]
-        entries = hass.config_entries.async_entries(DOMAIN)
+        entries = [e for e in hass.config_entries.async_entries(DOMAIN)
+                   if not getattr(e, "disabled_by", None)]
         if not entries:
             return self.json({"ws_token_is_default": None, "gateway_entries": 0})
         from .const import CONF_WS_GATEWAY_TOKEN, DEFAULT_WS_GATEWAY_TOKEN
@@ -276,7 +283,12 @@ class WindowGatewayHubMemberRemoveView(http.HomeAssistantView):
             payload = await request.json()
         except Exception:  # noqa: BLE001
             payload = {}
-        mid = str((payload or {}).get("mid") or "")
+        # 审计 2026-09-30 A-3：`(payload or {}).get(...)` 只挡假值——`request.json()`
+        # 会把 body 原样解成任意 JSON 形态，`[1]`/`"abc"`/`5` 这类**真值非 dict**
+        # 直接让 .get 抛 AttributeError ⇒ aiohttp 500（无 JSON 体），面板拿不到
+        # removedOk 语义。同文件 :219 的换码视图写法是对的（isinstance 判），
+        # 本处与下方改名视图是同一函数的判据分叉。
+        mid = str(payload.get("mid") or "") if isinstance(payload, dict) else ""
         removed = bool(mid) and await client.remove_member(mid)
         if mid:
             await client.list_members()      # 踢完刷新，否则面板还显示被踢的人
@@ -304,7 +316,9 @@ class WindowGatewayHubMemberRenameView(http.HomeAssistantView):
             payload = await request.json()
         except Exception:  # noqa: BLE001
             payload = {}
-        mid = str((payload or {}).get("mid") or "")
-        name = (payload or {}).get("name")
+        # 审计 2026-09-30 A-3 同族：判据与上方移除视图对齐（isinstance，非 `or {}`）
+        body = payload if isinstance(payload, dict) else {}
+        mid = str(body.get("mid") or "")
+        name = body.get("name")
         ok = await client.set_member_alias(mid, name)
         return self.json(_member_op_view(client, renameOk=bool(ok)))

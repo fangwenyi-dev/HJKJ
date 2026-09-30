@@ -193,17 +193,68 @@ def test_ws_connect_clears_connection_error_but_not_operation_error(tmp_path):
     assert "last_op_error" not in src, "_session_once 不得顺手清操作类错误"
 
 
-def test_connection_errors_stay_in_the_connection_slot():
-    """反钉：连接类的三个写入点不许挪去操作槽（否则 WS 异常会被操作成功清掉）。"""
+def _run_forever_once(client, raiser):
+    """真跑一轮 `_run_forever`：把 `_session_once` 换成会抛的桩，其余走真实现。
+
+    返回本轮结束时 last_error 的值。桩在抛错前把 `_stopping` 置真，循环在
+    "记录错误之后、退避睡眠之前"就返回——不需要真睡眠，也不需要网络。
+    """
+    async def _fake_session_once():
+        raiser(client)
+        client._stopping = True
+        raise _Boom("hub /agent/register -> 502")
+
+    client._session_once = _fake_session_once
+    asyncio.run(client._run_forever())
+    return client.last_error
+
+
+class _Boom(RuntimeError):
+    pass
+
+
+def test_connection_slot_survives_the_generic_catch(tmp_path):
+    """审计 2026-09-30 B-2 行为钉（替换原源码文本锚）。
+
+    旧钉写的是 `assert 'self.last_error = type(e).__name__' in src`——它把**缺陷
+    本身**钉成了必须存在的字面量：语义值 identity_rejected_loop 写完必然 raise，
+    异常一到那个覆写点就被改成异常类名，面板 hubErrorText 只认语义值，于是唯一
+    指路文案永久丢失。文本钉不仅抓不到修复，还会把修复判红。
+
+    现在钉的是行为：①语义值必须活着穿过宽 except；②没有语义值时异常**消息**
+    要进连接槽（:723-731 已定案 `why = str(e) or 类名`，:518 此前只打类名，
+    把 HubHttpError.status/err 一起丢了）；③两种情况都不得落进操作槽。
+    """
+    c, _ = _client(tmp_path)
+    got = _run_forever_once(c, lambda cli: setattr(cli, "last_error", "identity_rejected_loop"))
+    assert got == "identity_rejected_loop", \
+        "语义错误被兜底覆写成了 %r（面板只会显示'未连接'）" % got
+
+    c2, _ = _client(tmp_path)
+    got2 = _run_forever_once(c2, lambda cli: None)
+    assert got2 == "hub /agent/register -> 502", \
+        "连接槽只剩异常类名、丢了消息（运维无从区分云端发布中/凭据失效/被墙）：%r" % got2
+
+    for cli in (c, c2):
+        assert cli.last_op_error is None, "连接类错误挪进操作槽了——会被下一次操作成功清掉"
+
+
+def test_connection_errors_stay_out_of_the_operation_slot():
+    """反钉：操作类错误不许写回连接槽（否则 WS 异常会被操作成功清掉）。
+
+    这半边不变量与上面那条是**一对**（单向不变量必须配反向）：正向验"连接类留在
+    连接槽"，反向验"操作类不入侵连接槽"。
+    """
     src = inspect.getsource(hc.HubClient)
-    for anchor in ('self.last_error = type(e).__name__', 'self.last_error = "loop_%s" % type(e).__name__',
-                   'self.last_error = "identity_rejected_loop"', 'self.last_error = "identity_rejected"'):
-        assert anchor in src, "连接类写入点漂移：%r" % anchor
     for gone in ('self.last_error = "bindcode_failed"', 'self.last_error = "bindcode_rejected"',
                  'self.last_error = "members_unavailable"', 'self.last_error = "members_rejected"',
                  'self.last_error = "member_remove_failed"', 'self.last_error = "member_remove_rejected"',
-                 'self.last_error = "hub_too_old_for_member_code"'):
+                 'self.last_error = "hub_too_old_for_member_code"',
+                 'self.last_error = "bindcode_persist_failed"'):
         assert gone not in src, "操作类错误又写回连接槽了：%r" % gone
+    # 主循环自身异常仍必须留 "loop_" 前缀（面板与日志按它归因，:539-548 的看门狗）
+    assert 'self.last_error = "loop_%s" % type(e).__name__' in src, \
+        "主循环看门狗的写入点漂移：循环体自身异常将无处留痕"
 
 
 # ── 视图与 api 透传 ──────────────────────────────────────────────────

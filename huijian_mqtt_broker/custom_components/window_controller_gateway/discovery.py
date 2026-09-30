@@ -209,22 +209,39 @@ async def async_ignore_gateway(hass: HomeAssistant, gateway_sn: str):
             await _call_reg(entity_registry.async_remove, entity.entity_id)
             _LOGGER.debug("删除网关 %s 的实体: %s", gateway_sn, entity.entity_id)
 
-async def async_unignore_gateway(hass: HomeAssistant, gateway_sn: str):
-    """取消忽略网关设备"""
+async def async_unignore_gateway(hass: HomeAssistant, gateway_sn: str) -> bool:
+    """取消忽略网关设备。返回"该 SN 原本确实在忽略列表里并被移出"。
+
+    返回值是给调用方如实汇报用的（审计 2026-09-30 B-5）：本函数是误点"忽略"后
+    的唯一自救入口，过去它 no-op 也照样让上层打"已取消忽略"，用户与日志都无从
+    发现网关其实仍被屏蔽。
+    """
     _LOGGER.info("取消忽略网关: %s", gateway_sn)
     
     # 从忽略列表中移除网关，并重置会话通知去重记录，
     # 允许该网关在后续上报时重新触发发现通知
-    if DOMAIN in hass.data and "discovery" in hass.data[DOMAIN]:
-        discovery = hass.data[DOMAIN]["discovery"]
-        gateway_key = gateway_sn.lower()
-        if gateway_key in discovery.get("ignored_gateways", set()):
-            discovery["ignored_gateways"].discard(gateway_key)
-            _LOGGER.debug("网关 %s 已从忽略列表中移除", gateway_sn)
-        discovery.setdefault("announced_gateways", set()).discard(gateway_key)
-        # v1.7.12（E-1 配套）：取消忽略同样落盘
-        try:
-            from .persist import save_persistent_data
-            hass.async_create_task(save_persistent_data(hass))
-        except Exception as pe:  # noqa: BLE001
-            _LOGGER.warning("忽略列表持久化调度失败（本会话内已生效）: %s", pe)
+    # 审计 2026-09-30 B-5（BUG-9 同族漏改）：旧写法以 `"discovery" in hass.data[DOMAIN]`
+    # 为前提，而忽略记录可以只来自持久化加载（persist 填 GLOBAL_IGNORED_GATEWAYS，
+    # 不建 "discovery" 键）、发现平台初始化异常又在 __init__.py:62-67 被吞——那时
+    # 本函数整体 no-op，调用方（services.py 的 unignore_gateway）却照样打
+    # "已取消忽略" 的 INFO，用户看到成功却永不再出卡：唯一自救入口失效且无从排查。
+    # 与 async_remove_entry（__init__.py:955-961，v1.7.18 BUG-9 的根修）同口径：
+    # 直接操作那个"与 discovery dict 共享"的全局持久集合，不依赖键是否存在。
+    if DOMAIN not in hass.data:
+        hass.data[DOMAIN] = {}
+    gateway_key = gateway_sn.lower()
+    ignored = hass.data[DOMAIN].setdefault(GLOBAL_IGNORED_GATEWAYS, set())
+    removed = gateway_key in ignored
+    if removed:
+        ignored.discard(gateway_key)
+        _LOGGER.debug("网关 %s 已从忽略列表中移除", gateway_sn)
+    discovery = hass.data[DOMAIN].get("discovery") or {}
+    discovery.get("ignored_gateways", set()).discard(gateway_key)
+    discovery.setdefault("announced_gateways", set()).discard(gateway_key)
+    # v1.7.12（E-1 配套）：取消忽略同样落盘
+    try:
+        from .persist import save_persistent_data
+        hass.async_create_task(save_persistent_data(hass))
+    except Exception as pe:  # noqa: BLE001
+        _LOGGER.warning("忽略列表持久化调度失败（本会话内已生效）: %s", pe)
+    return removed

@@ -285,11 +285,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if not gateway_sn:
                     return self.async_abort(reason="invalid_input")
                 # 再次检查唯一性（确认期间可能已被其他流程配置；unique_id 统一小写）
-                    # v1.7.33（全量审计）：raise_on_progress=False——默认 True 时同 SN
-                    # 有在途发现流（发现卡未点）会直接抛异常，用户侧表现为
-                    # 流莫名消失；本流紧随其后的 already_configured 扫描成死码。
-                    # 与本文件 :208/:420/:437 既有写法对齐。
-                    await self.async_set_unique_id(gateway_sn.lower(), raise_on_progress=False)
+                # v1.7.33（全量审计）：raise_on_progress=False——默认 True 时同 SN
+                # 有在途发现流（发现卡未点）会直接抛异常，用户侧表现为
+                # 流莫名消失；本流紧随其后的 already_configured 扫描成死码。
+                # 与本文件 :208/:420/:437 既有写法对齐。
+                # 审计 2026-09-30 B-4：上面那段注释的续行缩进比语句深，把下一行
+                # async_set_unique_id 一起带进了 `if not gateway_sn:` 体内（AST 实测：
+                # 该调用落在 line 285 的 if 分支里），而 :286 已经 return ⇒ 重设
+                # unique_id 从未发生，本步只剩 :161 遗留的 _unique_id 在兜。
+                # 注释不影响缩进、代码影响——续行注释必须与语句同级或更浅。
+                await self.async_set_unique_id(gateway_sn.lower(), raise_on_progress=False)
                 self._abort_if_unique_id_configured()
                 # 兜底：兼容历史大小写原样的 entry unique_id
                 for entry in self.hass.config_entries.async_entries(DOMAIN):
@@ -736,8 +741,19 @@ class OptionsFlow(config_entries.OptionsFlow):
         """Manage options — 首次进入时根据是否已配置网关分流"""
         current_sn = self._config_entry.data.get(CONF_GATEWAY_SN, "")
         if not current_sn:
-            # 无网关 SN：进入添加网关步骤
-            return await self.async_step_add_gateway()
+            # 审计 2026-09-30 E-1：旧写法无条件分流到 add_gateway，于是"还没配网关"
+            # 的条目**永远进不到** async_step_options —— WS 端口/令牌/开关、
+            # debug_logging、discovery_interval、auto_discovery 一个入口都没有；
+            # 而 awaiting 分支早已按"半开口径"起了 9001 监听（__init__.py:515-517），
+            # ws_gateway_wanted 取的是 DEFAULT_WS_GATEWAY_TOKEN（const.py 里那个
+            # 小程序内置的公开值）⇒ 用户既看不到也改不掉。v1.7.33 专门修过
+            # "自定义令牌被静默改回默认"，那是同一风险的另一头。
+            # 改为菜单：两个步骤都可达（选中的 step id 由 HA 自动路由到
+            # async_step_add_gateway / async_step_options，本步不需要处理 user_input）。
+            return self.async_show_menu(
+                step_id="init",
+                menu_options=["add_gateway", "options"],
+            )
         # 已有网关：进入常规选项
         return await self.async_step_options()
 

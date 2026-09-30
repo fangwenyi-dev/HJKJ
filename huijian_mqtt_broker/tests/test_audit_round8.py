@@ -510,10 +510,23 @@ class TestCiPins:
     def test_hard_gate_still_hard(self):
         # continue-on-error 全文件唯一合法出现= warm-mirrors（best-effort
         # 预热）；e2e 自 v1.6.22 起是发布硬门禁，不得被顺手加回
+        #
+        # 审计 2026-09-30 H-7/A4 改钉：旧写法只数全文出现次数 + 比一个字节偏移
+        # （`0 <= CI.find("warm-mirrors:") <= keys[0]`）。实测变异——把这行
+        # continue-on-error 从 warm-mirrors **挪到 e2e job**（真栈 E2E 由发布硬
+        # 门禁降级为软失败，manifest/release 照发）——计数仍是 1、偏移仍满足，
+        # 本文件与 test_v1753 一起 40 条全绿。判据必须绑到"它落在 warm-mirrors
+        # 这个 job 的正文区间里"，而不是"在文件里某处、且在某个字符串之后"。
         keys = [m.start() for m in re.finditer(r"^\s*continue-on-error:", CI, re.M)]
         assert len(keys) == 1, f"continue-on-error 应仅剩 warm-mirrors 一处: {len(keys)}"
-        wm = CI.find("warm-mirrors:")
-        assert 0 <= wm <= keys[0], "唯一一处必须位于 warm-mirrors job 内"
+        wm = re.search(r"^  warm-mirrors:\n", CI, re.M)
+        assert wm, "warm-mirrors job 锚丢失（改名了？本钉需重写）"
+        nxt = re.search(r"^  [a-z][\w-]*:\n", CI[wm.end():], re.M)
+        wm_end = wm.end() + (nxt.start() if nxt else len(CI))
+        assert wm.start() <= keys[0] < wm_end, (
+            "唯一一处 continue-on-error 必须位于 warm-mirrors job 正文区间内——"
+            "挪进 e2e/manifest/release 就是把发布硬门禁降级为软失败"
+            "（实际偏移 %s，合法区间 [%s, %s)）" % (keys[0], wm.start(), wm_end))
 
 
 class TestWebPins:

@@ -19,6 +19,14 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # 审计 2026-09-30 F-4：本 job 此前没有 timeout-minutes（同文件 e2e job 有），
+    # 任一用例挂死就等 Actions 默认的 **6 小时**——而"异步挂死＝静默 exit 0"
+    # 这类失效在本仓踩过多次，看门狗必须存在。
+    # 为什么**不**加 pytest-timeout 的 --timeout：跨仓契约钉里
+    # test_v1747_cross_repo_contract._run 用的是 subprocess(timeout=300)，
+    # 任何小于它的 per-test 上限都会把"对端仓可见、真在跑"的正常路径判红
+    # （假红比无看门狗更糟）。job 级 25 分钟足以兜住挂死，且不改变任何用例语义。
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +64,40 @@ jobs:
             echo "✅ $f"
           done
 
+      - name: Clone peer repos when read-only deploy keys are configured
+        id: peer-sync
+        # 私有仓在公共 runner 里默认不可见 ⇒ 契约钉只能跳过。给了只读 deploy key 就真跑，
+        # 没给就把"没跑"交给下一步的 ::warning:: 说出去（不假装绿）。
+        env:
+          HUB_REPO_DEPLOY_KEY: ${{ secrets.HUB_REPO_DEPLOY_KEY }}
+          MINIPROGRAM_REPO_DEPLOY_KEY: ${{ secrets.MINIPROGRAM_REPO_DEPLOY_KEY }}
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/peers"
+          for pair in "HUB_REPO_DEPLOY_KEY:huijian-cloud-hub" \
+                      "MINIPROGRAM_REPO_DEPLOY_KEY:xiaochengxu-mqtt"; do
+            var="${pair%%:*}"; name="${pair##*:}"
+            key="${!var:-}"
+            [ -z "$key" ] && { echo "::notice title=对端仓未配置::$name 无只读 deploy key，契约钉将走「响亮跳过」分支"; continue; }
+            printf '%s\n' "$key" > "$RUNNER_TEMP/$name.key"
+            chmod 600 "$RUNNER_TEMP/$name.key"
+            GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/$name.key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+              git clone --depth 1 "git@github.com:fangwenyi-dev/$name.git" "$RUNNER_TEMP/peers/$name" \
+              || { echo "::warning title=对端仓 clone 失败::$name 拉不下来，契约钉按不可见处理"; continue; }
+            case "$name" in
+              huijian-cloud-hub) echo "hub=$RUNNER_TEMP/peers/$name" >> "$GITHUB_OUTPUT" ;;
+              xiaochengxu-mqtt)  echo "mp=$RUNNER_TEMP/peers/$name"  >> "$GITHUB_OUTPUT" ;;
+            esac
+          done
+
       - name: Python syntax & unit tests (v1.6.3 回归护栏)
+        # 审计 2026-09-30 H-4 复核：本步也注入对端仓路径——test_v1747 的跨仓
+        # 契约钉此前在 CI 必然 skip（"本地全跑、CI 一条不跑"）。配套把
+        # peer-sync 前移到本步之前（否则 steps.peer-sync.outputs.* 恒为空）。
+        # 没配 deploy key 时两个值为空 ⇒ 与原行为一致（由入口脚本响亮跳过）。
+        env:
+          HUB_REPO: ${{ steps.peer-sync.outputs.hub }}
+          MINIPROGRAM_REPO: ${{ steps.peer-sync.outputs.mp }}
         run: |
           # 38 个既有单测 + 注册表实参回归测试曾在本地全绿却漏掉 v1.6.0 的
           # "entity" 字面量回归——CI 从未跑过 pytest，本地验证形同虚设。补齐。
@@ -85,32 +126,6 @@ jobs:
           ruff check --select F,E9,B --ignore B008,B905               huijian_mqtt_broker/custom_components               huijian_mqtt_broker/tests               huijian_mqtt_broker/mdns_publisher.py               huijian_mqtt_broker/gateway_discovery_proxy.py
           python3 -m pytest huijian_mqtt_broker/tests -q
 
-      - name: Clone peer repos when read-only deploy keys are configured
-        id: peer-sync
-        # 私有仓在公共 runner 里默认不可见 ⇒ 契约钉只能跳过。给了只读 deploy key 就真跑，
-        # 没给就把"没跑"交给下一步的 ::warning:: 说出去（不假装绿）。
-        env:
-          HUB_REPO_DEPLOY_KEY: ${{ secrets.HUB_REPO_DEPLOY_KEY }}
-          MINIPROGRAM_REPO_DEPLOY_KEY: ${{ secrets.MINIPROGRAM_REPO_DEPLOY_KEY }}
-        run: |
-          set -u
-          mkdir -p "$RUNNER_TEMP/peers"
-          for pair in "HUB_REPO_DEPLOY_KEY:huijian-cloud-hub" \
-                      "MINIPROGRAM_REPO_DEPLOY_KEY:xiaochengxu-mqtt"; do
-            var="${pair%%:*}"; name="${pair##*:}"
-            key="${!var:-}"
-            [ -z "$key" ] && { echo "::notice title=对端仓未配置::$name 无只读 deploy key，契约钉将走「响亮跳过」分支"; continue; }
-            printf '%s\n' "$key" > "$RUNNER_TEMP/$name.key"
-            chmod 600 "$RUNNER_TEMP/$name.key"
-            GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/$name.key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-              git clone --depth 1 "git@github.com:fangwenyi-dev/$name.git" "$RUNNER_TEMP/peers/$name" \
-              || { echo "::warning title=对端仓 clone 失败::$name 拉不下来，契约钉按不可见处理"; continue; }
-            case "$name" in
-              huijian-cloud-hub) echo "hub=$RUNNER_TEMP/peers/$name" >> "$GITHUB_OUTPUT" ;;
-              xiaochengxu-mqtt)  echo "mp=$RUNNER_TEMP/peers/$name"  >> "$GITHUB_OUTPUT" ;;
-            esac
-          done
-
       - name: Cross-repo contract pins (跳过必须响亮，可见就真跑)
         # 这三仓有 110 条「两边各写一份」的契约，编译器与单测都抓不到。v1.7.52 之前它们
         # 在 CI 里从没跑过：脚本 exit 3、pytest 记 skipped、job 照绿，于是"CI 9/9 success"
@@ -126,6 +141,17 @@ jobs:
           HUB_REPO: ${{ steps.peer-sync.outputs.hub }}
           MINIPROGRAM_REPO: ${{ steps.peer-sync.outputs.mp }}
         run: bash huijian_mqtt_broker/tests/e2e/ci_contract_pins.sh
+
+
+      - name: Hub lifecycle real-stack e2e (跳过必须响亮，可见就真跑)
+        # 审计 2026-09-30 H-4 复核：hub_lifecycle_e2e.sh 此前无任何 CI step
+        # 调用——tests/test_v1742_hub_identity.py 守护的 35 条真栈断言
+        # （v1.7.41 抹盘自愈事故链）"本地全跑、CI 一条不跑"。入口脚本把
+        # "对端仓不可见"与"真跑失败"分成两条分支（同 ci_contract_pins.sh：
+        # 不可见 ⇒ ::warning + exit 0；可见 ⇒ 真跑 + PASS 计数下限自检）。
+        env:
+          HUB_REPO: ${{ steps.peer-sync.outputs.hub }}
+        run: bash huijian_mqtt_broker/tests/e2e/ci_hub_lifecycle.sh
 
       - name: JS syntax gate
         run: |

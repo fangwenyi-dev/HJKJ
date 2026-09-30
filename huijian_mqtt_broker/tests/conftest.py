@@ -2,6 +2,7 @@
 
 覆盖 window_controller_gateway/__init__.py 及其依赖模块的 import 链。
 """
+import asyncio
 import enum
 import os
 import sys
@@ -41,6 +42,82 @@ ha_components_number = _pkg("homeassistant.components.number")
 
 
 # ---- core ----
+class _DoneTask:
+    """async_create_task 的返回面替身：既能被 await，也有 cancel()/done()。
+
+    只返回裸 coro 的旧写法让两类判据都失去意义：存句柄后 .cancel() 的收尾路径
+    在假件下永远"成功"，而 await 它的测试会拿到 coro 而不是结果。
+    """
+
+    def __init__(self, coro=None):
+        self._coro = coro
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        return True
+
+    def cancelled(self):
+        return self._cancelled
+
+    def done(self):
+        # 真 async_create_task 返回的是**尚未完成**的 Task。此前这里恒 True，
+        # 而生产侧通篇是 `if task and not task.done(): task.cancel()`
+        # ——假件下那条分支永远不进，"卸载/停机会不会真取消后台任务"整类判据
+        # 被静默作废（对抗复核实锤，且与本类 docstring 的自述正好相反）。
+        return self._cancelled
+
+    def __await__(self):
+        if False:
+            yield
+        return None
+
+
+class FakeServices:
+    """`hass.services` 替身，签名与真实现等宽。
+
+    审计 2026-09-30（C-1 修复的配套桩）：域级服务的**重注册**落点补进了
+    async_setup_entry（旧实现只在 DOMAIN 级 async_setup 调过一次，删完全部条目
+    再加条目 ⇒ 7 个服务永久缺席）。多处 hass 替身根本没有 `services` 属性，
+    而真 HA 永远有——桩比真实现窄，就会把"生产能跑、测试打红"和调用形态漂移
+    一起放过（本仓已四次实锤这条纪律）。async_call 一并给出，服务处理器
+    可以被真调用而不只是被登记。
+    """
+
+    def __init__(self):
+        self.registered = {}      # (domain, service) -> handler
+        self.schemas = {}
+        self.removed = []
+        self.calls = []
+
+    def async_register(self, domain, service, service_func, schema=None,
+                       supports_response=None):
+        self.registered[(domain, service)] = service_func
+        self.schemas[(domain, service)] = schema
+
+    def async_remove(self, domain, service):
+        self.removed.append((domain, service))
+        self.registered.pop((domain, service), None)
+        self.schemas.pop((domain, service), None)
+
+    def has_service(self, domain, service):
+        return (domain, service) in self.registered
+
+    async def async_call(self, domain, service, service_data=None, blocking=True,
+                         context=None):
+        """真调已登记的处理器（不复制其内部逻辑，只补调度面）。"""
+        func = self.registered.get((domain, service))
+        if func is None:
+            raise KeyError("Service %s.%s not found" % (domain, service))
+        call = types.SimpleNamespace(domain=domain, service=service,
+                                     data=dict(service_data or {}))
+        self.calls.append(call)
+        result = func(call)
+        if hasattr(result, "__await__"):
+            result = await result
+        return result
+
+
 class HomeAssistant:
     """最小可用的假 HomeAssistant 实例"""
 
@@ -48,9 +125,21 @@ class HomeAssistant:
         self.data = {}
         self.config = types.SimpleNamespace(config_dir=".")
         self.loop = None
+        # 审计 2026-09-30：真 HA 的 hass.services 一定存在（域级服务注册面），
+        # 替身缺这一面会让 async_setup_entry 的新补注册路径直接判红。
+        self.services = FakeServices()
 
-    def async_create_task(self, coro):
-        return coro
+    def async_create_task(self, coro, name=None, **kw):
+        """审计 2026-09-30 H-6：真签名带 name=，且返回的是 **Task**。
+
+        旧写法 `return coro` 两头都不像：既没调度（测试里"任务真的跑了"的断言无从
+        成立），也不是 Task（凡"存下句柄后 .cancel()/.done()"的路径直接失真，而
+        unload 收尾正是这条路）。返回一个 done()/cancel() 齐备的替身，让"句柄
+        被存起来后被取消"这类判据在假件下仍然可判。
+        """
+        if asyncio.iscoroutine(coro):
+            return _DoneTask(coro)
+        return _DoneTask()
 
     def add_job(self, job, *args):
         if callable(job):
@@ -59,6 +148,29 @@ class HomeAssistant:
 
 
 ha_core.HomeAssistant = HomeAssistant
+# 各测试文件自建的 hass 替身也要能拿到同一个等宽桩（本仓 fake homeassistant
+# 包树的做法：替身符号从假模块导出，不让测试互相 import）。
+ha_core.FakeServices = FakeServices
+
+
+def full_status_view(**overrides):
+    """从**真** HubClient.status_view() 派生假件视图，只覆盖测试关心的那几个字段。
+
+    为什么要有这个东西（审计 2026-09-30 H-6 #5）：三处测试各写一份手写 dict 当
+    status_view，真实现加/减字段时假件静默不跟——于是
+    `test_member_op_views_return_the_full_status_view` 这类**名字**判的其实是假件
+    自己的键：真 status_view 停发 bindCodeTtlS，测试照样绿，而面板倒计时会退回
+    硬编兜底（huijian.js:427 自己写着"硬编 10 分钟在 hub 改了 TTL 后就是假话"）。
+    键集由真实现单向决定，假件不可能再"窄"。
+    """
+    from custom_components.window_controller_gateway.hub_client import HubClient
+
+    view = HubClient([], config_dir=".").status_view()
+    view.update(overrides)
+    return view
+
+
+ha_core.full_status_view = full_status_view
 ha_core.ServiceCall = type("ServiceCall", (), {})
 # v1.6.11：config_flow 首次被测试导入（审计 #6 钉桩）——homeassistant.core.callback
 # 是恒等标记装饰器，真实实现即返回原函数
@@ -197,7 +309,7 @@ ha_helpers_issue.ISSUES_DELETED = ISSUES_DELETED
 ha_components_http.HomeAssistantView = type("HomeAssistantView", (), {})
 ha_components_mqtt.async_connected = lambda hass: True
 ha_components_mqtt.async_publish = _noop
-ha_components_mqtt.async_subscribe = _noop
+ha_components_mqtt.async_subscribe = lambda *a, **k: (lambda: None)
 ha_components_button.ButtonEntity = type("ButtonEntity", (), {})
 ha_components_binary_sensor.BinarySensorEntity = type("BinarySensorEntity", (), {})
 ha_components_binary_sensor.BinarySensorDeviceClass = type(

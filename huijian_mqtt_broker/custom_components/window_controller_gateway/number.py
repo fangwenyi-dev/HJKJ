@@ -121,7 +121,14 @@ class WindowControllerRangeNumber(WindowControllerBaseEntity, NumberEntity):
             try:
                 value = int(value)
                 self._attr_native_value = float(max(SPEED_MIN, min(SPEED_MAX, value)))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
+                # 审计 2026-09-30 A-6：补捕 OverflowError——JSON `1e999`/`Infinity`
+                # 解析成 float('inf') 本身不抛错，而 `int(inf)` 抛的是
+                # OverflowError，旧的 (ValueError, TypeError) 元组接不住；实体
+                # __init__（:90）在 number 启动循环（无 try）里抛出 ⇒ 该条目所有
+                # 设备的速度/力度滑块一起消失，每次 reload 复发（一坏俱坏，与
+                # persist B-MED2 修的是同一后果，只换了维度）。口径对齐
+                # ws_gateway._as_int（v1.6.19 A-HIGH2 同条理由）。
                 _LOGGER.debug("设备 %s %s设定值无效: %r", self.device_sn, self._entity_label, value)
 
     async def async_update(self) -> None:

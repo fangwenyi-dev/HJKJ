@@ -50,7 +50,13 @@ def test_entrypoint_exists_and_delegates_to_the_real_pins():
     assert ENTRY.exists(), "CI 契约钉入口不存在（B3 未落地）"
     src = ENTRY.read_text(encoding="utf-8")
     assert src.startswith("#!"), "入口必须是可执行脚本（CI 用 bash 调它）"
-    assert "cross_repo_contract.sh" in src, "入口必须真调对账脚本，而不是自己另写一份判据"
+    # 审计 2026-09-30 H-4/A5 改钉：旧写法 `"cross_repo_contract.sh" in src` 会被
+    # 本脚本**第 4 行头注释**单独满足——真调用在 :38，完全不在判据射程内。
+    # 把 :38 那行 bash 调用整段删掉，这条"必须真调对账脚本"的钉照绿，而 CI 从此
+    # 只跑自己那份聚合计数。钉"真调"就必须锚在**非注释行的调用形态**上。
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert re.search(r"\bbash\b[^\n]*cross_repo_contract\.sh", code), \
+        "入口没有真调对账脚本（只剩注释提到它的名字也算假绿）"
 
 
 def test_skip_is_loud_when_peer_repos_invisible(tmp_path):
@@ -178,3 +184,33 @@ def test_ci_yaml_skip_path_is_visible():
         if any(isinstance(st.get("run"), str) and "ci_contract_pins.sh" in st["run"]
                for st in (job.get("steps") or [])):
             assert job.get("continue-on-error") is not True, "job %s 挂了 continue-on-error" % jname
+
+
+def test_ci_pytest_step_gets_peer_repo_paths():
+    """H-4 复核：主 pytest 步也必须拿到对端仓路径。
+
+    不注入的话 `test_v1747_cross_repo_contract.py` 在 CI 里必然 skip——那一步
+    是唯一在 pytest 内跑跨仓钉的入口，"CI 9/9 success"又会把"没跑"说成"跑过"。
+    判据按 job 内**顺序**取：peer-sync（clone 对端仓）必须排在 pytest 之前，
+    否则 `steps.peer-sync.outputs.*` 恒为空 ⇒ 注入等于没注入。
+    """
+    yaml = _yaml_or_skip()
+    doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    job_steps, idx, target = None, None, None
+    for job in (doc.get("jobs") or {}).values():
+        steps = job.get("steps") or []
+        for i, st in enumerate(steps):
+            if isinstance(st.get("run"), str) \
+                    and "pytest huijian_mqtt_broker/tests" in st["run"]:
+                target, idx, job_steps = st, i, steps
+                break
+        if target:
+            break
+    assert target is not None, "CI 里找不到跑 pytest 的 step（结构变了，本条判据要同步）"
+    env = target.get("env") or {}
+    assert "HUB_REPO" in env and "MINIPROGRAM_REPO" in env, \
+        "pytest 步没注入对端仓路径 ⇒ 跨仓契约钉在 CI 里永远 skip（H-4 回潮）"
+    peers = [i for i, st in enumerate(job_steps)
+             if isinstance(st.get("run"), str) and "git clone" in st["run"]]
+    assert peers and min(peers) < idx, \
+        "clone 对端仓的 step 必须排在 pytest 之前（否则注入的路径恒为空）"

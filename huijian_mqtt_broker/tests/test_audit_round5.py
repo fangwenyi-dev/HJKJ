@@ -607,7 +607,19 @@ class TestInfraHygiene:
                                "window_controller_gateway" / name).read_text(encoding="utf-8"))
             steps = data["options"]["step"]
             assert "options" in steps and "add_gateway" in steps, f"{name}: 真实渲染的步骤必须有文案"
-            assert "init" not in steps, f"{name}: init 步骤从不渲染（async_step_init 分流），死文案移除"
+            # 审计 2026-09-30 E-1 改钉：本钉原文是"init 步骤从不渲染（async_step_init
+            # 分流），死文案移除"——那正是缺陷本身：无 SN 条目被无条件分流到
+            # add_gateway，选项步骤永远不可达，而 awaiting 分支已用**公开默认令牌**
+            # 起了 9001 监听。init 现在渲染成菜单（两个步骤都可达），所以文案必须
+            # 在位；判据从"不得存在"翻成"必须存在且两个菜单项都有中文名"，
+            # 裸英文 step id 泄漏 UI 依旧判红。
+            assert "init" in steps, f"{name}: init 已渲染成菜单，文案不得缺"
+            menu = steps["init"].get("menu_options", {})
+            assert set(menu) == {"add_gateway", "options"}, \
+                f"{name}: init 菜单项文案必须与 async_step_init 的 menu_options 一一对应"
+            for _k, _v in menu.items():
+                assert isinstance(_v, str) and _v.strip() and any(
+                    "\u4e00" <= ch <= "\u9fff" for ch in _v), f"{name}: 菜单项 {_k} 文案非法"
             assert "gateway_sn" not in steps["options"].get("data", {}), \
                 f"{name}: 死控件的文案残留同步清理"
             errs = set(data["options"]["error"])

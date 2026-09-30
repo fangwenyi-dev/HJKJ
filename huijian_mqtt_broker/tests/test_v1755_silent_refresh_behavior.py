@@ -164,6 +164,10 @@ function findEntityByUniqueId(dev, domain, suffix) {
   return { domain: 'binary_sensor', unique_id: GW_SN + '_online', entity_id: GW_ONLINE_ENTITY };
 }
 const GATEWAY_SN_BY_ENTRY = {};
+// 审计 2026-09-30 B-7：生产代码里的模块级全局，被测函数按它判断"条目被禁用"。
+// 抽函数跑的假 DOM 必须把模块作用域的依赖一起补上，否则 ReferenceError——
+// 这不是被测代码的错，是桩缺面（本仓纪律：桩不得窄于真实现）。
+const DISABLED_ENTRIES = {};
 """
 
 HARNESS_TAIL = """
@@ -219,6 +223,29 @@ function subs() {
        'B: 徽标要由 online 实体推出在线（全空＝走了 catch 降级分支＝缺陷还在）: '
        + JSON.stringify(probe.status));
   want(probe.rebuild === 0, 'B: 不该升级完整重建（rebuild=' + probe.rebuild + '）');
+
+  // ── 场景 C：条目被禁用时本轮必须整体跳过（审计 2026-09-30 B-7）──
+  // 缺陷形态：renderGatewayDisabled 建的"条目未启用，暂不可用"容器会被后面的
+  // 刷新覆写成 8 颗可点按钮（点下去恒 4xx），同一张卡灰徽标配活按钮。
+  // 判据是模块级 DISABLED_ENTRIES，所以桩里必须真设真清。
+  resetProbe();
+  DISABLED_ENTRIES[ENTRY] = 1;
+  await updateGatewayDevices(ENTRY, GW_SN);
+  want(probe.haApi.length === 0,
+       'C: 禁用条目不得再打任何 HA API（白打 /devices + /states）: ' + JSON.stringify(probe.haApi));
+  want(probe.loadDeviceState.length === 0,
+       'C: 禁用条目不得更新设备状态: ' + JSON.stringify(probe.loadDeviceState));
+  want(probe.rebuild === 0,
+       'C: 禁用条目不得升级完整重建（那会把占位文案换成可点按钮）: ' + probe.rebuild);
+  want(probe.status.length === 0,
+       'C: 禁用条目不得写徽标（它压根没有 gw-status-* 元素）: ' + JSON.stringify(probe.status));
+  delete DISABLED_ENTRIES[ENTRY];
+  // 反向半条：清掉标记后必须**照常**刷新（否则"C 通过"只是因为整条函数没跑）
+  resetProbe();
+  await updateGatewayDevices(ENTRY, GW_SN);
+  want(probe.loadDeviceState.length === SUB_IDS.length,
+       'C2: 未禁用的条目仍要逐设备更新（反向半条，防 C 靠"什么都不做"蒙过）: '
+       + JSON.stringify(probe.loadDeviceState));
 
   if (bad) { console.log('updateGatewayDevices 真跑: ' + bad + ' 处不符'); process.exit(1); }
   console.log('OK');
@@ -278,3 +305,19 @@ def test_probe_catches_the_const_regression():
     rc, out, err = _run(_script(mutant))
     assert not (rc == 0 and "OK" in out), \
         "const 版居然跑过了：本测试抓不住这个缺陷（又一个假绿钉），必须重写探针"
+
+
+def test_probe_catches_the_disabled_entry_leak():
+    """自变异核验 2：删掉 DISABLED_ENTRIES 那道闸，场景 C 必须变红。
+
+    与 const 那条同构——钉子要自己证明自己抓得住。若这条哪天绿了，说明场景 C
+    的探针已经失真（比如 DISABLED_ENTRIES 变成了生产里根本不读的摆设）。
+    """
+    body = _extract()
+    mutant = body.replace("if (DISABLED_ENTRIES[entryId]) return;", "")
+    assert mutant != body, \
+        "变异没生效：updateGatewayDevices 里已无 `if (DISABLED_ENTRIES[entryId]) return;`" \
+        "——闸被改名/挪走/删掉了，B-7 的守卫与这条钉一起失效，必须重写"
+    rc, out, err = _run(_script(mutant))
+    assert not (rc == 0 and "OK" in out), \
+        "摘掉禁用条目守卫后场景 C 仍通过：这条钉是假绿，必须重写探针"

@@ -128,8 +128,21 @@ def handshake_token_ok(header_value: Optional[str], token: str) -> bool:
     """
     if not token:
         return True
+    # 审计 2026-09-30 A-1：hmac.compare_digest 对含非 ASCII 的 str **直接抛
+    # TypeError**（实测 C 解析器与 AIOHTTP_NO_EXTENSIONS 纯 Python 两臂均可达：
+    # aiohttp 只拦控制字符，非 ASCII 以 utf-8/surrogateescape 原样交付）。
+    # 本调用点无 try（try 从 _handle_ws 的预约计数之后才开始）⇒ 未认证方一发
+    # `Sec-WebSocket-Protocol: <非ASCII>,<正确令牌>` 就把契约规定的 401 变成
+    # 500 + HA ERROR 栈，且"正确令牌排在非 ASCII 候选之后"的合法客户端一起被拒。
+    # 令牌字符集是 [A-Za-z0-9_-]（token_charset_ok），非 ASCII 候选**永远不可能
+    # 匹配**，先筛掉再逐候选恒定时间比较：既不抛错，也不引入时序面（筛选只读
+    # 攻击者自带的候选，不读密钥内容）。token 自身非 ASCII 属存储被手改的畸形
+    # 形态——此时任何客户端都配不上，如实回 401 而不是崩。
+    if not token.isascii():
+        return False
     return any(hmac.compare_digest(cand, token)
-               for cand in offered_subprotocols(header_value))
+               for cand in offered_subprotocols(header_value)
+               if cand.isascii())
 
 
 def token_charset_ok(token: str) -> bool:
@@ -151,7 +164,14 @@ def validate_new_token(new_token: Any, old_token: Any, current_token: str) -> Op
     if not token_charset_ok(new_token):
         return _MSG_BAD_CHARS
     auth_active = bool(current_token)
+    # 审计 2026-09-30 A-1 同族第二站点：oldToken 是 WS 帧里的外部输入，
+    # 非 ASCII 时 compare_digest 抛 TypeError（newToken 侧上方已有字符集闸，
+    # 本行此前只判 isinstance str）。两侧任一带非 ASCII 都配不上（令牌字符集
+    # 是 [A-Za-z0-9_-]），如实回 _MSG_OLD_MISMATCH，而不是崩掉整条会话
+    # （协议要求每个 cmd 必有回包；崩了小程序只会干等）。
     if auth_active and (not isinstance(old_token, str)
+                        or not old_token.isascii()
+                        or not current_token.isascii()
                         or not hmac.compare_digest(old_token, current_token)):
         return _MSG_OLD_MISMATCH
     return None
@@ -270,6 +290,8 @@ class WsGatewayServer:
         self._listener: Optional[Callable[[str, str], None]] = None
         self._listener_managers: List[Any] = []
         self._stopping = False
+        # 审计 2026-09-30 C-3：首路 async_stop 的收口信号（懒建，第二次调用才需要）。
+        self._stop_done: Optional[asyncio.Event] = None
         # 在途握手计数（见 _handle_ws 槽位预约注释）
         self._pending_handshakes = 0
         # v1.6.19（第六轮审计 A-LOW6）：广播任务引用集合——裸 create_task
@@ -304,31 +326,45 @@ class WsGatewayServer:
 
     async def async_stop(self) -> None:
         """注销设备监听、踢下全部客户端并释放端口（幂等）。"""
+        # 审计 2026-09-30 C-3：旧写法第二路见 `_stopping` 为真就**立刻返回**，
+        # 而首路此刻还卡在客户端 close（最坏 ~10s）或 runner.cleanup 上——端口
+        # 并未释放。并发 ensure 因此马上新建实例并 async_start ⇒ OSError 端口仍被占，
+        # 而它只等 1.0s 重试一次（:988-1002，短于首路收尾窗口）⇒ 起不来，只留一行
+        # "下次条目变更会再补拉"，改端口/改令牌冻结成永不监听。
+        # 改为：第二路等首路真正收口后再返回（幂等语义不变，只是不再假称"已停好"）。
         if self._stopping:
+            done = self._stop_done
+            if done is not None:
+                await done.wait()
             return
         self._stopping = True
-        self._detach_listeners()
-        clients = list(self._clients)
-        self._clients.clear()
-        if clients:
-            # v1.7.12（第 6 轮审计 F3）：逐个 await ws.close()（对端不应答
-            # 时默认 10s 超时各拖各的）改并发 gather——4 客户端串行最坏 40s
-            # 卡死条目 unload/HA STOP 路径；return_exceptions 容忍单条异常
-            # （与旧逐条 except pass 同语义）
-            await asyncio.gather(
-                *(ws.close() for ws in clients), return_exceptions=True
-            )
-        # v1.6.19 A-LOW6：客户端已踢、监听已摘，残余广播任务无意义，取消收尾
-        for _t in list(self._bg_tasks):
-            _t.cancel()
-        self._bg_tasks.clear()
-        if self._runner is not None:
-            try:
-                await self._runner.cleanup()
-            except Exception as e:  # noqa: BLE001
-                _LOGGER.debug("WS 网关 runner cleanup 异常: %s", e)
-            self._runner = None
-        _LOGGER.info("小程序 WS 网关已停止")
+        self._stop_done = asyncio.Event()
+        try:
+            self._detach_listeners()
+            clients = list(self._clients)
+            self._clients.clear()
+            if clients:
+                # v1.7.12（第 6 轮审计 F3）：逐个 await ws.close()（对端不应答
+                # 时默认 10s 超时各拖各的）改并发 gather——4 客户端串行最坏 40s
+                # 卡死条目 unload/HA STOP 路径；return_exceptions 容忍单条异常
+                # （与旧逐条 except pass 同语义）
+                await asyncio.gather(
+                    *(ws.close() for ws in clients), return_exceptions=True
+                )
+            # v1.6.19 A-LOW6：客户端已踢、监听已摘，残余广播任务无意义，取消收尾
+            for _t in list(self._bg_tasks):
+                _t.cancel()
+            self._bg_tasks.clear()
+            if self._runner is not None:
+                try:
+                    await self._runner.cleanup()
+                except Exception as e:  # noqa: BLE001
+                    _LOGGER.debug("WS 网关 runner cleanup 异常: %s", e)
+                self._runner = None
+            _LOGGER.info("小程序 WS 网关已停止")
+        finally:
+            # 端口在这里才算真的释放完——唤醒等待方必须晚于 cleanup
+            self._stop_done.set()
 
     def _attach_listeners(self, managers: List[Any]) -> None:
         """把 device_update 推送监听挂到全部网关的 device_manager。"""
@@ -596,10 +632,22 @@ class WsGatewayServer:
             # 幽灵复活+小程序已收假成功 ack，恰是 F1/A-MED2 注释自认的
             # 现实分支却只回滚了一半语义。条目仍在列表=reload 进行中，
             # 如实 ack False；条目已从列表消失=删除随条目收口，ack True。
-            still_configured = any(
-                str((getattr(e, "data", None) or {}).get(CONF_GATEWAY_SN) or "")
+            matched = [
+                e for e in self.hass.config_entries.async_entries(DOMAIN)
+                if str((getattr(e, "data", None) or {}).get(CONF_GATEWAY_SN) or "")
                 .lower() == gw_sn.lower()
-                for e in self.hass.config_entries.async_entries(DOMAIN))
+            ]
+            # 审计 2026-09-30 E-2 的**反向**结论：本处**不**按 disabled_by 过滤。
+            # 这里问的不是"是不是有效配置"，而是"条目还在不不在配置列表里"——
+            # 若照单一真源口径滤掉禁用条目，禁用会被读成"已删除"并 ack ok:True，
+            # 而设备仍在注册表里（小程序收到假成功，下次 get_devices 又冒出来）。
+            # 第三态如实分开：条目在但被禁用 ⇒ 既非 reload 也非删除，重试无用。
+            disabled = [e for e in matched if getattr(e, "disabled_by", None)]
+            if matched and len(disabled) == len(matched):
+                _LOGGER.warning("WS unbind: 条目 %s 已被用户禁用，本地删除未落——"
+                                "请在 HA 中重新启用或删除该集成条目后再解绑", gw_sn)
+                return {"type": "unbind_ack", "ok": False, "msg": "entry disabled"}
+            still_configured = bool(matched)
             if still_configured:
                 _LOGGER.warning("WS unbind: 条目 %s 正处 reload，本地删除未落——"
                                 "请稍后重试解绑（设备暂在列表中属如实状态）", gw_sn)
@@ -652,6 +700,11 @@ class WsGatewayServer:
         wrote = False
         try:
             for entry in self.hass.config_entries.async_entries(DOMAIN):
+                # 审计 2026-09-30 E-2 同族：被禁用的条目不是"有效配置"，把新令牌
+                # 写进它的 options 既不会被运行态采纳（ws_gateway_wanted 已跳过），
+                # 又会让"全部条目禁用"那一路误判成 wrote=True 而不回滚内存值。
+                if getattr(entry, "disabled_by", None):
+                    continue
                 options = dict(entry.options or {})
                 if not options.get(CONF_WS_GATEWAY_ENABLED, DEFAULT_WS_GATEWAY_ENABLED):
                     continue
@@ -891,6 +944,17 @@ def ws_gateway_wanted(hass: HomeAssistant) -> Optional[Tuple[int, str]]:
     """聚合各 entry options：返回 (port, token)——取第一个未显式关闭
     WS 的 entry 的配置（v1.6.16 默认开）；全部显式关闭/无 entry → None。"""
     for entry in hass.config_entries.async_entries(DOMAIN):
+        # 审计 2026-09-30 E-2：禁用条目不算有效配置。这是本仓已经收过口的纪律
+        # （utils.py:92 把它定为"单一真源"、mqtt_bootstrap.py:229/352/450/563、
+        # config_flow.py:564、__init__.py:332 均自过滤 disabled_by），
+        # 而 async_entries() 默认 include_disabled=True。漏判的两条后果都实测可达：
+        # ①禁用条目①(port/token A) + 启用条目②(9001/token B) ⇒ 禁用触发 unload、
+        #   unload 尾部调本函数 ⇒ 采纳**被禁用条目①**的端口与令牌建服，小程序按
+        #   B 连恒 401 / 连错口；②全部条目禁用 ⇒ 本函数仍返回非 None，9001 继续
+        #   监听并回 gateway_list: []，正是"无任何网关时监听面不得空转残留"立令
+        #   禁止的形态。
+        if getattr(entry, "disabled_by", None):
+            continue
         options = entry.options or {}
         if not options.get(CONF_WS_GATEWAY_ENABLED, DEFAULT_WS_GATEWAY_ENABLED):
             continue
@@ -1033,6 +1097,22 @@ async def async_ensure_ws_gateway(hass: HomeAssistant) -> None:
     domain_data[WS_GATEWAY_DATA_KEY] = server
     server._attach_listeners([data["device_manager"] for _gw, data in server._entries_data()])
 
+    # 审计 2026-09-30 C-3：闩锁在 :977 只判一次，而它到本行之间全是让出点
+    # （async_start / 迟到撞车复检）。停机与条目 unload 并发时的具体交错：
+    # 本路已过 :977（那时还没置锁）→ 正卡在 async_start → STOP 侧读 current 时
+    # 我们尚未登记 ⇒ **谁也没停** → 我们随后登记 ⇒ 整个关机过程 9001 继续监听，
+    # 而 STOP 监听是 listen_once、已被消费，再无人来停它。
+    # 登记后复检一次：锁已置上就把刚起的自己停掉并摘注册，不留监听面过停机。
+    if domain_data.get(WS_GATEWAY_STOPPED_KEY):
+        _LOGGER.info("HA 正在停止，让位关掉刚拉起的 WS 网关（登记后复检闩锁）")
+        if domain_data.get(WS_GATEWAY_DATA_KEY) is server:
+            domain_data.pop(WS_GATEWAY_DATA_KEY, None)
+        try:
+            await server.async_stop()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
     from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
     async def _on_ha_stop(_event) -> None:
@@ -1059,4 +1139,9 @@ async def async_stop_ws_gateway(hass: HomeAssistant) -> None:
     current = domain_data.get(WS_GATEWAY_DATA_KEY)
     if current is not None:
         await current.async_stop()
-        domain_data.pop(WS_GATEWAY_DATA_KEY, None)
+        # 审计 2026-09-30 C-3：判等再 pop——与本文件 :954-959（BUG-6/F2 定案）
+        # 同一条理由：async_stop 有真实让出点，期间并发 ensure 可能已拉起新实例
+        # 并登记，无条件 pop 会删掉**他人**的注册 ⇒ 那台仍在监听 9001 的服务器
+        # 从此无人可停（孤儿持旧令牌）。同一函数上方与这里此前一处判等处不判等。
+        if domain_data.get(WS_GATEWAY_DATA_KEY) is current:
+            domain_data.pop(WS_GATEWAY_DATA_KEY, None)

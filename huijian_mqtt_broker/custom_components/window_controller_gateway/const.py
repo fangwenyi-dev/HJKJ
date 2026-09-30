@@ -264,3 +264,7 @@ def get_device_display_name(gateway_sn: str, device_sn: str, device_number: int 
 # 早晚漂移成"视图永远取不到单例"。
 HUB_DATA_KEY = "_hub_client"
 HUB_STOP_LISTENER_KEY = "_hub_stop_listener"
+# 审计 2026-09-30 C-2：HA 停机闩锁。与 WS_GATEWAY_STOPPED_KEY 同构——STOP 之后
+# 条目还会逐个 unload，每条 unload 尾部都会调一次 ensure；没有这把锁就会在关机
+# 过程中把刚停掉的长连重新拉起（而它的 STOP 监听注册时事件已派发过 ⇒ 无人回收）。
+HUB_STOPPED_KEY = "_hub_stopped"

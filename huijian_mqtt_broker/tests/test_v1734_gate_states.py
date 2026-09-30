@@ -32,6 +32,7 @@ import custom_components.window_controller_gateway.mqtt_bootstrap as mb
 import custom_components.window_controller_gateway.utils as utils
 import custom_components.window_controller_gateway.ws_gateway as wsg
 import homeassistant.components.mqtt as fake_mqtt
+from homeassistant.core import FakeServices
 from custom_components.window_controller_gateway.const import (
     DOMAIN, CONF_GATEWAY_SN)
 from custom_components.window_controller_gateway.mqtt_handler import (
@@ -85,6 +86,10 @@ class _Hass:
         self.is_stopping = False
         self.loop = None
         self.config = SimpleNamespace(config_dir=config_dir)
+        # 审计 2026-09-30 C-1 配套：真 HA 的 hass.services 恒在，而本替身此前没有
+        # 这一面——async_setup_entry 补上"域级服务重注册"后，桩比真实现窄就直接
+        # 把条目 setup 判成失败（本仓纪律：测试替身不得窄于真实现）。
+        self.services = FakeServices()
         self._entries = list(entries)
         self.tasks = []
         self.config_entries = SimpleNamespace(

@@ -7,6 +7,8 @@
 """
 import asyncio
 
+from homeassistant.core import full_status_view
+
 from custom_components.window_controller_gateway import api
 from custom_components.window_controller_gateway.const import DOMAIN, HUB_DATA_KEY
 
@@ -34,14 +36,16 @@ class _FakeClient:
         return True
 
     def status_view(self):
-        return {
-            "connected": True, "instanceId": "inst-1", "bindCode": "111111",
-            "bindCodeExpiresIn": 300, "bindCodeExpired": False, "gatewaySn": "GW1",
-            "gateways": [{"sn": "GW1", "deviceCount": 2}], "hub": "https://hub", "lastError": None,
-            "memberCode": "654321", "memberCodeExpiresIn": 300, "memberCodeExpired": False,
-            "members": self.members, "membersCount": len(self.members), "membersMax": 8,
-            "membersSupported": self.supported, "ownerMasked": "oFa…01",
-        }
+        # 审计 2026-09-30 H-6：键集由**真实现**单向决定（手写 dict 会随真实现演进
+        # 悄悄变窄，而"回包必须是完整视图"这类名字判的其实是假件自己的键）。
+        return full_status_view(
+            connected=True, instanceId="inst-1", bindCode="111111",
+            bindCodeExpiresIn=300, bindCodeExpired=False, gatewaySn="GW1",
+            gateways=[{"sn": "GW1", "deviceCount": 2}], hub="https://hub",
+            lastError=None, memberCode="654321", memberCodeExpiresIn=300,
+            memberCodeExpired=False,
+            members=self.members, membersCount=len(self.members), membersMax=8,
+            membersSupported=self.supported, ownerMasked="oFa…01")
 
 
 class _FakeHass:

@@ -135,7 +135,7 @@ def _make_hub_control(hass: HomeAssistant):
 # 归属放在 DOMAIN 级，是因为身份文件本来就在全局 config_dir——每条目各建实例会
 # 互相覆盖同一份身份，HA 重启后全部用同一个 instanceId 去连，hub 的 onAgent 把
 # 前一条顶掉 ⇒ N 台网关抢一条长连，且小程序只看到其中一台（用户报障原形）。
-from .const import HUB_DATA_KEY, HUB_STOP_LISTENER_KEY  # noqa: E402
+from .const import HUB_DATA_KEY, HUB_STOP_LISTENER_KEY, HUB_STOPPED_KEY  # noqa: E402
 
 
 def _hub_managers(hass: HomeAssistant) -> List[Any]:
@@ -151,12 +151,20 @@ def _hub_managers(hass: HomeAssistant) -> List[Any]:
 
 
 def _hub_option(hass: HomeAssistant, key: str) -> str:
-    """取"任一条目里非空的那个覆盖值"（只有一个实例，不存在改了不生效）。"""
+    """取"任一条目里非空的那个覆盖值"（只有一个实例，不存在改了不生效）。
+
+    审计 2026-09-30 E-2：只看**有效**条目（自过滤 disabled_by，与本仓
+    utils.entry_state_for_sn 的单一真源口径同判）。禁用条目的 options 不会被
+    _hub_managers 那条路采纳（条目未 setup 就没有 manager），却会在这里被读成
+    hub 地址/密钥——于是"禁用旧网关后云端长连仍指向旧 hub"。
+    """
     try:
         entries = list(hass.config_entries.async_entries(DOMAIN))
     except Exception:  # noqa: BLE001 - 无 config_entries（测试桩）时退回内置默认
         entries = []
     for ent in entries:
+        if getattr(ent, "disabled_by", None):
+            continue
         try:
             val = (ent.options or {}).get(key)
         except Exception:  # noqa: BLE001
@@ -181,6 +189,15 @@ async def async_ensure_hub_client(hass: HomeAssistant) -> None:
 
     if not managers:
         await async_stop_hub_client(hass)
+        return
+
+    # 审计 2026-09-30 C-2：停机闩锁。STOP 之后条目还会逐个 unload，每条 unload
+    # 尾部都调本函数；没有这把锁就会在关机过程中把刚停掉的长连**重新拉起**
+    # （HubClient.async_start 里是 ensure_future(_run_forever)），而它的 STOP
+    # 监听注册时事件已派发过 ⇒ 任务与 aiohttp 会话无人回收，云端看到一次
+    # instance 抖动。同形状的 WS 网关早已定案必须加锁（ws_gateway.py:977-980
+    # 的注释："若无此闩锁会把刚停掉的服务器在关机过程中重新拉起"）。
+    if domain_data.get(HUB_STOPPED_KEY):
         return
 
     if current is None:
@@ -219,10 +236,25 @@ def _register_hub_stop_listener(hass: HomeAssistant, domain_data: Dict[str, Any]
     """STOP 监听只注册一次（照抄 v1.7.33 对 ws_gateway"句柄不存不摘"那条教训）。"""
     if domain_data.get(HUB_STOP_LISTENER_KEY):
         return
+    # 审计 2026-09-30 C-2 复核补口：ensure 若在 async_start 的让出点里被 STOP
+    # 抢先（闩锁已置、事件已派发），走到这里再注册的 listen_once 永不触发，
+    # 句柄还要等下一个人来摘——直接不注册（hass.is_stopping 是仓内既有用法）。
+    if domain_data.get(HUB_STOPPED_KEY) or getattr(hass, "is_stopping", False):
+        return
     from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
     async def _on_ha_stop(_event) -> None:
-        await async_stop_hub_client(hass)
+        # 审计 2026-09-30 C-2：先置停机闩锁、再停通道——与 ws_gateway 的
+        # WS_GATEWAY_STOPPED_KEY 完全同构（那边的注释已是定案："STOP 后 entry
+        # 逐个 unload 也会调本函数，若无此闩锁会把刚停掉的服务器在关机过程中
+        # 重新拉起"）。hub 侧此前只有"监听只注册一次"，没有锁：≥2 条目停机时
+        # STOP 回调是并发任务，hub 的 _on_ha_stop 先跑完并 pop 掉 HUB_DATA_KEY，
+        # 另一条目 unload 尾部再 ensure ⇒ 关机中拉起新实例，而它的 STOP 监听
+        # 注册时事件已派发过 ⇒ 任务与 aiohttp 会话无人回收，云端看到一次
+        # instance 抖动。摘除侧也一并交给 from_stop（见 async_stop_hub_client）。
+        # 置停机闩锁在 async_stop_hub_client(from_stop=True) 里做，本回调只负责
+        # 把"这是 STOP 派发"这件事告诉它（一处置锁，避免两条路径口径分叉）。
+        await async_stop_hub_client(hass, from_stop=True)
 
     try:
         domain_data[HUB_STOP_LISTENER_KEY] = hass.bus.async_listen_once(
@@ -231,14 +263,27 @@ def _register_hub_stop_listener(hass: HomeAssistant, domain_data: Dict[str, Any]
         domain_data[HUB_STOP_LISTENER_KEY] = None
 
 
-async def async_stop_hub_client(hass: HomeAssistant) -> None:
-    """停掉安装级长连并摘键；幂等，二次调用不炸。"""
+async def async_stop_hub_client(hass: HomeAssistant, *, from_stop: bool = False) -> None:
+    """停掉安装级长连并摘键；幂等，二次调用不炸。
+
+    审计 2026-09-30 C-4：`from_stop` 只在 HA STOP 派发路径为真（见
+    _register_hub_stop_listener 的回调）。async_listen_once 的一次性监听器
+    **在事件派发时就被总线摘掉了**，此时再 unsub() 会让 HA core 打
+    "Unable to remove unknown listener" —— 同一形态在 :1140-1147（v1.7.31 F-A）
+    已被现场实锤修过（"0918 现场每次停机每条目一条，日志噪声盖真故障"），
+    本处是照抄注册侧、漏抄摘除侧。条目 unload 路径（非 STOP）里监听器还在，
+    该摘还是要摘，所以不能无条件跳过。
+    """
     domain_data = hass.data.get(DOMAIN)
     if not isinstance(domain_data, dict):
         return
+    if from_stop:
+        # 审计 2026-09-30 C-2：闩锁在停机侧置位（async_ensure_hub_client 据此
+        # 拒绝在关机过程中重新拉起）。
+        domain_data[HUB_STOPPED_KEY] = True
     current = domain_data.get(HUB_DATA_KEY)
     unsub = domain_data.pop(HUB_STOP_LISTENER_KEY, None)
-    if callable(unsub):
+    if callable(unsub) and not from_stop:
         try:
             unsub()
         except Exception:  # noqa: BLE001
@@ -265,6 +310,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """
     gateway_sn = entry.data.get(CONF_GATEWAY_SN, "")
     _LOGGER.info("=== 开始设置配置条目: %s, gateway: %s ===", entry.entry_id, gateway_sn or "(待配置)")
+
+    # 审计 2026-09-30 C-1：域级服务的**重注册**落点。注销有位置
+    # （async_remove_entry 在最后一个条目删除时按名 async_remove），重注册却没有——
+    # register_services 只在 DOMAIN 级 async_setup(:70) 调过一次，而组件一旦进了
+    # hass.config.components，HA 就不会再跑 async_setup，此后新建条目只走
+    # async_setup_entry。于是"删掉全部条目 → 再加一台网关"这条正常操作路径上，
+    # 7 个域级服务永久缺席（面板 start_pairing / check_gateway_status /
+    # rename_device 直接 Service not found，且没有任何自愈入口，直到重启 HA）。
+    # 原 :930 注释"register_services 每次 setup 全覆盖注册"把 DOMAIN setup 当成了
+    # 条目 setup，前提本身是错的。async_register 是覆盖式的，逐条目重入无害；
+    # 注册失败仍按原语义让本条目 setup 失败（与 :70 同一判据）。
+    if not register_services(hass):
+        return False
     
     try:
         from .device_manager import WindowControllerDeviceManager
@@ -272,6 +330,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except ImportError as e:
         _LOGGER.critical("导入核心模块失败: %s", e)
         return False
+
+    # v1.7.33（全量审计）：先清掉上一次生命周期遗留的**状态类**键——
+    # async_unload_entry 失败时不 pop 该条目字典，下次 setup 的 previous.update()
+    # 会把 _platforms_forwarded=True / _bg_tasks / unsub_listeners 原样继承：
+    # 门禁据此对从未 forward 的平台调 async_unload_platforms（每平台一条
+    # "Config entry was never loaded!" ERROR），旧任务/监听器列表也持续累积
+    # （已无引用可取消）。平台附加键（created_*）不受影响，仍在 update 中保留。
+    #
+    # 审计 2026-09-30 H-3 复核（本批行为钉抓出）：清理原先只写在**完整设置**
+    # 分支里，awaiting 分支（无 SN）不经过 ⇒ 残留 _bg_tasks 会被
+    # setdefault(...).append() 追加进旧列表（每次失败卸载累积一条死任务引用）。
+    # 提到分支分流之前，两分支同口径。
+    _prev_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if isinstance(_prev_data, dict):
+        for _stale in ("_platforms_forwarded", "_bg_tasks", "unsub_listeners"):
+            _prev_data.pop(_stale, None)
 
     # ---- 无网关 SN：最小设置，等待后续配置 ----
     if not gateway_sn:
@@ -630,17 +704,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "unsub_listeners": unsub_listeners,
             "_setup_complete": True
         }
-        # 合并已有数据（保留平台可能附加的键，如 created_remove_buttons）
-        # v1.7.33（全量审计）：先清掉上一次生命周期遗留的**状态类**键——
-        # async_unload_entry 失败时不 pop 该条目字典，下次 setup 的
-        # previous.update() 会把 _platforms_forwarded=True / _bg_tasks /
-        # unsub_listeners 原样继承：门禁据此对从未 forward 的平台调
-        # async_unload_platforms（每平台一条 "Config entry was never loaded!"
-        # ERROR），旧任务/监听器列表也持续累积（已无引用可取消）。
-        # 平台附加键（created_*）不受影响，仍在 update 中保留。
+        # 合并已有数据（保留平台可能附加的键，如 created_remove_buttons）；
+        # 状态类键的清理已在函数入口统一做（H-3 复核：两分支同口径）。
         previous = hass.data[DOMAIN].get(entry.entry_id, {})
-        for _stale in ("_platforms_forwarded", "_bg_tasks", "unsub_listeners"):
-            previous.pop(_stale, None)
         previous.update(entry_data)
         hass.data[DOMAIN][entry.entry_id] = previous
 
@@ -804,16 +870,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:
             _LOGGER.debug("取消停止监听器时出错: %s", e)
 
-    # 1.1 取消心跳监听器（无 SN 模式下的自动发现）
-    heartbeat_unsub = data.get("_unsub_heartbeat")
-    if heartbeat_unsub:
-        try:
-            heartbeat_unsub()
-            _LOGGER.debug("心跳监听器已取消")
-        except Exception as e:
-            _LOGGER.debug("取消心跳监听器时出错: %s", e)
-
-    # 1.5 取消后台任务（_bg_tasks），避免任务在卸载后继续执行
+    # 1.5 先取消后台任务（_bg_tasks），避免任务在卸载后继续执行
+    # 审计 2026-09-30 C-5：这一步**必须早于**心跳退订。旧顺序是 1.1 读
+    # _unsub_heartbeat → 1.5 取消任务，而 step 0 的 `await save_persistent_data`
+    # 就是让出点：等待态条目的"MQTT 未就绪→后台武装"任务（_arm_heartbeat_when_mqtt_ready，
+    # :443-493）可以在这两步之间完成 async_subscribe 并把句柄写进 data。
+    # 于是 1.1 已读过（拿不到）、1.5 对已结束的任务 cancel 无效 ⇒ gateway/rpt_rsp
+    # 上留下一只挂在已卸载条目上的耳朵，继续代答 001；reload 一轮多一只（仲裁只压
+    # 重复发布、不压订阅）。它自带的 `data_now is None` 双检也拦不住——条目数据要到
+    # 本函数结尾才 pop，卸载进行中该判据恒不成立。
     for bg_task in data.get("_bg_tasks", []):
         if bg_task and not bg_task.done():
             try:
@@ -826,6 +891,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.debug("后台任务异常: %s", e)
             except Exception as e:
                 _LOGGER.warning("取消后台任务时出错: %s", e)
+
+    # 1.1 取消心跳监听器（无 SN 模式下的自动发现）——在任务收尾**之后**读，
+    # 才能接住任务在让出点里刚补上的那只耳朵（见上方 C-5）。
+    heartbeat_unsub = data.get("_unsub_heartbeat")
+    if heartbeat_unsub:
+        try:
+            heartbeat_unsub()
+            _LOGGER.debug("心跳监听器已取消")
+        except Exception as e:
+            _LOGGER.debug("取消心跳监听器时出错: %s", e)
+        data["_unsub_heartbeat"] = None
 
     # 2. 先停止所有定时任务和监听器
     for unsub in data.get("unsub_listeners", []):
