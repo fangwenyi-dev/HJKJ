@@ -637,16 +637,36 @@ cleanup_mdns() {
     # python 仍活着，huijian.local 继续广播一个已死/已降权的 broker，网关连上即被拒。
     # 改用 base 镜像必有的 /proc 扫描（与 §7b 判活同源）：按 cmdline 匹配，
     # 跳过自身 PID；找不到就什么也不做，但绝不再依赖不存在的命令。
-    for _mdns_pid in $(ls /proc 2>/dev/null); do
+    # 2026-09-30 现场日志实锤：`/run.sh: line 645: /proc/8369/cmdline: No such
+    # file or directory` ×4。根因是 bash 的重定向**从左到右**生效——
+    # `cmd < 文件 2>/dev/null` 里"打不开文件"的报错由 shell 自己写到**尚未
+    # 重定向的 stderr** ⇒ 每次停容器（s6 正在回收子进程，ls 完就消失的 PID 一片）
+    # 都往加项日志灌噪声，把关停现场淹掉。故 `2>/dev/null` 必须排在 `<` 之前；
+    # `[ -r ]` 只是让绝大多数已消失的 PID 连 fork 都不必。
+    # 留路径杠杆 MDNS_PROC_ROOT（与 nginx 探针同一规矩）：行为钉可喂假 /proc 真跑。
+    _mdns_seen=0        # 扫描根是否列出了任何东西（见下方"回声"注释）
+    for _mdns_pid in $(ls "${MDNS_PROC_ROOT:-/proc}" 2>/dev/null); do
+        _mdns_seen=1
         case "${_mdns_pid}" in
             ''|*[!0-9]*) continue ;;
         esac
         [ "${_mdns_pid}" = "$$" ] && continue
-        if tr '\0' ' ' < "/proc/${_mdns_pid}/cmdline" 2>/dev/null \
+        _mdns_cmd="${MDNS_PROC_ROOT:-/proc}/${_mdns_pid}/cmdline"
+        [ -r "${_mdns_cmd}" ] || continue
+        if tr '\0' ' ' 2>/dev/null < "${_mdns_cmd}" \
            | grep -q 'mdns_publisher\.py'; then
             kill "${_mdns_pid}" 2>/dev/null || true
         fi
     done
+    # 审计 2026-09-30（第三轮 F-4）：上面为了消噪把 `<` 打不开的报错整条压掉，代价是
+    # "扫描根整个不对"（比如上层把 MDNS_PROC_ROOT 设成了别的、或 /proc 没挂）从此
+    # **一声不响**——publisher 残留、huijian.local 继续广播死 broker，日志里一个字没有。
+    # 消噪治的是"每次停机必现的噪声"，不能顺手把"从未发生但一旦发生就看不见"的
+    # 故障也一起抹平：只在 mDNS 确实起过（MDNS_PID 有值）而扫描**一根 PID 都没列出**
+    # 时才回声一句。正常路径 /proc 有几十条 ⇒ 恒不触发，不产噪声。
+    if [ -n "${MDNS_PID}" ] && [ "${_mdns_seen}" = 0 ]; then
+        echo "[mDNS] /proc 扫描未列出任何条目：publisher 可能残留，检查 MDNS_PROC_ROOT 是否被上层设置"
+    fi
 }
 # v1.6.4 停机路径根修：旧写法 trap cleanup_mdns EXIT INT TERM 的处理函数
 # 只清理不退出——SIGTERM 到达后 bash 跑完 handler 从被中断的 wait 返回

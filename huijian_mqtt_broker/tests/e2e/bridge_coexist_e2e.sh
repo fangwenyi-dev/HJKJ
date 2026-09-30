@@ -39,10 +39,10 @@ cleanup() {
     [ "${KEEP_SCENE:-0}" = 1 ] && return 0   # fail 现场留给开发者
     # 顺序：先看门狗（防复活）再按登记单杀全部后代；零 pattern 匹配
     kill "${SH_PID:-}" 2>/dev/null
-    while read -r xpid; do kill "$xpid" 2>/dev/null; done < "$L/.pids" 2>/dev/null
+    while read -r xpid; do kill "$xpid" 2>/dev/null; done 2>/dev/null < "$L/.pids"
     sleep 1
     kill -9 "${SH_PID:-}" 2>/dev/null
-    while read -r xpid; do kill -9 "$xpid" 2>/dev/null; done < "$L/.pids" 2>/dev/null
+    while read -r xpid; do kill -9 "$xpid" 2>/dev/null; done 2>/dev/null < "$L/.pids"
     rm -rf "$L"
 }
 # 端口排他检查（不杀任何进程——pattern 杀在嵌套/孤儿场景互伤已 7 次实发，

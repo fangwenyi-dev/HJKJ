@@ -1073,11 +1073,18 @@ def test_c7_run_sh_does_not_depend_on_pkill():
 
 
 def test_c7_cleanup_mdns_kills_both_the_subshell_and_python():
-    """注释不算数（对抗复核实测：整段换成含全部字样的注释，3 条钉仍全绿）。"""
+    """注释不算数（对抗复核实测：整段换成含全部字样的注释，3 条钉仍全绿）。
+
+    路径判据钉的是**形状**而不是 `/proc/` 字样：v1.7.56 后扫描根走杠杆
+    `${MDNS_PROC_ROOT:-/proc}`，裸 `/proc/` 已不在生效行里（旧判据当场变红，
+    是钉落后于实现、不是回退）。写成正则同时把"默认值仍是 /proc"钉住——
+    杠杆只给测试用，生产不设置即真路径。
+    """
     body = _cleanup_mdns_code()
     assert 'kill "${MDNS_PID}"' in body, "看门狗子 shell 那条 kill 不许删"
-    assert "/proc/" in body and "mdns_publisher" in body, \
-        "python 那一条要按 /proc cmdline 真杀掉（与 §7b 判活同源）"
+    assert re.search(r"\$\{MDNS_PROC_ROOT:-/proc\}/\$\{_mdns_pid\}/cmdline", body) \
+        and "mdns_publisher" in body, \
+        "python 那一条要按 /proc/<pid>/cmdline 真杀掉（与 §7b 判活同源）"
 
 
 def test_c7_cleanup_skips_own_pid():
@@ -2620,3 +2627,517 @@ def test_b7_probe_catches_the_guard_removal():
         rc, out = _node_run(_B7_HEAD + "\n" + mutant + "\n" + tail)
         assert not (rc == 0 and "OK" in out), \
             "摘掉%s后仍全绿：B-7 的钉抓不住这一道的回潮\n%s" % (label, out)
+
+
+# ═════════ 复核第三轮补钉（代理 7 条指控：5 成立补 6 钉、1 剔除、1 并入）═════════
+# 代理实测这些回退形态当时全绿：C-7 的 /proc 扫描整段注释化、grep 串改成永不相交、
+# F-2 去掉 sleep、while 改 if、吞取消挪到 cleanup 的调用点、给守卫测试自己加 `or True`。
+# 下面每条都按"真跑或结构位"重做，并在整树变异副本（.qoder-tmp-verify/mut7.py）里用
+# 同型变异验红。剔除的那条不补：指控说"hub 入口下限 35→1 或去掉计数自检仍全绿"，实测
+# test_v1753_ci_contract_pins.py 的 F-4/F-5 两条钉正断这两个数字，改 1 当场红——
+# 记在这里免得后人重提。
+
+def _sq(p):
+    """给 bash 的单引号包裹（测试里的路径都不含单引号）。"""
+    return "'" + Path(p).as_posix() + "'"
+
+
+def _c7_fake_proc(tmp_path):
+    """假 /proc：publisher(1234) + 看门狗子 shell(5555，cmdline 里**没有** publisher 字样，
+    这正是"必须显式 kill $MDNS_PID"的理由) + mosquitto(77，不许被杀) + 无关(4321)
+    + 竞态(8888，目录在、cmdline 已消失) + 非数字条目(self/thread-self)。
+
+    非数字条目**带可读 cmdline**，且 `self` 那只的 cmdline **恰好就是 publisher**：
+    第三轮复核实测原 fixture 里 self 没有 cmdline ⇒ "非数字条目不炸"那半条其实是
+    `[ -r ]` 兜的，`case` 守卫整段删掉照样绿（白给）。现在 `case` 是拦住它的唯一闸。
+    """
+    root = tmp_path / "proc"
+    entries = (("1234", "python3\x00/usr/bin/mdns_publisher.py\x00"),
+               ("5555", "/bin/bash\x00/run.sh\x00"),
+               ("77", "mosquitto\x00-c\x00/etc/mosquitto/mosquitto.conf\x00"),
+               ("4321", "sh\x00-c\x00sleep 5\x00"),
+               ("self", "python3\x00/usr/bin/mdns_publisher.py\x00"),
+               ("thread-self", "/bin/bash\x00/run.sh\x00"))
+    for pid, cmd in entries:
+        d = root / pid
+        d.mkdir(parents=True)
+        (d / "cmdline").write_bytes(cmd.encode("utf-8"))
+    (root / "8888").mkdir()          # 竞态臂：目录还在、cmdline 已消失
+    (root / "9999").mkdir(parents=True)
+    (root / "9999" / "cmdline").mkdir()   # 存在且 `[ -r ]` 为真、但 open 必失败（EISDIR）
+    # 注：msys 允许 open 目录（错误由 tr 自己吐、已被 2>/dev/null 吞），Linux 才在 open
+    # 阶段由 shell 报 ⇒ 这条臂在 Linux 上额外守住"次序错了但 -r 恰好放过"那一格。
+    return root
+
+
+def _c7_run(tmp_path, fn, mdns_pid="", lever=True, extra=""):
+    kills = tmp_path / "kills.txt"
+    script = (fn
+              + "kill() { echo \"$1\" >> " + _sq(kills) + "; }\n"
+              + ("export MDNS_PROC_ROOT=" + _sq(tmp_path / "proc") + "\n" if lever else "")
+              + "MDNS_PID=%s\n" % ("'%s'" % mdns_pid if mdns_pid else "''")
+              + extra + "cleanup_mdns\n")
+    r = _bash_run(script)
+    got = kills.read_text(encoding="utf-8").split() if kills.exists() else []
+    return r, got
+
+
+def test_c7_cleanup_mdns_really_kills_both_pids_in_the_production_shape(tmp_path):
+    """行为钉（生产形状：MDNS_PID 有值）：两只都要点名，mosquitto 一只都不许动。
+
+    第三轮复核实锤：本钉上一版把 `MDNS_PID=''` 写死 ⇒ `if [ -n "${MDNS_PID}" ]` 恒假，
+    把判据翻成 `-z` 之后钉看到的 kill 清单**一个字不变**，而生产从此不杀看门狗子
+    shell —— publisher 10 秒后被子 shell 重新拉起，huijian.local 继续广播死 broker。
+    ⇒ 现在按**生产会走的那条臂**测，并用点名式断言（不是 `== [恰好一个集合]`，
+    削弱成"杀不到也算过"就不再是一步廉价自残）。
+    """
+    _c7_fake_proc(tmp_path)
+    fn = _runsh_function("cleanup_mdns")
+    r, got = _c7_run(tmp_path, fn, mdns_pid="5555")
+    assert r.returncode == 0, "cleanup_mdns 不该非零退出：%s" % r.stderr[:200]
+    assert r.stderr == "", \
+        "扫描窗口内 PID 消失时不许往日志灌噪声（现场缺陷）：%s" % r.stderr[:200]
+    assert "1234" in got, "mdns_publisher 那只必须被杀，实得 %s" % got
+    assert "5555" in got, "看门狗子 shell（MDNS_PID）必须被杀，否则 10s 后 publisher 复活，实得 %s" % got
+    assert "77" not in got and "4321" not in got and "9999" not in got, \
+        "pattern 不许松到误伤 broker/无关进程，实得 %s" % got
+    assert "self" not in got and "thread-self" not in got, \
+        "非数字条目必须被 case 闸拦下（self 那只的 cmdline 恰好命中 publisher，没了闸就被当 PID 递给 kill），实得 %s" % got
+    assert r.stdout == "", "生产形状下扫描正常，不该有回声：%r" % r.stdout[:200]
+
+
+def test_c7_cleanup_mdns_is_noop_without_mdns_started(tmp_path):
+    """反向半条：没起过 mDNS（MDNS_PID 空）时，除了 publisher 一只都不许动，
+    且**不许**因为"扫描正常"而误报回声（回声只在扫不到任何条目时出）。"""
+    _c7_fake_proc(tmp_path)
+    fn = _runsh_function("cleanup_mdns")
+    r, got = _c7_run(tmp_path, fn, mdns_pid="")
+    assert got == ["1234"], "publisher 仍须被杀且只杀它，实得 %s" % got
+    assert r.stdout == "", "扫描列出了条目 ⇒ 不该有回声：%r" % r.stdout[:200]
+
+
+def test_c7_scan_root_asks_proc_when_lever_unset(tmp_path):
+    """F-4：`MDNS_PROC_ROOT` 杠杆的**默认分支**是生产唯一会走的那条，必须有自己的臂。
+
+    复核实测：只把 `ls "${MDNS_PROC_ROOT:-/proc}"` 的默认值改成 `/proc/1`（形状钉只锚
+    cmdline 那一处、行为钉永远 export 杠杆 ⇒ 这一处从没被执行过），结果一只不杀且
+    **完全静默**。这里把 `ls` 打成 shim：既不真读 /proc，又把"到底问了哪个根"记下来。
+    """
+    fn = _runsh_function("cleanup_mdns")
+    asked = tmp_path / "asked.txt"
+    # 只桩 ls（记参数 + 一根 PID 都不列），其余原样 ⇒ 同时验"扫不到条目必须回声"
+    r, got = _c7_run(tmp_path, fn, mdns_pid="5555", lever=False, extra=(
+        "ls() { echo \"$1\" >> %s; return 0; }\n" % _sq(asked)))
+    assert r.returncode == 0, "扫描根为空不该让清理非零退出：%s" % r.stderr[:200]
+    q = asked.read_text(encoding="utf-8").split() if asked.exists() else []
+    assert q and q[0] == "/proc", \
+        "杠杆不设时扫描根必须是 /proc（生产唯一会走的臂），实问 %s" % q
+    assert got == ["5555"], \
+        "扫描那半边一根 PID 都没列出 ⇒ /proc 里的 publisher 不许被杀到（5555 是显式 MDNS_PID 那条，与本臂无关），实得 %s" % got
+    assert "publisher 可能残留" in r.stdout, \
+        "扫不到任何条目必须回声一句（消噪不等于抹故障）——这是 F-4 的可见性半条，实得 %r" % r.stdout[:200]
+
+
+def test_c7_scan_root_lever_appears_exactly_twice():
+    """形状半条：扫描根在 cleanup_mdns 里出现**两处**（ls 与 cmdline 路径），两处都得带
+    `:-/proc` 默认。第三轮的 F-4 正是"只改一处"躲过了单点正则。"""
+    body = _cleanup_mdns_code()
+    n = body.count("${MDNS_PROC_ROOT:-/proc}")
+    assert n == 2, "扫描根默认值应恰好两处（ls + cmdline），实得 %d" % n
+
+
+def test_no_test_lever_env_in_the_production_image():
+    """测试杠杆（*_PROC_ROOT / NGINX_PROC_*）只许测试进程设，**不许进生产镜像**。
+
+    复核实测的第二条入口：`Dockerfile` 里加一行 `ENV MDNS_PROC_ROOT=/proc/1` ⇒ 全仓
+    1312 条照绿，而容器里扫描从此指到错的根上静默失效（行为钉永远自己 export 覆盖掉）。
+    """
+    levers = ("MDNS_PROC_ROOT", "NGINX_PROC_ROOT", "NGINX_PROC_TCP")
+    offenders = []
+    for f in (ROOT / "Dockerfile", ROOT / "config.yaml"):
+        if not f.exists():
+            continue
+        for i, ln in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            s = ln.strip()
+            if s.startswith("#"):
+                continue
+            if any(lv in s for lv in levers):
+                offenders.append("%s:%d %s" % (f.name, i, s[:80]))
+    assert not offenders, "生产镜像里设置了测试杠杆 ⇒ 真路径被顶掉且无测试能看见：%s" % offenders
+
+
+def test_c7_mdns_cleanup_is_wired_to_the_exit_trap():
+    """F-5：全仓没有一条钉断言 trap 接线 ⇒ `trap cleanup_mdns EXIT` 掏成 `trap : EXIT`
+    后清理函数变成**死代码**（SIGTERM 那条路还有 shutdown_handler 兜，但 mosquitto
+    连续 5 次退出走 `exit 1`、以及任何自然退出路径都不再清理 mDNS）。"""
+    code = _code_lines(RUN_SH)
+    assert re.search(r"^trap\s+cleanup_mdns\s+EXIT\b", code, re.M), \
+        "EXIT 陷阱必须接 cleanup_mdns（改成 trap : 就没人清理 publisher）"
+    assert re.search(r"^trap\s+shutdown_handler\s+INT\s+TERM\b", code, re.M), \
+        "INT/TERM 必须接 shutdown_handler（v1.6.4 停机根修的接线）"
+
+
+def test_f2_watchdog_is_backgrounded_not_foreground():
+    """F-8：8 条 F-2 钉全在**文本切片**上做判据，"这段到底有没有被放到后台"没人钉。
+
+    复核实测把结尾 `) &` 改成 `)`（一个字符）⇒ `bash run.sh` 卡死在 3a 的无限循环里，
+    mosquitto / mDNS / 集成安装 / Web UI **全部不启动**，加项永远 starting，全仓零反应。
+    这是整批里最贵的一条，所以单独钉：看门狗子 shell 必须以 `) &` 收尾。
+    """
+    seg = _code_lines(_watchdog_seg())
+    assert re.search(r"^\) &$", seg, re.M), \
+        "nginx 看门狗没有以 `) &` 后台化 ⇒ 前台死循环卡住整个 run.sh"
+    assert "nginx 存活看门狗已启动" in seg, \
+        "后台化那一句之后的启动回声必须在（回声缺失=这段被整体挪走或前移）"
+
+
+def _watchdog_block():
+    """抽 nginx 看门狗**整块**（含结尾的 `) &`），供有界孪生真跑。"""
+    m = re.search(r"^(\(\n    NGINX_RESTART_COUNT=0.*?\n\) &)", RUN_SH, re.M | re.S)
+    assert m, "找不到 nginx 看门狗整块（结构变了，本钉需同步）"
+    return m.group(1)
+
+
+def test_f2_watchdog_ticks_and_probes_once_per_lap(tmp_path):
+    """行为钉（有界孪生真跑）：**每圈都睡、每圈都探、睡的那个数必须是 20**。
+
+    第三轮复核实测两条"形状都在"的回退当时全绿：
+      ① 循环体第一句插恒真守卫 `[ "${NGINX_PROCS:-0}" -ge 0 ] && continue` ⇒ 一圈都不睡、
+         一圈都不探（看门狗形同虚设，且空转烧满一个核）；
+      ② `sleep 20` → `sleep 0` ⇒ 忙轮询每圈 fork 一串探针子进程，并把"连续 5 次即放弃"
+         的时间尺度打乱（几秒烧完配额，之后永久不再拉起 nginx）。
+    两条都满足"while 在场 + 循环体里有一行 `sleep <数字>`"的字样判据 ⇒ 只能真跑数次数。
+
+    孪生只做两处**机械**改写，且各自断言改写成功（否则本钉在测空气）：
+    `while true; do` → `for _wd_i in 1 2 3; do`（有界）、`) &` → `)`（前台才拿得到计数）。
+    `sleep`/两个探针/`nginx` 打成"记一次数"的桩 ⇒ 次数即判据。
+    """
+    blk = _watchdog_block()
+    assert "while true; do" in blk, "孪生锚丢失（while 不在了）"
+    twin = blk.replace("while true; do", "for _wd_i in 1 2 3; do", 1)[:-2]   # 去掉 " &"
+    assert "for _wd_i in 1 2 3; do" in twin and twin.endswith(")"), "孪生改写失败"
+
+    sleeps = tmp_path / "sleeps.txt"
+    probes = tmp_path / "probes.txt"
+    bail = tmp_path / "bail.txt"
+    script = ("set -e\nset -o pipefail\n"
+              + "sleep() { echo \"$1\" >> " + _sq(sleeps) + "; }\n"
+              + "nginx_probe_listen() { echo x >> " + _sq(probes) + "; echo 1; }\n"
+              + "nginx_probe_procs() { echo 1; }\n"
+              + "nginx() { echo BAILOUT >> " + _sq(bail) + "; }\n"
+              + twin + "\necho LAP-DONE\n")
+    r = _bash_run(script)
+    assert r.returncode == 0, "看门狗块不该非零退出：%s" % r.stderr[:200]
+    assert "LAP-DONE" in r.stdout, "循环没跑完就退出了（中途 exit/崩溃）：%s" % r.stderr[:200]
+    sargs = sleeps.read_text(encoding="utf-8").split() if sleeps.exists() else []
+    pargs = probes.read_text(encoding="utf-8").split() if probes.exists() else []
+    assert sargs == ["20", "20", "20"], \
+        "每圈必须睡一次且睡的正是宣告的 20s 节拍（3 圈）——实得 %s" % sargs
+    assert len(pargs) == 3, \
+        "每圈必须各探一次端口（3 圈⇒3 次）；睡或探被 continue 绕过就会在这里红，实得 %d 次" % len(pargs)
+    assert not bail.exists(), "探针判健康时不许拉起 nginx（误拉起＝重启计数被绕过）"
+
+
+def test_c7_scan_pattern_is_the_same_script_as_the_launch_line():
+    """grep 串必须与**启动命令行**里的脚本名同源。
+
+    复核实测：把匹配串改成 `mdns_publisher_NEVER_MATCH.py`，三条字样钉全绿——
+    于是扫描从此一只也杀不到（比"整段注释掉"更隐蔽，因为代码看着还在认真扫）。
+    """
+    code = _code_lines(RUN_SH)
+    launch = re.search(r"python3\s+(\S*mdns_publisher\.py)", code)
+    assert launch, "找不到 mDNS 启动命令行（本钉需重写）"
+    target = launch.group(1).replace("\\", "").rsplit("/", 1)[-1]
+    scans = [s.replace("\\", "") for s in re.findall(r"grep -q '([^']+)'", code)]
+    assert target in scans, \
+        "扫描匹配串与启动脚本不同源（改一边就静默失效）：%s vs %r" % (scans, target)
+
+
+def test_f2_watchdog_loops_forever_with_a_bounded_cadence():
+    """两条元判据（复核实测：删 `sleep 20` 后 7 条 F-2 钉全绿；while→if 同族）。
+
+    看门狗必须①真的无限循环——只跑一遍就是 F-2 的原缺陷（首启探一次就终身不管）；
+    ②循环体里有节拍 sleep——没有 sleep 就成了忙轮询，每圈 fork 一串子进程。
+    """
+    seg = _code_lines(_watchdog_seg())
+    assert re.search(r"^\s*while true; do\s*$", seg, re.M), \
+        "看门狗不再是无限循环（F-2 原缺陷回潮：只探一次就终身不管）"
+    i = seg.index("while true; do")
+    body = seg[i:seg.index("done", i)]
+    assert re.search(r"^\s*sleep\s+\d+\s*$", body, re.M), \
+        "循环体里没有节拍 sleep（忙轮询：每圈 fork 探针子进程）"
+
+
+def _cleanup_reachable_names(trees):
+    """会（直接或间接）走到某个 `.cleanup()` 的函数名闭包——F-7 的"上移一层"就藏在这里。
+
+    不动点扩张：调 `.cleanup()` 的函数 → await 那个函数的函数 → await 那个函数的函数 …
+    只认两种调用形态：`X.cleanup()`（Attribute）与 `name(...)`（Name）。跨模块按**名字**
+    合并（本包内函数名不冲突；真冲突只会让判据更宽，不会漏）。
+    """
+    names = set()
+    for tree in trees:
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call)]
+            if any(getattr(c.func, "attr", "") == "cleanup" for c in calls):
+                names.add(fn.name)
+    grew = True
+    while grew:
+        grew = False
+        for tree in trees:
+            for fn in [n for n in ast.walk(tree)
+                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and fn.name not in names]:
+                for cal in ast.walk(fn):
+                    if (isinstance(cal, ast.Call) and isinstance(cal.func, ast.Name)
+                            and cal.func.id in names):
+                        names.add(fn.name)
+                        grew = True
+                        break
+    return names
+
+
+def test_c6_cleanup_callers_do_not_swallow_cancellation():
+    """吞取消可能在**调用点**、可能**上移一层**、也可能用 `contextlib.suppress` 一行落地。
+
+    第三轮复核实测两条当时全绿的回退：① 给 `await _cleanup_partial_setup(...)` 包一层
+    `except asyncio.CancelledError: pass`（判据只认 Try.body 里**直接**的 `X.cleanup()`，
+    而这里是 `Name` 不是 `Attribute` ⇒ 整条跳过）；② `with contextlib.suppress(
+    CancelledError, Exception)`（`ast.With` 根本不产生 `Try` 节点）。
+    ⇒ 判据改成：先把"能走到 .cleanup()"的函数名做成不动点闭包，再扫 Try **和** With。
+    允许"捕了再 raise"（那是正确的收口形态），只禁捕了不传。
+    """
+    trees = []
+    for p in sorted(PKG.rglob("*.py")):
+        trees.append((p, ast.parse(p.read_text(encoding="utf-8"))))
+    names = _cleanup_reachable_names([t for _p, t in trees])
+    assert names, "闭包为空（本包没有 .cleanup() 调用点？判据需同步重写）"
+
+    def touches_cleanup(node):
+        for cal in ast.walk(node):
+            if not isinstance(cal, ast.Call):
+                continue
+            if getattr(cal.func, "attr", "") == "cleanup":
+                return True
+            if isinstance(cal.func, ast.Name) and cal.func.id in names:
+                return True
+        return False
+
+    offenders = []
+    for p, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                if not touches_cleanup(node):
+                    continue
+                for h in node.handlers:
+                    if h.type is None or "CancelledError" not in ast.unparse(h.type):
+                        continue
+                    if any(isinstance(n, ast.Raise) for n in h.body):
+                        continue
+                    offenders.append("%s:%d try/except CancelledError 不传" % (p.name, node.lineno))
+            elif isinstance(node, ast.With):
+                if not touches_cleanup(node):
+                    continue
+                for item in node.items:
+                    ce = ast.unparse(item.context_expr)
+                    if "suppress" in ce and "CancelledError" in ce:
+                        offenders.append("%s:%d contextlib.suppress(CancelledError)"
+                                         % (p.name, node.lineno))
+    assert not offenders, \
+        "cleanup 链上的调用点吞掉停机取消（C-6 同族，含上移一层与 suppress）：%s" % offenders
+
+
+@pytest.mark.asyncio
+async def test_c6_cancellation_propagates_out_of_partial_setup():
+    """真跑半条（一条顶三条形状）：`_cleanup_partial_setup` 里的取消必须**穿出来**。
+
+    桩件 `cleanup()` 里 await 长睡 ⇒ cancel 落进去就是 CancelledError。现状用
+    `except Exception`，而 CancelledError 自 3.8 起是 BaseException 的子类 ⇒ 捕不住、
+    正确向上传。谁把它改扁（`except BaseException`、`suppress(...)`、调用点再包一层），
+    这条当场红——不用等形状判据被绕过。
+    先给 0.05s 让真实现走到第一次 await，再 cancel。
+    外面套 wait_for(5s)：取消若被就地吞掉，函数会继续 await 第二只的 sleep(3600) ⇒
+    本钉**挂死**而不是红（异步挂死=静默失败，看门狗必须自带）。
+    """
+    class _Boom:
+        def __init__(self):
+            self.entered = False
+
+        async def cleanup(self):
+            self.entered = True
+            await asyncio.sleep(3600)
+
+    h, m = _Boom(), _Boom()
+    task = asyncio.ensure_future(
+        pkg._cleanup_partial_setup(h, m, [], hass=None, entry=None))
+    await asyncio.sleep(0.05)
+    assert h.entered, "桩件没被调用 ⇒ 本钉在测空气"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+
+def _assert_is_tautological(test_node):
+    """恒真/自瘪断言的形状判据。命中返回原因串，否则 None。
+
+    第三轮复核实测：只判"顶层 Constant / 顶层 Or 带真值常量"的旧版被三种一行改动绕过
+    （`isinstance(x, object)`、`x or not x`、`got == [..] or got == []`），而元钉自己的
+    自述就是"治把测试改瘪这条最便宜的死法"⇒ 判据放宽到形状级：
+      1) 顶层恒真常量（`assert True`）；
+      2) **任意深度**的 `X or <真值常量>`（括号、`all([…])` 里都算，常量真值永不为假）；
+      3) `X or not X`（排中律恒真）；
+      4) `isinstance(…, object)`（对任何非 None 对象恒真，等于没判）；
+      5) 同一个量既 `== <非空集合>` 又 `== <空容器字面量>`（"退化即通过"——
+         行为钉最常见的瘪法：杀不到也算过）。
+    存量已扫过：全仓 tests/ 在这五条下 0 命中 ⇒ 不留豁免名单。
+    """
+    def _dump(x):
+        try:
+            return ast.dump(x)
+        except Exception:
+            return repr(x)
+
+    t = test_node
+    if isinstance(t, ast.Constant) and t.value:
+        return "assert 恒真常量"
+    for n in ast.walk(t):
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "isinstance" \
+                and len(n.args) == 2 and getattr(n.args[1], "id", "") == "object":
+            return "isinstance(x, object) 恒真"
+        if isinstance(n, ast.BoolOp) and isinstance(n.op, ast.Or):
+            if any(isinstance(v, ast.Constant) and v.value for v in n.values):
+                return "X or True"
+            neg = {_dump(v.operand) for v in n.values
+                   if isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.Not)}
+            pos = {_dump(v) for v in n.values
+                   if not (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.Not))}
+            if neg & pos:
+                return "X or not X（排中律）"
+            comps = [v for v in n.values if isinstance(v, ast.Compare)]
+            if comps and len(comps) == len(n.values):
+                lefts = {_dump(c.left) for c in comps}
+                has_empty = any(isinstance(c.comparators[0], (ast.List, ast.Dict, ast.Set,
+                                                             ast.Tuple))
+                                and not c.comparators[0].elts for c in comps)
+                if len(lefts) == 1 and has_empty:
+                    return "同一个量既判相等又判空集（退化即通过）"
+    return None
+
+
+def test_no_tautological_assertions_in_tests():
+    """治"把测试自己改瘪"：复核实测给 A-5 的守卫加一个 `or True`，5 条钉全绿。
+
+    产品代码一行没动、断言却永久成立——这类一行改动是钉最便宜的死法，所以给它
+    一条机器判据（形状清单见 `_assert_is_tautological`）。
+    作用域：`tests/` **递归**的 `test_*.py` + 所有 `conftest.py`（第三轮覆盖面核查
+    点名"子目录新增 test_*.py 会逃出单层 glob"；当下 0 命中，但闸要提前建好）。
+    """
+    files = sorted((ROOT / "tests").rglob("test_*.py")) \
+        + sorted((ROOT / "tests").rglob("conftest.py"))
+    offenders = []
+    for p in files:
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assert):
+                continue
+            why = _assert_is_tautological(node.test)
+            if why:
+                offenders.append("%s:%d %s" % (p.name, node.lineno, why))
+    assert not offenders, "存在恒真/自瘪断言（把产品改坏也不会红）：%s" % offenders[:8]
+
+
+def _matrix_arms():
+    """从 mutation_matrix.py 里**结构化**取臂表。
+
+    不能整表 `literal_eval`：臂的 7 元组里 old/new 是模块级常量拼接（SCAN_BLOCK 等），
+    不是字面量 ⇒ 只取需要的四个字段，文件常量按模块级 `X = "..."` 解析。
+    """
+    src = (ROOT / "tests" / "mutation_matrix.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    consts = {}
+    for n in tree.body:
+        if (isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)):
+            consts[n.targets[0].id] = n.value.value
+    got = [n for n in tree.body if isinstance(n, ast.Assign)
+           and getattr(n.targets[0], "id", "") == "ARMS"]
+    assert len(got) == 1, "mutation_matrix.py 的 ARMS 结构变了，本钉需同步"
+    arms = []
+    for t in got[0].value.elts:
+        assert isinstance(t, ast.Tuple) and len(t.elts) == 7, "臂必须是 7 元组"
+        mid = ast.literal_eval(t.elts[0])
+        rel = t.elts[1]
+        rel_v = (ast.literal_eval(rel) if isinstance(rel, ast.Constant)
+                 else consts.get(getattr(rel, "id", "")))
+        arms.append((mid, rel_v, ast.literal_eval(t.elts[4]), ast.literal_eval(t.elts[5])))
+    return arms
+
+
+def test_mutation_matrix_cannot_silently_shrink_or_point_at_nothing():
+    """变异矩阵自身也要有闸（否则它就成了新的"看着在跑其实什么都没测"）。
+
+    第三轮复核实测过两种"矩阵假在跑"：锚漂移（`_patch` 数不到 ⇒ 该臂根本没打上）与
+    选择器指向不存在的判据（`-k` 命中 0 条 ⇒ pytest 报 `no tests ran` 而退出码非零，
+    被误读成"红=抓到了"）。这里把四件事钉死：臂数下限、id 唯一、每条 `-k` 至少命中
+    审计文件里一个真实测试名、被改文件在盘上存在（`DYN:` 动态锚由脚本自己保证唯一）。
+    """
+    arms = _matrix_arms()
+    ids = [a[0] for a in arms]
+    assert len(ids) >= 29, "变异矩阵臂数缩到 %d（有人删臂？）" % len(ids)
+    assert len(set(ids)) == len(ids), "臂 id 重复：同一条被数了两次 ⇒ 计数虚高"
+    names = [n.name for n in ast.walk(ast.parse(
+        (ROOT / "tests" / "test_audit_2026_09_30_fixes.py").read_text(encoding="utf-8")))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name.startswith("test_")]
+    bad = []
+    for mid, rel, k, expect in arms:
+        assert expect in ("red", "green"), "%s: 预期只能是 red/green" % mid
+        if rel and not rel.startswith("DYN:") and not (ROOT / rel).exists():
+            bad.append("%s: 被改文件不存在 %s" % (mid, rel))
+        toks = [t.strip() for t in re.split(r"\s+or\s+", k) if t.strip()]
+        if not any(any(t in n for n in names) for t in toks):
+            bad.append("%s: -k %r 命不中任何测试名 ⇒ 空跑" % (mid, k))
+    assert not bad, "变异矩阵有空跑/悬空臂：%s" % bad
+
+
+def test_no_shell_input_redirect_before_stderr_suppress():
+    """C-7 现场缺陷的**同类清零**：`cmd < 文件 2>/dev/null` 一律禁止。
+
+    bash 的重定向**从左到右**生效：`<` 打不开时报错的是 shell 自己，而那一刻
+    `2>/dev/null` 还没挂上 ⇒ 错误写进未被重定向的 stderr。线上加项日志实锤
+    `/run.sh: line 645: /proc/8369/cmdline: No such file or directory` ×4（停
+    容器时 s6 正在回收子进程，ls 完就消失的 PID 一片），关停现场被噪声淹没。
+    正确形：`2>/dev/null < 文件`（把抑制排在打开动作之前）。
+
+    判据覆盖 run.sh + 全部 e2e shell，**按 bash 的口径先行续接**（行尾 `\\` 拼成
+    一条命令）——只逐行扫会漏掉跨行写的同形缺陷。整行注释剔除（注释满足是本轮
+    复核点名过的假绿面）。
+
+    `> 目标 2>/dev/null`（输出侧同族）**故意不在本钉内**，理由逐条核过：7 处候选里
+    3 处（integration.json 两写、/run/bridge_last_ts）失败时 shell 那句报错是**唯一**
+    可见证据，重排等于把排障线索一起关掉——那 3 处要修得配 else/|| 回声，属于另一件
+    事；其余 4 处已有 `[错误]/[警告]` 回声，重排只是去掉重复噪声，且输出目标
+    (/usr/share/nginx/html、/run) 是镜像里保证存在的目录，无现场故障可指。⇒ 输入侧
+    是真事故（每次停机必现）、输出侧是假想收益，本批只做前者。
+    """
+    files = [ROOT / "run.sh"] + sorted((ROOT / "tests" / "e2e").glob("*.sh"))
+    bad = re.compile(r"(?<![<>])<\s*[\"']?[^|;&<>]*?2>/dev/null")
+    offenders = []
+    for p in files:
+        joined, cur = [], ""
+        for ln in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = ln.rstrip()
+            if s.endswith("\\"):
+                cur += s[:-1]
+            else:
+                joined.append(cur + s)
+                cur = ""
+        if cur:
+            joined.append(cur)
+        for cmd in joined:
+            st = cmd.strip()
+            if st and not st.startswith("#") and bad.search(cmd):
+                offenders.append("%s: %s" % (p.name, st[:90]))
+    assert not offenders, \
+        "`<` 排在 `2>/dev/null` 之前＝打不开文件的报错漏进日志（C-7 现场同族）：%s" % offenders
