@@ -22,6 +22,19 @@
         // 的那份判据覆盖不到它们——卡片是 renderGatewayDisabled 建的，后续刷新并不知道
         // 它是禁用条目，于是照样长出一排点下去恒 4xx 的按钮。渲染与刷新共用这一份。
         const DISABLED_ENTRIES = {};
+        // 审计 2026-09-30 B-7 的**失效条件**（本批复核补口）：上面那份集合只在
+        // loadGateways 整建时清，而 silentRefresh 的重建判据此前只比 entry_id 集合——
+        // "禁用→重新启用"和"启动期 setup_retry→loaded"都不改变 id 集合，于是卡片
+        // 连同"这条目不可用"的判定一起陈旧：恒停在「条目未启用，暂不可用」零按钮，
+        // 只有手动刷新/F5 能纠正（与 v1.7.55 那条 P0 同族——面板不自愈）。
+        // ENTRY_SIG 记下"这张卡是按哪个形态渲染的"，形态一变即升级为整建。
+        const ENTRY_SIG = {};
+        // 渲染输入只留一份判据：loadGateways 记的和 silentRefresh 比的是同一个函数，
+        // 两处各自拼字段迟早漂移。
+        function entryRenderSig(entry) {
+            return [entry.disabled_by || '', entry.state || '',
+                    (entry.data && entry.data.gateway_sn) || ''].join('|');
+        }
         // 审计 2026-09-30 G-1：配对收尾定时器的句柄必须存下来。旧写法两处
         // setTimeout 都不接句柄、startPairing 也没有重入闸，于是 30s 后再点一次
         // 「配对」时，**前一次**的 60s 回调会把新窗口（应到 t=95s）的 PAIRING_UNTIL
@@ -527,6 +540,14 @@
                     const rendered = new Set(Array.from(gwItems).map(el => el.id.replace('gw-', '')));
                     let same = ids.size === rendered.size;
                     if (same) for (const id of ids) { if (!rendered.has(id)) { same = false; break; } }
+                    // 本批复核补口（B-7 缺的失效条件）：id 集合相同但**渲染形态**变了
+                    // （禁用↔启用、setup_retry/not_loaded↔loaded、条目换了 SN）同样必须
+                    // 整建。旧判据只看 id ⇒ 卡片连同 DISABLED_ENTRIES 的判定一起陈旧，
+                    // 用户看到的是"重新启用后网关永远没有按钮"，只能手动刷新/F5。
+                    // 签名缺失（这张卡不是 loadGateways 建的）按不一致处理——宁可多重建一次。
+                    if (same) for (const e of entries) {
+                        if (ENTRY_SIG[e.entry_id] !== entryRenderSig(e)) { same = false; break; }
+                    }
                     if (!same) needRebuild = true;
                 } else if (gwItems.length === 0) {
                     needRebuild = true; // 无卡片可更新：退回重建（旧行为）
@@ -697,19 +718,23 @@
                 const resp = await haApi('/config/config_entries/entry?domain=' + DOMAIN);
                 if (!resp.ok) throw new Error('HA API ' + resp.status);
                 const entries = await resp.json();
+                // v1.7.12（第 6 轮审计 L-10）：全量重建前清空三张渲染态映射——
+                // 条目被删除后旧 key 永不清理，同 entryId 复用（HA reload
+                // 偶发复用不回来，但残留脏映射会让静默刷新拿旧 SN 发控制）。
+                // 审计 2026-09-30 B-7：禁用集合同一处在重建前清空——必须在这里清
+                // 而不是在下面的填充循环之后，否则本轮的判定会被下一轮抹掉。
+                // 本批复核：三行提到「空清单」早退**之前**——放在后面时条目被全删
+                // 的那一轮三张表都还留着上一轮的键；形态签名同批加上。
+                for (const k of Object.keys(GATEWAY_SN_BY_ENTRY)) delete GATEWAY_SN_BY_ENTRY[k];
+                for (const k of Object.keys(DISABLED_ENTRIES)) delete DISABLED_ENTRIES[k];
+                for (const k of Object.keys(ENTRY_SIG)) delete ENTRY_SIG[k];
                 if (!entries || entries.length === 0) {
                     container.innerHTML = '<div class="empty-state"><div class="icon">📡</div><p>暂无网关</p><p class="hint">LoRa 网关上电后自动发现，或手动添加集成</p></div>';
                     return;
                 }
                 let html = '';
-                // v1.7.12（第 6 轮审计 L-10）：全量重建前清空 SN 映射——
-                // 条目被删除后旧 key 永不清理，同 entryId 复用（HA reload
-                // 偶发复用不回来，但残留脏映射会让静默刷新拿旧 SN 发控制）。
-                // 审计 2026-09-30 B-7：禁用集合同一处在重建前清空——必须在这里清
-                // 而不是在下面的填充循环之后，否则本轮的判定会被下一轮抹掉。
-                for (const k of Object.keys(GATEWAY_SN_BY_ENTRY)) delete GATEWAY_SN_BY_ENTRY[k];
-                for (const k of Object.keys(DISABLED_ENTRIES)) delete DISABLED_ENTRIES[k];
                 for (const entry of entries) {
+                    ENTRY_SIG[entry.entry_id] = entryRenderSig(entry);
                     // v1.7.33：与 :176-177 的 MQTT 条目同口径——禁用条目不再当
                     // 正常网关渲染（旧版照常配控制按钮，点下去只会 HA 4xx，
                     // 徽标恒"未知"而用户无从知道是条目被禁用）。

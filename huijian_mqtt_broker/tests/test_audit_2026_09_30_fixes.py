@@ -2523,6 +2523,10 @@ const document = {
 };
 const GATEWAY_SN_BY_ENTRY = {};
 const DISABLED_ENTRIES = {};
+// 2026-10-01 复核批：loadGateways 现在还要写「渲染形态签名」映射（B-7 的失效
+// 条件）。假件缺这个键 ⇒ ReferenceError 被 loadGateways 自己的 catch 吞掉，
+// 测试只在断言处报"条目没被处理"，看不出是假件缺位（下面补判据函数，同规矩）。
+const ENTRY_SIG = {};
 const PAIRING_UNTIL = {};
 // DOMAIN/INGRESS_BASE 是真函数体里要读的模块级常量：桩不给 ⇒ loadGateways 的
 // catch 会吞掉 ReferenceError，测试只在断言处报"条目没被处理"，看不出是假件缺位。
@@ -2544,7 +2548,8 @@ function deviceSnOf() { return null; }
 function findEntityByUniqueId() { return null; }
 function updateGatewayStatus() {}
 function loadDeviceState() {}
-"""
+""" + "\n// 判据函数逐字取自生产，不在假件里重抄一份（两处各自漂移＝钉验的不是产品）。\n" \
+     + _extract_js_func("entryRenderSig") + "\n"
 
 _B7_TAIL = r"""
 let bad = 0;
