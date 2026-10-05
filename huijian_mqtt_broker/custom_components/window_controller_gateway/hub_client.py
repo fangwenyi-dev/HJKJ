@@ -28,7 +28,7 @@ import random
 import re
 import tempfile
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -128,6 +128,10 @@ OP_BINDCODE = "bindcode"
 OP_MEMBERS = "members"
 OP_MEMBER_REMOVE = "member_remove"
 OP_MEMBER_RENAME = "member_rename"
+# 审计 2026-10-05 D-1 补口：身份类操作错误（云端已签发、本机落盘失败）。
+# 它既不是"连接断了"（长连照活），也不属于换码/成员任何一族，混进连接槽会被
+# 每轮尝试清掉且面板不映射 ⇒ 单独一家。
+OP_IDENTITY = "identity"
 
 _ALIAS_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
@@ -354,6 +358,10 @@ class HubClient:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._managers: List[Any] = list(managers or [])
+        # 上一轮成功构造的设备视图，键 (gwSn, sn)。hub 侧要靠"这一批是全量"淘汰已删
+        # sn，所以单台设备视图构造失败不能让它从快照里消失＝从"状态不更新"升级成
+        # "小程序里设备没了"。这里留一份回退位。
+        self._last_views: Dict[Any, Dict[str, Any]] = {}
         self.config_dir = config_dir
         self.base = (base or HUB_DEFAULT_BASE).rstrip("/")
         self.install_key = install_key or HUB_DEFAULT_INSTALL_KEY
@@ -398,6 +406,7 @@ class HubClient:
         self._task: Optional[asyncio.Task] = None
         self._stopping = False           # 停机闩锁（照 _lifecycle._closing 纪律）
         self._state_dirty = asyncio.Event()
+        self._snapshot_degraded = False   # 残缺快照只告警一次（恢复前不再刷屏）
         # 两把锁都按事件循环懒建（见 _loop_bound_lock）
         self._send_lock: Optional[asyncio.Lock] = None
         self._send_lock_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -700,14 +709,22 @@ class HubClient:
         # _run_forever ⇒ 本轮作废，下一轮 _ensure_registered 见内存里有身份直接 return
         # ⇒ 一切"看起来正常"，直到 HA 重启才暴露：磁盘没凭据 ⇒ 重新注册 ⇒ 换
         # instanceId ⇒ 作废所有人手上的绑定码 + hub 侧留一条孤儿实例。身份只在内存里
-        # 活着是可继续工作的状态，但必须让人看得见，所以记 last_error 而非静默。
+        # 活着是可继续工作的状态，但必须让人看得见——看得见的具体落点见下方操作槽。
         try:
             await self._save_identity()
         except Exception as e:  # noqa: BLE001 - 落盘失败不许掐断刚签发的身份
-            self.last_error = "identity_persist_failed:%s" % type(e).__name__
+            # 审计 2026-10-05 D-1 补口（v1.7.56 只修了一半）：这里原先写 `last_error`
+            # （连接类槽），但那个槽 ① 每轮尝试开头就被清成 None、② 面板 hubErrorText
+            # 只认 identity_rejected/identity_rejected_loop 两个值 ⇒ 注释承诺的"必须让人
+            # 看得见"根本不成立。改走**操作类槽**：不被每轮清、面板按 hubOpErrorText
+            # 渲染（与同批换码站点 bindcode_persist_failed 同口径）。
+            self._set_op_error(OP_IDENTITY, "identity_persist_failed")
             self._logger.warning(
                 "hub 身份落盘失败（%s），本次凭据仅存内存：HA 重启后会重新注册并作废绑定码",
                 type(e).__name__)
+        else:
+            # 这一轮写盘成功＝上一条落盘告警已过时，成功即清（同族口径）
+            self._clear_op_error(OP_IDENTITY)
         # 绑定码要让用户看得到，但日志只记摘要（凭据不回显纪律）
         self._logger.info("hub 注册成功 instance=%s 绑定码=%s（请在插件页查看完整码）",
                           self.instance_id, cred_brief(self.bind_code))
@@ -1118,43 +1135,77 @@ class HubClient:
         except Exception:  # noqa: BLE001
             return None
 
-    def collect_state_items(self) -> List[Dict[str, Any]]:
-        """按 LAN 同源视图构造状态条目——**遍历全部网关条目**。
+    def build_state_snapshot(self) -> Tuple[List[Dict[str, Any]], bool]:
+        """按 LAN 同源视图构造**全量**状态快照，回 (items, authoritative)。
 
         小程序云模式按 `gwSn` 分桶渲染网关列表，所以每台网关的设备都必须带自己的
         gwSn；只推第一条＝用户报障的"只添加了一个网关给小程序"。
+
+        `authoritative` 是对 hub 的承诺："这批就是当前全部设备，没在这批里的 sn 已经
+        不存在了"——hub 要靠它淘汰已删设备（删了不消失＝用户报的幽灵设备）。承诺一旦
+        兑现，漏一台就少一台，所以三种"漏法"分开处理：
+        · 设备视图构造失败/回不了 sn：设备确实还在 `manager.devices` 里 ⇒ 回退上一轮的
+          成功视图，快照仍然全（首轮没有回退位才判不权威）；
+        · 读某个 manager 的 devices/gateway_sn 失败、或 builder 取不到：这批根本看不见
+          那台网关 ⇒ 不权威；
+        · 一个 manager 都没挂上（条目全在卸载中／启动没完成）：此时的"空"不代表"没有
+          设备" ⇒ 不权威。零设备但 manager 在（真把最后一台删了）⇒ 权威空快照，必须上行。
         """
-        items: List[Dict[str, Any]] = []
         builder = self._resolve_builder()
         if builder is None:
-            return items
+            return [], False
+        items: List[Dict[str, Any]] = []
+        fresh: Dict[Any, Dict[str, Any]] = {}
+        authoritative = True
         for manager in self._managers:
             try:
                 devices = getattr(manager, "devices", {}) or {}
                 gateway_sn = getattr(manager, "gateway_sn", "") or ""
             except Exception:  # noqa: BLE001 - 单条目异常不拖垮整批上行
+                authoritative = False
                 continue
             for dev_sn, dev in list(devices.items()):
+                view: Optional[Dict[str, Any]] = None
                 try:
-                    view = builder(dev_sn, gateway_sn, dev or {})
-                except Exception:  # noqa: BLE001
+                    built = builder(dev_sn, gateway_sn, dev or {})
+                    if isinstance(built, dict) and built.get("sn"):
+                        view = built
+                        # 云通道没有 LAN 那路 device_update 实时推送，锁定模式只能靠
+                        # 状态上行带过去——device_ws_view 是 device_list 项视图（不含它），
+                        # 这里补上与 LAN `_device_update_payload` 同源的字段。
+                        view["windLockMode"] = _attr_int(dev, "wind_lock_mode")
+                except Exception as e:  # noqa: BLE001
+                    self._logger.debug(
+                        "hub 设备视图构造失败（%s），按上一轮视图上报：%s",
+                        type(e).__name__, dev_sn)
+                if view is None:
+                    view = self._last_views.get((gateway_sn, dev_sn))
+                if view is None:
+                    authoritative = False
                     continue
-                if isinstance(view, dict) and view.get("sn"):
-                    # 云通道没有 LAN 那路 device_update 实时推送，锁定模式只能靠
-                    # 状态上行带过去——device_ws_view 是 device_list 项视图（不含它），
-                    # 这里补上与 LAN `_device_update_payload` 同源的字段。
-                    view["windLockMode"] = _attr_int(dev, "wind_lock_mode")
-                    items.append(view)
-        return items
+                items.append(view)
+                fresh[(gateway_sn, dev_sn)] = view
+        if not self._managers:
+            authoritative = False
+        self._last_views = fresh
+        return items, authoritative
 
     async def _flush_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         while not self._stopping:
             await self._state_dirty.wait()
             self._state_dirty.clear()
             await asyncio.sleep(HUB_STATE_DEBOUNCE_S)
-            items = self.collect_state_items()
-            if not items:
+            items, authoritative = self.build_state_snapshot()
+            if not authoritative:
+                # 宁可不推（下一次状态变化或 5 分钟保活还会再试），也不能把残缺快照
+                # 当全量交出去——那会让 hub 把没看见的设备判成已删除。
+                if not self._snapshot_degraded:
+                    self._snapshot_degraded = True
+                    self._logger.warning(
+                        "hub 状态快照不完整（网关条目未挂上或视图构造失败），"
+                        "本轮不上行；恢复前云端设备列表停在上一批")
                 continue
+            self._snapshot_degraded = False
             try:
                 await self._send_json(ws, {"t": "state", "items": items})
             except Exception as e:  # noqa: BLE001 - 发送失败交给外层重连

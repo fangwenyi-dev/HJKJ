@@ -533,6 +533,13 @@ class WindowControllerDeviceManager:
                         return None
         
         # 强制设备类型为开窗器，忽略传入的其他类型
+        # 审计 2026-10-05 B-3 补口：强制本身是产品口径（本集成只支持开窗器，实体
+        # 型号与命令表都按它选），**但上报原值必须留下**——否则 `_validate_migration`
+        # 的"仅支持开窗器"校验拿不到任何可判输入，恒真（v1.7.56 只把跨条目查表管道
+        # 接通了，谓词仍恒不成立）。原值只在内存里：HA 重启后回填路径拿不到上报值，
+        # 那种形态按放行处理（与"旧网关条目已卸载"同一 fail-open 口径）。
+        reported_type = (device_type if isinstance(device_type, str) and device_type
+                         else DEVICE_TYPE_WINDOW_OPENER)
         device_type = DEVICE_TYPE_WINDOW_OPENER
 
         device_existed = device_sn in self.devices
@@ -586,6 +593,7 @@ class WindowControllerDeviceManager:
                     "sn": device_sn,
                     "name": device_name_with_sn,
                     "type": device_type,
+                    "reported_type": reported_type,
                     "status": "connected",
                     "attributes": {},
                     "last_update": time.time()
@@ -604,6 +612,9 @@ class WindowControllerDeviceManager:
             
             # 更新设备类型为开窗器（保留用户自定义的设备名称）
             self.devices[device_sn]["type"] = device_type
+            # 原值以**首次上报**为准：其余上报路径（002/003/迁移）传的都是常量
+            # WINDOW_OPENER，无条件覆盖会把 legacy 报来的真实类型洗白成"看着合法"。
+            self.devices[device_sn].setdefault("reported_type", reported_type)
             
             # 更新设备注册信息，确保config_entry_id和via_device正确
             try:
@@ -680,6 +691,7 @@ class WindowControllerDeviceManager:
             "sn": device_sn,
             "name": device_name_with_sn,
             "type": device_type,
+            "reported_type": reported_type,
             "status": "connected",
             "attributes": {},
             # v1.7.12（审计 DM-F1 同族收口）：创建即新鲜——003 绑定等设备
@@ -759,6 +771,9 @@ class WindowControllerDeviceManager:
                     await _call_reg(device_registry.async_remove_device, device.id)
                 except Exception as re_err:  # noqa: BLE001
                     _LOGGER.warning("竞态回滚注册表条目失败（可能已被级联删除）: %s", re_err)
+                # 与 remove_device 同口径：缓存里少了一台就要标脏，否则云端快照停在
+                # "这台还在"，而这条路径恰恰是用户刚点过删除的那台（幽灵设备）。
+                self._notify_status_listeners(device_sn)
                 return None
 
             _LOGGER.info("开窗器设备添加成功: %s (%s)", device_name_with_sn, device_sn)
@@ -892,13 +907,15 @@ class WindowControllerDeviceManager:
         
         _LOGGER.info("设备移除流程完成: %s", device_sn)
 
-        # v1.7.33（全量审计）说明：删除**不**经 _notify_status_listeners。
-        # 该漏斗的 payload 构造要求设备仍在缓存（_device_update_payload 里
-        # `devices.get(device_sn)`，缺失即返回 None），删除后调用只会空转；
-        # 而固件 WS 协议只定义了 device_update（七键）一种推送，没有"设备已
-        # 删除"类型——凭空造一种会破坏"1:1 复刻 app_ws_gateway.c"的纪律。
-        # 删除可见性由发起方闭环：WS unbind 走 ok ack + 后续 get_devices 刷新，
-        # HA 按钮路径由实体/注册表移除表达。
+        # 删除要经 _notify_status_listeners（v1.7.59）：hub 的状态上行把"这一批就是
+        # 全部设备"当承诺交给云端淘汰已删 sn（=用户报的"别人小程序里还留着删掉的设备"），
+        # 而设备从 self.devices 消失本身不产生状态变化事件 ⇒ 不标脏就要等网关下一次 002
+        # 上报或 5 分钟保活才重推，删除在云端延迟到分钟级。
+        # LAN 侧这次调用是空转不是回归：ws_gateway._device_update_payload 读
+        # devices.get(device_sn)，设备没了就返回 None。"设备已删除"的 WS 消息类型
+        # 仍然不造——固件只定义了 device_update（七键）一种推送，凭空造一种会破坏
+        # "1:1 复刻 app_ws_gateway.c"的纪律；小程序 LAN 列表照旧由 get_devices 刷新。
+        self._notify_status_listeners(device_sn)
         
         # 协议说明：002 是网关主动发起的上报，HA 无法主动触发设备发现
         # 设备删除后，设备列表更新依赖网关下一次主动上报 002 消息
@@ -1606,15 +1623,25 @@ class WindowControllerDeviceManager:
         # ⇒ 整条"仅支持开窗器"校验从未生效（容量/SN 格式两项仍生效，只有这条静默失效）。
         # 改为跨条目聚合查（谁缓存了这个 SN 就问谁），查不到仍按放行处理——
         # 旧网关条目可能已卸载，把它升级成硬错误会新拦掉本来能成的迁移。
+        # 审计 2026-10-05 B-3 补口（v1.7.56 只修了一半）：判据不能读 `"type"`——
+        # `add_device` 按产品口径把它强制成开窗器，于是 `!= 开窗器` **恒假**，
+        # 查表管道接通之后校验依然一次都没生效过。改读上报原值 `reported_type`
+        # （只有 legacy `device_discovery` 分支会带来非开窗器值）；缺该键（HA 重启后
+        # 由注册表回填、或上报本来就只给常量）仍按放行处理，与上面同一 fail-open 口径。
         for device_sn in old_gateway_devices:
             device_info = self._find_device_record(device_sn)
-            if device_info and device_info.get("type") != DEVICE_TYPE_WINDOW_OPENER:
+            reported = (device_info or {}).get("reported_type") \
+                or (device_info or {}).get("type")
+            if device_info and reported and reported != DEVICE_TYPE_WINDOW_OPENER:
                 error = f"设备 {device_sn} 类型不兼容，仅支持开窗器"
                 _LOGGER.error(error)
                 validation_result["errors"].append(error)
                 validation_result["valid"] = False
             elif device_info is None:
                 _LOGGER.debug("设备 %s 不在任何网关缓存中，类型校验按放行处理", device_sn)
+            elif not device_info.get("reported_type"):
+                _LOGGER.debug("设备 %s 无上报原值可判（回填/重启后丢失），类型校验按放行处理",
+                              device_sn)
         
         # 2. 验证新网关容量
         new_gateway_devices_count = self._count_gateway_devices(new_gateway_sn)

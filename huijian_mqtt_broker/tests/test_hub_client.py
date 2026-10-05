@@ -225,7 +225,7 @@ def test_ws_url_switches_scheme_and_carries_no_credentials(tmp_path):
     assert hc.WS_HEADER_INSTANCE_ID == "x-hub-instance-id" and hc.WS_HEADER_SECRET == "x-hub-secret"
 
 
-def test_collect_state_items_uses_injected_view_and_survives_bad_entries(tmp_path):
+def test_state_snapshot_uses_injected_view_and_survives_bad_entries(tmp_path):
     manager = FakeManager(devices={"A1B2": {"attributes": {"wind_lock_mode": 1}}, "BAD": {}})
 
     def builder(sn, gw, dev):
@@ -234,13 +234,13 @@ def test_collect_state_items_uses_injected_view_and_survives_bad_entries(tmp_pat
         return {"sn": sn, "gwSn": gw, "position": 30}
 
     client, _, _ = make_client(tmp_path, manager=manager, view_builder=builder)
-    items = client.collect_state_items()
+    items, _auth = client.build_state_snapshot()
     # 坏条目被跳过、不炸；锁定模式随状态上行带过去（云通道没有 LAN 那路
     # device_update 实时推送，缺失即小程序永远显示"--"）
     assert items == [{"sn": "A1B2", "gwSn": "GW1", "position": 30, "windLockMode": 1}]
 
 
-def test_collect_state_items_wind_lock_mode_unknown_stays_minus_one(tmp_path):
+def test_state_snapshot_wind_lock_mode_unknown_stays_minus_one(tmp_path):
     cases = {
         "MISS": {},                                     # 无 attributes
         "NONE": {"attributes": {"wind_lock_mode": None}},
@@ -252,7 +252,7 @@ def test_collect_state_items_wind_lock_mode_unknown_stays_minus_one(tmp_path):
     manager = FakeManager(devices=cases)
     client, _, _ = make_client(tmp_path, manager=manager,
                                view_builder=lambda sn, gw, dev: {"sn": sn, "gwSn": gw})
-    modes = {it["sn"]: it["windLockMode"] for it in client.collect_state_items()}
+    modes = {it["sn"]: it["windLockMode"] for it in client.build_state_snapshot()[0]}
     assert modes == {"MISS": -1, "NONE": -1, "BOOL": -1, "JUNK": -1, "INF": -1, "OK0": 0}
 
 
@@ -866,7 +866,7 @@ def test_state_items_cover_every_gateway_not_just_the_first(tmp_path):
     m1 = FakeManager(gateway_sn="GW1", devices={"A1B2": {"attributes": {"r_travel": 30}}})
     m2 = FakeManager(gateway_sn="GW2", devices={"C3D4": {"attributes": {"r_travel": 70}}})
     client, _, _ = make_client(tmp_path, managers=[m1, m2])
-    items = client.collect_state_items()
+    items, _auth = client.build_state_snapshot()
     sns = sorted(i["sn"] for i in items)
     assert sns == ["A1B2", "C3D4"], "只聚合到一条网关＝小程序永远看不到全部设备: %s" % sns
     gw = {i["sn"]: i.get("gwSn") for i in items}
@@ -904,7 +904,13 @@ def test_register_payload_reports_a_gateway_sn(tmp_path):
 
 
 def test_no_manager_means_empty_items_and_no_crash(tmp_path):
-    """所有条目都在卸载中：宁可回空列表，也不能抛（上行协程抛错会打断长连）。"""
+    """所有条目都在卸载中：宁可回空列表，也不能抛（上行协程抛错会打断长连）。
+
+    而且这个空**不权威**——"一个 manager 都没挂上"不等于"家里没有设备"，
+    把它当全量交给 hub 就是让云端把全部设备判成已删除。
+    """
     client, _, _ = make_client(tmp_path, managers=[])
-    assert client.collect_state_items() == []
+    items, authoritative = client.build_state_snapshot()
+    assert items == []
+    assert authoritative is False, "零 manager 的空快照不得当全量承诺交出去"
     assert client.status_view()["gateways"] == []

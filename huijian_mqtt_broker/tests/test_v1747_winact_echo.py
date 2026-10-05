@@ -5,7 +5,7 @@
 与设备实际值无关——因为加载项的两条状态通道都只回 `position/battery/state`：
   · LAN `device_list` 用 `device_ws_view`（5 字段）
   · LAN `device_update` 推送（7 键，含 windLockMode）
-  · 云通道 `collect_state_items` = `device_ws_view` + 单独补一个 windLockMode
+  · 云通道 `build_state_snapshot` = `device_ws_view` + 单独补一个 windLockMode
 而设备其实**上报了** `rwp_winact_speed` / `rwp_winact_strength`，`_ctypes.py:501-513`
 也把它们解析进了 `attributes["winact_speed"/"winact_strength"]`，HA 侧 number 实体
 正是靠 `_state_key` 读它显示真值。所以换手机、清缓存、或在 HA 里调过速度之后，
@@ -81,7 +81,7 @@ def test_cloud_state_items_carry_speed_and_strength(tmp_path):
             return None
 
     client = hc.HubClient([_Manager()], config_dir=str(tmp_path), session=object())
-    items = client.collect_state_items()
+    items, _auth = client.build_state_snapshot()
     assert len(items) == 1, items
     it = items[0]
     assert it["winactSpeed"] == 33 and it["winactStrength"] == 66, it

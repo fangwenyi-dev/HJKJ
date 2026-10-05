@@ -1168,8 +1168,13 @@ def test_d1_register_persist_failure_keeps_the_issued_identity(tmp_path, monkeyp
     asyncio.run(c._ensure_registered())          # 旧形态：这里直接抛穿到 _run_forever
     assert c.instance_id == "inst-9" and c._secret == "sec-9"
     assert c._identity_rejected is False
-    assert (c.last_error or "").startswith("identity_persist_failed"), \
-        "落盘失败必须留痕：否则用户直到 HA 重启（重新注册、作废绑定码、留孤儿实例）才知道"
+    # 审计 2026-10-05 D-1 补口（改钉不回退产品）：留痕点从连接槽搬到**操作槽**。
+    # 旧写法写 `last_error`，但那个槽每轮尝试开头被清成 None、面板 hubErrorText 又只认
+    # identity_rejected/identity_rejected_loop 两个码 ⇒ 注释承诺的"必须让人看得见"
+    # 在用户侧根本不成立；操作槽既不被每轮清、又是面板 hubOpErrorText 的输入（操作类优先）。
+    assert c.last_op_error == "identity_persist_failed", \
+        "落盘失败必须留在面板会渲染的槽：否则用户直到 HA 重启（重新注册、作废绑定码、留孤儿实例）才知道"
+    assert c.last_error is None, "不许再写连接槽——写了也看不见，还会被下一轮清掉"
 
     # 反向半条：下一轮不许重复注册（内存身份可用＝"可继续工作"的那半句成立）
     calls = []
@@ -1187,6 +1192,7 @@ def test_d1_register_persist_failure_keeps_the_issued_identity(tmp_path, monkeyp
     monkeypatch.setattr(c2, "_http", ok_register)
     asyncio.run(c2._ensure_registered())
     assert c2.last_error is None
+    assert c2.last_op_error is None, "成功即清（同族口径）：上一轮的落盘告警不得赖在面板上"
     assert hc.load_identity(str(tmp_path))["instanceId"] == "inst-9"
 
 
@@ -3055,8 +3061,9 @@ def test_no_tautological_assertions_in_tests():
 def _matrix_arms():
     """从 mutation_matrix.py 里**结构化**取臂表。
 
-    不能整表 `literal_eval`：臂的 7 元组里 old/new 是模块级常量拼接（SCAN_BLOCK 等），
-    不是字面量 ⇒ 只取需要的四个字段，文件常量按模块级 `X = "..."` 解析。
+    不能整表 `literal_eval`：臂的元组里 old/new 是模块级常量拼接（SCAN_BLOCK 等），
+    不是字面量 ⇒ 只取需要的字段，文件常量按模块级 `X = "..."` 解析。
+    第 8 位（判据所在测试文件）同样是常量（GHOST/AUDIT），一并走 `_v`。
     """
     src = (ROOT / "tests" / "mutation_matrix.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
@@ -3065,18 +3072,35 @@ def _matrix_arms():
         if (isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
                 and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)):
             consts[n.targets[0].id] = n.value.value
+
+    def _v(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        return consts.get(getattr(node, "id", ""))
+
     got = [n for n in tree.body if isinstance(n, ast.Assign)
            and getattr(n.targets[0], "id", "") == "ARMS"]
     assert len(got) == 1, "mutation_matrix.py 的 ARMS 结构变了，本钉需同步"
     arms = []
     for t in got[0].value.elts:
-        assert isinstance(t, ast.Tuple) and len(t.elts) == 7, "臂必须是 7 元组"
-        mid = ast.literal_eval(t.elts[0])
-        rel = t.elts[1]
-        rel_v = (ast.literal_eval(rel) if isinstance(rel, ast.Constant)
-                 else consts.get(getattr(rel, "id", "")))
-        arms.append((mid, rel_v, ast.literal_eval(t.elts[4]), ast.literal_eval(t.elts[5])))
+        assert isinstance(t, ast.Tuple) and len(t.elts) in (7, 8), \
+            "臂必须是 7 元组（或带判据文件的 8 元组）"
+        arms.append((ast.literal_eval(t.elts[0]), _v(t.elts[1]),
+                     ast.literal_eval(t.elts[4]), ast.literal_eval(t.elts[5]),
+                     _v(t.elts[7]) if len(t.elts) > 7 else ""))
     return arms
+
+
+def _matrix_test_names(rel):
+    """某个判据文件里的真实测试名（按文件缓存，避免每臂重解析）。
+
+    用 `ast.walk` 而不是 `tree.body`：类里的 `async def test_*` 也会被 `-k` 选中，
+    判据宇宙少收一层就会把正常的臂误报成"空跑"。
+    """
+    tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+    return [n.name for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name.startswith("test_")]
 
 
 def test_mutation_matrix_cannot_silently_shrink_or_point_at_nothing():
@@ -3085,24 +3109,28 @@ def test_mutation_matrix_cannot_silently_shrink_or_point_at_nothing():
     第三轮复核实测过两种"矩阵假在跑"：锚漂移（`_patch` 数不到 ⇒ 该臂根本没打上）与
     选择器指向不存在的判据（`-k` 命中 0 条 ⇒ pytest 报 `no tests ran` 而退出码非零，
     被误读成"红=抓到了"）。这里把四件事钉死：臂数下限、id 唯一、每条 `-k` 至少命中
-    审计文件里一个真实测试名、被改文件在盘上存在（`DYN:` 动态锚由脚本自己保证唯一）。
+    **它那一条声明的判据文件**里一个真实测试名、被改文件与判据文件都在盘上存在
+    （`DYN:` 动态锚由脚本自己保证唯一）。
     """
     arms = _matrix_arms()
     ids = [a[0] for a in arms]
-    assert len(ids) >= 29, "变异矩阵臂数缩到 %d（有人删臂？）" % len(ids)
+    assert len(ids) >= 37, "变异矩阵臂数缩到 %d（有人删臂？）" % len(ids)
     assert len(set(ids)) == len(ids), "臂 id 重复：同一条被数了两次 ⇒ 计数虚高"
-    names = [n.name for n in ast.walk(ast.parse(
-        (ROOT / "tests" / "test_audit_2026_09_30_fixes.py").read_text(encoding="utf-8")))
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and n.name.startswith("test_")]
+    cache = {}
     bad = []
-    for mid, rel, k, expect in arms:
+    for mid, rel, k, expect, tfile in arms:
         assert expect in ("red", "green"), "%s: 预期只能是 red/green" % mid
         if rel and not rel.startswith("DYN:") and not (ROOT / rel).exists():
             bad.append("%s: 被改文件不存在 %s" % (mid, rel))
+        tf = tfile or "tests/test_audit_2026_09_30_fixes.py"
+        if not (ROOT / tf).exists():
+            bad.append("%s: 判据文件不存在 %s" % (mid, tf))
+            continue
+        if tf not in cache:
+            cache[tf] = _matrix_test_names(tf)
         toks = [t.strip() for t in re.split(r"\s+or\s+", k) if t.strip()]
-        if not any(any(t in n for n in names) for t in toks):
-            bad.append("%s: -k %r 命不中任何测试名 ⇒ 空跑" % (mid, k))
+        if not any(any(t in n for n in cache[tf]) for t in toks):
+            bad.append("%s: -k %r 在 %s 里命不中任何测试名 ⇒ 空跑" % (mid, k, tf))
     assert not bad, "变异矩阵有空跑/悬空臂：%s" % bad
 
 

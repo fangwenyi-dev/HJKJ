@@ -18,6 +18,10 @@
   * 等价臂（expect="green"）：产品后果与变异前**可证等价**的形态，钉必须继续保持绿——
     它守的是"别把优化误当缺陷钉死"，也是反向半条。
 
+臂形制：`(id, 被改文件, old 字面量, new 字面量, -k 选择器, 预期 red/green, 缘由[, 判据文件])`
+——第 8 位缺省是 `tests/test_audit_2026_09_30_fixes.py`（前 29 臂的判据都在那里），
+新批次把判据写在别的文件时必须显式带上第 8 位，否则 `-k` 命不中＝空跑报绿。
+
 用法：
     python3 tests/mutation_matrix.py [--floor N] [--only id[,id]] [--list]
 退出码：0=全部符合预期；非 0=有臂失守（响亮，不静默跳过）。
@@ -35,8 +39,12 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent          # huijian_mqtt_broker/tests
 PKG_ROOT = HERE.parent                                   # huijian_mqtt_broker
 AUDIT = "tests/test_audit_2026_09_30_fixes.py"
+GHOST = "tests/test_v1759_ghost_device.py"
 RUNSH = "run.sh"
 INIT = "custom_components/window_controller_gateway/__init__.py"
+HUBC = "custom_components/window_controller_gateway/hub_client.py"
+DMGR = "custom_components/window_controller_gateway/device_manager.py"
+WSGW = "custom_components/window_controller_gateway/ws_gateway.py"
 DOCKER = "Dockerfile"
 E2E = "tests/e2e/bridge_coexist_e2e.sh"
 IGNORE = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
@@ -179,6 +187,62 @@ ARMS = [
     ("taut_degenerate_empty", AUDIT, ASSERT_SARGS,
      '    assert sargs == ["20", "20", "20"] or sargs == [], \\', "tautological", "red",
      "同一个量既判相等又判空集（杀不到也算过）"),
+    # ── v1.7.59 幽灵设备链：删除要变成一次可被淘汰的全量快照 ──
+    # 这八条的共同形状：产品"看着还在认真上行状态"，但删掉的设备永远留在云端。
+    ("ghost_flush_drops_empty", HUBC,
+     "            items, authoritative = self.build_state_snapshot()\n",
+     "            items, authoritative = self.build_state_snapshot()\n"
+     "            if not items:\n                continue\n",
+     "test_last_device_deleted_still_pushes_an_empty_snapshot", "red",
+     "退回 v1.7.58 的 `if not items: continue`：删掉最后一台时全量快照不再上行，"
+     "hub 的 merge-only 状态表永久留着那个 sn", GHOST),
+    ("ghost_zero_manager_treated_as_full", HUBC,
+     "        if not self._managers:\n            authoritative = False\n", "",
+     "test_zero_manager_batch_is_not_pushed", "red",
+     "零 manager 的『空』当成全量交出去：启动未完成/条目全在卸载时把云端整表清空"
+     "（比幽灵设备更糟的反方向）", GHOST),
+    ("ghost_unbuildable_claimed_full", HUBC,
+     "                if view is None:\n                    authoritative = False\n"
+     "                    continue\n",
+     "                if view is None:\n                    continue\n",
+     "test_unbuildable_from_the_very_first_round_is_not_authoritative", "red",
+     "首轮就构造不出视图（没有回退位）还判权威 ⇒ hub 把这台看不见的设备判成已删除",
+     GHOST),
+    ("ghost_fallback_resurrects", HUBC,
+     "        self._last_views = fresh\n",
+     "        for _k, _v in self._last_views.items():\n"
+     "            if _k not in fresh:\n                items.append(_v)\n"
+     "        self._last_views = fresh\n",
+     "test_fallback_cache_never_resurrects_a_deleted_device", "red",
+     "把回退位当数据源（而不是失败兜底）＝已删设备每轮被自己写回快照，加固本身变成"
+     "幽灵设备的制造者", GHOST),
+    ("ghost_remove_no_notify", DMGR,
+     '        # "1:1 复刻 app_ws_gateway.c"的纪律；小程序 LAN 列表照旧由 get_devices 刷新。\n'
+     "        self._notify_status_listeners(device_sn)\n",
+     '        # "1:1 复刻 app_ws_gateway.c"的纪律；小程序 LAN 列表照旧由 get_devices 刷新。\n',
+     "test_remove_device_notifies_status_listeners_after_the_cache_drop", "red",
+     "删除不标脏（本批用户报障的原形）：云端要等下一次 002 上报或 5 分钟保活才知道少了设备",
+     GHOST),
+    ("ghost_notify_before_cache_drop", DMGR,
+     '        # "1:1 复刻 app_ws_gateway.c"的纪律；小程序 LAN 列表照旧由 get_devices 刷新。\n'
+     "        self._notify_status_listeners(device_sn)\n",
+     '        # "1:1 复刻 app_ws_gateway.c"的纪律；小程序 LAN 列表照旧由 get_devices 刷新。\n',
+     "test_remove_device_notifies_status_listeners_after_the_cache_drop", "red",
+     "通知时机提前到缓存删除之前：0.3s 后重扫到的仍是旧名单，那台已删设备被原样再推一次"
+     "（钉住的是顺序，不是『调用过就行』）", GHOST),
+    ("ghost_race_pop_no_notify", DMGR,
+     "                self._notify_status_listeners(device_sn)\n                return None\n",
+     "                return None\n",
+     "test_race_rollback_pop_also_marks_dirty", "red",
+     "v1.7.12 DM-F3 竞态复检那次 pop 不标脏：并发添加把已删设备又带上过一次快照，"
+     "之后再无事件 ⇒ 云端停在『这台还在』", GHOST),
+    ("lan_payload_fabricated_for_missing_device", WSGW,
+     "        dev = data[\"device_manager\"].devices.get(device_sn)\n"
+     "        if dev is None:\n            return None\n",
+     "        dev = data[\"device_manager\"].devices.get(device_sn) or {}\n",
+     "test_removal_notify_stays_silent_on_the_lan_channel", "red",
+     "给不存在的设备造 device_update：新增的删除通知会凭空造出固件没有的消息类型",
+     GHOST),
 ]
 
 
@@ -209,8 +273,8 @@ def _copy():
     return d
 
 
-def _run(root, k=None, full=False):
-    args = [sys.executable, "-m", "pytest", "tests" if full else AUDIT,
+def _run(root, k=None, path=None, full=False):
+    args = [sys.executable, "-m", "pytest", "tests" if full else (path or AUDIT),
             "-q", "-p", "no:cacheprovider", "--no-header"]
     if k:
         args += ["-k", k]
@@ -255,7 +319,14 @@ def main():
                         + f7_old.replace("        await _cleanup", "            await _cleanup", 1)
                         + "\n        except asyncio.CancelledError:\n            pass")}
     wanted = set(x.strip() for x in a.only.split(",") if x.strip())
-    extra = {"c6_contextlib_suppress": [(INIT, "import asyncio\n", "import asyncio\nimport contextlib\n")]}
+    extra = {"c6_contextlib_suppress": [(INIT, "import asyncio\n", "import asyncio\nimport contextlib\n")],
+             # 顺序臂：主补丁摘掉"缓存删完之后"的通知，这里再把它插到缓存删除之前。
+             # 两条合起来才是"通知过但时机错"这一形态——单独任何一条都不成立。
+             "ghost_notify_before_cache_drop": [(
+                 DMGR,
+                 '        device_info = self.devices.get(device_sn) or {}\n',
+                 '        self._notify_status_listeners(device_sn)\n'
+                 '        device_info = self.devices.get(device_sn) or {}\n')]}
 
     base = _copy()
     brc, btail = _run(base, None, full=True)
@@ -271,7 +342,8 @@ def main():
 
     n_red_expected = 0
     for arm in ARMS:
-        mid, rel, old, new, k, expect, why = arm
+        mid, rel, old, new, k, expect, why = arm[:7]
+        tpath = arm[7] if len(arm) > 7 else AUDIT      # 判据文件缺省=审计本文件
         if wanted and mid not in wanted:
             continue
         if rel.startswith("DYN:"):
@@ -299,7 +371,7 @@ def main():
                          "note": "变异后语法不合法 ⇒ 这条红不算抓到（等价回退要求）"})
             shutil.rmtree(root, ignore_errors=True)
             continue
-        rc, tail = _run(root, k)
+        rc, tail = _run(root, k, tpath)
         want_red = expect == "red"
         rows.append({"id": mid, "expect": expect, "ok": (rc != 0) == want_red,
                      "note": tail.replace("\n", " | ")[-260:]})
