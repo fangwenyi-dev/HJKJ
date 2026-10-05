@@ -30,7 +30,8 @@ from .const import (
     WS_RESERVED_PORTS,
 )
 from .mqtt_handler import WindowControllerMQTTHandler
-from .mqtt_bootstrap import ensure_mqtt_connection, has_bootstrap_marker
+from .mqtt_bootstrap import (ensure_mqtt_connection, has_bootstrap_marker,
+                              _usable_mqtt_entries)
 from .utils import is_mqtt_loaded, async_wait_mqtt_loaded
 
 _LOGGER = logging.getLogger(__name__)
@@ -559,7 +560,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if is_mqtt_loaded(self.hass):
             return True
 
-        has_entries = bool(self.hass.config_entries.async_entries("mqtt"))
+        # v1.7.61 对抗复核 C1-b：被忽略（source=ignore，永不加载）的条目
+        # 不算"已有 MQTT 线索"——旧口径会让"只有 ignore 条目"的机器白等
+        # 宽限窗后误报 broker_not_ready，掩盖真正的根因。
+        has_entries = bool(_usable_mqtt_entries(
+            self.hass.config_entries.async_entries("mqtt")))
         marker_pending = (not has_entries) and await has_bootstrap_marker(self.hass)
 
         # 完全没有 MQTT 条目、也没有引导标记 → 用户确实尚未启用/配置 MQTT，
@@ -584,7 +589,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             positively_pending = any(
                 not getattr(e, "disabled_by", None)
                 and _entry_state(e) in pending_states
-                for e in self.hass.config_entries.async_entries("mqtt")
+                for e in _usable_mqtt_entries(
+                    self.hass.config_entries.async_entries("mqtt"))
             )
             if not positively_pending:
                 errors["base"] = "broker_not_ready"

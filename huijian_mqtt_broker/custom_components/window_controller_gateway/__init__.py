@@ -544,22 +544,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     # reload/HA 重启。改为无限期耐心武装（每 120s 一条节流留痕）；
                     # 任务在 _bg_tasks，卸载/reload 统一取消，data_now 双检兜底。
                     _waited = 0
+                    _next_ensure = 0   # 立刻催一次，之后 120→240→480→…封顶 3600s
                     while not await async_wait_mqtt_loaded(hass, timeout=120.0):
                         _waited += 120
                         if hass.data.get(DOMAIN, {}).get(entry.entry_id) is None:
                             return  # 条目已卸载/重载，放弃武装
-                        # v1.7.61（10-05 现场）：等待期间**顺带重试一次引导**。
+                        # v1.7.61（10-05 现场）：等待期间**顺带重试引导**。
                         # 旧实现只等不催——若 MQTT 条目没建成/被删（典型：只有一条
                         # source=ignore 的"被忽略"条目，永不加载），本循环会无限
                         # 干等，首台网关的自动添加永不成链。ensure 幂等（模块级锁 +
                         # 双重检查），标记不在时是 no-op；标记在位时这是除 healer
                         # 之外唯一的自愈点（healer 无标记只核验不重建）。
-                        try:
-                            from .mqtt_bootstrap import ensure_mqtt_connection
-                            await ensure_mqtt_connection(hass)
-                        except Exception as _boot_e:  # noqa: BLE001 — 下轮再试
-                            _LOGGER.debug("等待就绪期间的引导重试失败（下轮再试）: %s",
-                                          _boot_e)
+                        # 对抗复核 C2-c：重试带指数退避（120→240→…封顶 3600s），
+                        # 与 v1.7.30"接管破坏面不得恒频施压"的纪律同向。
+                        if _waited >= _next_ensure:
+                            _next_ensure = max(120, _next_ensure) * 2
+                            try:
+                                from .mqtt_bootstrap import ensure_mqtt_connection
+                                await ensure_mqtt_connection(hass)
+                            except Exception as _boot_e:  # noqa: BLE001 — 下轮再试
+                                _LOGGER.debug(
+                                    "等待就绪期间的引导重试失败（下轮再试）: %s",
+                                    _boot_e)
                         _LOGGER.warning(
                             "MQTT 集成仍未就绪（累计 %ds），心跳武装持续等待——"
                             "请检查 MQTT 集成能否连上 broker（慧尖内置为 2022）",

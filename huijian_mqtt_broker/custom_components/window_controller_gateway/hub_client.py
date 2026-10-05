@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -625,6 +626,11 @@ class HubClient:
         if not self._bind_code_at:
             try:
                 self._bind_code_at = float(ident.get("bindCodeAt") or 0)
+                # v1.7.61 对抗复核 S1：`1e999`（JSON 合法）→ float('inf') 不抛，
+                # 却会让 bind_code_expires_in 的 int() 抛 OverflowError ⇒
+                # status_view（面板 API）500、_keepalive_loop 任务静默死亡。
+                if not math.isfinite(self._bind_code_at):
+                    self._bind_code_at = 0.0
             except (TypeError, ValueError):
                 self._bind_code_at = 0.0
         # 老身份文件没有 bindCodeTtl ⇒ 0 ⇒ 有效期回落 BIND_CODE_TTL_S（向后兼容读取）
@@ -763,7 +769,12 @@ class HubClient:
         """当前绑定码剩余秒数（负数=已过期；0 是签发时刻未知＝按过期处理）。"""
         if not self.bind_code or not self._bind_code_at:
             return -1
-        return int(self.bind_code_ttl_s() - (time.time() - self._bind_code_at))
+        try:
+            return int(self.bind_code_ttl_s() - (time.time() - self._bind_code_at))
+        except (OverflowError, ValueError):
+            # v1.7.61 对抗复核 S1 出口守卫：_bind_code_at/ttl 任一为非有限数时
+            # int() 抛 OverflowError（旧实现直接炸穿面板 status_view 与保活循环）。
+            return -1
 
     async def refresh_bind_code(self, kind: str = "owner") -> bool:
         """向 hub 换一个新绑定码（旧码当场作废）。kind='member' 换的是**成员码**。

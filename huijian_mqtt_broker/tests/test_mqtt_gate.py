@@ -327,7 +327,11 @@ class TestMqttReadyGate:
             await self._flow(hass)._async_gate_mqtt_ready(errors, already_waited=True)
             is False
         )
-        assert errors["base"] == "broker_not_ready"
+        # v1.7.61 口径升级（对抗复核 C1-b）：禁用/被忽略（source=ignore）条目
+        # 不算"已有 MQTT 线索"（与 utils.entry_state_for_sn 单一真源同口径）
+        # ⇒ 无标记时错误码 broker_not_ready → mqtt_not_available——用户该做的
+        # 是"去启用/删除那条条目"，而不是"等 broker 就绪"。快败不空等不变。
+        assert errors["base"] == "mqtt_not_available"
 
     @pytest.mark.asyncio
     async def test_late_ready_passes_gate(self, monkeypatch):

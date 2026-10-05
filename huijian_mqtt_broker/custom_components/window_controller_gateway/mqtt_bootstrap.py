@@ -160,7 +160,10 @@ def _read_endpoint_sync(path: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         port = int(data.get("port") or BUILTIN_PORT)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # v1.7.61 对抗复核 S3：非有限数（1e999→inf）的 int() 抛 OverflowError，
+        # 旧实现让整份端点文件被判"读不到"（外层兜底吞成 None）⇒ 通道核验静默
+        # 关闭（no_endpoint）。按非法端口回落，保留核验能力。
         port = BUILTIN_PORT
     return {"broker": str(data["broker"]), "port": port}
 
@@ -259,7 +262,9 @@ async def verify_builtin_channel(hass: HomeAssistant) -> str:
     try:
         cur_broker = str((first.data or {}).get("broker") or "")
         cur_port = int((first.data or {}).get("port") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # v1.7.61 对抗复核 S2：条目 data 的 port 为 1e999→inf 时 int() 抛
+        # OverflowError，而 healer 无 try 调用本函数 ⇒ 巡检任务静默死亡。
         cur_broker, cur_port = "", 0
     if cur_broker != exp_broker or cur_port != exp_port:
         return "mismatch"
@@ -375,7 +380,9 @@ async def ensure_mqtt_connection(hass: HomeAssistant) -> Optional[bool]:
         # v1.6.3：内置 Broker 固定监听 2022（见 mosquitto.conf/run.sh），
         # 旧回退值 1883 指向根本不监听的端口，属死配置
         port = int(data.get("port") or 2022)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # v1.7.61 对抗复核 S4：标记被手改出 1e999 同型缺口——溢出逃出 ensure
+        # 会被上层吞成"连不上"（假归因）。按默认口回落。
         port = 2022
     username = data.get("username") or None
     password = data.get("password") or None
@@ -399,25 +406,28 @@ async def ensure_mqtt_connection(hass: HomeAssistant) -> Optional[bool]:
     all_entries = hass.config_entries.async_entries("mqtt")
     existing_entries = _usable_mqtt_entries(all_entries)
     if all_entries and not existing_entries:
+        disabled = [e for e in all_entries if getattr(e, "disabled_by", None)]
         ignored = _ignored_mqtt_entries(all_entries)
-        if ignored:
-            # v1.7.61：仅剩 source=ignore 条目——它永不加载，不是有效配置。
-            # 保留标记（等下轮自愈/用户处置），并点名这条根因。
+        if disabled:
             _LOGGER.warning(
-                "HA 里只有被忽略的 MQTT 条目（source=ignore，永不加载，%d 条）——"
-                "它不构成有效 MQTT 配置，慧尖会尝试创建新条目；若被 HA 的单实例闸"
-                "拦下，请到 设置→设备与服务 删除那条被忽略的 MQTT 条目后重启慧尖"
-                "加载项。引导标记已保留待自愈",
-                len(ignored),
+                "MQTT 配置条目全部处于禁用状态（%d 个）——慧尖不代为启用/删除，"
+                "请在 设置→设备与服务→MQTT 重新启用或删除该条目后重启慧尖加载项；"
+                "引导标记已保留待自动重试",
+                len(disabled),
             )
             return False
-        _LOGGER.warning(
-            "MQTT 配置条目全部处于禁用状态（%d 个）——慧尖不代为启用/删除，"
-            "请在 设置→设备与服务→MQTT 重新启用或删除该条目后重启慧尖加载项；"
-            "引导标记已保留待自动重试",
-            len(all_entries),
-        )
-        return False
+        if ignored:
+            # v1.7.61 复核修订（HA 2024.12 源码 config_entries.py:1285-1289 实证）：
+            # 单实例闸对 **SOURCE_USER 流不统计 ignore 条目**（闸只看
+            # include_ignore=False 那一支，第二支带 `source != SOURCE_USER`）⇒
+            # "只有被忽略条目"时建条**本可成功**。早退（初版修法）等于把唯一的
+            # 自愈出口关掉——此处只 loud 点名根因，然后**继续走创建路径**。
+            _LOGGER.warning(
+                "HA 里只有被忽略的 MQTT 条目（source=ignore，永不加载，%d 条）——"
+                "它不挡 user 流，慧尖继续创建新条目；若创建被单实例闸拦下（旧版 "
+                "HA 或并存禁用条目），请先删除那条被忽略的 MQTT 条目再重启加载项",
+                len(ignored),
+            )
 
     if existing_entries:
         first = existing_entries[0]
@@ -533,11 +543,12 @@ async def ensure_mqtt_connection(hass: HomeAssistant) -> Optional[bool]:
         # 出现"全禁用"竞态时保留标记并告警（与入口熔断同口径）。
         locked_all = hass.config_entries.async_entries("mqtt")
         locked_enabled = _usable_mqtt_entries(locked_all)
-        if locked_all and not locked_enabled:
+        locked_disabled = [e for e in locked_all if getattr(e, "disabled_by", None)]
+        if locked_all and not locked_enabled and locked_disabled:
+            # 只有**禁用**条目才算"真的挡住建条"（HA 单实例闸计禁用、不计 ignore）
             _LOGGER.warning(
-                "等待 MQTT 引导锁期间条目被禁用/被忽略（source=ignore 永不加载），"
-                "保留引导标记；请在 设置→设备与服务→MQTT 重新启用或删除条目后"
-                "重启慧尖加载项"
+                "等待 MQTT 引导锁期间条目被禁用，保留引导标记；"
+                "请在 设置→设备与服务→MQTT 重新启用或删除条目后重启慧尖加载项"
             )
             return False
         if locked_enabled:

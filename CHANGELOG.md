@@ -21,9 +21,11 @@
 
 **七、翻译：`translations/zh-Hans.json` 缺失 → 选项菜单整片空白（用户截图实锤）**：HA 简体中文的语言码是 **zh-Hans**，本仓只带 `zh-CN.json` ⇒ 前端取不到组件翻译、回退 en（也未带）⇒ `options.step.init` 菜单两项空白、错误卡显示裸键（早前那张 `broker_not_ready` 同因）。补 `zh-Hans.json`（与 zh-CN 逐字节一致）并立"两份同步"判据防漂移。
 
-**判据**：新增 `tests/test_v1761_audit_mustfix.py` **18 条**——每组都配反向臂（合法文件照常加载、正常端口/显式关闭照旧、落盘失败不许被清、网关过滤不许被拆、表单新值必须覆盖旧值），防"修一条拆一条"式假修）＋ `tests/test_v1761_arm_bootstrap_retry.py` **2 条**（等待期必须重试引导、未就绪仍无限耐心）＋ `tests/test_v1761_ignore_source_and_i18n.py` **7 条**（ignore 源不被接管/标记得保留并点名根因、正常条目照旧落地、`ignored_only` 判词、zh-Hans 在包且与 zh-CN 逐字一致）。
+**八、对抗复核（发版前派"尝试推翻"代理，抓回本批自伤 1 处 + 同类漏网 4 处）**：① **C1-c 自伤（最重）**：初版"只有 ignore 条目 ⇒ 保留标记并早退"把唯一自愈出口关掉了——HA 源码实证（2024.12.0 `config_entries.py:1285-1289`）单实例闸对 SOURCE_USER 流**不统计** ignore 条目、建条本可成功；改为 loud 点名后**继续走创建**（并存禁用条目/老版 HA 被拦时才保标记）。② **C1-b**：config_flow 的 MQTT 就绪门禁仍把 ignore 条目当"已有线索"（白等宽限窗后误报 broker_not_ready）⇒ 换用 `_usable_mqtt_entries`；一条 v1.7.18 旧钉（禁用条目形态的错误码）按新口径升级为 `mqtt_not_available`，"快败不空等"不变量原样保留。③ **C2-c**：武装循环的引导重试退避化（120→240→…封顶 3600s），不把 v1.7.30 的"接管施压不恒频"纪律拉回 120s 恒定。④ **S1–S4 同类漏网**：四处 `int()` 漏 `OverflowError`——身份文件 `bindCodeAt:1e999`（会炸面板 status_view 与保活任务）、核验读条目 port（healer 无 try ⇒ 巡检静默死亡）、端点文件 port（整份文件被判读不到 ⇒ 核验静默关闭）、引导标记 port（溢出被吞成假"连不上"）。**S5**（cover/number 同类 int()）攻击未证可达，记录在案不改。
 
-**门禁**：pytest **1402**（基线 1375 + 本批 27；收集数＝通过数、零 skip）；ruff（CI 同参 `--select F,E9,B --ignore B008,B905`）/ compileall / JSON 解析全绿；四源版本位与 6 处 index.html 字面量＝1.7.61（字节级替换，CRLF 未翻）。**本批只到工作树**：未跑变异矩阵、未真机复验、未提交未推送（发版前按纪律整树重跑 + 派"尝试推翻"复核）。**.184 现场无需等发版即可自救**：设置→设备与服务→MQTT 删除那条被忽略（source=ignore）的条目 → 重启慧尖加载项 → reload 集成，引导会重建真正的 MQTT 条目。
+**判据**：新增 `tests/test_v1761_audit_mustfix.py` **18 条**——每组都配反向臂（合法文件照常加载、正常端口/显式关闭照旧、落盘失败不许被清、网关过滤不许被拆、表单新值必须覆盖旧值），防"修一条拆一条"式假修）＋ `tests/test_v1761_arm_bootstrap_retry.py` **2 条**（等待期必须重试引导、未就绪仍无限耐心）＋ `tests/test_v1761_ignore_source_and_i18n.py` **7 条**（ignore 源不被接管、被拦时标记得保留并点名根因、正常条目照旧落地、`ignored_only` 判词、zh-Hans 在包且与 zh-CN 逐字一致）＋ `tests/test_v1761_adversarial_followups.py` **10 条**（对抗复核每条的"真洞臂＋反向臂"：ignore-only 必须继续建条、禁用/并存形态保标记不发流、门禁快败码、身份 1e999 归零、三处 port 1e999 不抛、退避只催 3 次）。
+
+**门禁**：pytest **1412**（基线 1375 + 本批 37；收集数＝通过数、零 skip）；ruff（CI 同参 `--select F,E9,B --ignore B008,B905`）/ compileall / JSON 解析全绿；四源版本位与 6 处 index.html 字面量＝1.7.61（字节级替换，CRLF 未翻）。**本批只到工作树**：未跑变异矩阵、未真机复验、未提交未推送（发版前按纪律整树重跑 + 派"尝试推翻"复核）。**.184 现场无需等发版即可自救**：设置→设备与服务→MQTT 删除那条被忽略（source=ignore）的条目 → 重启慧尖加载项 → reload 集成，引导会重建真正的 MQTT 条目。
 
 ## [1.7.60] - 2026-10-05
 

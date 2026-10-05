@@ -83,23 +83,30 @@ def _mk_entry(source, disabled_by=None, broker="127.0.0.1", port=2022,
 
 
 def test_ignore_source_entry_is_not_taken_over(tmp_path):
-    """被忽略的条目**不许**被当成有效配置、更不许被"接管"改写。"""
+    """被忽略的条目**不许**被当成有效配置、更不许被"接管"改写；正确动作是
+    **继续创建新条目**（HA 单实例闸对 user 流不计 ignore，源码实证）。"""
+    from homeassistant.data_entry_flow import FlowResultType
     marker = _marker(tmp_path)
     hass = _EnsureHass(marker, [_mk_entry("ignore")],
-                       flow_results=[{"type": "abort",
-                                      "reason": "single_instance_allowed"}])
+                       flow_results=[{"flow_id": "f1", "type": FlowResultType.FORM},
+                                     {"type": FlowResultType.CREATE_ENTRY}],
+                       mqtt_loaded=True)
     asyncio.run(mb.ensure_mqtt_connection(hass))
     assert hass.updated == [], "不得改写被忽略条目的数据（它不是我们的配置）"
     assert hass.reload_calls == [], "不得 reload 一个永不加载的条目"
+    assert hass.flow.calls and hass.flow.calls[0][0] == "init", \
+        "正确动作是创建新条目（早退=自愈出口关闭，见对抗复核 C1-c）"
 
 
-def test_ignore_only_keeps_marker_and_warns(tmp_path, caplog):
-    """只有忽略条目 + 建条被 single_instance 拦 ⇒ **标记必须保留**（旧实现删标记
-    自称"视为已有配置"，随后再无人重建 → 现场形态）。"""
+def test_create_aborted_keeps_marker_and_warns(tmp_path, caplog):
+    """建条流被 single_instance 拦（老版 HA / 并存禁用条目）⇒ **标记必须保留**
+    （旧实现删标记自称"视为已有配置"，随后再无人重建 → 现场形态），且点名根因。"""
     import logging
+    from homeassistant.data_entry_flow import FlowResultType
     marker = _marker(tmp_path)
     hass = _EnsureHass(marker, [_mk_entry("ignore")],
-                       flow_results=[{"type": "abort",
+                       flow_results=[{"flow_id": "f1", "type": FlowResultType.FORM},
+                                     {"type": FlowResultType.ABORT,
                                       "reason": "single_instance_allowed"}])
     with caplog.at_level(logging.WARNING,
                          logger="custom_components.window_controller_gateway"):
@@ -108,7 +115,6 @@ def test_ignore_only_keeps_marker_and_warns(tmp_path, caplog):
     assert result is False
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "忽略" in text, "必须点名'被忽略的 MQTT 条目'这一根因"
-
 
 def test_valid_entry_still_matches_and_lands(tmp_path):
     """反向臂：正常启用条目（数据一致）照旧走匹配分支并删标记。"""
