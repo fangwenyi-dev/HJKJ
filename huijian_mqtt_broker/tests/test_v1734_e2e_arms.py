@@ -2,8 +2,9 @@
 
 K 臂：未配置网关首报 001 → `gateway/{sn}/req` 上**恰好一条**同型代答
       （head/ctype/id/sn 回带 + data.errcode:0 + uuid）+ 发现卡挂起。
-L 臂：空 SN 等待条目 + 首报 → SN 自动填进**同一条目**、条目 loaded、
-      子设备真注册、**零**发现卡（"直接添加到集成"零点击契约），
+L 臂：空 SN 等待条目 + 首报 → **不再静默填充**（v1.7.62 起）——必须弹发现卡、
+      等待条目不得出现网关设备；REST 走完卡片流后新条目 loaded、子设备真注册、
+      等待条目被清理，
       且两耳并存（handler 耳 + 心跳耳）时仍 1 请求 1 答。
 
 本地无 docker（run_local.sh 走 WSL），故两臂的 CI 真栈结果由 e2e job 承担；
@@ -53,10 +54,12 @@ class TestArmsPresent:
             "等待条目必须按 entry_id 甄别（REST 条目表不含 data，见下）"
         assert 'if _aw_state != "loaded":' in seg, \
             "L 臂必须验等待条目真 loaded（心跳耳挂载前提）"
-        assert "_stray" in seg and "不得再弹发现卡" in seg, \
-            "L 臂必须验零发现卡（弹卡=用户被要求确认已加进来的网关）"
-        assert 'if _n_entries != 2' in seg, \
-            "L 臂必须验零点击路径不新建条目（新建=没走 3.5 填充）"
+        assert "静默填充回潮" in seg, \
+            "L 臂必须钉'等待条目不得被静默填充'（v1.7.62 反向半边）"
+        assert "_cards_for(AUTO_GW)" in seg and "必须弹发现卡" in seg, \
+            "L 臂必须验发现卡挂起（首台也弹卡的新语义）"
+        assert "未被清理" in seg, \
+            "L 臂必须验确认添加后等待条目被清理（async_remove_awaiting_entries）"
         assert "config_entry_id={awaiting_id}" in seg and "含网关SN" in seg, \
             "L 臂接管证据必须走 devices 视图（产品级真值面）"
         assert "_check_single_ack(_l_acks, AUTO_GW, 7202" in seg, \
@@ -86,15 +89,15 @@ class TestArmsPresent:
 
     def test_summary_reports_both_arms(self):
         i = SRC.index("GITHUB_STEP_SUMMARY")
-        assert "首报 001 代答" in SRC[i:] and "零点击自动添加" in SRC[i:]
+        assert "首报 001 代答" in SRC[i:] and "首台弹卡确认" in SRC[i:]
 
-    def test_l_arm_takeover_republishes(self):
-        """接管证据必须周期重发 002（每轮换 id）：单发一条落在 reload 窗内
-        （旧订阅已退、新订阅未挂）就白等 60s——真栈竞态假红。"""
+    def test_l_arm_republishes_distinct_ids(self):
+        """周期重发 002（每轮换 id）：既喂卡片流的连接测试窗，也当'不许静默
+        填充'的判据面——单发一条落在竞态窗内就白等。同 id 会被 5s 去重层吃掉。"""
         i_l = SRC.index(f'AUTO_GW = "{AUTO_GW}"')
         seg = SRC[i_l:]
-        assert "while time.time() < _dead and not _taken:" in seg
-        assert "_rid += 1" in seg, "重发必须换 id（同 id 会被 5s 去重层吃掉）"
+        assert "while not _stop.is_set():" in seg, "重发必须是后台周期线程"
+        assert "_i += 1" in seg, "重发必须换 id（同 id 会被 5s 去重层吃掉）"
 
 
 # ============ ①b 在途流查询：WS 而非 405 的 REST 端点 ============
@@ -122,9 +125,9 @@ class TestFlowQueryContract:
         seg = SRC[i:SRC.index("def _wait_acks(")]
         assert "die(" in seg, "strict 查询失败必须显式失败"
         assert "last_err" in seg, "非 strict 路径要把错误带回给最终 die 文案"
-        i_l = SRC.index("_stray = _cards_for(AUTO_GW")
+        i_l = SRC.index("_cards = _cards_for(AUTO_GW")
         assert "strict=False" not in SRC[i_l:i_l + 60], \
-            "L 臂的\"0 张卡\"断言必须走 strict（查询失败即红，不得当 0 张）"
+            "L 臂的\"卡必须挂起\"断言必须走 strict（查询失败即红，不得当没卡）"
         i_k = SRC.index("_c = _cards_for(NEW_GW")
         assert "strict=False" in SRC[i_k:i_k + 80] and "last_err=" in SRC[i_k:i_k + 80], \
             "K 臂轮询期容错、最终 die 带出末次错误"

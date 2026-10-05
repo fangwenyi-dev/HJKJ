@@ -498,11 +498,13 @@ if _card is None:
         f"WS 查询末两次错误={_errs[-2:]}")
 step("K", f"首报 001 真栈实证 ✓（1 请求 1 答·含 uuid；发现卡 {_card.get('flow_id')[:8]} 已挂起）")
 
-# ---------- L. 空 SN 等待条目 + 首报 → 零点击「直接添加到集成」 ----------
-# v1.7.11/v1.7.12 设计：发现代理建一个空 SN 的等待条目挂心跳耳；网关首报后
-# discovery 第 3.5 步把 SN **直接填进该条目**（不弹卡、无需用户点确认），
-# reload 由 update listener 单驱动。本臂真栈走完整条零点击链，并顺带把
-# v1.7.30 仲裁在"两耳并存"形态下钉死（此刻 handler 耳 + 心跳耳同时在听）。
+# ---------- L. 空 SN 等待条目 + 首报 → 弹卡确认（v1.7.62：取消零点击静默填充） ----------
+# v1.7.11 的"首报即把 SN 静默填进等待条目"已按用户裁定取消（现场判为不可见
+# 添加）：等待条目只当耳朵，首台网关同样弹发现卡；用户确认后由
+# async_remove_awaiting_entries 清掉等待条目。本臂真栈走完整条链：卡必须挂起
+# 且**条目不得被填充**（反向半边）→ REST 走完卡片流（discovery→user→可选
+# confirm_add，连接测试窗内由后台 002 喂养）→ 新条目 loaded + devices 三真 +
+# 等待条目被清理；并顺带把 v1.7.30 仲裁在"两耳并存"形态下钉死。
 AUTO_GW = "E2EGW0000003"
 AUTO_DEV = "500700000002"
 step("L", "建空 SN 等待条目（发现代理同款 REST 路径）")
@@ -546,48 +548,110 @@ pc.publish("gateway/rpt_rsp", json.dumps(_first_report(AUTO_GW, 7202))) \
 _l_acks = _wait_acks(f"gateway/{AUTO_GW}/req", _l0)
 _check_single_ack(_l_acks, AUTO_GW, 7202, "L 两耳并存首报")
 
-# 零点击接管：周期性重发 002（每轮换 id）。单发一条若落在 reload 窗内（旧
-# 订阅已退、新订阅未挂）就会白等——真网关本就是周期上报，重发贴近现场又
-# 消掉这处竞态假红。
-_taken, _rid, _seen = False, 7203, {}
-_dead = time.time() + 90
-while time.time() < _dead and not _taken:
-    pc.publish("gateway/rpt_rsp", json.dumps({
-        "head": {"cmdid": "002", "id": _rid}, "ctype": "002", "id": _rid,
-        "sn": AUTO_GW, "data": {"status": 1, "devices": [
-            {"sn": AUTO_DEV, "model": "5007", "battery": 1210,
-             "r_travel": 60}]}})).wait_for_publish(timeout=5)
-    _rid += 1
-    _t_poll = time.time() + 6
-    while time.time() < _t_poll and not _taken:
-        st, d2 = call("GET", f"/api/window_controller_gateway/devices"
-                             f"?config_entry_id={awaiting_id}")
-        if st == 200 and isinstance(d2, list):
-            _ids = {i[1] for d in d2 for i in (d.get("identifiers") or [])
-                    if isinstance(i, list) and len(i) > 1}
-            _seen = {"条目数": len(d2), "含网关SN": AUTO_GW in _ids,
-                     "含子设备": AUTO_DEV in _ids,
-                     "网关在线": any(x.get("gateway_online") is True for x in d2)}
-            _taken = _seen["含网关SN"] and _seen["含子设备"] and _seen["网关在线"]
-        if not _taken:
-            time.sleep(2)
-if not _taken:
-    _fl = _hj_flows(strict=False) or []
-    _ents = [(str(e.get("entry_id"))[:8], e.get("state")) for e in _hj_entries()]
-    die(f"零点击自动添加链断：等待条目 {str(awaiting_id)[:8]} 未接管 {AUTO_GW}"
-        f"（devices 视图={_seen}，需三真）；条目快照[(id,state)]={_ents}；"
-        f"在途流="
-        f"{[(f.get('handler'), (f.get('context') or {}).get('unique_id')) for f in _fl]}")
+# v1.7.62 新语义：等待条目在位时，周期 002 **不得**触发静默填充，必须挂发现卡。
+# 后台持续 002（贴合真网关周期上报）：既喂卡片的连接测试窗，也当"不许静默
+# 填充"的判据面——旧版会在几秒内把等待条目填掉、且不弹卡。
+import threading
+_stop = threading.Event()
 
-_stray = _cards_for(AUTO_GW)
-if _stray:
-    die(f"零点击自动填充不得再弹发现卡，实得 {len(_stray)} 张（用户会被要求"
-        "确认一台已经加进来的网关）")
-_n_entries = len(_hj_entries())
-if _n_entries != 2:
-    die(f"零点击路径不得新建条目（应仍为 网关+等待 两条），实得 {_n_entries} 条")
-step("L", f"零点击自动添加真栈实证 ✓（{AUTO_GW} 填入等待条目→loaded→"
-           f"子设备 {AUTO_DEV} 注册；发现卡 0 张；两耳并存仍 1 请求 1 答）")
+
+def _auto_pub():
+    _i = 7300
+    while not _stop.is_set():
+        pc.publish("gateway/rpt_rsp", json.dumps({
+            "head": {"cmdid": "002", "id": _i}, "ctype": "002", "id": _i,
+            "sn": AUTO_GW, "data": {"status": 1, "devices": [
+                {"sn": AUTO_DEV, "model": "5007", "battery": 1210,
+                 "r_travel": 60}]}}))
+        _i += 1  # 每轮换 id：同 id 会被 5s 去重层吃掉（v1.7.34 L 臂既有钉）
+        time.sleep(2)
+
+
+threading.Thread(target=_auto_pub, daemon=True).start()
+try:
+    # (1) 发现卡必须挂起（60s 轮询）；等待条目**不得**出现网关设备
+    _card, _dead = None, time.time() + 60
+    while time.time() < _dead and _card is None:
+        _cards = _cards_for(AUTO_GW) or []
+        _card = _cards[0] if _cards else None
+        if _card is None:
+            time.sleep(2)
+    if _card is None:
+        _fl2 = _hj_flows(strict=False) or []
+        _fl2_desc = [(f.get("handler"), (f.get("context") or {}).get("unique_id"))
+                     for f in _fl2]
+        die("v1.7.62 新语义：等待条目在位的首台网关必须弹发现卡（60s 未出现）；"
+            f"在途流={_fl2_desc}")
+    st, d2 = call("GET", f"/api/window_controller_gateway/devices"
+                         f"?config_entry_id={awaiting_id}")
+    _ids2 = {i[1] for d in (d2 or []) for i in (d.get("identifiers") or [])
+             if isinstance(i, list) and len(i) > 1} if st == 200 else set()
+    if AUTO_GW in _ids2:
+        die("静默填充回潮：等待条目被自动填入 SN（v1.7.62 已取消该行为）")
+    step("L", f"发现卡 {str(_card.get('flow_id'))[:8]} 已挂起、等待条目未被填充 ✓")
+
+    # (2) REST 走完卡片流（＝用户在卡片上点确认）：discovery → user →（可选 confirm_add）
+    _fid = _card.get("flow_id")
+    _name = f"慧尖网关 {AUTO_GW[-4:]}"
+    st, res = call("POST", f"/api/config/config_entries/flow/{_fid}",
+                   json_body={"gateway_sn": AUTO_GW, "gateway_name": _name})
+    for _round in range(6):
+        if not isinstance(res, dict):
+            die(f"卡片流响应异常: {res}")
+        if res.get("type") == "create_entry":
+            break
+        if res.get("type") != "form":
+            die(f"卡片流中止于 {res.get('type')}: "
+                f"{res.get('reason') or res.get('errors')}")
+        _sid = res.get("step_id")
+        if _sid == "user":
+            _body = {"gateway_sn": AUTO_GW, "gateway_name": _name}
+        elif _sid == "confirm_add":
+            _body = {"confirm": True}
+        else:
+            die(f"卡片流进入未知步骤 {_sid}: {res}")
+        st, res = call("POST", f"/api/config/config_entries/flow/{_fid}",
+                       json_body=_body)
+    else:
+        die(f"卡片流 6 轮未完成: {res}")
+    step("L", "卡片流经 REST 确认完成（create_entry）✓")
+
+    # (3) 新条目 loaded + devices 三真 + 等待条目被清理
+    _new_id, _seen = None, {}
+    _dead = time.time() + 60
+    while time.time() < _dead and _new_id is None:
+        _new = [e for e in _hj_entries()
+                if e.get("entry_id") not in (entry, awaiting_id)]
+        if len(_new) == 1:
+            _new_id = _new[0].get("entry_id")
+            st, d3 = call("GET", f"/api/window_controller_gateway/devices"
+                                 f"?config_entry_id={_new_id}")
+            if st == 200 and isinstance(d3, list):
+                _ids3 = {i[1] for d in d3 for i in (d.get("identifiers") or [])
+                         if isinstance(i, list) and len(i) > 1}
+                _seen = {"条目数": len(d3), "含网关SN": AUTO_GW in _ids3,
+                         "含子设备": AUTO_DEV in _ids3,
+                         "网关在线": any(x.get("gateway_online") is True for x in d3)}
+                if not all(_seen.values()):
+                    _new_id = None
+        if not _new_id:
+            time.sleep(2)
+    if not _new_id:
+        _ents = [(str(e.get("entry_id"))[:8], e.get("state")) for e in _hj_entries()]
+        die(f"确认添加后新条目/devices 三真未达标：devices={_seen}；条目快照={_ents}")
+    _dead = time.time() + 10
+    while time.time() < _dead:
+        if not [e for e in _hj_entries() if e.get("entry_id") == awaiting_id]:
+            break
+        time.sleep(1)
+    else:
+        die(f"等待条目 {str(awaiting_id)[:8]} 未被清理——确认添加后的配套动作未生效")
+finally:
+    _stop.set()
+
+step("L", f"首台弹卡确认链真栈实证 ✓（卡挂起→REST 确认→新条目 loaded→"
+           f"子设备 {AUTO_DEV} 注册→等待条目已清理；两耳并存仍 1 请求 1 答）")
+
 
 # ---------- I. WS 网关默认监听 ----------
 step("I", f"WS 网关 {WS_PORT} 常听断言（v1.6.16 默认开语义守护）")
@@ -648,8 +712,9 @@ if summary:
                 f"- gateway_online + 子设备注册 + WS {WS_PORT} 常听 ✓\n"
                 "- HomeKit 双机型：5007 Window(SET_POSITION/position/004 真发)、5002 三态(位置服务被拒) ✓\n"
                 f"- 首报 001 代答：未配置网关 1 请求 1 答（含 uuid）+ 发现卡挂起 ✓\n"
-                f"- 零点击自动添加：空 SN 等待条目 → {AUTO_GW} 自动填充 → loaded → "
-                f"子设备 {AUTO_DEV} 注册，发现卡 0 张，两耳并存仍 1 答 ✓\n"
+                f"- 首台弹卡确认（v1.7.62）：等待条目不被静默填充 → 卡挂起 → "
+                f"REST 确认 → {AUTO_GW} loaded → 子设备 {AUTO_DEV} 注册 → "
+                f"等待条目已清理，两耳并存仍 1 答 ✓\n"
                 f"- soak 500 条注入 ~{rate:.0f}/s，HA 全程可用\n")
 
 pc.loop_stop()
