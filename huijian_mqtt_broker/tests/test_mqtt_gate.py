@@ -45,7 +45,11 @@ from custom_components.window_controller_gateway.mqtt_bootstrap import (
 # ==================== 共用 Fake ====================
 
 class GateHass:
-    """门禁所需的最小 hass 面：hass.data + config_entries.async_entries。"""
+    """门禁所需的最小 hass 面：hass.data + config_entries.async_entries。
+
+    v1.7.62：补 async_create_task——真 HA 必有（config_flow 的
+    _schedule_awaiting_cleanup 用它派后台清理），桩不得窄于真实现（既有纪律）。
+    """
 
     def __init__(self, mqtt=None, mqtt_entries=None):
         self.data = {} if mqtt is None else {"mqtt": mqtt}
@@ -53,6 +57,13 @@ class GateHass:
         self.config_entries = types.SimpleNamespace(
             async_entries=lambda domain: entries if domain == "mqtt" else []
         )
+        self.created_tasks = []
+
+    def async_create_task(self, coro, name=None, **kw):
+        self.created_tasks.append(name)
+        if hasattr(coro, "close"):
+            coro.close()
+        return None
 
 
 class MarkerHass:
@@ -79,6 +90,17 @@ class EnsureHass(MarkerHass):
         super().__init__(marker_path)
         entries = list(mqtt_entries or [])
         self.removed_entries = []
+        # v1.7.62：真 HA 必有 async_create_task（config_flow 的等待条目清理
+        # 经它派发），桩不得窄于真实现——既有纪律。
+        self.created_tasks = []
+
+        def _create_task(coro, name=None, **kw):
+            self.created_tasks.append(name)
+            if hasattr(coro, "close"):
+                coro.close()
+            return None
+
+        self.async_create_task = _create_task
         self.flow = types.SimpleNamespace(calls=[], _results=list(flow_results))
 
         async def _async_init(domain, context=None):

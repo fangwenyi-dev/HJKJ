@@ -9,7 +9,6 @@ from homeassistant.helpers import entity_registry as er
 from .const import (
     DOMAIN,
     CONF_GATEWAY_SN,
-    CONF_GATEWAY_NAME,
     GLOBAL_IGNORED_GATEWAYS,
 )
 
@@ -83,38 +82,13 @@ async def async_discover_gateway(hass: HomeAssistant, gateway_sn: str, gateway_n
             _LOGGER.debug("网关 %s 已在配置条目中，跳过发现", gateway_sn)
             return
     
-    # 3.5 自动填充空 SN 的已有条目：用户先安装了集成（无 SN），
-    #     之后网关上电被发现，直接填充该条目而非创建新流程
-    for entry in existing_entries:
-        if not entry.data.get(CONF_GATEWAY_SN):
-            _LOGGER.info("发现网关 %s，自动填充空 SN 的已有条目 %s", gateway_sn, entry.entry_id)
-            new_data = {
-                **entry.data,
-                CONF_GATEWAY_SN: gateway_sn,
-                CONF_GATEWAY_NAME: entry.data.get(CONF_GATEWAY_NAME, gateway_name),
-            }
-            # v1.7.12（第 6 轮审计 E-4，B-LOW7① 同款漏改点）：填充时补设
-            # unique_id——旧版条目永远无 uid，HA 原生查重（本集成三个流入口
-            # 的 async_set_unique_id/_abort_if_unique_id_configured）对它全程
-            # 失效。仅当该 uid 未被其他条目占用时设置，防 InvalidData。
-            update_kwargs = {}
-            if not getattr(entry, "unique_id", None):
-                try:
-                    owner = hass.config_entries.async_entry_for_domain_unique_id(
-                        DOMAIN, gateway_key)
-                    if owner is None or owner.entry_id == entry.entry_id:
-                        update_kwargs["unique_id"] = gateway_key
-                except Exception:  # 老 core 无此 API/异常——退回只填 data
-                    pass
-            # v1.7.11：async_update_entry 会经 add_update_listener 触发
-            # async_reload（异步任务），不可再显式 async_reload——双 reload
-            # 并发竞态（真栈实锤：交错两次 reload 使 awaiting 条目 setup 阶段
-            # 就加载的 sensor/cover 等平台被重复卸载，打出 "Config entry was
-            # never loaded!" ValueError 刷屏）。与 _migrate_devices_async
-            # （:684 注释）同口径：只 update，让 listener 单驱动 reload。
-            hass.config_entries.async_update_entry(entry, data=new_data, **update_kwargs)
-            return
-    
+    # 3.5 v1.7.62（用户裁定）：**取消静默自动填充**——首台网关同样走发现卡片，
+    #     由用户点确认。旧行为（把空 SN 等待条目直接填上 SN 转正）在一次现场
+    #     里被用户判为"静默添加、不可见、像是配置出了问题"；发现链的每一次
+    #     添加都应留下可见的确认动作。等待条目此后只当耳朵：用户确认后由
+    #     `async_remove_awaiting_entries` 清理（见 config_flow 的三个创建口）。
+    #     护栏：继续往下走 4/5/5.5，任一闸命中仍不弹卡（忽略列表/会话去重/冷却）。
+
     # 4. 检查网关是否已在设备注册表中
     device_registry = dr.async_get(hass)
     existing_device = device_registry.async_get_device(
@@ -171,6 +145,34 @@ async def async_discover_gateway(hass: HomeAssistant, gateway_sn: str, gateway_n
     discovery_data.setdefault("announced_gateways", set()).add(gateway_key)
     
     _LOGGER.info("已使用标准发现流程发现网关: %s", gateway_name)
+
+async def async_remove_awaiting_entries(hass: HomeAssistant,
+                                        keep_entry_id: str = None) -> int:
+    """清理零功能「等待条目」（data 无 gateway_sn）——v1.7.62 首台弹卡的配套。
+
+    用户在前台确认添加网关后，那条只为"装耳朵"而存在的空条目再无职责：
+    新条目自带 handler 订阅，多网关场景由各 handler 的"他网关"分支接管
+    （与原"填充转正"路径的最终形态一致，只是改由用户点一下触发）。删除
+    失败只告警——绝不影响刚完成的添加。
+    """
+    removed = 0
+    for entry in list(hass.config_entries.async_entries(DOMAIN)):
+        if keep_entry_id and entry.entry_id == keep_entry_id:
+            continue
+        if entry.data.get(CONF_GATEWAY_SN):
+            continue
+        # E-2 口径：禁用条目是用户决策，慧尖不代劳删除（本函数读 disabled_by，
+        # 已登记进 test_audit_2026_09_30_fixes 的有效站点表——元校验会拦漏声明）
+        if getattr(entry, "disabled_by", None):
+            continue
+        try:
+            await hass.config_entries.async_remove(entry.entry_id)
+            removed += 1
+            _LOGGER.info("已清理等待条目 %s（网关已由用户确认添加）", entry.entry_id)
+        except Exception as e:  # noqa: BLE001 — 清理失败不影响添加结果
+            _LOGGER.warning("清理等待条目失败（不影响添加）: %s", e)
+    return removed
+
 
 async def async_ignore_gateway(hass: HomeAssistant, gateway_sn: str):
     """忽略网关设备"""

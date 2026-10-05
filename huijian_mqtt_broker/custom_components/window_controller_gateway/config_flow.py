@@ -146,6 +146,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="repair", errors={"base": "mqtt_bootstrap_still_pending"})
         return self.async_show_form(step_id="repair")
 
+    def _schedule_awaiting_cleanup(self) -> None:
+        """v1.7.62：用户确认添加网关后，清掉零功能「等待条目」（首台弹卡的配套）。
+
+        三条创建路径（发现卡确认 / 用户填 SN / 连接测试后仍添加）都要过这里；
+        清理是后台任务：条目已创建成功，清理失败也不影响添加结果。
+        """
+        from .discovery import async_remove_awaiting_entries
+        self.hass.async_create_task(async_remove_awaiting_entries(self.hass))
+
     async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
         """Handle user step
 
@@ -211,6 +220,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         errors["base"] = "cannot_connect"
 
                     if not errors:
+                        self._schedule_awaiting_cleanup()
                         return self.async_create_entry(
                             title=gateway_name,
                             data={
@@ -317,6 +327,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for entry in self.hass.config_entries.async_entries(DOMAIN):
                     if entry.data.get(CONF_GATEWAY_SN, "").lower() == gateway_sn.lower():
                         return self.async_abort(reason="already_configured")
+                self._schedule_awaiting_cleanup()
                 return self.async_create_entry(
                     title=gateway_name,
                     data={

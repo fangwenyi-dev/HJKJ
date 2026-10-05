@@ -2071,6 +2071,8 @@ _E2_VALID_SITES = {
     ("utils.py", "entry_state_for_sn"): "单一真源本身",
     ("ws_gateway.py", "ws_gateway_wanted"): "端口/令牌采纳——E-2 案发现场",
     ("ws_gateway.py", "WsGatewayServer._persist_token"): "新令牌不得写进禁用条目",
+    ("discovery.py", "async_remove_awaiting_entries"):
+        "v1.7.62 首台弹卡配套：只清空 SN 等待条目，禁用条目是用户决策不代删",
 }
 _E2_EXISTENCE_SITES = {
     ("__init__.py", "_migrate_devices_async"): "等指定条目 reload 结束",

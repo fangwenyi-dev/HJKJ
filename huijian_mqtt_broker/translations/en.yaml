@@ -62,6 +62,7 @@ configuration:
   fast_auto_discovery:
     name: Fast gateway auto-discovery
     description: >-
-      A first-boot LoRa gateway completes setup automatically (fully
-      automatic for the first unit, confirmation card from the second).
+      A reporting gateway raises a discovery card in "Devices & Services";
+      confirm it to finish setup (since v1.7.62 every unit, including the
+      first, needs this confirmation - no more silent auto-add).
       Keep enabled; disabling requires manual setup in "Integrations".

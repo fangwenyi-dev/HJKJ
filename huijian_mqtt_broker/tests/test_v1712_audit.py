@@ -452,10 +452,11 @@ class TestIgnorePersistence:
         # ignore/unignore 都必须调度落盘
         assert src.count("save_persistent_data(hass)") >= 2, \
             "E-1：忽略/取消忽略未触发持久化"
-        assert 'update_kwargs["unique_id"] = gateway_key' in src, \
-            "E-4：步骤 3.5 自动填充未回填 unique_id"
-        assert "async_entry_for_domain_unique_id" in src, \
-            "E-4：unique_id 占用者判重缺失（撞车即 InvalidData）"
+        assert "async_update_entry(entry" not in src, \
+            "v1.7.62：静默填充（步骤 3.5）已整体移除——首台网关也走发现卡"
+        cf_src = _read(PKG / "config_flow.py")
+        assert "async_entry_for_domain_unique_id" in cf_src, \
+            "E-4：unique_id 占用者判重缺失（撞车即 InvalidData；已迁至 config_flow）"
 
     def test_backup_failure_is_loud(self):
         src = _read(PKG / "persist.py")

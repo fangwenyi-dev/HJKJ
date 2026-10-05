@@ -15,7 +15,7 @@ import custom_components.window_controller_gateway as pkg
 import custom_components.window_controller_gateway.discovery as disc_mod
 import custom_components.window_controller_gateway.ws_gateway as wsg_mod
 from custom_components.window_controller_gateway.const import (
-    DOMAIN, CONF_GATEWAY_NAME, CONF_GATEWAY_SN)
+    DOMAIN, CONF_GATEWAY_SN)
 
 HA_NEVER_LOADED_MSG = "Config entry was never loaded!"
 
@@ -136,16 +136,25 @@ class TestAutoFillSingleReload:
         )
         return hass, calls
 
-    def test_autofill_updates_data_without_explicit_reload(self):
+    def test_awaiting_entry_not_silently_filled_card_instead(self):
+        """v1.7.62（用户裁定）：空 SN 等待条目**不再被静默填充**——首台网关
+        同样弹发现卡（旧 v1.7.11 行为＝不可见添加，现场两次被判为"配置有问题"）。
+        （旧的"填充只经 update listener 单驱动 reload"议题随实现移除而终结。）"""
         hass, calls = self._disc_hass()
+        flows = []
+
+        async def fake_init(domain, context=None, data=None):
+            flows.append({"context": context, "data": data})
+
+        hass.config_entries.flow.async_init = fake_init
+        disc_mod.dr = SimpleNamespace(async_get=lambda h: SimpleNamespace(
+            async_get_device=lambda identifiers=None: None))
         asyncio.run(disc_mod.async_discover_gateway(
             hass, "100122501203", "慧尖网关 1203"))
-        assert len(calls["update"]) == 1
-        upd = calls["update"][0]
-        assert upd[CONF_GATEWAY_SN] == "100122501203"
-        assert upd[CONF_GATEWAY_NAME] == "慧尖网关 1203"
-        assert calls["reload"] == [], \
-            "显式 async_reload 会撞上 update listener 的 reload（双 reload 竞态）"
+        assert calls["update"] == [], "不许再静默填充（首台弹卡）"
+        assert calls["reload"] == []
+        assert len(flows) == 1, "必须走标准发现流（卡片）"
+        assert flows[0]["data"]["gateway_sn"] == "100122501203"
 
     def test_second_gateway_after_fill_gets_flow(self):
         """填充转正后（条目带 SN），第二个网关走标准 discovery flow——
