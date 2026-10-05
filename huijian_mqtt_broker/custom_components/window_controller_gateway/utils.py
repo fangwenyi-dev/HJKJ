@@ -363,13 +363,23 @@ def is_mqtt_loaded(hass: HomeAssistant) -> bool:
 def is_mqtt_connected(hass: HomeAssistant) -> bool:
     """MQTT broker 是否已连接（官方 API，带兼容回退）。
 
-    ``homeassistant.components.mqtt.async_connected(hass)`` 是 2023.5+ 官方
-    辅助函数；旧版不存在时回退为"集成已加载即视为可用"。
+    v1.7.63（对抗复核 C-4）：官方符号是**同步的** ``is_connected(hass)``
+    （HA 2024.12 `components/mqtt/__init__.py:553` 逐字核验）。旧实现 import
+    的 ``async_connected`` **在 HA 里根本不存在** ⇒ 恒走 ImportError 回退到
+    ``is_mqtt_loaded``，"已加载但没连上"判据全线失效（通道卡漏报 disconnected、
+    两条归因 WARNING 永不打印），而假件恰好挂了真机没有的符号把测试喂成全绿。
+    旧版 HA 无该符号时仍回退为"集成已加载即视为可用"。
+
+    v1.7.63（对抗复核 F2）：真 ``is_connected`` 直接读
+    ``hass.data[DATA_MQTT].client.connected``——HA 启动期竞态（条目已列出、
+    data 尚未写入）或条目 setup_error 时抛 **KeyError/AttributeError**，旧
+    except 面接不住 ⇒ 唯一无 try 的消费点（healer 常驻核验）任务静默死亡。
+    结构缺失一律并入回退面（回退函数用 ``.get``，不可能抛）。
     """
     try:
-        from homeassistant.components.mqtt import async_connected
-        return bool(async_connected(hass))
-    except (ImportError, AttributeError):
+        from homeassistant.components.mqtt import is_connected
+        return bool(is_connected(hass))
+    except (ImportError, AttributeError, KeyError):
         return is_mqtt_loaded(hass)
 
 

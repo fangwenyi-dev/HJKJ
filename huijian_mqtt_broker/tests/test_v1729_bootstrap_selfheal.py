@@ -58,6 +58,15 @@ def _mk(monkeypatch, marker_seq, ensure_effects=None):
     monkeypatch.setattr(mb, "_clear_takeover_issue",
                         lambda h: calls.__setitem__("clear", calls["clear"] + 1))
     monkeypatch.setattr(mb, "BOOTSTRAP_RETRY_INTERVAL", 0.0)
+
+    # v1.7.63（C-6）：healer 健康即**常驻**（不再收尾退出）——本组旧钉用
+    # "首轮巡查后按停机收尾"把它收口，计数语义不变（退出改由 sleep/停机驱动）。
+    async def _stop_after_one(hass, delay):
+        # 只对**常驻核验**的睡（1800s 档）返回停机；重试路径 delay=0 照常继续，
+        # 否则旧钉的"三轮 ensure"会被第一轮的停机桩掐断。
+        return delay < 60
+
+    monkeypatch.setattr(mb, "_interruptible_sleep", _stop_after_one)
     return calls
 
 
@@ -136,15 +145,21 @@ class TestWiring:
 
     def test_repair_flow_defined(self):
         src = (PKG / "config_flow.py").read_text(encoding="utf-8")
-        assert "async def async_step_repair" in src
-        assert "mqtt_bootstrap_fixed" in src and "mqtt_bootstrap_still_pending" in src
+        # v1.7.63（对抗复核 C-5）：HA 的修复流**不启动**集成 config flow（只查
+        # repairs 平台）——旧入口 config_flow.async_step_repair 是死代码，已删除；
+        # 真入口迁到 repairs.py（async_create_fix_flow + confirm 步真动作）。
+        rep_src = (PKG / "repairs.py").read_text(encoding="utf-8")
+        assert "async def async_create_fix_flow" in rep_src
+        assert "async_step_confirm" in rep_src and "still_broken" in rep_src
+        assert "async_step_repair" not in src, "死代码必须清掉（假宣称的一部分）"
 
 
 class TestStringsSymmetry:
     KEYS = [
-        ("config", "step", "repair", "title"),
-        ("config", "error", "mqtt_bootstrap_still_pending"),
-        ("config", "abort", "mqtt_bootstrap_fixed"),
+        # v1.7.63：修复流翻译随入口迁到 issues.<id>.fix_flow（HA 修复流契约）
+        ("issues", "mqtt_bootstrap_pending", "fix_flow", "step", "confirm", "description"),
+        ("issues", "mqtt_bootstrap_pending", "fix_flow", "error", "still_broken"),
+        ("issues", "mqtt_channel_broken", "fix_flow", "step", "confirm", "description"),
         ("issues", "mqtt_bootstrap_pending", "title"),
         ("issues", "mqtt_bootstrap_pending", "description"),
     ]

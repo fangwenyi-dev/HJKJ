@@ -717,14 +717,29 @@ if [ -f /usr/bin/mdns_publisher.py ] && command -v python3 >/dev/null 2>&1; then
             # 杀掉，RC=$? 与重启分支永不执行（看门狗形同虚设）。`|| RC=$?`
             # 让失败成为已处理条件，循环才真正活着。
             RC=0
+            MDNS_RUN_START=$(date +%s)
             python3 /usr/bin/mdns_publisher.py "${MQTT_PORT}" || RC=$?
             if [ "${RC}" -eq 0 ]; then
                 echo "[mDNS] 广播进程正常退出，不再重启"
                 break
             fi
+            # v1.7.63（N-1 附带）：稳定运行 ≥60s 视为新的一轮故障——计数归零
+            # （照 mosquitto 自愈循环同款先例），否则长跑后的单次崩溃直接跳到
+            # 已累积的大退避。
+            if [ $(( $(date +%s) - MDNS_RUN_START )) -ge 60 ]; then
+                MDNS_RETRY=0
+            fi
+            # v1.7.63（对抗复核 N-1）：先封顶再移位——bash 算术按 64 位有符号
+            # 回绕，MDNS_RETRY≥61 时 1<<(n-1) 溢出成负数/0（实测 61→-6.9e18、
+            # 64→0），负值过不了下面的 -gt 比较 ⇒ sleep 收负数、看门狗变忙循环
+            # 刷屏。另一处：mDNS 段落在 set +e 区间，子 shell 不继承 errexit。
             MDNS_RETRY=$((MDNS_RETRY + 1))
-            BACKOFF=$((10 * (1 << (MDNS_RETRY - 1))))
-            [ "${BACKOFF}" -gt 600 ] && BACKOFF=600
+            if [ "${MDNS_RETRY}" -ge 7 ]; then
+                BACKOFF=600
+            else
+                BACKOFF=$((10 * (1 << (MDNS_RETRY - 1))))
+                [ "${BACKOFF}" -gt 600 ] && BACKOFF=600
+            fi
             if [ "${RC}" -eq 3 ]; then
                 echo "[mDNS] 广播因**名字冲突**退出（同局域网另一台慧尖加载项占着 huijian.local）——重试不会成功，请按上一行提示二选一处理；${BACKOFF} 秒后再探一次（连续第 ${MDNS_RETRY} 次）"
             else

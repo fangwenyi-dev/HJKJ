@@ -31,7 +31,7 @@ class WindowControllerMQTTHandler(_LifecycleMixin, _ProtocolMixin,
     - ``self.connected``：**网关是否在线**。收到网关上报（001/002/005）置 True，
       网关超时未上报（GATEWAY_TIMEOUT_SECONDS）置 False；重连（重新订阅）成功后
       置 True 代表 MQTT 层就绪，网关真实在线状态由后续上报刷新。
-    - **MQTT broker 是否就绪**：用 ``homeassistant.components.mqtt.async_connected(hass)``
+    - **MQTT broker 是否就绪**：用 ``homeassistant.components.mqtt.is_connected(hass)``
       检查（见 check_connection），与 ``self.connected`` 是两回事。
     - ``pairing_active``：网关是否处于配对模式（与 connected 无关）。
     """

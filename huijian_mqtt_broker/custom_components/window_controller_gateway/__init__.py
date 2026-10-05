@@ -544,7 +544,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     # reload/HA 重启。改为无限期耐心武装（每 120s 一条节流留痕）；
                     # 任务在 _bg_tasks，卸载/reload 统一取消，data_now 双检兜底。
                     _waited = 0
-                    _next_ensure = 0   # 立刻催一次，之后 120→240→480→…封顶 3600s
+                    _ensure_after = 0   # 到达该累计秒数即催一轮（首轮立刻催）
+                    _gap = 120          # 每催一轮后翻倍，封顶 3600s（v1.7.63 C-8）
                     while not await async_wait_mqtt_loaded(hass, timeout=120.0):
                         _waited += 120
                         if hass.data.get(DOMAIN, {}).get(entry.entry_id) is None:
@@ -555,10 +556,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         # 干等，首台网关的自动添加永不成链。ensure 幂等（模块级锁 +
                         # 双重检查），标记不在时是 no-op；标记在位时这是除 healer
                         # 之外唯一的自愈点（healer 无标记只核验不重建）。
-                        # 对抗复核 C2-c：重试带指数退避（120→240→…封顶 3600s），
+                        # 对抗复核 C2-c/C-8：重试带指数退避（120→240→…封顶 3600s），
                         # 与 v1.7.30"接管破坏面不得恒频施压"的纪律同向。
-                        if _waited >= _next_ensure:
-                            _next_ensure = max(120, _next_ensure) * 2
+                        if _waited >= _ensure_after:
+                            # v1.7.63（对抗复核 C-8）：旧式 max(120,x)*2 无界翻倍
+                            # （注释承诺的 3600s 封顶并不存在）——改"绝对时刻 +
+                            # 间隔封顶"：120→240→…→3600，之后每 3600s 催一次。
+                            _ensure_after = _waited + _gap
+                            _gap = min(_gap * 2, 3600)
                             try:
                                 from .mqtt_bootstrap import ensure_mqtt_connection
                                 await ensure_mqtt_connection(hass)
@@ -1069,6 +1074,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
                     _LOGGER.debug("注销服务 %s 失败（可能未注册）: %s",
                                   _svc_name, _svc_err)
             _LOGGER.info("全部条目已删除，域级服务已注销")
+            # v1.7.63（C-10）：全部条目被删 ⇒ 两张诊断卡一并清掉（healer 此后
+            # 不再运行，僵尸卡无人清）
+            try:
+                from .mqtt_bootstrap import _clear_channel_issue, _clear_mdns_issue
+                _clear_channel_issue(hass)
+                _clear_mdns_issue(hass)
+            except Exception as _ir_err:  # noqa: BLE001 — 可见性面失败不影响删除
+                _LOGGER.debug("清理诊断卡失败（不影响删除结果）: %s", _ir_err)
     except Exception as e:  # noqa: BLE001
         _LOGGER.debug("服务注销检查失败（不影响删除结果）: %s", e)
 

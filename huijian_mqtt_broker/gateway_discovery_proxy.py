@@ -130,7 +130,14 @@ class DiscoveryProxy:
     ACK_EVIDENCE_TTL = 90.0
 
     def _instance_uuid(self):
-        if self._uuid is None and self._read_uuid is not None:
+        """读实例指纹；**空结果不缓存**（v1.7.63 对抗复核 C-3）。
+
+        代理先起、集成 setup 后落盘 instance 文件是常规时序：旧实现第一次读到
+        "文件不存在"就把 "" 永久缓存，此后本进程内 001 永不代答（注释承诺的
+        "等集成落盘"不成立，需重启代理才恢复）。空结果保持待读，下一帧重试
+        ——一次文件读，代价可忽略。
+        """
+        if not self._uuid and self._read_uuid is not None:
             try:
                 self._uuid = self._read_uuid() or ""
             except Exception:  # noqa: BLE001
@@ -156,8 +163,22 @@ class DiscoveryProxy:
         seen[str(msg_id)] = now
         # HA 有新鲜应答 = 通道活着 → 解除该 SN 的"失聪"态并清空请求积压
         #（代理立即停手；若 HA 再度静默，需重新积累两轮未答才接管）
-        self._ha_deaf.pop(parts[1], None)
-        self._req_ids.pop(parts[1], None)
+        # v1.7.63（C-2）：**自答甄别**——标准 MQTT 3.1.1 无 no-local，本代理发出的
+        # 兜底应答会被 broker 回送给同一订阅者（本代理正订着 gateway/+/req）；它
+        # 不构成"HA 有应答"的证据，旧实现据此每答一帧清一次失聪态，退化成隔帧
+        # 才答（实测 [101,103,105]）。
+        # v1.7.63（对抗复核 F1）：回声必须**按次消费**，不能在记账期内一律不解除
+        # ——HA 的真应答与重发帧同 id（utils 的 ack 逐字回带请求 id），若把记账期内
+        # 所有同 id 帧都当自答吞掉，HA 恢复后它的每一条真应答都会被忽略 ⇒ 失聪态
+        # 永驻、代理对每帧双答（比原缺陷更重）。本代理每条自答经 broker 恰回送一
+        # 帧：第一帧消费记账（= 回声），此后同 (sn,id) 再现一帧只可能是 HA 自己
+        # 的真应答 ⇒ 解除失聪态。
+        key = (parts[1], str(msg_id))
+        if key in self._self_acked:
+            self._self_acked.pop(key, None)   # 消费"本代理自答回声"这一帧
+        else:
+            self._ha_deaf.pop(parts[1], None)
+            self._req_ids.pop(parts[1], None)
         for stale in [k for k, ts in seen.items() if now - ts > self.ACK_EVIDENCE_TTL]:
             seen.pop(stale, None)
 
@@ -214,14 +235,19 @@ class DiscoveryProxy:
         if ctype == "001":
             body["uuid"] = uuid  # 001 应答必带指纹（与 _handle_ctype_001 同形）
         ack = {"head": "$SH", "ctype": ctype, "id": msg_id, "sn": sn, "data": body}
+        # v1.7.63（C-2 时序半条）：**先记账再发布**——自答经 broker 回送（无
+        # no-local）在发布调用内部就可能到达 _note_downlink，后置记账会让那一帧
+        # 认不出来、照样清掉失聪态。发布失败则撤销记账（与仲裁撤销同语义）。
+        self._self_acked[key] = now
         try:
             ok = self._pub_ack(sn, ack) is not False
         except Exception as e:  # noqa: BLE001 — 代答失败绝不反噬主循环
+            self._self_acked.pop(key, None)
             self._log(f"[发现代理] {ctype} 代答发布异常（忽略该帧）: {e}")
             return
         if not ok:
+            self._self_acked.pop(key, None)
             return
-        self._self_acked[key] = now
         for stale in [k for k, ts in self._self_acked.items()
                       if now - ts > self.ACK_EVIDENCE_TTL]:
             self._self_acked.pop(stale, None)
@@ -332,7 +358,10 @@ class DiscoveryProxy:
                 # /broker 拒连时照样打"已重放上报×2"假日志；且 _replayed 在
                 # 发布**前**消费掉该 SN，失败后网关心跳再报也永不重试，
                 # 卡片永远不出。显式 False 才算失败（None=旧测试桩视为成功）。
-                ok1 = self._pub(raw.strip())
+                # v1.7.63（对抗复核 C-1）：-v 之后 raw 是 "topic payload"，
+                # 重放必须只发 payload_raw——旧行把主题前缀一起发出去，
+                # 集成侧 json.loads 必失败（发现卡不出），日志还照打假成功。
+                ok1 = self._pub(payload_raw.strip())
                 if ok1 is False:
                     self._log("[发现代理] 重放发布失败（mosquitto_pub 被拒/不可用），"
                               "本 SN 不记账，随下一条上报重试")
@@ -340,7 +369,7 @@ class DiscoveryProxy:
                 self._replayed.add(sn)
                 try:
                     self._sleep(3.0)
-                    self._pub(raw.strip())
+                    self._pub(payload_raw.strip())
                 except Exception:
                     pass
                 self._log("[发现代理] 已重放上报×2，集成内部发现链应弹出网关卡片")

@@ -173,3 +173,27 @@ class TestBootstrap:
         p.handle_line("garbage")
         p.handle_line(json.dumps({"head": "$SH", "ctype": "003", "sn": "100122501203"}))
         assert pubs == []
+
+
+# ============ v1.7.63 对抗复核 C-1：-v 行的重放载荷不许带主题前缀 ============
+
+class TestReplayPayloadHygiene:
+    """本批新增 `-v`（行首带主题）后，重放分支仍用**整行** raw ⇒ 载荷变成
+    `"gateway/rpt_rsp {json}"`，集成侧 json.loads 必失败、发现卡不出。
+    历次单测喂纯 JSON（topic=None）永不进入该缺陷形态——本组钉走 verbose 行。"""
+
+    def test_verbose_line_replay_is_clean_json(self):
+        p, pubs, log, _ = _proxy(entries=[])
+        p.handle_line("gateway/rpt_rsp " + FIELD_005)
+        assert len(pubs) == 2, "首报仍要重放两次（立即 + 3s 兜底）"
+        for raw in pubs:
+            payload = json.loads(raw)          # 不许再抛（旧实现丢主题前缀）
+            assert payload["sn"] == "100122501203"
+        assert gdp.parse_report(pubs[0]) == ("100122501203", "005"), \
+            "重放载荷必须能被集成侧同形解析器认出来"
+
+    def test_plain_payload_replay_unchanged(self):
+        """反向臂：纯 payload 形态（旧注入/旧测试）行为不变。"""
+        p, pubs, _, _ = _proxy(entries=[])
+        p.handle_line(FIELD_005)
+        assert len(pubs) == 2 and json.loads(pubs[0])["sn"] == "100122501203"

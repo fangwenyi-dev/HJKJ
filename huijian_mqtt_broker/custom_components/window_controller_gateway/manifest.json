@@ -1,7 +1,7 @@
 {
   "domain": "window_controller_gateway",
   "name": "慧尖开窗器网关",
-  "version": "1.7.62",
+  "version": "1.7.63",
   "config_flow": true,
   "documentation": "https://github.com/fangwenyi-dev/ha-gateway-plugin",
   "issue_tracker": "https://github.com/fangwenyi-dev/ha-gateway-plugin/issues",

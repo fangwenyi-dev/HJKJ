@@ -292,3 +292,43 @@ def test_arm_retry_backs_off(tmp_path, monkeypatch):
     # + 武装循环按 120→240→480s 退避在 r1/r2/r4 各催 1 次 = 4；若写成"每轮都催"
     # 会是 1+6=7。
     assert ensure_calls["n"] == 4, f"期望 1(安装期)+3(退避) 次，实得 {ensure_calls['n']}"
+
+
+def test_arm_retry_backoff_caps_at_3600(tmp_path, monkeypatch):
+    """C-8（对抗复核）：注释承诺"封顶 3600s"，旧实现 `max(120,x)*2` 无界翻倍。
+    跑 70 轮（8400s）：催促点应落在 120/240/480/960/1920/3840/7440，
+    最后一段间隔恰为 3600（封顶生效），且任何一段都不许超过它。"""
+    import custom_components.window_controller_gateway.ws_gateway as wsg
+
+    async def noop(h):
+        return None
+
+    monkeypatch.setattr(pkg, "save_persistent_data", noop)
+    monkeypatch.setattr(wsg, "async_ensure_ws_gateway", noop)
+
+    rounds = {"n": 0}
+    calls_at = []
+
+    async def fake_ensure(hass):
+        calls_at.append(rounds["n"] * 120)   # 记录催促时刻（秒）
+
+    async def fake_wait(hass, timeout=120.0, interval=0.5):
+        rounds["n"] += 1
+        return rounds["n"] > 70
+
+    monkeypatch.setattr(mb, "ensure_mqtt_connection", fake_ensure)
+    monkeypatch.setattr(pkg_utils, "async_wait_mqtt_loaded", fake_wait)
+
+    hass = _arm_hass(tmp_path)
+    entry = _Entry()
+
+    async def go():
+        hass.loop = asyncio.get_running_loop()
+        await pkg.async_setup_entry(hass, entry)
+        await asyncio.sleep(0.3)
+
+    asyncio.run(go())
+    arm_calls = [t for t in calls_at if t > 0]      # 去掉安装期那一次（t=0）
+    assert arm_calls == [120, 240, 480, 960, 1920, 3840, 7440], arm_calls
+    gaps = [b - a for a, b in zip(arm_calls, arm_calls[1:])]
+    assert max(gaps) == 3600, f"末段必须封顶 3600，实得 {gaps}"

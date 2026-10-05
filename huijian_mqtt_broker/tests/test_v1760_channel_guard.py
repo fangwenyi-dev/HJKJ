@@ -21,7 +21,6 @@ import pytest
 
 import homeassistant.components.mqtt as fake_mqtt
 import custom_components.window_controller_gateway.mqtt_bootstrap as mb
-import custom_components.window_controller_gateway.config_flow as cf_mod
 from custom_components.window_controller_gateway.const import DOMAIN
 
 PKG = Path(__file__).resolve().parents[1] / "custom_components" / "window_controller_gateway"
@@ -88,7 +87,7 @@ def test_verify_mismatch_when_pointing_elsewhere(tmp_path):
 
 def test_verify_disconnected(tmp_path, monkeypatch):
     hass = _VerHass(tmp_path, [_mqtt_entry()])
-    monkeypatch.setattr(fake_mqtt, "async_connected", lambda hass: False)
+    monkeypatch.setattr(fake_mqtt, "is_connected", lambda hass: False)
     assert asyncio.run(mb.verify_builtin_channel(hass)) == "disconnected"
 
 
@@ -147,8 +146,9 @@ def test_healer_stays_and_reports_when_channel_broken(tmp_path, monkeypatch):
         "通道故障必须出可修复的 HA 修复条目（可见可修）"
 
 
-def test_healer_exits_only_when_channel_ok(tmp_path, monkeypatch):
-    """标记已删 + 不变量成立：清卡片退出（原语义保留）。"""
+def test_healer_healthy_clears_card(tmp_path, monkeypatch):
+    """标记已删 + 不变量成立：清卡片；v1.7.63（C-6）起 healer 常驻，
+    收尾改由"停机/启用条目清零"驱动——本钉用停机桩收口，清卡语义不变。"""
     from homeassistant.helpers import issue_registry as ir
     ir.ISSUES_DELETED.clear()
     hass = _HealHass(tmp_path, [_mqtt_entry()])
@@ -158,7 +158,11 @@ def test_healer_exits_only_when_channel_ok(tmp_path, monkeypatch):
     async def no_marker(h):
         return False
 
+    async def stop_now(h, delay):
+        return delay < 60   # 只收口常驻核验的睡（1800s 档）
+
     monkeypatch.setattr(mb, "has_bootstrap_marker", no_marker)
+    monkeypatch.setattr(mb, "_interruptible_sleep", stop_now)
     _run_healer(hass)
     assert (DOMAIN, mb.CHANNEL_ISSUE_ID) in ir.ISSUES_DELETED
     assert hass.data[DOMAIN]["_bootstrap_healer"] is None
@@ -166,9 +170,17 @@ def test_healer_exits_only_when_channel_ok(tmp_path, monkeypatch):
 
 # ============ 三、代理 001 兜底应答（用户点名：应该回复这条就够了） ============
 
-def _proxy(publish_ack=None, read_uuid=None):
+def _proxy(publish_ack=None, read_uuid=None, echo_back=False):
     pubs, logs, acks = [], [], []
     clock = {"t": 1000.0}
+
+    def _pub_ack(sn, payload):
+        acks.append((sn, payload))
+        if echo_back:
+            # 标准 MQTT 3.1.1 无 no-local：本代理订着 gateway/+/req，
+            # broker 必然把它自己的应答回送过来（C-2 的现场形态）。
+            p._note_downlink(f"gateway/{sn}/req", json.dumps(payload))
+        return True
 
     p = gdp.DiscoveryProxy(
         lambda: [{"domain": DOMAIN, "state": "loaded"}],   # 耳朵已在 → 纯观察
@@ -177,8 +189,7 @@ def _proxy(publish_ack=None, read_uuid=None):
         now=lambda: clock["t"],
         log=logs.append,
         sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
-        publish_ack=(None if publish_ack is None else
-                     (lambda sn, payload: acks.append((sn, payload)) or True)),
+        publish_ack=(None if publish_ack is None else _pub_ack),
         read_uuid=read_uuid,
     )
     return p, pubs, logs, acks, clock
@@ -308,6 +319,58 @@ def test_ack_guard_off_without_injection():
     assert acks == []
 
 
+def test_ack_guard_picks_up_uuid_when_file_arrives_later():
+    """C-3（对抗复核，实测复现）：代理先起、集成 setup 后落盘指纹文件是常规时序
+    ——旧实现第一次读到"文件不存在"就把 "" 永久缓存，此后本进程内 001 永不代答。
+    修后：空结果不缓存，文件就位后立刻可答。"""
+    state = {"u": None}
+    p, _, _, acks, _ = _proxy(publish_ack=True, read_uuid=lambda: state["u"])
+    p.handle_line(_req001(100))
+    p.handle_line(_req001(101))          # 首次真读 → 空（旧实现在此把 "" 缓存）
+    assert acks == []
+    state["u"] = UUID                    # 集成随后落盘
+    p.handle_line(_req001(102))
+    p.handle_line(_req001(103))
+    assert acks and acks[-1][1]["id"] == 103,         "指纹文件就位后必须立刻能代答（旧实现需重启代理才恢复）"
+
+
+def test_self_ack_echo_does_not_clear_deaf_state():
+    """C-2（对抗复核，实测复现）：本代理的兜底应答会被 broker 回送给同一订阅者
+    ——旧实现把回送的自答也当"HA 有应答"证据，每答一帧清一次失聪态 ⇒ 隔帧才答。
+    修后：自答不构成 HA 存活证据，上行 100..105 应得到 101..105 每帧一答。"""
+    p, _, _, acks, _ = _proxy(publish_ack=True, read_uuid=lambda: UUID, echo_back=True)
+    for i in range(100, 106):
+        p.handle_line(_req001(i))
+    assert [a[1]["id"] for a in acks] == [101, 102, 103, 104, 105],         "每帧都要被代答（旧实现 [101,103,105] 隔帧）"
+
+
+def test_real_ha_ack_still_clears_deaf_state():
+    """反向臂：**非自答**的 req 帧（真 HA 的应答）仍须解除失聪态、代理停手。"""
+    p, _, _, acks, _ = _proxy(publish_ack=True, read_uuid=lambda: UUID)
+    p.handle_line(_req001(100))
+    p.handle_line(_req001(101))          # 判失聪 → 代答 101
+    assert len(acks) == 1
+    p.handle_line('gateway/%s/req {"head":"$SH","ctype":"001","id":999,"sn":"%s",'
+                  '"data":{"errcode":0,"uuid":"x"}}' % (GW, GW))   # 真 HA 的应答
+    p.handle_line(_req001(102))
+    assert len(acks) == 1, "HA 活着 ⇒ 代理停手（自答甄别不许做成「永不停手」）"
+
+
+def test_ha_true_ack_with_self_acked_id_still_clears_deaf():
+    """F1（对抗复核，本机复现）：HA 的真应答与请求**同 id**（ack 逐字回带请求
+    id；网关重发也用同 id）——若把记账期内所有同 id 帧都当自答吞掉，HA 恢复后
+    它的每一条真应答都会被忽略 ⇒ 失聪态永驻、代理对每帧双答（比 C-2 原缺陷
+    更重）。修后语义：回声按次消费，同 id 的第二帧必是 HA 真应答 ⇒ 停手。"""
+    p, _, _, acks, _ = _proxy(publish_ack=True, read_uuid=lambda: UUID, echo_back=True)
+    p.handle_line(_req001(100))
+    p.handle_line(_req001(101))          # 判失聪 → 代答 101 + broker 回声一帧
+    assert len(acks) == 1
+    p.handle_line('gateway/%s/req {"head":"$SH","ctype":"001","id":101,"sn":"%s",'
+                  '"data":{"errcode":0,"uuid":"x"}}' % (GW, GW))   # HA 对同 id 101 的真应答
+    p.handle_line(_req001(102))
+    assert len(acks) == 1, "HA 已恢复（同 id 真应答）⇒ 代理必须停手（不许永不停手）"
+
+
 def test_verbose_topic_lines_still_parse():
     """mosquitto_sub -v 的行("topic payload")由代理剥主题再解析；纯 payload 形态
     （旧测试/旧 argv）继续吃。带主题的整行不能直接喂 parse_report。"""
@@ -342,7 +405,7 @@ def test_awaiting_entry_loaded_but_deaf_is_loud(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(fake_mqtt, "async_subscribe", asub)
     monkeypatch.setattr(fake_mqtt, "async_publish",
                         lambda *a, **k: asyncio.sleep(0))
-    monkeypatch.setattr(fake_mqtt, "async_connected", lambda hass: False)
+    monkeypatch.setattr(fake_mqtt, "is_connected", lambda hass: False)
 
     async def noop_save(hass):
         return None
@@ -410,38 +473,51 @@ class _FlowStub:
         return {"type": "form", "errors": errors}
 
 
-def test_repair_flow_channel_issue_uses_channel_verdict(monkeypatch):
-    """通道修复条目：判据必须是 verify_builtin_channel（标记早已被删，
-    用标记判据会把"没修好"误报成"已修好"）。"""
-    async def fake_ensure(hass):
-        return None
+def test_repair_flow_channel_issue_uses_channel_verdict():
+    """v1.7.63（对抗复核 C-5）：修复入口迁到 repairs.py 的 RepairsFlow（HA 契约）
+    ——通道条目的判据必须是 verify_builtin_channel（标记早已被删，标记判据会把
+    "没修好"误报成"已修好"）。真 flow 实例 + 只桩表单面驱动。"""
+    import custom_components.window_controller_gateway.repairs as rep_mod
 
-    async def fake_marker(hass):
-        return False
+    class _Rec:
+        def __init__(self):
+            self.forms, self.created = [], []
 
-    async def ok_verdict(hass):
-        return "ok"
+        def show_form(self, step_id=None, data_schema=None, errors=None,
+                      description_placeholders=None):
+            self.forms.append({"step_id": step_id, "errors": errors})
+            return {"type": "form", "step_id": step_id, "errors": errors}
 
-    monkeypatch.setattr(mb, "ensure_mqtt_connection", fake_ensure)
-    monkeypatch.setattr(mb, "has_bootstrap_marker", fake_marker)
-    monkeypatch.setattr(mb, "verify_builtin_channel", ok_verdict)
-    async def _drive(stub):
-        await cf_mod.ConfigFlow.async_step_repair(stub, {"submit": True})
+        def create_entry(self, title="", data=None):
+            self.created.append(data or {})
+            return {"type": "create_entry"}
 
-    stub = _FlowStub({"issue_id": mb.CHANNEL_ISSUE_ID})
-    stub.hass = SimpleNamespace()
-    asyncio.run(_drive(stub))
-    assert stub.aborted == ["mqtt_bootstrap_fixed"]
+    async def _run(verdict):
+        async def fake_ensure(h):
+            return None
 
-    async def bad_verdict(hass):
-        return "mismatch"
+        async def fake_verify(h):
+            return verdict
 
-    monkeypatch.setattr(mb, "verify_builtin_channel", bad_verdict)
-    stub2 = _FlowStub({"issue_id": mb.CHANNEL_ISSUE_ID})
-    stub2.hass = SimpleNamespace()
-    asyncio.run(_drive(stub2))
-    assert stub2.aborted == []
-    assert stub2.forms and stub2.forms[0][1] == {"base": "mqtt_bootstrap_still_pending"}
+        # 模块级 from-import：必须打 rep_mod 上的绑定（打 mb.* 无效）
+        rep_mod.ensure_mqtt_connection = fake_ensure
+        rep_mod.verify_builtin_channel = fake_verify
+        rec = _Rec()
+        flow = rep_mod.GatewayRepairFlow()
+        flow.hass = SimpleNamespace()
+        flow.issue_id = mb.CHANNEL_ISSUE_ID
+        flow.data = {}
+        flow.async_show_form = rec.show_form
+        flow.async_create_entry = rec.create_entry
+        await flow.async_step_init()
+        await flow.async_step_confirm({"submit": True})
+        return rec
+
+    ok = asyncio.run(_run("ok"))
+    assert ok.created == [{}], "核验通过 ⇒ create_entry（HA 由此删卡）"
+    bad = asyncio.run(_run("mismatch"))
+    assert bad.created == [] and bad.forms[-1]["errors"] == {"base": "still_broken"}, \
+        "核验未过 ⇒ 回显错误、不删卡（旧标记判据会把没修好误报成已修好）"
 
 
 # ============ 六、mDNS 撞名（用户裁定 B：不改名，只响亮） ============
@@ -545,6 +621,6 @@ def test_wiring_pins():
     heal_src = (PKG / "mqtt_bootstrap.py").read_text(encoding="utf-8")
     assert heal_src.count("verify_builtin_channel(hass)") >= 1, \
         "healer 常驻核验必须接上 verify_builtin_channel"
-    cf_src = (PKG / "config_flow.py").read_text(encoding="utf-8")
-    assert "verify_builtin_channel(self.hass)" in cf_src, \
-        "通道修复条目的一键修必须用通道核验判据（标记判据会误报已修好）"
+    rep_src = (PKG / "repairs.py").read_text(encoding="utf-8")
+    assert "verify_builtin_channel(self.hass)" in rep_src, \
+        "通道修复条目的一键修必须用通道核验判据（标记判据会误报已修好；v1.7.63 起入口在 repairs.py）"

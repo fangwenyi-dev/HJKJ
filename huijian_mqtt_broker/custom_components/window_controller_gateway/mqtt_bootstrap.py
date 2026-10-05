@@ -168,6 +168,37 @@ def _read_endpoint_sync(path: str) -> Optional[Dict[str, Any]]:
     return {"broker": str(data["broker"]), "port": port}
 
 
+async def _probe_endpoint(hass: HomeAssistant) -> tuple:
+    """端点文件三态探针（v1.7.63 C-7）：("no_endpoint", None) 缺失 /
+    ("endpoint_broken", None) 存在但读不出或无 broker 字段 / ("ok", data) 可用。
+
+    旧实现把"缺失/损坏"都并成 None ⇒ 卡片误清 + 核验静默关闭（文件被截断时
+    通道其实可能仍是坏的）。状态与数据一次读出，避免双读竞态。
+    """
+    try:
+        path = hass.config.path(ENDPOINT_FILENAME)
+    except Exception:  # noqa: BLE001 — 无 config 面（测试替身）
+        return "no_endpoint", None
+    executor = getattr(hass, "async_add_executor_job", None)
+
+    def _sync():
+        if not os.path.isfile(path):
+            return "no_endpoint", None
+        data = _read_endpoint_sync(path)
+        if data is None:
+            return "endpoint_broken", None
+        return "ok", data
+
+    try:
+        if callable(executor):
+            return await executor(_sync)
+        return _sync()
+    except Exception:  # noqa: BLE001 — v1.7.63（对抗复核 F5）：探针本体逃逸＝
+        # 无结论（probe_error ⇒ 走 guard 不清卡）；折成 no_endpoint 会被 healer
+        # 当"通过"清卡并永久关核验——与 C-7"判定面坏不误清"自相矛盾。
+        return "probe_error", None
+
+
 async def async_read_endpoint(hass: HomeAssistant) -> Optional[Dict[str, Any]]:
     try:
         path = hass.config.path(ENDPOINT_FILENAME)
@@ -199,6 +230,14 @@ async def async_read_mdns_status(hass: HomeAssistant) -> Optional[Dict[str, Any]
     return data if isinstance(data, dict) else None
 
 
+def _clear_mdns_issue(hass: HomeAssistant) -> None:
+    try:
+        from homeassistant.helpers import issue_registry as ir
+        ir.async_delete_issue(hass, DOMAIN, MDNS_ISSUE_ID)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("清除 mDNS 撞名提示卡失败（卡片可能滞留）: %s", err)
+
+
 async def _mdns_guard(hass: HomeAssistant) -> None:
     """mDNS 撞名提示卡（v1.7.60，用户裁定的 B 方案：不改名、只响亮）。
 
@@ -222,7 +261,7 @@ async def _mdns_guard(hass: HomeAssistant) -> None:
                 },
             )
         else:
-            ir.async_delete_issue(hass, DOMAIN, MDNS_ISSUE_ID)
+            _clear_mdns_issue(hass)
     except Exception as err:  # noqa: BLE001 — 可见性面失败不影响自愈主流程
         _LOGGER.warning("mDNS 撞名提示卡更新失败（丢可见性）: %s", err)
 
@@ -239,21 +278,29 @@ async def verify_builtin_channel(hass: HomeAssistant) -> str:
     可周期核验的真源。
 
     返回（全部为只读判定）：
-    - ``no_endpoint``  ：无端点文件（HACS 独立安装/关掉自动配置）→ 无判定依据，
-      按"不打断既有语义"处理（收尾退出，不报警）
-    - ``ok``           ：存在启用条目、地址匹配、客户端已连接
-    - ``no_entry``     ：端点文件在，但没有任何启用中的 MQTT 条目
-    - ``mismatch``     ：条目在，但指向的 broker:port 不是内置端点
-    - ``disconnected`` ：条目地址正确，但客户端尚未连上（broker 未起/凭据被拒）
+    - ``no_endpoint``    ：无端点文件（HACS 独立安装/关掉自动配置）→ 无判定依据，
+      按"不打断既有语义"处理（不报警）
+    - ``endpoint_broken``：端点文件**存在但读不出/无 broker 字段**（v1.7.63 C-7：
+      旧实现与"缺失"混为一谈 ⇒ 卡被误清且核验关闭）。按"判定面坏了"处理：不清卡
+    - ``probe_error``    ：条目表读取抛错（v1.7.63 C-7：旧实现归 no_endpoint 会
+      把"探针坏了"当"通过"）。保守：不清卡
+    - ``ok``             ：存在启用条目、地址匹配、客户端已连接
+    - ``no_entry``       ：端点文件在，但没有任何启用中的 MQTT 条目
+    - ``ignored_only``   ：只剩 source=ignore（永不加载）的条目
+    - ``mismatch``       ：条目在，但指向的 broker:port 不是内置端点
+    - ``disconnected``   ：条目地址正确，但客户端尚未连上（broker 未起/凭据被拒）
     """
-    endpoint = await async_read_endpoint(hass)
-    if not endpoint:
-        return "no_endpoint"
+    state, endpoint = await _probe_endpoint(hass)
+    if state != "ok":
+        return state   # missing → no_endpoint；broken → endpoint_broken
     exp_broker, exp_port = endpoint["broker"], int(endpoint["port"])
     try:
         raw_entries = hass.config_entries.async_entries("mqtt")
-    except Exception:  # noqa: BLE001 — 判定面不可读时不误报
-        return "no_endpoint"
+    except Exception as e:  # noqa: BLE001 — 判定面不可读：不是"通过"，是"没探到"
+        from .utils import log_throttled
+        log_throttled(hass, "_channel_probe_err", "entries", 600.0, _LOGGER.warning,
+                      "MQTT 条目表读取失败，通道核验本轮无结论（不误清卡）: %s", e)
+        return "probe_error"
     entries = _usable_mqtt_entries(raw_entries)
     if not entries:
         # v1.7.61：只有 source=ignore 条目——永不加载，给专门判词（卡片归因准确）
@@ -720,7 +767,9 @@ async def _interruptible_sleep(hass: HomeAssistant, delay: float) -> bool:
 def _report_takeover_issue(hass: HomeAssistant) -> None:
     """B：把"引导未完成"升为 HA 修复条目（设置→系统→问题），带一键重试。
 
-    静默失败 → 可见可修；fix flow 由 config_flow.async_step_repair 承接。
+    静默失败 → 可见可修；fix flow 由 **repairs.py**（async_create_fix_flow →
+    GatewayRepairFlow）承接——v1.7.63 订正：HA 的修复流不启动集成自己的
+    config flow，旧入口 config_flow.async_step_repair 从未被调用过。
     issue registry 不可用（异常/老版本）只丢可见性，不影响自愈主循环。
     """
     try:
@@ -731,8 +780,9 @@ def _report_takeover_issue(hass: HomeAssistant) -> None:
             # inspect 双臂验证 unexpected keyword 'is_fix_flow' + 官方
             # repairs 文档同口径。旧臆造名使本函数**每次都 TypeError 被下面
             # except 吞成 DEBUG**：修复条目自 v1.7.29 起从未出过卡，
-            # async_step_repair 整面不可达，healer 告警文案把用户指向
-            # 一个不存在的入口。签名复制品守卫见
+            # 修复入口整面不可达（v1.7.63 另证实：即使卡片出了，HA 也只
+            # 走 ConfirmRepairFlow——入口须在 repairs.py，见该文件头注释），
+            # healer 告警文案把用户指向一个不存在的入口。签名复制品守卫见
             # tests/conftest.py:issue_registry + test_v1731。
             is_fixable=True,
             severity="warning",
@@ -759,8 +809,8 @@ def _report_channel_issue(hass: HomeAssistant, verdict: str) -> None:
     v1.7.60 定线：**只报障 + 一键修，不主动接管**。条目可能承载用户/其他
     加载项的连接（官方 Mosquitto/EMQX），静默改写是破坏性动作（v1.7.30 已
     就"接管破坏面"定过案）；本修复只负责让故障可见可修——修复流走
-    config_flow.async_step_repair，可执行的动作是"重启慧尖加载项后重试"
-    （重启会重写引导标记，接管分支即可把条目改回内置端点）。
+    repairs.py：提交即重跑一轮 ensure + 通道核验（真动作；v1.7.63 前
+    卡上的"点提交重试"是空操作——HA 走 ConfirmRepairFlow 只删卡）。
     """
     try:
         from homeassistant.helpers import issue_registry as ir
@@ -790,6 +840,12 @@ async def _channel_guard(hass: HomeAssistant, verdict: str) -> None:
     （重启重写引导标记 → 接管分支把条目改回内置端点）。绝不反噬主流程。
     """
     detail = {
+        "endpoint_broken": ("端点文件存在但读不出（被截断/改坏）——无法核验 HA 是否"
+                            "仍连在内置 Broker 上；请检查 HA 配置目录下 "
+                            "window_controller_gateway_mqtt_endpoint.json（或重装/"
+                            "重启慧尖加载项重建它）"),
+        "probe_error": ("MQTT 条目表本轮读不到（HA 侧瞬时异常）——核验无结论；"
+                        "若持续出现请查 HA 日志"),
         "no_entry": "HA 里没有启用中的 MQTT 配置条目",
         "ignored_only": ("HA 里只有被忽略（source=ignore，永不加载）的 MQTT 条目"
                          "——请到 设置→设备与服务 删除它，或直接添加一次 MQTT 集成"),
@@ -851,6 +907,12 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
             while True:
                 if getattr(hass, "is_stopping", False) or \
                         _enabled_huijian_entry_count(hass) == 0:
+                    # v1.7.63（C-10）：收尾前清卡——否则"通道坏 → 出卡 → 用户
+                    # 禁用慧尖条目"后 healer 不再运行，僵尸卡永留（即便 MQTT 被
+                    # 改回内置端点也无人清）。停机路径不清（避免关机刷屏）。
+                    if not getattr(hass, "is_stopping", False):
+                        _clear_channel_issue(hass)
+                        _clear_mdns_issue(hass)
                     return  # 宿主停机 / 启用条目已清空（v1.7.31 A-3：
                             # 禁用不再把 healer 骗成永续巡查——BUG-5 同口径）
                 if not await has_bootstrap_marker(hass):
@@ -860,8 +922,22 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                     # 凭据失配时，慧尖永不复查/告警/自愈。现场形态：网关仍在
                     # 上报（broker 侧可见），HA 侧零订阅者 ⇒ 001 无人应答
                     # （固件 5s 重发不止血）+ 发现卡永不出，日志全绿。
-                    # 改为常驻低频核验：不变量成立（或无判定依据）才收尾。
-                    verdict = await verify_builtin_channel(hass)
+                    # v1.7.63（C-6）：**真常驻**——健康也睡 30 分钟再复查，
+                    # 只有停机/启用条目清零才收尾（旧实现"健康即 return"是
+                    # 一次性核验，docstring/CHANGELOG 宣称的"此后被抢走也复查"
+                    # 并不成立；mDNS 卡也因此只在那一次被查）。
+                    # v1.7.63（对抗复核 F2）：核验本体任何逃逸都不得杀死常驻
+                    # healer（v1.7.61 S2"巡检任务静默死亡"同族）——按"无结论"
+                    # 处理：不清卡、走 guard 留痕、继续循环。
+                    try:
+                        verdict = await verify_builtin_channel(hass)
+                    except Exception as err:  # noqa: BLE001 — 按无结论处理
+                        verdict = "probe_error"
+                        from .utils import log_throttled
+                        log_throttled(hass, "_channel_verify_err", "verify",
+                                      600.0, _LOGGER.warning,
+                                      "MQTT 通道核验异常（按无结论处理，不清卡）: %s",
+                                      err)
                     # 标记已删 = 引导已落地，旧"引导未落地"卡片语义终结
                     _clear_takeover_issue(hass)
                     # mDNS 撞名提示（独立于通道核验：即便通道全绿，第二台 HA
@@ -869,8 +945,8 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                     await _mdns_guard(hass)
                     if verdict in ("ok", "no_endpoint"):
                         _clear_channel_issue(hass)
-                        return  # 引导已落地且通道核验通过（或无判定依据）
-                    await _channel_guard(hass, verdict)
+                    else:
+                        await _channel_guard(hass, verdict)
                     if not await _interruptible_sleep(hass, CHANNEL_VERIFY_INTERVAL):
                         return
                     continue

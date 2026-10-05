@@ -39,6 +39,7 @@ ha_components_binary_sensor = _pkg("homeassistant.components.binary_sensor")
 ha_components_sensor = _pkg("homeassistant.components.sensor")
 ha_components_cover = _pkg("homeassistant.components.cover")
 ha_components_number = _pkg("homeassistant.components.number")
+ha_components_repairs = _pkg("homeassistant.components.repairs")
 
 
 # ---- core ----
@@ -307,7 +308,9 @@ ha_helpers_issue.ISSUES_DELETED = ISSUES_DELETED
 
 # ---- components ----
 ha_components_http.HomeAssistantView = type("HomeAssistantView", (), {})
-ha_components_mqtt.async_connected = lambda hass: True
+# v1.7.63 对抗复核 C-4：真 HA（2024.12 源码 :553）只有 is_connected，
+# 没有 async_connected——假件不许带真机没有的属性（本仓已记过的反模式）。
+ha_components_mqtt.is_connected = lambda hass: True
 ha_components_mqtt.async_publish = _noop
 ha_components_mqtt.async_subscribe = lambda *a, **k: (lambda: None)
 ha_components_button.ButtonEntity = type("ButtonEntity", (), {})
@@ -346,6 +349,19 @@ class FakeRestoreEntity:
 
 
 ha_helpers_restore_state.RestoreEntity = FakeRestoreEntity
+
+# ---- components.repairs（v1.7.63 C-5）：真契约 = data_entry_flow.FlowHandler
+# 子类，带 issue_id/data 两个属性（HA components/repairs/models.py 逐字核验）；
+# 修复流只能经 async_create_fix_flow 产出（HA 会 hasattr 校验平台）。
+class RepairsFlow:
+    """假基类：只保真契约面（issue_id/data + FlowHandler 的 show/create/abort）。"""
+
+    issue_id = None
+    data = None
+
+
+ha_components_repairs.RepairsFlow = RepairsFlow
+
 
 # ---- v1.6.9：base_entity 生命周期方法链补 super() 后，真实 HA 里
 # Entity 基类（homeassistant/helpers/entity.py）对两个钩子都有空实现，

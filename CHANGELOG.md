@@ -3,6 +3,32 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.7.63] - 2026-10-05
+
+第二轮独立审计（`docs/bug-audit-2026-10-05-round2.md`：12 条新发现 C-1~C-11 + N-1）经逐条自验后的收口批：**必修 7 + 次批 4**。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**。
+
+**一、C-1 发现代理重放载荷被 `-v` 主题前缀污染（"上报不出卡"被自己的改动重新引入）**：v1.7.60 给代理加 `-v`（行首带主题）看下行面，但重放分支仍把整行 `raw`（=`"gateway/rpt_rsp {json}"`）当 `mosquitto_pub -m` 载荷——发回 `gateway/rpt_rsp` 后集成心跳耳 `json.loads` 必失败（本机实测 `Expecting value: line 1 column 1`）⇒ 首报即时重放与 3s 兜底重放都出不了卡，而日志照打"已重放上报×2"假成功。修法：重放一律只发剥掉主题的 `payload_raw`；`_split_verbose` 契约（topic 仅用于甄别）写进注释。单测此前没拦住（喂纯 JSON 不走重放分支）——补"verbose 行真走重放 + 载荷可解析"的真形态钉。
+
+**二、C-2 本代理自己的代答被当"HA 有应答"的证据 ⇒ 失聪态被清、隔帧才答**：标准 MQTT 3.1.1 无 no-local——代理订着 `gateway/+/req`、兜底应答又发往同一主题，broker 必把自答回送给自己（本机复现：6 帧上行只代答 3 帧）。修法：`(sn,id)` 自答甄别 + **回声按次消费**（对抗复核 F1 二次收口：记账期内一律不解除会把 HA 同 id 的真应答也吞掉 ⇒ 失聪态永驻、每帧双答——HA 的 ack 与请求逐字同 id；每条自答经 broker 恰回送一帧，第一帧消费记账＝回声，同 (sn,id) 再现即真应答 ⇒ 解除）；记账与发布序对调防"发布失败仍记账"。
+
+**三、C-3 实例指纹"读空即永久缓存" ⇒ 本进程内 001 永不代答**：代理先起、集成 setup 后落盘 `window_controller_gateway_instance.json` 的时序下，第一次读到"文件不存在"就把 `""` 永久缓存，注释承诺的"等集成落盘"不成立（本机按序复现：落盘后仍不代答）。修法：只缓存非空结果、空结果下帧重试；`_uuid_warned` 继续管日志一次性。
+
+**四、C-4 `is_mqtt_connected` 依赖的 `async_connected` 在 HA 里根本不存在**（HA 2024.12 `components/mqtt/__init__.py:553` 逐字核验：只有同步 `is_connected(hass)`）：生产恒走 ImportError 回退 `is_mqtt_loaded` ⇒ "已加载但没连上"判据全线失效——`verify_builtin_channel` 的 `disconnected` 判词不可达（通道卡对"凭据失配 / broker 没起"漏报）、v1.7.60 两条归因 WARNING 永不打印。测试全绿的根源照旧（"假件比真实现宽"：conftest 假件挂了真机没有的符号）。修法：换真符号（旧 HA 保留回退链）；conftest 假件改名补 `is_connected`；新增"假件符号 ⊆ 真 HA"元钉 + 全仓禁 `async_connected`。
+
+**五、C-5 + C-9 新卡的「修复」按钮是空操作 + `fix_flow` 无翻译**：全仓无 `repairs.py` ⇒ HA 走 `ConfirmRepairFlow`，点「修复」提交后**只删卡、不执行任何动作**（HA 源码逐字核验）——卡上承诺的"点此提交立即重试一轮"是死代码（旧入口 `config_flow.async_step_repair` 从未被调用、`issue_id` 上下文无人写入）。修法：新增 `repairs.py`（`async_create_fix_flow` → 确认步 → 提交跑一轮 `ensure_mqtt_connection` + 标记/通道核验 → 成功 `create_entry`（HA 自动删卡）/ 失败 `still_broken` 回显）；三份翻译（strings / zh-CN / zh-Hans）补 `fix_flow.step.confirm` 与错误文案；删除死入口与配套文案键。
+
+**六、C-8 武装循环的 ensure 退避没有 3600s 封顶（注释与代码不符）**：`_next_ensure = max(120, _next_ensure) * 2` 无界翻倍（同批 healer 的 `_retry_delay` 有封顶——同一纪律被代码分叉）。修法：改"绝对时刻 + `min(gap*2, 3600)`"：120→240→…→3600，之后每 3600s 一轮。
+
+**七、N-1 mDNS 看门狗退避的整数溢出**：`10 * (1 << (MDNS_RETRY-1))` 在 retry≥61 按 64 位有符号回绕成负数/0（本机实测 61→-6.9e18、64→0），`-gt 600` 对负数不成立 ⇒ `sleep` 报错后忙循环刷 stderr（mDNS 段在 `set +e` 后、子 shell 不继承 errexit ⇒ 不是"看门狗退出"，是刷屏空转）。修法：`-ge 7` 守卫先行封顶再算 + "进程稳定运行 ≥60s 复位重试计数"（照抄 mosquitto 自愈循环先例）。
+
+**八、次批四条**：① **C-6 healer 真常驻**——"健康即收尾"令 docstring/CHANGELOG 宣称的"此后被抢走也复查"不成立、mDNS 卡只在那一瞬被查；改健康也睡 30 分钟后 `continue`，退出只留"停机 / 启用条目清零"，且退出时清两张卡。② **C-7 `no_endpoint` 三态化**——文件缺失照旧 `no_endpoint`；"存在但损坏 / 无 broker 字段"新判词 `endpoint_broken`、判定面抛错 `probe_error`（两者都不清卡——旧实现会把坏文件/坏探针当"通过"清卡并永久关闭核验）。③ **C-10 禁用 / 删光条目清卡**——healer 退出分支 + `async_remove_entry`（最后一个条目被删）都清两张诊断卡；停机路径不清（避免关机噪声）。④ **C-11 `fast_discovery_e2e.sh` 按新语义重写并接线进 CI**——旧脚本断言停在 v1.7.11"静默自动填充 + 全自动配齐"，v1.7.62 后自相矛盾且从未被 CI 引用（哑门）；重写为"出卡 → 等待条目不被填充（反向半边）→ REST 走完确认 → 等待条目被清理"，并新增 **C-1 守卫**（全程 `mosquitto_sub -v` 录制 `gateway/rpt_rsp`：重放自发布必须可观测 + 逐帧 `json.loads` 全过，录制帧数下限防空扫绿）；`run_e2e.sh` 第 4 步接 token 回传 / mosquitto 客户端 / aiohttp 三条桥，成为每次发版必跑的真栈关口。注意 C-11 的语义值：discovery 60s 冷却使相位 E 的卡最迟在 B 出卡后 ~62s 出现（轮询按 90s 放宽——是语义不是竞态）。
+
+**九、对抗复核（发版前派"尝试推翻"代理逐条攻，5 条指控全部本机复现后收口）**：① **F1（高）C-2 修法过修**——"自答甄别"把 HA 的真应答也吞了：HA 的 ack 与请求逐字同 id、网关重发也用同 id，记账期内一律不解除 ⇒ HA 恢复后失聪态**永驻**、代理每帧双答（比 C-2 原缺陷更重）。改"回声**按次消费**"：每答一帧经 broker 恰回送一帧，第一帧消费记账（＝回声），同 (sn,id) 再现即 HA 真应答 ⇒ 解除。② **F2（中）`is_connected` 结构缺失抛 KeyError 逃出回退面**（HA 启动期竞态 / 条目 setup_error）⇒ 唯一无 try 的消费点（healer 常驻核验）任务静默死亡；修：回退面加 KeyError + healer 核验调用整体 try→probe_error（v1.7.61 S2"巡检任务静默死亡"的系统性收口）。③ **F3（中）修复流首步转发 init data**——HA 把 `{"issue_id": …}` 当 user_input 传首步（`data_entry_flow.py:342` + `repairs/websocket_api.py:130-132` 逐字核验），转发＝点"修复"的瞬间直接执行、确认步被绕过（HA 自家 ConfirmRepairFlow 首步即不传参）；改首步只渲染确认、零动作。④ **F5（低）端点探针逃逸仍折成 no_endpoint**（C-7 只修了一半：entries 探针三态了、端点探针没跟上）⇒ 改 probe_error。⑤ **F4（低）接受不进改**：稳定 ≥60s 复位退避计数使 61–90s 周期的崩溃不升退避至 600s——与本文件 mosquitto 自愈循环先例同语义（"稳定超过阈值＝新一轮故障"），10s 级重试非忙循环，N-1 核心目标（负数 sleep 忙循环）不受影响；记录在案。
+
+**判据**：新增 `tests/test_v1763_repairs_flow.py` **10 条**（平台存在/签名/成功删卡/失败回显/未知 id 响亮/三份翻译一致/首步零动作……）、`tests/test_v1763_healer_resident.py` **9 条**（常驻复查、被抢走出卡、零条退出清卡、核验逃逸不死、C-7 三判词、端点探针逃逸、判词进门）、`tests/test_v1763_mdns_watchdog.py` **2 条**（run.sh 抽段真跑喂 61/64/200 必须落 [10,600]；裸移位只许出现在守卫后）、`tests/test_v1763_fast_e2e_wiring.py` **6 条**（driver 后真调用/非注释/rc 闸、桥接三件、CI→run_e2e 转递闭包、新语义与 C-1 锚、旧自动填充断言禁复活、裸 dev_count 反钉）；升级 `test_v1760_channel_guard.py` +4（自答回灌正反两臂、同 id 真应答须解除失聪态、uuid 后到）、`test_discovery_proxy.py` +2（verbose 行重放载荷可解析）、`test_v1761_adversarial_followups.py` +1（ensure 封顶 3600）、`test_utils.py` +2（假件符号 ⊆ 真 HA 元钉、is_connected 结构缺失不炸穿）；`test_v1730` 的 healer 节奏钉按常驻语义**升级**（节奏 [1,2,4,8,8] 与"仅一条封顶告警"不变量原样保留，新增"常驻期仅一次切片睡、清零即退不悬挂"）。
+
+**门禁**：pytest **1454**（基线 1418 + 36）；ruff（CI 同参）/ compileall / JSON 解析 / `bash -n`（run.sh + 全部 e2e shell）/ node --check 全绿；变异矩阵 **53/53**（37 既有 + 本批 16 新/改臂，1 条等价臂保持绿）全绿。**本批只到工作树**：未提交未推送。
+
 ## [1.7.62] - 2026-10-05
 
 用户裁定：**首台网关不再静默自动添加，同样弹发现卡**（现场两次报障"第一个网关上报了 还是直接添加到集成中的，没有出现弹出卡片"）。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**。

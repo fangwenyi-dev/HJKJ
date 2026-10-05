@@ -205,13 +205,20 @@ class TestBackoff:
         assert mb._retry_delay(99) == 3600.0
 
     def test_healer_rhythm_and_single_cap_warning(self, monkeypatch, caplog):
-        """六轮未落地：sleep 序列 1,2,4,8,8；触顶 WARNING 恰好一条。"""
+        """六轮未落地：sleep 序列 1,2,4,8,8；触顶 WARNING 恰好一条。
+
+        v1.7.63（C-6）升级：标记落地后 healer 不再退出，转**常驻核验**——
+        旧断言"落地即退出"随语义取消（旧形态在 resident 分支上会永不返回）。
+        本用例以"启用条目清零"驱动收尾：既保住节奏/单条封顶告警的原不变量，
+        又钉住常驻期进入切片睡且"清零即退、不悬挂"（对应生产：用户禁用/删光
+        慧尖条目）。
+        """
         monkeypatch.setattr(mb, "BOOTSTRAP_RETRY_INTERVAL", 1.0)
         monkeypatch.setattr(mb, "BOOTSTRAP_RETRY_MAX_INTERVAL", 8.0)
+        entries = [SimpleNamespace(entry_id="E1")]
         hass = SimpleNamespace(
             data={DOMAIN: {}}, is_stopping=False,
-            config_entries=SimpleNamespace(
-                async_entries=lambda d: [SimpleNamespace(entry_id="E1")]),
+            config_entries=SimpleNamespace(async_entries=lambda d: list(entries)),
             async_create_task=lambda coro, name=None: asyncio.ensure_future(coro),
         )
         markers = [True, True, True, True, True, True, True, True, True, True,
@@ -221,9 +228,21 @@ class TestBackoff:
 
         async def fake_sleep(d, *a, **k):
             delays.append(d)
+            # 标记已落地、节奏段走完 ⇒ 首个 30s 切片即模拟"禁用/删光条目"，
+            # 由 _interruptible_sleep 的片间复检驱动收尾
+            if d >= 30 and entries:
+                entries.clear()
             await real_sleep(0)
 
+        async def fake_verify(h):
+            return "ok"
+
+        async def fake_mdns(h):
+            return None
+
         monkeypatch.setattr(mb.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(mb, "verify_builtin_channel", fake_verify)
+        monkeypatch.setattr(mb, "_mdns_guard", fake_mdns)
         monkeypatch.setattr(mb, "has_bootstrap_marker",
                             lambda hass: asyncio.ensure_future(_pop(markers)))
         monkeypatch.setattr(mb, "ensure_mqtt_connection",
@@ -237,7 +256,11 @@ class TestBackoff:
             await asyncio.wait_for(hass.data[DOMAIN]["_bootstrap_healer"], timeout=5)
         asyncio.run(main())
 
-        assert delays == [1.0, 2.0, 4.0, 8.0, 8.0], "轮间隔必须按 2 倍退避封顶"
+        rhythm = [d for d in delays if d < 30]
+        assert rhythm == [1.0, 2.0, 4.0, 8.0, 8.0], "轮间隔必须按 2 倍退避封顶"
+        resident_chunks = [d for d in delays if d >= 30]
+        assert len(resident_chunks) == 1, \
+            "常驻核验期必须进入一次切片睡（清零复检即退，不许悬挂）"
         caps = [r for r in caplog.records if "封顶" in r.getMessage()]
         assert len(caps) == 1, "首次触顶只许一条 WARNING，此后不刷屏"
         assert hass.data[DOMAIN]["_bootstrap_healer"] is None

@@ -84,4 +84,26 @@ if [ -s "$CFG/summary.md" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     cat "$CFG/summary.md" >> "$GITHUB_STEP_SUMMARY"
 fi
 [ "$RC" -eq 0 ] || { diag "driver rc=$RC"; exit "$RC"; }
+
+echo "==== 4. 发现代理真栈关口（fast_discovery_e2e.sh） ===="
+# v1.7.63（C-11 接线）：该脚本此前从未被 CI 引用（"哑门"），且断言停在
+# v1.7.11 的静默自动填充语义。它也是唯一真跑 gateway_discovery_proxy.py
+# **进程**的关口——C-1 类"重放载荷被 -v 主题前缀污染"只有它能拦。
+# 三条环境桥接必须成功（不做静默跳过，缺一即响亮失败）：
+#  · token：driver 在 HA 容器内把 owner token 写 /tmp/ha_e2e_token → 取回宿主机
+docker cp ha-e2e:/tmp/ha_e2e_token /tmp/ha_e2e_token
+#  · mosquitto 客户端：代理以子进程方式调用 mosquitto_sub/pub（与生产同款）
+sudo apt-get update -qq
+sudo apt-get install -y -qq mosquitto-clients
+#  · aiohttp：WS 观测探针（ws_flows_probe / ws_device_probe）在宿主机跑
+pip install -q aiohttp
+RC_F=0
+CFG="$CFG" HA_PY=$(command -v python3) \
+    bash "$DIR/fast_discovery_e2e.sh" || RC_F=$?
+[ "$RC_F" -eq 0 ] || {
+    echo "── 发现代理日志尾部 ──"
+    tail -40 /tmp/proxy_e2e.log 2>/dev/null || true
+    diag "fast_discovery rc=$RC_F"
+    exit "$RC_F"
+}
 echo "==== E2E 编排完成 ✅ ===="

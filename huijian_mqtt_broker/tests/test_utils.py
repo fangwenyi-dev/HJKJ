@@ -24,22 +24,53 @@ class TestIsMqttLoaded:
 
 
 class TestIsMqttConnected:
+    """v1.7.63（对抗复核 C-4）：真 HA 只有 `is_connected`（同步，2024.12 源码
+    :553 逐字核验），`async_connected` **不存在**——旧实现 import 恒失败、
+    悄悄回退 is_mqtt_loaded，"连上没连上"判据全线失效。本组钉真符号。"""
+
     def test_connected_true(self, monkeypatch):
         from homeassistant.components import mqtt as mqtt_mod
-        monkeypatch.setattr(mqtt_mod, "async_connected", lambda hass: True)
+        monkeypatch.setattr(mqtt_mod, "is_connected", lambda hass: True)
         assert is_mqtt_connected(FakeHass(mqtt=object())) is True
 
     def test_connected_false(self, monkeypatch):
         from homeassistant.components import mqtt as mqtt_mod
-        monkeypatch.setattr(mqtt_mod, "async_connected", lambda hass: False)
-        assert is_mqtt_connected(FakeHass(mqtt=object())) is False
+        monkeypatch.setattr(mqtt_mod, "is_connected", lambda hass: False)
+        assert is_mqtt_connected(FakeHass(mqtt=object())) is False,             "『已加载但没连上』必须能判出来（旧实现恒回退 is_mqtt_loaded）"
 
     def test_fallback_when_api_missing(self, monkeypatch):
-        """旧版 HA 无 async_connected：回退为"集成已加载即视为可用"。"""
+        """旧版 HA 无 is_connected：回退为"集成已加载即视为可用"。"""
         from homeassistant.components import mqtt as mqtt_mod
-        monkeypatch.delattr(mqtt_mod, "async_connected", raising=False)
+        monkeypatch.delattr(mqtt_mod, "is_connected", raising=False)
         assert is_mqtt_connected(FakeHass(mqtt=object())) is True
         assert is_mqtt_connected(FakeHass(mqtt=None)) is False
+
+    def test_runtime_keyerror_falls_back_not_raises(self, monkeypatch):
+        """F2（对抗复核）：真 is_connected 读 hass.data[DATA_MQTT].client——
+        HA 启动期竞态/条目 setup_error 时抛 KeyError/AttributeError；旧 except
+        面接不住 ⇒ healer 常驻核验（无 try）被炸死。修后：结构缺失一律并回
+        回退面（is_mqtt_loaded 用 .get，不可能抛）。"""
+        from homeassistant.components import mqtt as mqtt_mod
+
+        def _boom(hass):
+            raise KeyError("mqtt")
+
+        monkeypatch.setattr(mqtt_mod, "is_connected", _boom)
+        assert is_mqtt_connected(FakeHass(mqtt=object())) is True
+        assert is_mqtt_connected(FakeHass(mqtt=None)) is False
+
+        def _boom_attr(hass):
+            raise AttributeError("client")
+
+        monkeypatch.setattr(mqtt_mod, "is_connected", _boom_attr)
+        assert is_mqtt_connected(FakeHass(mqtt=object())) is True
+
+    def test_fake_module_matches_real_ha_symbols(self):
+        """元钉（假件不得宽于真实现）：conftest 假 mqtt 只提供真 HA 有的符号。
+        真机没有 async_connected——再挂它，全部「连上没连上」判据会被假绿喂饱。"""
+        import homeassistant.components.mqtt as fake_mqtt
+        assert not hasattr(fake_mqtt, "async_connected"),             "假件带上了真 HA 没有的 async_connected（本仓已记过的反模式）"
+        assert hasattr(fake_mqtt, "is_connected")
 
 
 # ==================== 注册表查找兼容层（v1.6.3 回归护栏） ====================

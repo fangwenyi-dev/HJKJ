@@ -47,6 +47,20 @@ DMGR = "custom_components/window_controller_gateway/device_manager.py"
 WSGW = "custom_components/window_controller_gateway/ws_gateway.py"
 DOCKER = "Dockerfile"
 E2E = "tests/e2e/bridge_coexist_e2e.sh"
+# v1.7.63 收口批新增臂的被改文件与判据文件
+PROXY = "gateway_discovery_proxy.py"
+UTILS = "custom_components/window_controller_gateway/utils.py"
+MB = "custom_components/window_controller_gateway/mqtt_bootstrap.py"
+REPAIRS = "custom_components/window_controller_gateway/repairs.py"
+RUN_E2E_F = "tests/e2e/run_e2e.sh"
+TDP = "tests/test_discovery_proxy.py"
+TUTILS = "tests/test_utils.py"
+T1760 = "tests/test_v1760_channel_guard.py"
+T1761AF = "tests/test_v1761_adversarial_followups.py"
+T1763H = "tests/test_v1763_healer_resident.py"
+T1763R = "tests/test_v1763_repairs_flow.py"
+T1763W = "tests/test_v1763_fast_e2e_wiring.py"
+T1763M = "tests/test_v1763_mdns_watchdog.py"
 IGNORE = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
 TIMEOUT = 900
 
@@ -243,6 +257,131 @@ ARMS = [
      "test_removal_notify_stays_silent_on_the_lan_channel", "red",
      "给不存在的设备造 device_update：新增的删除通知会凭空造出固件没有的消息类型",
      GHOST),
+    # ── v1.7.63 第二轮审计收口批（C-1..C-11 + N-1）：每条修复的"退回原形"臂 ──
+    # 共同形状：这些缺陷此前测试全绿（假件比真实现宽 / 喂的是构造行 /
+    # 脚本从未被 CI 引用）——修法与钉一起进仓后，把产品改回原缺陷形态必须当场红。
+    ("c1_replay_raw_line_restored", PROXY,
+     "                ok1 = self._pub(payload_raw.strip())\n",
+     "                ok1 = self._pub(raw.strip())\n",
+     "test_verbose_line_replay_is_clean_json", "red",
+     "C-1 原形：重放发整行（含 -v 主题前缀）⇒ 集成侧 json.loads 必失败（日志照打假成功）",
+     TDP),
+    ("c2_selfack_echo_clears_deaf", PROXY,
+     "        key = (parts[1], str(msg_id))\n"
+     "        if key in self._self_acked:\n"
+     '            self._self_acked.pop(key, None)   # 消费"本代理自答回声"这一帧\n'
+     "        else:\n"
+     "            self._ha_deaf.pop(parts[1], None)\n"
+     "            self._req_ids.pop(parts[1], None)\n",
+     "        self._ha_deaf.pop(parts[1], None)\n"
+     "        self._req_ids.pop(parts[1], None)\n",
+     "test_self_ack_echo_does_not_clear_deaf_state", "red",
+     "C-2 原形：自答回送被当 HA 应答证据 ⇒ 失聪态隔帧即清（6 帧只代答 3 帧）",
+     T1760),
+    ("f1_echo_marker_persists", PROXY,
+     "        key = (parts[1], str(msg_id))\n"
+     "        if key in self._self_acked:\n"
+     '            self._self_acked.pop(key, None)   # 消费"本代理自答回声"这一帧\n'
+     "        else:\n"
+     "            self._ha_deaf.pop(parts[1], None)\n"
+     "            self._req_ids.pop(parts[1], None)\n",
+     "        key = (parts[1], str(msg_id))\n"
+     "        if key in self._self_acked:\n"
+     "            pass\n"
+     "        else:\n"
+     "            self._ha_deaf.pop(parts[1], None)\n"
+     "            self._req_ids.pop(parts[1], None)\n",
+     "test_ha_true_ack_with_self_acked_id_still_clears_deaf", "red",
+     "F1 原形：记账期内一律不解除 ⇒ HA 恢复后真应答全被当自答吞掉、永不停手",
+     T1760),
+    ("f2a_keyerror_not_caught", UTILS,
+     "    except (ImportError, AttributeError, KeyError):\n",
+     "    except (ImportError, AttributeError):\n",
+     "test_runtime_keyerror_falls_back_not_raises", "red",
+     "F2 原形：is_connected 结构缺失抛 KeyError 逃出回退面 ⇒ 消费方（healer）被炸",
+     TUTILS),
+    ("f2b_healer_verify_unguarded", MB,
+     "                    except Exception as err:  # noqa: BLE001 — 按无结论处理\n"
+     "                        verdict = \"probe_error\"\n",
+     "                    except Exception as err:  # noqa: BLE001 — 按无结论处理\n"
+     "                        raise\n",
+     "test_healer_survives_verify_exception", "red",
+     "F2 原形：核验逃逸不收敛（handler 直接 re-raise）⇒ 常驻 healer 静默死亡（S2 同族）",
+     T1763H),
+    ("f3_repair_init_forwards_input", REPAIRS,
+     "        return await self.async_step_confirm()\n",
+     "        return await self.async_step_confirm(user_input)\n",
+     "test_init_step_does_not_run_repair_on_card_click", "red",
+     "F3 原形：首步转发 init data ⇒ 点修复瞬间直接执行、确认步被绕过",
+     T1763R),
+    ("f5_probe_exception_folded", MB,
+     '        return "probe_error", None\n',
+     '        return "no_endpoint", None\n',
+     "test_probe_exception_is_probe_error_not_no_endpoint", "red",
+     "F5 原形：端点探针逃逸折成 no_endpoint ⇒ healer 当通过清卡（C-7 只修了一半）",
+     T1763H),
+    ("c3_empty_uuid_cached", PROXY,
+     "        if not self._uuid and self._read_uuid is not None:\n",
+     "        if self._uuid is None and self._read_uuid is not None:\n",
+     "test_ack_guard_picks_up_uuid_when_file_arrives_later", "red",
+     "C-3 原形：读空即永久缓存 ⇒ 集成后落盘也不代答（001 永不兜底）",
+     T1760),
+    ("c4_async_symbol_restored", UTILS,
+     "        from homeassistant.components.mqtt import is_connected\n"
+     "        return bool(is_connected(hass))\n",
+     "        from homeassistant.components.mqtt import async_connected\n"
+     "        return bool(async_connected(hass))\n",
+     "test_connected_false", "red",
+     "C-4 原形：import 真机不存在的 async_connected ⇒ 恒走回退，disconnected 判词与两条 WARNING 全失效",
+     TUTILS),
+    ("c5_repair_success_removed", REPAIRS,
+     "                return self.async_create_entry(data={})\n",
+     "                return self.async_show_form(step_id=\"confirm\", "
+     "errors={\"base\": \"still_broken\"})\n",
+     "test_channel_issue_fix_reenables_and_creates_entry", "red",
+     "C-5 原形：修复成功也不产生 create_entry ⇒ HA 不删卡且用户看不到任何动作",
+     T1763R),
+    ("c6_resident_sleep_dropped", MB,
+     "                    if not await _interruptible_sleep(hass, CHANNEL_VERIFY_INTERVAL):\n"
+     "                        return\n"
+     "                    continue\n",
+     "                    return\n",
+     "test_healer_stays_resident_when_healthy", "red",
+     "C-6 原形：健康即收尾 ⇒ 一次性核验（此后被抢走/判定面坏掉都无人复查）",
+     T1763H),
+    ("c7_broken_folded_no_endpoint", MB,
+     "            return \"endpoint_broken\", None\n",
+     "            return \"no_endpoint\", None\n",
+     "test_verify_endpoint_broken_is_named", "red",
+     "C-7 原形：端点半坏与无依据混同 ⇒ 坏文件被当通过清卡并永久关核验",
+     T1763H),
+    ("c8_gap_cap_removed", INIT,
+     "                            _gap = min(_gap * 2, 3600)\n",
+     "                            _gap = _gap * 2\n",
+     "test_arm_retry_backoff_caps_at_3600", "red",
+     "C-8 原形：注释称封顶 3600s 而实现无界翻倍 ⇒ 几分钟后即近乎停摆",
+     T1761AF),
+    ("c10_exit_clear_dropped", MB,
+     "                    if not getattr(hass, \"is_stopping\", False):\n"
+     "                        _clear_channel_issue(hass)\n"
+     "                        _clear_mdns_issue(hass)\n",
+     "                    if not getattr(hass, \"is_stopping\", False):\n"
+     "                        pass\n",
+     "test_healer_clears_cards_when_entries_all_disabled", "red",
+     "C-10 原形：启用条目清零直接退出不清卡 ⇒ 禁用后僵尸卡永留",
+     T1763H),
+    ("c11_fast_e2e_wiring_dropped", RUN_E2E_F,
+     "    bash \"$DIR/fast_discovery_e2e.sh\" || RC_F=$?\n",
+     "    true \"fast_discovery_e2e.sh 未接线\"\n",
+     "test_run_e2e_invokes_fast_script_after_driver", "red",
+     "C-11 原形：真栈关口不被引用（哑门）——meta 钉必须抓着接线",
+     T1763W),
+    ("n1_backoff_cap_raised", RUNSH,
+     "            if [ \"${MDNS_RETRY}\" -ge 7 ]; then\n                BACKOFF=600\n",
+     "            if [ \"${MDNS_RETRY}\" -ge 7 ]; then\n                BACKOFF=100000\n",
+     "test_backoff_expression_runs_in_range", "red",
+     "N-1 近似原形：封顶被抬高 ⇒ 溢出档位不再落 [10,600]（sleep 负数/0 忙循环家族）",
+     T1763M),
 ]
 
 

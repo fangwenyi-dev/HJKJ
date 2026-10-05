@@ -32,17 +32,12 @@
         "data": {
           "confirm": "仍然添加"
         }
-      },
-      "repair": {
-        "title": "重试 MQTT 自动配置",
-        "description": "慧尖正在按加载项引导标记自动配置 HA 的 MQTT 集成（内置 Broker 127.0.0.1:2022）。点此重试一轮；若仍失败，请检查慧尖加载项是否在运行，并查看 HA 日志中的 mqtt_bootstrap 行。"
       }
     },
     "error": {
       "invalid_sn_format": "序列号格式无效，必须至少10位字母数字",
       "mqtt_not_available": "MQTT 集成未启用，请先在 Home Assistant 中启用 MQTT",
       "broker_not_ready": "MQTT Broker 未就绪：已有 MQTT 配置条目，但客户端尚未连上。使用慧尖一体化加载项时请确认其处于运行状态（内置 Broker 端口 2022）；自行搭建 Broker 请检查其可达性与凭据。系统会自动重试连接，请稍等约一分钟后重试。",
-      "mqtt_bootstrap_still_pending": "仍未完成：内置 Broker 未运行、MQTT 条目被禁用或凭据被拒。请确认慧尖加载项处于运行状态后再次提交，或查看 HA 日志 mqtt_bootstrap 行。",
       "cannot_connect": "连接网关失败",
       "invalid_ws_token": "令牌需为 8-62 位，仅允许字母、数字、下划线与连字符（含空格/逗号会拆散子协议握手造成永久自锁）",
       "ws_port_reserved": "该端口被本加载项自身占用（2022=MQTT Broker / 10998=Web UI / 8123=Home Assistant / 1883=外部 broker 惯用口），请换其它端口",
@@ -55,8 +50,7 @@
       "updated_existing_gateway": "已更新现有网关配置，开始迁移设备",
       "ignored": "已忽略该网关",
       "invalid_sn_format": "网关SN格式无效（至少10位字母数字）",
-      "migration_not_supported": "迁移功能暂未启用，请手动删除旧网关后重新添加",
-      "mqtt_bootstrap_fixed": "MQTT 自动配置已完成"
+      "migration_not_supported": "迁移功能暂未启用，请手动删除旧网关后重新添加"
     }
   },
   "issues": {
@@ -66,11 +60,33 @@
     },
     "mqtt_channel_broken": {
       "title": "慧尖网关失联：HA 的 MQTT 连接不在内置 Broker 上",
-      "description": "网关仍在上报，但 Home Assistant 的 MQTT 客户端没有连在慧尖内置 Broker（127.0.0.1:2022）上，因此收不到任何网关消息：绑定请求（001）无人应答（固件每 5 秒重发不止血），也不会有设备/网关卡片出现。诊断码: {verdict}。修复：到 设置→设备与服务→MQTT 核对条目——地址 127.0.0.1、端口 2022、用户名 ha_mqtt（默认密码 huijian2022，与加载项配置一致）。若要让慧尖自动把条目改回内置端点：先重启「慧尖 LoRa 网关」加载项（重启会重写引导标记），再回来点「提交」重试。慧尖每 30 分钟自动复查，恢复后本卡片自动消失。"
+      "description": "网关仍在上报，但 Home Assistant 的 MQTT 客户端没有连在慧尖内置 Broker（127.0.0.1:2022）上，因此收不到任何网关消息：绑定请求（001）无人应答（固件每 5 秒重发不止血），也不会有设备/网关卡片出现。诊断码: {verdict}。修复：到 设置→设备与服务→MQTT 核对条目——地址 127.0.0.1、端口 2022、用户名 ha_mqtt（默认密码 huijian2022，与加载项配置一致）。若要让慧尖自动把条目改回内置端点：先重启「慧尖 LoRa 网关」加载项（重启会重写引导标记），再回来点「提交」重试。慧尖每 30 分钟自动复查，恢复后本卡片自动消失。",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "重试一轮通道核验",
+            "description": "将重跑一轮引导并核验 HA 的 MQTT 客户端是否连在内置 Broker（127.0.0.1:2022）上。成功即关闭本卡片；仍未成功会回显错误——按提示核对 设置→设备与服务→MQTT 条目的地址与凭据。"
+          }
+        },
+        "error": {
+          "still_broken": "仍未修复：MQTT 客户端没有连在内置 Broker 上。请核对条目指向 127.0.0.1:2022、用户名/密码与加载项配置一致；若该条目被其他加载项占用，请改回或删除后重试。"
+        }
+      }
     },
     "mqtt_bootstrap_pending": {
       "title": "慧尖 MQTT 自动配置未完成",
-      "description": "慧尖加载项已声明要用内置 Broker（127.0.0.1:2022）自动配置 HA 的 MQTT 集成，但尚未成功——LoRa 网关的上报到不了 HA。系统自动重试（间隔 5 分钟起指数递增、封顶 1 小时）；也可点此提交修复立即重试一轮。若反复失败：确认慧尖加载项处于运行状态，并查看 HA 日志中的 mqtt_bootstrap 行定位原因（常见：MQTT 条目被禁用、原 broker 仍被 Supervisor 托管、凭据被拒）。"
+      "description": "慧尖加载项已声明要用内置 Broker（127.0.0.1:2022）自动配置 HA 的 MQTT 集成，但尚未成功——LoRa 网关的上报到不了 HA。系统自动重试（间隔 5 分钟起指数递增、封顶 1 小时）；也可点此提交修复立即重试一轮。若反复失败：确认慧尖加载项处于运行状态，并查看 HA 日志中的 mqtt_bootstrap 行定位原因（常见：MQTT 条目被禁用、原 broker 仍被 Supervisor 托管、凭据被拒）。",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "重试一轮 MQTT 自动配置",
+            "description": "将重跑一轮引导：把内置 Broker（127.0.0.1:2022）自动配置成 HA 的 MQTT 集成。成功即关闭本卡片；仍未成功会留在本页并回显错误——请确认慧尖加载项在运行、且内置 Broker 未被别的 MQTT 条目占用。"
+          }
+        },
+        "error": {
+          "still_broken": "仍未修复：引导尚未落地。请确认慧尖加载项已启动（内置 Broker 127.0.0.1:2022 可达）；必要时重启加载项后再点一次。"
+        }
+      }
     }
   },
   "options": {
