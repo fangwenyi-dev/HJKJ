@@ -1293,13 +1293,20 @@ class WindowControllerDeviceManager:
         for task in list(self._background_tasks):
             if not task.done():
                 task.cancel()
-        for task in list(self._background_tasks):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                _LOGGER.debug("后台任务取消异常: %s", e)
+        # v1.7.64（第三轮复核 #8）：本仓 C-6 不变量是"cleanup 链上任何地方都不许
+        # 就地吞掉取消信号"（见 tests/test_audit_2026_09_30_fixes.py 的 test_c6_*）。
+        # 旧写法逐条 `await task` + `except asyncio.CancelledError: pass` 正好违反：
+        # 上层在 cleanup 仍 await 某个后台任务时取消 cleanup，CancelledError 会从
+        # `await task` 抛出并被 pass 吃掉 ⇒ 取消传不出本函数，HA 停机/重载只能等
+        # 超时。gather(return_exceptions=True) 的语义恰好分开两种取消：子任务被取消
+        # 作为结果值返回（不转抛，后续清理照常跑完），而 cleanup 自身被取消时
+        # gather 当场抛 CancelledError（正确向上传）。
+        for res in await asyncio.gather(*list(self._background_tasks),
+                                        return_exceptions=True):
+            # CancelledError 自 3.8 起继承 BaseException，isinstance(..., Exception)
+            # 天然把它排除在外——这里只剩"后台任务自己异常退出"需要留痕
+            if isinstance(res, Exception):
+                _LOGGER.debug("后台任务取消异常: %s", res)
         self._background_tasks.clear()
         self.devices.clear()
         self._device_registry_cache = None

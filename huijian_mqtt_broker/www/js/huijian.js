@@ -210,6 +210,11 @@
                     return '云端 hub 版本过旧，暂不支持成员码';
                 case 'members_unavailable':
                     return '家庭成员读取失败（云端暂不可达），请稍后重试';
+                case 'bad_body':
+                    // v1.7.64（#6）：加载项自己产生的码——hub 回了 200 但响应体不是
+                    // 对象（云函数返回空时云托管照样回 200 + null）。未知码走 default
+                    // 回空串＝整条不显示，用户点了「添加家人/移除」会看到毫无反应。
+                    return '云端返回的响应看不懂（不是预期对象），这次操作可能没生效——请稍后重试；反复出现请把本条上报';
                 case 'members_rejected':
                     return '云端拒绝读取家庭成员，请稍后重试';
                 case 'member_remove_failed':
@@ -705,11 +710,25 @@
         // ========== HA API 调用 ==========
         // v1.7.18（第 7 轮审计 BUG-18）：用户正在交互的滑块不回写——30s 静默
         // 刷新/控制后 2s 刷新与手指拖动重叠时，旧版无条件覆写 value 导致
-        // thumb 跳回、设置静默丢失（toast 却已提示"已发送"）。拖动中滑块即
-        // activeElement（鼠标/触摸通用）；松手 change 事件照常发控制，下轮
-        // 刷新自然同步真值。
+        // thumb 跳回、设置静默丢失（toast 却已提示"已发送"）。松手 change 事件
+        // 照常发控制，下轮刷新自然同步真值。
+        // v1.7.64（第三轮复核 #9）：判据补第二条凭据。"拖动中滑块即 activeElement"
+        // 只对鼠标/键盘成立——iOS Safari 不把焦点给非文本控件，手指拖 range 时
+        // document.activeElement 仍是 body ⇒ 手机上一条没修。原生 input 事件在
+        // 鼠标/触摸/键盘三种拖动下都逐帧派发（本页滑块旁标签实时跟着走靠的就是它），
+        // 以它为交互凭据与拖动形态无关，且**不新增 pointer/touch 监听**——
+        // v1.7.22「防误触纯 CSS、JS 不劫持滑块默认行为」的约定不破。
+        // 保持窗只兜住"拖完到下一次刷新"这段（覆盖 2s 控制后刷新，30s 那轮照常同步真值）。
+        const USER_INPUT_AT = new WeakMap();
+        const USER_INPUT_HOLD_MS = 4000;
+        function markUserInput(el) {
+            if (el) USER_INPUT_AT.set(el, Date.now());
+        }
         function userInteracting(el) {
-            return !!el && document.activeElement === el;
+            if (!el) return false;
+            if (document.activeElement === el) return true;
+            const at = USER_INPUT_AT.get(el);
+            return !!at && (Date.now() - at) < USER_INPUT_HOLD_MS;
         }
         async function haApi(path, method = 'GET', body = null) {
             const opts = { method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store' };
@@ -1099,7 +1118,7 @@
             if (posCapable) {
                 html += '<div class="slider-row"><span class="slider-label">位置</span>' +
                     '<input type="range" class="position-slider" min="0" max="100" value="' + (currentPos === '--' ? 0 : escapeHtml(currentPos)) + '"' +
-                    ' oninput="this.nextElementSibling.textContent=this.value+\'%\'"' +
+                    ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value+\'%\'"' +
                     ' onchange="controlDevicePosition(\'' + jsAttr(devId) + '\', this.value, \'' + jsAttr(entryId) + '\')">' +
                     '<span class="slider-value position-value">' + escapeHtml(currentPos) + (currentPos === '--' ? '' : '%') + '</span></div>';
             } else {
@@ -1109,12 +1128,12 @@
             html +=
                 '<div class="slider-row"><span class="slider-label">速度</span>' +
                 '<input type="range" class="speed-slider" min="' + escapeHtml(speedMin) + '" max="' + escapeHtml(speedMax) + '" value="' + escapeHtml(speedValid ? speedEntity.state : speedMin) + '"' +
-                ' oninput="this.nextElementSibling.textContent=this.value' + (speedUnit ? '+\'' + jsAttr(speedUnit) + '\'' : '') + '"' +
+                ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value' + (speedUnit ? '+\'' + jsAttr(speedUnit) + '\'' : '') + '"' +
                 ' onchange="controlDevice(\'' + jsAttr(devId) + '\',\'set_speed\',\'' + jsAttr(entryId) + '\', this.value)">' +
                 '<span class="slider-value speed-value">' + (speedValid ? escapeHtml(speedEntity.state + speedUnit) : '--') + '</span></div>' +
                 '<div class="slider-row"><span class="slider-label">力度</span>' +
                 '<input type="range" class="strength-slider" min="' + escapeHtml(strengthMin) + '" max="' + escapeHtml(strengthMax) + '" value="' + escapeHtml(strengthValid ? strengthEntity.state : strengthMin) + '"' +
-                ' oninput="this.nextElementSibling.textContent=this.value' + (strengthUnit ? '+\'' + jsAttr(strengthUnit) + '\'' : '') + '"' +
+                ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value' + (strengthUnit ? '+\'' + jsAttr(strengthUnit) + '\'' : '') + '"' +
                 ' onchange="controlDevice(\'' + jsAttr(devId) + '\',\'set_strength\',\'' + jsAttr(entryId) + '\', this.value)">' +
                 '<span class="slider-value strength-value">' + (strengthValid ? escapeHtml(strengthEntity.state + strengthUnit) : '--') + '</span></div>' +
                 '</div>';

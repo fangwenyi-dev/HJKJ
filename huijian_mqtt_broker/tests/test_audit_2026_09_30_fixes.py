@@ -2911,8 +2911,76 @@ def _cleanup_reachable_names(trees):
     return names
 
 
+C6_TEARDOWN_NAMES = frozenset({"cleanup", "async_unload_entry", "async_remove_entry"})
+C6_SCAN_TYPES = (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)
+
+
+def _c6_swallows(node):
+    """该节点上"捕取消却不传"的形态描述；没有则 None。
+
+    v1.7.64（对抗复核 A-4）三处收口：
+    ① 假阳性——旧实现只查 handler **直接**语句里的 `raise`，而"条件再抛"
+      （`except CancelledError: if not ready: raise`，本仓 hub_client 的 WS 闸就是
+      这个写法）是判据自己明文允许的收口形态，却被判红 ⇒ 改搜整棵子树。
+    ② 盲区 `async with contextlib.suppress(CancelledError)`：旧实现只扫 `ast.With`，
+      而 `async with` 是 `AsyncWith` 另一种节点，写成 async with 就整条跳过。
+    ③ 盲区 `except* CancelledError: pass`：`TryStar` 根本不是 `Try` 节点。
+    """
+    if isinstance(node, (ast.Try, ast.TryStar)):
+        for h in node.handlers:
+            if h.type is None or "CancelledError" not in ast.unparse(h.type):
+                continue
+            if any(isinstance(n, ast.Raise)
+                   for stmt in h.body for n in ast.walk(stmt)):
+                continue
+            return "第 %d 行 try/except CancelledError 不传" % node.lineno
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            ce = ast.unparse(item.context_expr)
+            if "suppress" in ce and "CancelledError" in ce:
+                return "第 %d 行 contextlib.suppress(CancelledError)" % node.lineno
+    return None
+
+
+def _c6_touches_cleanup(node, names):
+    """节点里是否直接/间接走到某个 `.cleanup()`（含不动点闭包内的 Name 调用）。"""
+    for cal in ast.walk(node):
+        if not isinstance(cal, ast.Call):
+            continue
+        if getattr(cal.func, "attr", "") == "cleanup":
+            return True
+        if isinstance(cal.func, ast.Name) and cal.func.id in names:
+            return True
+    return False
+
+
+def _c6_offenders_in_tree(tree, names):
+    """两作用面一起扫：① cleanup 链上的**调用点**；② teardown 系函数的**本体**。
+
+    ② 是 v1.7.64（#8 + 对抗复核 A-3）扩出来的——旧闭包只收"调用了 .cleanup()"的
+    函数名，被调的那个本体自己不在宇宙里，于是 device_manager.cleanup 与
+    `__init__.async_unload_entry` 里的 `except CancelledError: pass/debug` 全绿通过。
+    """
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, C6_SCAN_TYPES) and _c6_touches_cleanup(node, names):
+            hit = _c6_swallows(node)
+            if hit:
+                hits.append(hit)
+    for fn in [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name in C6_TEARDOWN_NAMES]:
+        for node in ast.walk(fn):
+            if isinstance(node, C6_SCAN_TYPES):
+                hit = _c6_swallows(node)
+                if hit:
+                    hits.append("%s 本体 %s" % (fn.name, hit))
+    return hits
+
+
 def test_c6_cleanup_callers_do_not_swallow_cancellation():
-    """吞取消可能在**调用点**、可能**上移一层**、也可能用 `contextlib.suppress` 一行落地。
+    """吞取消可能在**调用点**、可能**上移一层**、可能用 `contextlib.suppress` 一行落地，
+    也可能就在 **teardown 函数本体**里。
 
     第三轮复核实测两条当时全绿的回退：① 给 `await _cleanup_partial_setup(...)` 包一层
     `except asyncio.CancelledError: pass`（判据只认 Try.body 里**直接**的 `X.cleanup()`，
@@ -2920,6 +2988,11 @@ def test_c6_cleanup_callers_do_not_swallow_cancellation():
     CancelledError, Exception)`（`ast.With` 根本不产生 `Try` 节点）。
     ⇒ 判据改成：先把"能走到 .cleanup()"的函数名做成不动点闭包，再扫 Try **和** With。
     允许"捕了再 raise"（那是正确的收口形态），只禁捕了不传。
+
+    v1.7.64 再补第三种（实形两处：device_manager.cleanup 逐条 await 后台任务、
+    `__init__.async_unload_entry` 的 _bg_tasks/_check_task 收尾）与判据自身的
+    三处盲区/假阳性——见 `_c6_offenders_in_tree` 与 `_c6_swallows`。形状的自证在
+    tests/test_audit_2026_10_05_round3_fixes.py（合成源码四臂 + 真跑两臂）。
     """
     trees = []
     for p in sorted(PKG.rglob("*.py")):
@@ -2927,38 +3000,21 @@ def test_c6_cleanup_callers_do_not_swallow_cancellation():
     names = _cleanup_reachable_names([t for _p, t in trees])
     assert names, "闭包为空（本包没有 .cleanup() 调用点？判据需同步重写）"
 
-    def touches_cleanup(node):
-        for cal in ast.walk(node):
-            if not isinstance(cal, ast.Call):
-                continue
-            if getattr(cal.func, "attr", "") == "cleanup":
-                return True
-            if isinstance(cal.func, ast.Name) and cal.func.id in names:
-                return True
-        return False
-
     offenders = []
+    seen_bodies = 0
     for p, tree in trees:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Try):
-                if not touches_cleanup(node):
-                    continue
-                for h in node.handlers:
-                    if h.type is None or "CancelledError" not in ast.unparse(h.type):
-                        continue
-                    if any(isinstance(n, ast.Raise) for n in h.body):
-                        continue
-                    offenders.append("%s:%d try/except CancelledError 不传" % (p.name, node.lineno))
-            elif isinstance(node, ast.With):
-                if not touches_cleanup(node):
-                    continue
-                for item in node.items:
-                    ce = ast.unparse(item.context_expr)
-                    if "suppress" in ce and "CancelledError" in ce:
-                        offenders.append("%s:%d contextlib.suppress(CancelledError)"
-                                         % (p.name, node.lineno))
+        offenders += ["%s %s" % (p.name, h) for h in _c6_offenders_in_tree(tree, names)]
+        seen_bodies += sum(1 for n in ast.walk(tree)
+                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and n.name in C6_TEARDOWN_NAMES)
+
+    # 判据宇宙不许静默缩小：三个 teardown 本体都必须在扫
+    assert seen_bodies >= 3, \
+        "teardown 本体只找到 %d 个（应有 cleanup / async_unload_entry / " \
+        "async_remove_entry）——判据宇宙在缩小，需同步重写" % seen_bodies
+
     assert not offenders, \
-        "cleanup 链上的调用点吞掉停机取消（C-6 同族，含上移一层与 suppress）：%s" % offenders
+        "cleanup/卸载链上（含调用点与 teardown 本体）吞掉停机取消（C-6 同族）：%s" % offenders
 
 
 @pytest.mark.asyncio

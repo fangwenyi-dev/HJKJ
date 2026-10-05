@@ -188,11 +188,19 @@ def cred_brief(value: Any) -> str:
 
 
 def _positive_int(value: Any) -> int:
-    """云端回的数值一律过这道闸：bool/不可解析/非正数 ⇒ 0（＝未知，调用方回落兜底）。"""
+    """云端回的数值一律过这道闸：bool/不可解析/非正数 ⇒ 0（＝未知，调用方回落兜底）。
+
+    v1.7.64（对抗复核 A-1）：一并拒 float 不可表示的整数。本函数的产物最终都要做
+    浮点算术（`ms / 1000.0`、`ttl - (time.time() - at)`），而 JSON 允许任意精度整数
+    ——`10**400` 原样放行的话那两处算术抛 OverflowError：`_ttl_from_expire_ms` 在
+    `_ensure_registered`（无局部兜底）里炸 ⇒ 长连主循环每 5s 重启且永远修不好；
+    成员码倒计时在 `status_view` 里炸 ⇒ 面板 500（两处本机实测）。
+    """
     if value is None or isinstance(value, bool):
         return 0
     try:
         n = int(value)
+        float(n)   # 超出 float 可表示范围（≈1.8e308）＝后续浮点算术必抛，按不可用处理
     except (TypeError, ValueError, OverflowError):
         return 0
     return n if n > 0 else 0
@@ -597,7 +605,15 @@ class HubClient:
         async with session.post(self.base + path, json=payload, **kwargs) as resp:
             if resp.status != 200:
                 raise HubHttpError(path, resp.status, await self._err_of(resp))
-            return await resp.json()
+            # v1.7.64（第三轮复核 #6）：200 也要验形状。云函数返回空时云托管照样回
+            # 200 + `null`（或 `[]`/字符串），旧实现原样 return ⇒ 调用方在 **try 之外**
+            # 做 `data.get("ok")`（见 list_members 的 if not data.get(...)）⇒
+            # AttributeError 逃出本方法：面板路由 500、maybe_refresh_members 打死保活
+            # task（本仓"巡检任务静默死亡"同族）。按边界形状拒，错误码可辨识。
+            body = await resp.json()
+            if not isinstance(body, dict):
+                raise HubHttpError(path, resp.status, "bad_body")
+            return body
 
     @staticmethod
     async def _err_of(resp: Any) -> Optional[str]:
@@ -631,18 +647,32 @@ class HubClient:
                 # status_view（面板 API）500、_keepalive_loop 任务静默死亡。
                 if not math.isfinite(self._bind_code_at):
                     self._bind_code_at = 0.0
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # v1.7.64（#3 同类漏网）：身份文件里的大整数进 float() 抛的是
+                # OverflowError，旧元组接不住 ⇒ 从 _load_identity 逃出：面板侧
+                # （refresh_bind_code/list_members）500，长连侧每 5s 重启主循环
+                # 却永远修不好那份文件（本仓"巡检反复异常不落地"同族）
                 self._bind_code_at = 0.0
         # 老身份文件没有 bindCodeTtl ⇒ 0 ⇒ 有效期回落 BIND_CODE_TTL_S（向后兼容读取）
         if not self._bind_code_ttl_s:
             self._bind_code_ttl_s = _positive_int(ident.get("bindCodeTtl"))
 
     async def _load_aliases(self) -> None:
-        """读本机成员称呼表（幂等：面板路由不经过 async_start，改名前自己补一次）。"""
+        """读本机成员称呼表（幂等：面板路由不经过 async_start，改名前自己补一次）。
+
+        v1.7.64（对抗复核 A-2）：读盘与赋 `_aliases_loaded` 必须在**同一把写锁内**并
+        做二次判。旧实现两个并发改名各自发起一次读盘，慢的那次回来把
+        `self.member_aliases` 整个覆盖成"第一次落盘之前"的磁盘快照——即便读-改-写
+        已经入锁，先完成的那次改名仍会在内存与磁盘上被抹掉（冷启动窗：
+        `_aliases_loaded` 还是 False 时面板就能连着点两行改名）。
+        """
         if self._aliases_loaded:
             return
-        self.member_aliases = await asyncio.to_thread(load_member_aliases, self.config_dir)
-        self._aliases_loaded = True
+        async with self._alias_write_lock():
+            if self._aliases_loaded:
+                return
+            self.member_aliases = await asyncio.to_thread(load_member_aliases, self.config_dir)
+            self._aliases_loaded = True
 
     async def set_member_alias(self, mid: str, name: Any) -> bool:
         """给一位家人起本机称呼（面板「改名」）。留空＝恢复显示云端掩码。
@@ -663,19 +693,24 @@ class HubClient:
             self._set_op_error(OP_MEMBER_RENAME, "member_rename_rejected")
             return False
         cleaned = clean_member_alias(name)
-        table = dict(self.member_aliases)
-        if cleaned:
-            table[mid] = cleaned
-        else:
-            table.pop(mid, None)
-        try:
-            async with self._alias_write_lock():
+        # v1.7.64（第三轮复核 #5）：读-改-写必须**整体在锁内**。旧实现把
+        # `dict(self.member_aliases)` 快照做在锁外，两行「改名」并发时两边从同一
+        # 份快照出发、各自整份覆盖落盘 ⇒ 先完成的那次改名静默丢失（锁只串行了
+        # 写盘，没串行 read-modify-write）。内存提交一并挪进锁内：后一人必须看得见
+        # 前一人的结果，否则同样的丢更新会在内存里再复现一次。
+        async with self._alias_write_lock():
+            table = dict(self.member_aliases)
+            if cleaned:
+                table[mid] = cleaned
+            else:
+                table.pop(mid, None)
+            try:
                 await asyncio.to_thread(save_member_aliases, self.config_dir, table)
-        except Exception as e:  # noqa: BLE001 - 写不进去就别在内存里假装记住了
-            self._set_op_error(OP_MEMBER_RENAME, "member_rename_failed")
-            self._logger.warning("成员称呼落盘失败（%s），本次改名未保存", type(e).__name__)
-            return False
-        self.member_aliases = table
+            except Exception as e:  # noqa: BLE001 - 写不进去就别在内存里假装记住了
+                self._set_op_error(OP_MEMBER_RENAME, "member_rename_failed")
+                self._logger.warning("成员称呼落盘失败（%s），本次改名未保存", type(e).__name__)
+                return False
+            self.member_aliases = table
         self._clear_op_error(OP_MEMBER_RENAME)
         return True
 
@@ -856,7 +891,13 @@ class HubClient:
         """成员码剩余秒数（-1＝无码/签发时刻未知，与 owner 码同口径：不当"刚过期"渲染）。"""
         if not self.member_code or not self._member_code_at:
             return -1
-        return int(self.member_code_ttl_s() - (time.time() - self._member_code_at))
+        try:
+            return int(self.member_code_ttl_s() - (time.time() - self._member_code_at))
+        except (OverflowError, ValueError):
+            # v1.7.64（对抗复核 A-1）：与上方 bind_code_expires_in 的 v1.7.61 S1 出口
+            # 守卫同形——这条是同族漏网，非有限/过大的 ttl 或签发时刻会让 int() 抛
+            # OverflowError 直接炸穿 status_view（面板 500）
+            return -1
 
     async def list_members(self) -> bool:
         """拉家庭成员（掩码 openid + mid 句柄）。

@@ -1,5 +1,6 @@
 """开窗器网关Cover平台 - 供LLM等使用Cover语义控制开窗器"""
 import logging
+import math
 import time
 
 from homeassistant.core import HomeAssistant
@@ -170,8 +171,16 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
                     # （int(0.5)=0 ≤0），违反用户定案的">0=打开"语义。协议
                     # 规定整数 0-100，但 JSON 可携浮点——用 float 直比，
                     # 非数值串由既有 except (ValueError, TypeError) 落 None
-                    return float(r_travel) <= 0
-            except (ValueError, TypeError):
+                    # v1.7.64（第三轮复核 #3 同类收口）：这条转换还漏两种死法——
+                    # ① JSON 大整数进 float() 抛的是 OverflowError，旧元组接不住，
+                    #   异常从实体属性直接炸穿状态机；
+                    # ② inf/nan 转换不抛错，而 `inf<=0`、`nan<=0` 皆 False ⇒ 垃圾值
+                    #   被静默解释成"打开"。非有限数一律落 None（未知），与
+                    #   ws_gateway._as_int / hub_client._attr_int 同口径。
+                    position = float(r_travel)
+                    if math.isfinite(position):
+                        return position <= 0
+            except (ValueError, TypeError, OverflowError):
                 pass
         return None
 
@@ -213,7 +222,10 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
                 pos = last_attrs.get("position")
                 if pos is not None:
                     attributes["r_travel"] = max(0, min(100, int(pos)))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            # v1.7.64（#3 同类）：restore 状态里的 r_travel_raw/position 是 HA 自己
+            # 落盘的历史值，形态不可控——inf/极大浮点进 int() 抛的是 OverflowError，
+            # 旧元组接不住 ⇒ async_added_to_hass 整段恢复失败（重启后状态永远回填不上）
             pass
         status = DEVICE_STATUS_OPEN if last_state.state == "open" else DEVICE_STATUS_CLOSED
         _LOGGER.info(
@@ -268,7 +280,9 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
             raw = int(r_travel)
             if 0 <= raw <= 100:
                 return raw
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            # v1.7.64（#3 同类）：inf/极大浮点进 int() 抛的是 OverflowError，旧元组
+            # 接不住会直接从属性炸出去；接住它就落到下方的开/关端点兜底
             pass
         status = device.get("status")
         if status == DEVICE_STATUS_OPEN:
@@ -308,7 +322,9 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
                     # v1.6.26（第八轮审计 B-2）：一并持久化原始值，
                     # 恢复路径据此区分"真 100%"与"未校准 255 被钳成 100"
                     attrs["r_travel_raw"] = raw
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, OverflowError):
+                    # v1.7.64（#3 同类）：属性字典在 HA 状态机里被逐轮构造，这里
+                    # 逃逸的异常会让实体整轮状态写不出去（Web 面板停在旧值）
                     pass
         return attrs
 

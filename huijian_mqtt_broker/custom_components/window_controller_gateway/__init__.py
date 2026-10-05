@@ -933,18 +933,28 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # 上留下一只挂在已卸载条目上的耳朵，继续代答 001；reload 一轮多一只（仲裁只压
     # 重复发布、不压订阅）。它自带的 `data_now is None` 双检也拦不住——条目数据要到
     # 本函数结尾才 pop，卸载进行中该判据恒不成立。
-    for bg_task in data.get("_bg_tasks", []):
-        if bg_task and not bg_task.done():
-            try:
-                bg_task.cancel()
-                try:
-                    await bg_task
-                except asyncio.CancelledError:
-                    _LOGGER.debug("后台任务已取消")
-                except Exception as e:
-                    _LOGGER.debug("后台任务异常: %s", e)
-            except Exception as e:
-                _LOGGER.warning("取消后台任务时出错: %s", e)
+    # v1.7.64（对抗复核 A-3）：C-6 不变量——卸载/清理链上任何地方都不许就地吞掉取消。
+    # 旧写法逐条 `await bg_task` + `except CancelledError: debug` 正好违反：HA 取消
+    # async_unload_entry 时，CancelledError 从 `await bg_task` 抛出，被当成"子任务的
+    # 取消"记一条 debug 就过去了 ⇒ 取消传不出去，卸载被硬跑到结尾并返回 True
+    # （HA 以为干净卸载）。gather(return_exceptions=True) 把两种取消分开：子任务取消
+    # 作为结果值返回（不转抛），本协程被取消时 gather 当场抛出（正确向上传）。
+    # 快照一次——v1.6.11 #3 同因：任务完成回调会原地收缩这张列表。
+    _bg = [t for t in list(data.get("_bg_tasks", [])) if t is not None]
+    for bg_task in _bg:
+        if not bg_task.done():
+            bg_task.cancel()
+    if _bg:
+        try:
+            results = await asyncio.gather(*_bg, return_exceptions=True)
+        except Exception as e:  # noqa: BLE001 - 收尾自身异常不许把卸载吃掉（取消不在这格）
+            _LOGGER.warning("取消后台任务时出错: %s", e)
+        else:
+            for res in results:
+                # CancelledError 自 3.8 起继承 BaseException，isinstance(..., Exception)
+                # 天然把它排除在外——这里只剩"后台任务自己异常退出"需要留痕
+                if isinstance(res, Exception):
+                    _LOGGER.debug("后台任务异常: %s", res)
 
     # 1.1 取消心跳监听器（无 SN 模式下的自动发现）——在任务收尾**之后**读，
     # 才能接住任务在让出点里刚补上的那只耳朵（见上方 C-5）。
@@ -969,13 +979,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if "mqtt_handler" in data and data["mqtt_handler"]:
         if hasattr(data["mqtt_handler"], '_check_task') and data["mqtt_handler"]._check_task:
             try:
-                data["mqtt_handler"]._check_task.cancel()
-                try:
-                    await data["mqtt_handler"]._check_task
-                except asyncio.CancelledError:
-                    _LOGGER.debug("MQTT检查任务已取消")
-                except Exception as e:
-                    _LOGGER.debug("MQTT检查任务异常: %s", e)
+                _ck = data["mqtt_handler"]._check_task
+                _ck.cancel()
+                # v1.7.64（对抗复核 A-3 同形）：旧写法 `except CancelledError: debug`
+                # 会把"本协程被取消"和"子任务被我们取消"混为一谈、就地吞掉。
+                # gather 的 return_exceptions 只把后者收成结果值，前者照样向上传。
+                for res in await asyncio.gather(_ck, return_exceptions=True):
+                    if isinstance(res, Exception):
+                        _LOGGER.debug("MQTT检查任务异常: %s", res)
                 _LOGGER.info("已停止MQTT后台检查任务")
             except Exception as e:
                 _LOGGER.warning("停止MQTT后台检查任务时出错: %s", e)

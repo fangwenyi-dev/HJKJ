@@ -16,6 +16,7 @@ M 个子设备」退回只显示 `gatewaySn`；新版只在"点二维码"那条 
   2) 单一渲染出口：`loadRemoteControl` 必须走 `applyHubStatus`，且旧渲染器指纹消失；
   3) `hubErrorText`：DOM/CSS/接线齐备 + **node 真跑**映射（只映射已知码，未知一律不显示）。
 """
+import ast
 import re
 import shutil
 import subprocess
@@ -120,31 +121,65 @@ def test_hub_error_slots_are_split_conn_vs_op():
         assert "default:" in body and "return ''" in body, "%s 未知码必须回空串（不显示）" % fn
 
 
+def _str_consts_in_slot_arg(node):
+    """只取"会作为码值落进操作槽"的字符串字面量：直接常量，或 `X or "码"` 的尾项。
+    `data.get("err")` 里的 `"err"` 是字典键不是码——按尾项/直接常量收窄。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        last = node.values[-1]
+        if isinstance(last, ast.Constant) and isinstance(last.value, str):
+            return {last.value}
+    return set()
+
+
+def _codes_the_plugin_can_emit():
+    """操作槽里可能出现的码，一律从**生产代码**派生（AST），不再抄手写清单。
+
+    为什么必须派生：手写清单等于没测。v1.7.64 让 `_http` 新产生 `bad_body`（经调用方
+    `e.err or "…"` 落进操作槽），它不在任何手写清单里，而面板对未知码走
+    `default: return ''`（上面 conn/op 那条钉刻意要求的行为）⇒ 用户点完「添加家人」
+    毫无反应，而全量 1481 条当时全绿。
+    """
+    codes = set()
+    for p in sorted((ROOT / "custom_components" / "window_controller_gateway").rglob("*.py")):
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call):
+                continue
+            fname = n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", None)
+            if fname == "_set_op_error" and len(n.args) >= 2:
+                codes |= _str_consts_in_slot_arg(n.args[1])
+            elif fname == "HubHttpError" and len(n.args) >= 3:
+                # 第三实参 = err；调用方普遍写 `e.err or "<兜底码>"`，err 非空时直接进槽
+                codes |= _str_consts_in_slot_arg(n.args[2])
+    return codes
+
+
 def test_op_error_covers_every_code_the_plugin_can_emit():
     """操作类映射必须覆盖加载项真会产生的每个值：漏一个＝用户点了没反应。
 
     取值来源两类：① hub 的真实 err（no_owner/members_full/rate_limited/registry_full/
     superseded/bad_secret/unknown_instance/unknown_member/owner_cannot_leave）——此前被压成
     一个笼统的 bindcode_rejected，面板只能说"稍后再试"，而 no_owner 的正解是"先自己扫码
-    成为主人"，重试永远不会成功；② 本地降级值（网络失败/老 hub）。
+    成为主人"，重试永远不会成功；② 本地降级值（网络失败/老 hub）+ 本地形状闸产生的码。
+    ② 现在从生产代码 AST 派生（见 `_codes_the_plugin_can_emit` 为什么要派生）。
     """
-    py = (ROOT / "custom_components" / "window_controller_gateway" / "hub_client.py").read_text(encoding="utf-8")
     body = _single_func_body(JS, "hubOpErrorText")
-    local = ("bindcode_failed", "bindcode_rejected", "hub_too_old_for_member_code",
-             "members_unavailable", "members_rejected",
-             "member_remove_failed", "member_remove_rejected")
-    for code in local:
-        assert '"%s"' % code in py or "'%s'" % code in py, \
-            "加载项已不再产生 %s（映射表在验死码）" % code
-        assert "'%s'" % code in body, "hubOpErrorText 漏映射本地降级值 %s" % code
+    derived = _codes_the_plugin_can_emit()
+    assert derived, "派生集为空＝扫描锚点漂移，本钉在扫空气"
+    for code in sorted(derived):
+        if code == "members_unsupported":
+            # 唯一例外：它是**持续状态**而不是故障，由成员区自己说清
+            # （#hubError 在 owner 码区域，把成员类的话摆那儿正是本批 P2-3(a) 修的那个形态）
+            assert "'members_unsupported'" not in body, \
+                "members_unsupported 不该进 #hubError（那是 owner 码区域，成员区已自己说明）"
+            continue
+        assert "'%s'" % code in body, \
+            "hubOpErrorText 漏映射加载项会产生的码 %s（未知码走 default 回空串＝用户点了没反应）" % code
     for code in ("no_owner", "members_full", "rate_limited", "registry_full", "superseded",
                  "bad_secret", "unknown_instance", "unknown_member", "owner_cannot_leave"):
         assert "'%s'" % code in body, "hubOpErrorText 漏映射 hub 错误码 %s（用户会看到点了没反应）" % code
-    # 唯一例外：members_unsupported 是**持续状态**而不是故障，由成员区自己说清
-    # （#hubError 在 owner 码区域，把成员类的话摆那儿正是本批 P2-3(a) 修的那个形态）
-    assert '"members_unsupported"' in py, "解析锚点漂移：hub_client 不再产生 members_unsupported"
-    assert "'members_unsupported'" not in body, \
-        "members_unsupported 不该进 #hubError（那是 owner 码区域，成员区已自己说明）"
 
 
 def test_hub_error_text_really_runs_in_node():

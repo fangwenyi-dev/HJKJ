@@ -3,6 +3,40 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.7.64] - 2026-10-06
+
+第三轮只读复核（`docs/bug-audit-2026-10-05-round3.md`）残余条目的判决与收口批：报告 6 条待决 **5 真 2 假**——真 5 条全修，假 2 条留证不改（含它自己给的一条"可选加固"）。发版前派"尝试推翻"代理回攻，抓回 **4 条确证缺陷（A-1~A-4：我这批"修不到底"的、同类仍漏的、判据自身假阳性与盲区的）+ 我自己引入的 1 处自伤**，全部本机复现后收口。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**；本批纯缺陷收口，无新功能。
+
+**一、#3 cover.py 数值转换的 OverflowError 类（四处）+ hub_client 同类漏网一处**：`float(大整数)` 抛的是 OverflowError，旧 `except (ValueError, TypeError)` 接不住 ⇒ 异常从实体属性直接炸穿状态机（`is_closed` / `current_cover_position` / `extra_state_attributes` / 重启 restore 回填四处同形）；而 inf/nan 转换本身不抛错，`inf<=0` 与 `nan<=0` 都是 False ⇒ 垃圾位置被静默判成"打开"。修法：四处补捕 OverflowError，`is_closed` 加 `math.isfinite` 闸，非有限数一律落 None（未知）——与 `ws_gateway._as_int` / `hub_client._attr_int` 既有口径对齐（本仓对同一类已系统性修过 5 次，这是第 6 处漏网）。同类扫描另抓出 `hub_client._load_identity` 的 `float(bindCodeAt)`：漏网后果不是面板 500，就是长连主循环每 5s 重启却永远修不好那份身份文件。全仓判据升级为机器验证步（见"判据"）。
+
+**二、#5 成员改名的并发丢更新**：`set_member_alias` 的 `dict(self.member_aliases)` 快照做在**锁外**，锁只串行了写盘、没串行 read-modify-write ⇒ 面板两行「改名」并发时两边从同一份快照出发、各自整份覆盖落盘，先完成那次静默丢失。修法：读-改-写与内存提交整体入锁（真跑双臂：磁盘慢时两条不同 mid 的改名在文件与内存里都必须在；串行两次必须基于第一次结果而非初始空表）。冷启动侧的第二次读盘竞态见第七条 A-2。
+
+**三、#6 hub `_http` 不验 200 的响应体形状**：云函数返回空时云托管照样给 200 + `null`，旧实现原样 return ⇒ 调用方在 **try 之外** 做 `data.get("ok")`（`list_members`），AttributeError 逃出方法：面板路由 500、`maybe_refresh_members` 打死保活 task（本仓"巡检任务静默死亡"同族）。修法：边界处验 dict，非 dict 抛 `HubHttpError(status, err="bad_body")`——错误码可辨识，不混进网络类失败。
+
+**四、#8 `device_manager.cleanup` 吞掉停机取消（本仓 C-6 不变量的作用面漏洞）**：取消全部后台任务后逐条 `await task` + `except asyncio.CancelledError: pass`——cleanup **自身**被取消时 CancelledError 正是从 `await task` 抛出并被 pass 吃掉 ⇒ 取消传不出本函数，HA 停机/条目重载只能等超时。既有不变量钉 `test_c6_cleanup_callers_do_not_swallow_cancellation` 之所以全绿：它的不动点闭包只收"**调用了** .cleanup() 的函数名"，**cleanup 本体不在判据宇宙里**（device_manager 整包被视而不见）。修法：改 `gather(*tasks, return_exceptions=True)`——子任务取消作为结果值返回（不转抛，后续 clear() 照跑完），cleanup 自身被取消时 gather 当场抛（正确向上传）；同时**把钉扩到 teardown 函数本体**，"捕了再 raise 合法"的口径不变。卸载链上的同形两处见第七条 A-3。
+
+**五、#9 面板滑块防覆写在手机上等于没修**：`userInteracting` 只认 `document.activeElement`，而 v1.7.18 注释自称"鼠标/触摸通用"名不符实——iOS Safari 不把焦点给非文本控件，手指拖 `<input type=range>` 时 activeElement 仍是 body ⇒ 30s 无感刷新照旧覆写，thumb 跳回、设置静默丢失（BUG-18 原症状在手机上重演）。修法：以**原生 `input` 事件时间戳**为第一凭据（鼠标/触摸/键盘三种拖动都逐帧派发；本页滑块旁标签实时跟走靠的就是它），4s 保持窗兜住"拖完到下一次回写"这段，activeElement 保留为第二凭据。**没有**新增 touch/pointer 监听——v1.7.22「防误触纯 CSS、JS 不劫持滑块默认行为」的约定不破（同批补反向钉）。
+
+**六、两条"不改"的判决（报告的建议本身有问题）**：① §3.1「C-2 窄竞态」建议给 `_self_acked` 加 `consumed` 标志——现实现 pop 之后同 id 第二帧**已经**走"解除失聪"分支，加 consumed 也是在第二帧解除；回声真丢时两者都是"第一帧被当回声、下一帧恢复"，**逐帧等价、窗口闭不上**（要闭它得在代答载荷里带自答标记＝改线协议，代价大于收益）。该语义已由 `tests/mutation_matrix.py` 的 c2/f1 两臂双向守着，不动。② §4.1「注释滞后」不成立：`mqtt_bootstrap.py` 那条 return 的注释当时就写着"宿主停机 / 启用条目已清空"两条路径。另：报告对第一轮 #10/#12 的**撤回成立**（`run.sh` 用的是 `FNR`——每文件重置，正是喂 `/proc/net/tcp` + `tcp6` 两份文件的正解，第二轮误报）。
+
+**七、发版前对抗复核（派代理逐条攻，5 条指控全部本机复现后收口）**：
+
+① **A-1（高）#3 同类仍有两处落点我的判据根本看不见**——它们**没有 try**，而我的 OverflowError 类扫描只查"捕了 ValueError/TypeError 的 Try 子树"。`_positive_int` 对 JSON 任意精度大整数（`10**400`）原样放行（`int()` 不抛），产物却全要进浮点算术：`_ttl_from_expire_ms` 的 `ms/1000.0` 实测抛 OverflowError，其唯一调用点在 `_ensure_registered`（无局部兜底）⇒ 逃出长连主循环，每 5s 重启且永远修不好那份状态；成员码倒计时同理在 `status_view` 里抛 ⇒ 面板 500（同族 `bind_code_expires_in` 早在 v1.7.61 S1 就有出口守卫，成员码这条是漏网——复现时同一个值过去返回 -1、这里炸）。修法：源头 `_positive_int` 加 **float 可表示性闸**（`float(n)` 抛即按不可用＝0，回落本地常量），视图层补与 sibling 同形的出口守卫做双保险；端到端钉"绕过头闸直塞视图层也不许炸 status_view"。
+
+② **A-2（中）#5 修不到底：`_load_aliases()` 的读盘仍在锁外**。并发改名时两边的读盘都早于第一次落盘，慢的那次回来把 `self.member_aliases` 覆盖成"落盘之前"的磁盘快照 ⇒ 先完成那次改名在内存与磁盘上一起丢（冷启动窗：`_aliases_loaded` 还没置上时面板就能连点两行）。修法：读盘与赋 flag 进**同一把写锁**并做锁内二次判（后一人拿锁时表已就绪，直接复用，第二次读盘根本不再发生）。**我第一版的并发测试看不到这一侧**（gather 的调度运气让两次读盘都早于提交，旧代码照样绿）——改成显式调度（A 进到读盘 → B 进到读盘 → B 晚一步返回旧快照）后旧代码当场红。
+
+③ **A-3（中）#8 同形还剩两处，扩面后的 C-6 钉看不见**：`__init__.async_unload_entry` 里 `_bg_tasks` 的逐条 `await bg_task` 与 `_check_task` 的 `await`，两处都写 `except asyncio.CancelledError: _LOGGER.debug(...)`。HA 取消卸载时 CancelledError 从 `await 子任务` 抛出，被当成"子任务取消"记一条 debug 就过去了 ⇒ 取消传不出去，卸载被硬跑到结尾**返回 True**（HA 以为干净卸载，实际是半程取消）。旧判据的第二作用面只认 `name == "cleanup"`，第一作用面对这两个内层 Try 判 `touches_cleanup` 不成立 ⇒ 现状跑钉全绿。修法：两处同改 `gather(return_exceptions=True)`；判据宇宙从 `cleanup` 扩到 `cleanup / async_unload_entry / async_remove_entry`，并加"宇宙静默缩小"的上限自检（找不满三个即红）。
+
+④ **A-4（低）C-6 判据自身三处缺陷**：假阳性——旧写法只查 handler **直接**语句里的 `raise`，把"条件再抛"（`except CancelledError: if not ready: raise`，本仓 hub_client 的 WS 闸就是这个形态）判红，而这正是 docstring 明文允许的收口形态；盲区两条——`async with contextlib.suppress(CancelledError)`（只扫 `ast.With`，`AsyncWith` 是另一种节点）与 `except* CancelledError: pass`（`TryStar` 不是 `Try`）。修法：判据提到模块级、搜整棵 handler 子树、扫 Try/TryStar/With/AsyncWith 四类节点，并用**合成源码四臂**给判据自己做形状验证——正是这四臂当场炸出 `ast.walk(h.body)` 传 list 的隐形雷（那一行在旧判据里从未被触发过，所以从没红过）。
+
+⑤ **自伤一处（我自己抓的，不在代理报告里）**：#6 新产生的错误码 `bad_body` 会经调用方的 `e.err or "…"` 落进面板操作槽，而面板对未知码走 `default: return ''`（那是 conn/op 拆分钉刻意要求的行为）⇒ 用户点「添加家人/移除」会**毫无反应**；守这条的 `test_op_error_covers_every_code_the_plugin_can_emit` 用的是**手写码清单**，新码天生不在清单里，1481 条全绿放过了它。修法：面板补 `case 'bad_body'` 文案，并把那条钉从手写清单升级成**从生产代码 AST 派生码值宇宙**（`_set_op_error` 槽参数字面量 + `HubHttpError(..., err)` 字面量，豁免只留 `members_unsupported` 并写明理由）；删掉 case 的变异臂逐字报出"漏映射…bad_body…用户点了没反应"。
+
+**判据**：新增 `tests/test_audit_2026_10_05_round3_fixes.py` **44 条**——① 全仓 OverflowError 类机器验证步（AST 扫 Try 体内的直接 `int()`/`float()` 转换，实参按构造为 str 者除外），自带变异臂；② cover.py 四条落点逐条真跑（大整数/±inf/nan → 不抛、判未知；0/0.5/65/255 正常语义不变的反向臂）；③ 并发改名双臂 + 冷启动第二次读盘 + 写盘失败不提交内存；④ `_http` 四种非 dict 体 + dict 透传 + `list_members` 降级不抛 + `bad_body` 的 node 真跑文案；⑤ cleanup/卸载链正反两向真跑（自身取消穿出、子任务取消不转抛、"每个任务都被 await 过"不因 gather 化丢失）+ **判据自身形状四臂**（合成源码：吞取消报、条件再抛不报、async with suppress 报、except* 报）；⑥ node 真跑 `userInteracting` 四场景（焦点/触摸/过保持窗/null）+ 覆盖率钉（renderDevice 每条 range 都带交互标记、三处回写都有守卫）+ 反向钉（JS 不得出现 touchstart/pointerdown）；⑦ A-1 端到端（`status_view` 在绕过入界闸的非有限/超大值下仍不抛）。升级两条既有钉：`test_c6_cleanup_callers_do_not_swallow_cancellation`（判据本体模块级化 + teardown 宇宙 + 上限自检）、`test_op_error_covers_every_code_the_plugin_can_emit`（码值宇宙改由生产代码派生）。
+
+**门禁**：pytest **1498**（基线 1454 + 本批 44，零 fail 零 skip）；ruff（CI 同参 F,E9,B）/ compileall / JSON+YAML 解析 / `node --check`×3 / `bash -n`（run.sh + 9 个 e2e shell）全绿；仓内**变异矩阵 53/53**（52 臂应红、0 失守）；本批另做**针对性变异自证 14 臂全 RED**（把每处修复改回原缺陷形态在临时副本里跑，含"摘掉源头闸""退回锁外读盘""卸载退回吞取消""删掉面板文案"各臂）；版本位 config.yaml / manifest.json / version.json×2 / index.html（CURRENT_VERSION + 5 处缓存位）＝1.7.64 字节级替换，行尾未翻；三份翻译（strings / zh-CN / zh-Hans）结构逐键对账，`fix_flow` 齐备、`config.step.repair` 零残留。
+
+**未验边界（诚实口径）**：真机点两张「修复」卡、真栈 E2E（`run_e2e.sh` / `fast_discovery_e2e.sh`）、C-6 常驻 healer 跑满 1800s、C-2 竞态实测——报告 §五 这四条本批**一条都没闭**；A-2/A-3 的并发与取消面是"本机显式调度实测 + 逻辑链"，未在真 HA 的停机竞态里复现。发版依据是量具全绿（10-01 判例），真机复验允许后补。
+
 ## [1.7.63] - 2026-10-05
 
 第二轮独立审计（`docs/bug-audit-2026-10-05-round2.md`：12 条新发现 C-1~C-11 + N-1）经逐条自验后的收口批：**必修 7 + 次批 4**。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**。
