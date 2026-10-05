@@ -29,7 +29,8 @@ from .services import register_services
 from .api import async_setup_api
 from .hub_client import (HUB_DEFAULT_BASE, HUB_DEFAULT_INSTALL_KEY, HubClient,
                          resolve_hub_base)
-from .utils import is_mqtt_loaded, iter_devices, async_write_instance_uuid_file
+from .utils import (is_mqtt_loaded, iter_devices, async_write_instance_uuid_file,
+                    log_throttled)
 
 _LOGGER = logging.getLogger(__name__)
 

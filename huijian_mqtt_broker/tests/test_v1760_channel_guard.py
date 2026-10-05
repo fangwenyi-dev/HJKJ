@@ -20,7 +20,6 @@ from types import SimpleNamespace
 import pytest
 
 import homeassistant.components.mqtt as fake_mqtt
-import homeassistant.helpers.issue_registry as fake_ir
 import custom_components.window_controller_gateway.mqtt_bootstrap as mb
 import custom_components.window_controller_gateway.config_flow as cf_mod
 from custom_components.window_controller_gateway.const import DOMAIN
