@@ -134,8 +134,14 @@ class _CtypeHandlersMixin:
                             continue
                         
                         # 保留原有检查逻辑作为备份
-                        device_model = device_info.get("model", "").lower()
-                        device_vesion = device_info.get("vesion", "").lower()
+                        # v1.7.61（10-05 审计 #7）：与 device_sn 同型守卫——
+                        # 键存在值为 null 时 `.get(默认)` 返回 None，None.lower()
+                        # 抛 AttributeError 被逐条 except 吞掉 ⇒ 该设备本帧既不
+                        # 更新也不自动入库（已存在设备的 r_travel/电量随之冻结）。
+                        _model = device_info.get("model")
+                        _vesion = device_info.get("vesion")
+                        device_model = _model.lower() if isinstance(_model, str) else ""
+                        device_vesion = _vesion.lower() if isinstance(_vesion, str) else ""
                         if "gateway" in device_model or "网关" in device_model:
                             continue
                         elif "gateway" in device_vesion or "网关" in device_vesion:

@@ -745,6 +745,12 @@ class HubClient:
                 "bindCodeAt": round(self._bind_code_at, 3),
                 "bindCodeTtl": self._bind_code_ttl_s,
             })
+        # v1.7.61（10-05 审计 #4）：落盘成功 ⇒ "身份只在内存"的告警条件已消失，
+        # 必须在这里清。这是**所有落盘路径的汇合点**（注册路径与
+        # refresh_bind_code 都经此）——旧实现只在 _ensure_registered 的 else
+        # 分支清，而该方法在"内存已有身份"时早返回 ⇒ 首轮落盘失败后任何后续
+        # 成功落盘都不再清，面板永久显示"没保存云端身份/重启会作废绑定码"。
+        self._clear_op_error(OP_IDENTITY)
 
     def bind_code_ttl_s(self) -> int:
         """当前绑定码的有效期秒数：云端回的优先，没有才回落 BIND_CODE_TTL_S。"""

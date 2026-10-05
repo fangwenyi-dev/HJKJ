@@ -963,7 +963,11 @@ def ws_gateway_wanted(hass: HomeAssistant) -> Optional[Tuple[int, str]]:
             port = int(raw_port)
             if port < 1024 or port > 65535:
                 raise ValueError
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            # v1.7.61（10-05 审计 #2）：补 OverflowError——int(float('inf'))
+            # 抛的类型既不是 ValueError 也不是 TypeError（实测 issubclass 均为
+            # False），非有限浮点（Storage 手改/旧版本残留）会逃出本函数，
+            # 四个调用点只记 error ⇒ 9001 永不监听、改端口/令牌也不重聚合。
             port = DEFAULT_WS_GATEWAY_PORT
         # v1.7.18（第 7 轮审计 BUG-7）：保留端口运行时防线——config_flow
         # 表单已拦，但 Storage 手改/旧版本残留等非表单路径写入 port=2022

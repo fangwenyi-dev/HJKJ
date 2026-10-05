@@ -49,6 +49,32 @@ ENDPOINT_FILENAME = "window_controller_gateway_mqtt_endpoint.json"
 BUILTIN_BROKER = "127.0.0.1"
 BUILTIN_PORT = 2022
 
+
+def _usable_mqtt_entries(entries) -> list:
+    """「有效 MQTT 配置」= 未禁用 **且** 非 source=ignore（v1.7.61，10-05 现场）。
+
+    HA 里 `source=ignore` 的条目是用户在发现卡上点过"忽略"的记录，**永不加载**。
+    旧实现只滤 `disabled_by` ⇒ 把这种条目当已配置：走"匹配/接管"分支后删掉引导
+    标记自称成功，而真正的 MQTT 条目永不创建 ⇒ `is_mqtt_loaded` 恒假 ⇒ 心跳耳
+    无限干等、首台网关的自动添加不成链（现场 .184 实锤：mqtt not_loaded +
+    source=ignore + devices 空 + "MQTT 集成仍未就绪"）。与 v1.7.18 BUG-5
+    "禁用条目不算有效配置" 同口径扩大。
+    """
+    out = []
+    for e in entries:
+        if getattr(e, "disabled_by", None):
+            continue
+        if str(getattr(e, "source", "") or "") == "ignore":
+            continue
+        out.append(e)
+    return out
+
+
+def _ignored_mqtt_entries(entries) -> list:
+    return [e for e in entries
+            if not getattr(e, "disabled_by", None)
+            and str(getattr(e, "source", "") or "") == "ignore"]
+
 #: mDNS 广播状态文件（容器侧 mdns_publisher.py 写，无凭据）：同局域网存在
 #: 第二台慧尖加载项时名字（huijian.local）被先注册者独占，本机广播永久失败
 #: ——集成侧据此出提示卡，别让"网关永远只连另一台 HA"成为无迹之谜。
@@ -222,12 +248,13 @@ async def verify_builtin_channel(hass: HomeAssistant) -> str:
         return "no_endpoint"
     exp_broker, exp_port = endpoint["broker"], int(endpoint["port"])
     try:
-        entries = [e for e in hass.config_entries.async_entries("mqtt")
-                   if not getattr(e, "disabled_by", None)]
+        raw_entries = hass.config_entries.async_entries("mqtt")
     except Exception:  # noqa: BLE001 — 判定面不可读时不误报
         return "no_endpoint"
+    entries = _usable_mqtt_entries(raw_entries)
     if not entries:
-        return "no_entry"
+        # v1.7.61：只有 source=ignore 条目——永不加载，给专门判词（卡片归因准确）
+        return "ignored_only" if _ignored_mqtt_entries(raw_entries) else "no_entry"
     first = entries[0]
     try:
         cur_broker = str((first.data or {}).get("broker") or "")
@@ -370,8 +397,20 @@ async def ensure_mqtt_connection(hass: HomeAssistant) -> Optional[bool]:
     # 且根因不可见。统一口径：仅启用条目算有效 MQTT 配置；全禁用则 loud
     # 告警并保留标记（禁用是用户决策，插件不代劳启用/删除）。
     all_entries = hass.config_entries.async_entries("mqtt")
-    existing_entries = [e for e in all_entries if not getattr(e, "disabled_by", None)]
+    existing_entries = _usable_mqtt_entries(all_entries)
     if all_entries and not existing_entries:
+        ignored = _ignored_mqtt_entries(all_entries)
+        if ignored:
+            # v1.7.61：仅剩 source=ignore 条目——它永不加载，不是有效配置。
+            # 保留标记（等下轮自愈/用户处置），并点名这条根因。
+            _LOGGER.warning(
+                "HA 里只有被忽略的 MQTT 条目（source=ignore，永不加载，%d 条）——"
+                "它不构成有效 MQTT 配置，慧尖会尝试创建新条目；若被 HA 的单实例闸"
+                "拦下，请到 设置→设备与服务 删除那条被忽略的 MQTT 条目后重启慧尖"
+                "加载项。引导标记已保留待自愈",
+                len(ignored),
+            )
+            return False
         _LOGGER.warning(
             "MQTT 配置条目全部处于禁用状态（%d 个）——慧尖不代为启用/删除，"
             "请在 设置→设备与服务→MQTT 重新启用或删除该条目后重启慧尖加载项；"
@@ -493,11 +532,12 @@ async def ensure_mqtt_connection(hass: HomeAssistant) -> Optional[bool]:
         # v1.7.18（BUG-5）：等锁期间条目可能被禁用——双检同样只认启用条目；
         # 出现"全禁用"竞态时保留标记并告警（与入口熔断同口径）。
         locked_all = hass.config_entries.async_entries("mqtt")
-        locked_enabled = [e for e in locked_all if not getattr(e, "disabled_by", None)]
+        locked_enabled = _usable_mqtt_entries(locked_all)
         if locked_all and not locked_enabled:
             _LOGGER.warning(
-                "等待 MQTT 引导锁期间条目被禁用，保留引导标记；"
-                "请在 设置→设备与服务→MQTT 重新启用或删除条目后重启慧尖加载项"
+                "等待 MQTT 引导锁期间条目被禁用/被忽略（source=ignore 永不加载），"
+                "保留引导标记；请在 设置→设备与服务→MQTT 重新启用或删除条目后"
+                "重启慧尖加载项"
             )
             return False
         if locked_enabled:
@@ -589,12 +629,14 @@ async def ensure_mqtt_connection(hass: HomeAssistant) -> Optional[bool]:
             if reason == "single_instance_allowed":
                 # 已有 MQTT 条目（或 HA 核心层单实例拦截）：按已存在处理。
                 # v1.7.18（BUG-5 同口径）：拦截也可能全来自**禁用条目**——
+                # v1.7.61：或全来自**被忽略条目**（source=ignore 永不加载）。
                 # 死条目永不 setup，"已存在"是假象，不得删标记掩盖根因。
                 _cur = hass.config_entries.async_entries("mqtt")
-                if _cur and not [e for e in _cur if not getattr(e, "disabled_by", None)]:
+                if _cur and not _usable_mqtt_entries(_cur):
                     _LOGGER.warning(
-                        "MQTT 单实例拦截来自禁用条目，保留引导标记；"
-                        "请在 设置→设备与服务→MQTT 重新启用或删除该条目"
+                        "MQTT 单实例拦截来自禁用/被忽略（source=ignore）条目，"
+                        "保留引导标记；请在 设置→设备与服务→MQTT 重新启用或删除"
+                        "该条目（含被忽略的那条）后重启慧尖加载项"
                     )
                     return False
                 _LOGGER.info("MQTT 配置流程中止（%s），视为已有配置", reason)
@@ -738,6 +780,8 @@ async def _channel_guard(hass: HomeAssistant, verdict: str) -> None:
     """
     detail = {
         "no_entry": "HA 里没有启用中的 MQTT 配置条目",
+        "ignored_only": ("HA 里只有被忽略（source=ignore，永不加载）的 MQTT 条目"
+                         "——请到 设置→设备与服务 删除它，或直接添加一次 MQTT 集成"),
         "mismatch": "HA 的 MQTT 条目指向了别的 Broker",
         "disconnected": "MQTT 条目地址正确但客户端未连上内置 Broker（未起/凭据被拒）",
     }.get(verdict, verdict)

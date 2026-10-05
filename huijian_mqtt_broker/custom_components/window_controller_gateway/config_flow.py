@@ -889,7 +889,14 @@ class OptionsFlow(config_entries.OptionsFlow):
                 errors[CONF_WS_GATEWAY_PORT] = "ws_port_reserved"
             else:
                 user_input = {**user_input, CONF_WS_GATEWAY_TOKEN: token}
-                return self.async_create_entry(title="", data=user_input)
+                # v1.7.61（10-05 审计 #11）：整表覆盖会把**表单外的** options
+                # 静默清空——hub_base / hub_install_key 是 __init__._hub_option
+                # 会读的受支持覆盖项（hub_client.py:54 明写），却不在本表单里。
+                # 用户进选项页保存一次（哪怕只改一个开关），自建 hub 端点/安装
+                # 密钥即被清空、云通道回落内置默认且界面无提示。改为"旧表打底、
+                # 表单字段覆盖"——与 async_step_add_gateway 那侧保留 options 同口径。
+                merged = {**self._config_entry.options, **user_input}
+                return self.async_create_entry(title="", data=merged)
 
         return self.async_show_form(
             step_id="options",

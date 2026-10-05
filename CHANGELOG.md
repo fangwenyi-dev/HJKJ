@@ -3,6 +3,28 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.7.61] - 2026-10-05
+
+独立缺陷审计（`docs/bug-audit-2026-10-05.md`，12 条经逐条复核**全部为真**）里判"必修"的 5 条收口。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**。
+
+**一、persist 根类型/版本位无闸 → 整个集成 setup 失败（审计 #1）**：`json.load` 成功但根不是对象（`[1,2,3]`/`"x"`/`123`/`true`）时 `data.get()` AttributeError；`schema_version` 为 `"2"`/null 时 `>` 比较 TypeError——两者都逃出 `load_persistent_data`，而唯一调用点是 `async_setup` 里的**裸 await** ⇒ 全部网关条目/实体不可用直到手工修文件。修法：主文件与 `.bak` 双双补根类型闸（非法按损坏处理，交给既有备份救援/退化路径），版本位非 int（含 bool）按 0 处理并告警，其余字段照常加载。
+
+**二、ws_gateway_wanted 端口 `int()` 漏 OverflowError → WS 网关永不监听（审计 #2）**：`int(float('inf'))` 抛的类型既非 ValueError 也非 TypeError（实测 issubclass 均 False），异常逃出本函数而四个调用点只记 error ⇒ 9001 永不监听、改端口/令牌也不重聚合。回退默认口（与既有 port 越界/保留口回退同口径）。
+
+**三、hub 身份落盘成功不清 `OP_IDENTITY` → 面板永久假告警（审计 #4）**：清除点全仓仅 1 处且只在 `_ensure_registered` 的 else 分支，而该方法"内存已有身份"即早返回、`refresh_bind_code` 成功落盘也只清 OP_BINDCODE ⇒ 首轮落盘失败后，哪怕磁盘上已有完整身份，面板仍**永久**显示"没保存云端身份/重启会作废绑定码"。清除点上收到 `_save_identity` 成功之后——注册与换码两条落盘路径的汇合点；失败路径保持不清（反向臂钉住）。
+
+**四、002 里 `model`/`vesion` 为 null 整条吞设备（审计 #7）**：键存在值为 null 时 `.get(默认)` 不生效，`None.lower()` 被逐条 except 吞掉 ⇒ 该设备本帧既不更新也不入库（已存在设备的 r_travel/电量冻结）。与同条消息的 `device_sn` 同型守卫；`gateway/网关` 过滤语义不变（反向臂钉住）。
+
+**五、选项页保存清空带外配置（审计 #11）**：表单不含 `hub_base`/`hub_install_key`（`__init__._hub_option` 会读，hub_client 明写是受支持覆盖项），整表覆盖 ⇒ 保存一次（哪怕只改一个开关）即静默清空自建 hub 端点/安装密钥、云通道回落内置默认。改"旧表打底、表单字段覆盖"，与 `async_step_add_gateway` 保留 options 同口径。
+
+**六、现场追加（.184 只读实测，用户当场报障）——"首台网关自动添加没成功"的真根因**：HA REST 实见 `mqtt` 条目 **state=not_loaded + source=ignore**（被"忽略"过的发现条目，**永不加载**），而慧尖引导只滤 `disabled_by` ⇒ 把它当已配置 → 删引导标记自称成功 → 真正的 MQTT 条目永不创建 → `is_mqtt_loaded` 恒假 → 心跳耳无限干等（日志"MQTT 集成仍未就绪（累计 120s）"）→ 网关上报无人听、devices 表为空。修法：`_usable_mqtt_entries()` 收口"有效 MQTT 配置"＝未禁用 **且** 非 source=ignore（引导入口熔断/锁内双检/单实例拦截 + 通道核验四处同源），通道核验新增 `ignored_only` 判词（卡片直接点名"删除那条被忽略的条目"）。**顺带补"只等不催"**：心跳武装的等待循环从不重试引导（重试只在 healer，无标记时 healer 只核验不重建）⇒ 等待期每 120s 顺带跑一次幂等的 `ensure_mqtt_connection`，无限干等变自愈。
+
+**七、翻译：`translations/zh-Hans.json` 缺失 → 选项菜单整片空白（用户截图实锤）**：HA 简体中文的语言码是 **zh-Hans**，本仓只带 `zh-CN.json` ⇒ 前端取不到组件翻译、回退 en（也未带）⇒ `options.step.init` 菜单两项空白、错误卡显示裸键（早前那张 `broker_not_ready` 同因）。补 `zh-Hans.json`（与 zh-CN 逐字节一致）并立"两份同步"判据防漂移。
+
+**判据**：新增 `tests/test_v1761_audit_mustfix.py` **18 条**——每组都配反向臂（合法文件照常加载、正常端口/显式关闭照旧、落盘失败不许被清、网关过滤不许被拆、表单新值必须覆盖旧值），防"修一条拆一条"式假修）＋ `tests/test_v1761_arm_bootstrap_retry.py` **2 条**（等待期必须重试引导、未就绪仍无限耐心）＋ `tests/test_v1761_ignore_source_and_i18n.py` **7 条**（ignore 源不被接管/标记得保留并点名根因、正常条目照旧落地、`ignored_only` 判词、zh-Hans 在包且与 zh-CN 逐字一致）。
+
+**门禁**：pytest **1402**（基线 1375 + 本批 27；收集数＝通过数、零 skip）；ruff（CI 同参 `--select F,E9,B --ignore B008,B905`）/ compileall / JSON 解析全绿；四源版本位与 6 处 index.html 字面量＝1.7.61（字节级替换，CRLF 未翻）。**本批只到工作树**：未跑变异矩阵、未真机复验、未提交未推送（发版前按纪律整树重跑 + 派"尝试推翻"复核）。**.184 现场无需等发版即可自救**：设置→设备与服务→MQTT 删除那条被忽略（source=ignore）的条目 → 重启慧尖加载项 → reload 集成，引导会重建真正的 MQTT 条目。
+
 ## [1.7.60] - 2026-10-05
 
 **状态：测试版（真机未复验，建议先在一台试装）**——本批含行为变更：HA 侧失聪（连续两帧无人应答）时，容器会在同一 uuid 指纹下主动代答网关的 001/002/005；并新增两张 HA 提示卡（MQTT 通道失效 / mDNS 撞名）。生效需**重装加载项镜像 + HA 重启或条目 reload**。

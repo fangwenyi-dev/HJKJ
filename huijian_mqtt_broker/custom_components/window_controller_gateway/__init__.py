@@ -548,6 +548,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         _waited += 120
                         if hass.data.get(DOMAIN, {}).get(entry.entry_id) is None:
                             return  # 条目已卸载/重载，放弃武装
+                        # v1.7.61（10-05 现场）：等待期间**顺带重试一次引导**。
+                        # 旧实现只等不催——若 MQTT 条目没建成/被删（典型：只有一条
+                        # source=ignore 的"被忽略"条目，永不加载），本循环会无限
+                        # 干等，首台网关的自动添加永不成链。ensure 幂等（模块级锁 +
+                        # 双重检查），标记不在时是 no-op；标记在位时这是除 healer
+                        # 之外唯一的自愈点（healer 无标记只核验不重建）。
+                        try:
+                            from .mqtt_bootstrap import ensure_mqtt_connection
+                            await ensure_mqtt_connection(hass)
+                        except Exception as _boot_e:  # noqa: BLE001 — 下轮再试
+                            _LOGGER.debug("等待就绪期间的引导重试失败（下轮再试）: %s",
+                                          _boot_e)
                         _LOGGER.warning(
                             "MQTT 集成仍未就绪（累计 %ds），心跳武装持续等待——"
                             "请检查 MQTT 集成能否连上 broker（慧尖内置为 2022）",

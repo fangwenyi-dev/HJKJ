@@ -43,6 +43,15 @@ async def load_persistent_data(hass: HomeAssistant) -> None:
             data = await hass.async_add_executor_job(_read_file)
         except Exception as e:
             _LOGGER.error("加载持久化数据失败（主文件损坏）: %s", e)
+        else:
+            # v1.7.61（10-05 审计 #1）：根类型闸。json 解析成功但根不是对象
+            # （[1,2,3]/"x"/123/true）时下方 data.get() 抛 AttributeError，
+            # 而唯一调用点是 async_setup 里的裸 await ⇒ **整个集成 setup 失败**。
+            # 按"损坏"处理：置 None 让既有的 .bak 救援/退化路径接管。
+            if data is not None and not isinstance(data, dict):
+                _LOGGER.error("持久化数据根类型非法（%s），按损坏处理并尝试备份恢复",
+                              type(data).__name__)
+                data = None
     else:
         # v1.6.12（第五轮审计 #10）：主文件缺失此前直接 return，.bak 永不救援
         # ——误删主文件后重启即全量丢失（映射/手动删除列表），而备份明明在。
@@ -56,8 +65,13 @@ async def load_persistent_data(hass: HomeAssistant) -> None:
             def _read_bak():
                 with open(bak_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            data = await hass.async_add_executor_job(_read_bak)
-            _LOGGER.info("从 .bak 恢复成功")
+            bak = await hass.async_add_executor_job(_read_bak)
+            # v1.7.61：备份同样过根类型闸（.bak 也可能是非对象根）
+            if isinstance(bak, dict):
+                data = bak
+                _LOGGER.info("从 .bak 恢复成功")
+            else:
+                _LOGGER.error(".bak 根类型非法（%s），放弃恢复", type(bak).__name__)
         except Exception as e:
             _LOGGER.error("从 .bak 恢复也失败: %s", e)
 
@@ -69,6 +83,12 @@ async def load_persistent_data(hass: HomeAssistant) -> None:
         return
 
     version = data.get("schema_version", 0)
+    # v1.7.61（10-05 审计 #1）：版本位类型闸——"2"/null/浮点/bool 直接参与
+    # `>` 比较会抛 TypeError（bool 还会被当 int 混过），同属"逃逸到 async_setup"
+    # 的形态。非法一律按 0 处理并告警，其余字段照常加载。
+    if isinstance(version, bool) or not isinstance(version, int):
+        _LOGGER.warning("schema_version 类型非法（%r），按 0 处理", version)
+        version = 0
     if version > SCHEMA_VERSION:
         _LOGGER.warning(
             "持久化数据版本(%d)高于当前支持版本(%d)，可能不兼容",

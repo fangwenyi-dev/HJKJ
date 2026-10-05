@@ -1,0 +1,155 @@
+{
+  "title": "慧尖开窗器网关",
+  "config": {
+    "step": {
+      "user": {
+        "title": "配置开窗器网关",
+        "description": "请输入网关序列号和名称",
+        "data": {
+          "gateway_sn": "网关序列号",
+          "gateway_name": "网关名称（可选）"
+        }
+      },
+      "replace": {
+        "title": "替换网关",
+        "description": "选择要替换的旧网关，设备将迁移到新网关 {gateway_name}（SN: {new_gateway_sn}）",
+        "data": {
+          "old_gateway_sn": "旧网关",
+          "new_gateway_sn": "新网关序列号"
+        }
+      },
+      "confirm_migration": {
+        "title": "确认设备迁移",
+        "description": "即将将设备从旧网关 {old_gateway} 迁移到新网关 {new_gateway}（共 {device_count} 个设备）",
+        "data": {
+          "confirm": "确认迁移",
+          "remove_old": "迁移后移除旧网关"
+        }
+      },
+      "confirm_add": {
+        "title": "网关未响应",
+        "description": "在测试时间内未收到网关上报（SN: {gateway_sn}）。\n网关可能未上电、未连接 MQTT 或上报间隔较长。\n确认仍要添加吗？添加后网关上线并上报时会自动发现设备。",
+        "data": {
+          "confirm": "仍然添加"
+        }
+      },
+      "repair": {
+        "title": "重试 MQTT 自动配置",
+        "description": "慧尖正在按加载项引导标记自动配置 HA 的 MQTT 集成（内置 Broker 127.0.0.1:2022）。点此重试一轮；若仍失败，请检查慧尖加载项是否在运行，并查看 HA 日志中的 mqtt_bootstrap 行。"
+      }
+    },
+    "error": {
+      "invalid_sn_format": "序列号格式无效，必须至少10位字母数字",
+      "mqtt_not_available": "MQTT 集成未启用，请先在 Home Assistant 中启用 MQTT",
+      "broker_not_ready": "MQTT Broker 未就绪：已有 MQTT 配置条目，但客户端尚未连上。使用慧尖一体化加载项时请确认其处于运行状态（内置 Broker 端口 2022）；自行搭建 Broker 请检查其可达性与凭据。系统会自动重试连接，请稍等约一分钟后重试。",
+      "mqtt_bootstrap_still_pending": "仍未完成：内置 Broker 未运行、MQTT 条目被禁用或凭据被拒。请确认慧尖加载项处于运行状态后再次提交，或查看 HA 日志 mqtt_bootstrap 行。",
+      "cannot_connect": "连接网关失败",
+      "invalid_ws_token": "令牌需为 8-62 位，仅允许字母、数字、下划线与连字符（含空格/逗号会拆散子协议握手造成永久自锁）",
+      "ws_port_reserved": "该端口被本加载项自身占用（2022=MQTT Broker / 10998=Web UI / 8123=Home Assistant / 1883=外部 broker 惯用口），请换其它端口",
+      "required": "必填项未填写",
+      "already_configured": "该网关已配置"
+    },
+    "abort": {
+      "already_configured": "该网关已配置",
+      "invalid_input": "输入无效，请返回重新配置",
+      "updated_existing_gateway": "已更新现有网关配置，开始迁移设备",
+      "ignored": "已忽略该网关",
+      "invalid_sn_format": "网关SN格式无效（至少10位字母数字）",
+      "migration_not_supported": "迁移功能暂未启用，请手动删除旧网关后重新添加",
+      "mqtt_bootstrap_fixed": "MQTT 自动配置已完成"
+    }
+  },
+  "issues": {
+    "mdns_name_conflict": {
+      "title": "网关自动发现被另一台 HA 占用（同局域网第二台慧尖加载项）",
+      "description": "本机（{local_ip}）的 mDNS 广播注册失败：huijian.local 已被局域网内另一台设备占用（占位者：{owner}）——走 mDNS 自动发现的 LoRa 网关只会连上那一台 HA，本机永远看不到它们的上报。处理二选一：①关掉其中一台的慧尖加载项（一个家只留一台）；②把网关的 MQTT 服务器地址改成 {local_ip}:2022（本机 broker 照常可用）。改完重启对应加载项使状态刷新。"
+    },
+    "mqtt_channel_broken": {
+      "title": "慧尖网关失联：HA 的 MQTT 连接不在内置 Broker 上",
+      "description": "网关仍在上报，但 Home Assistant 的 MQTT 客户端没有连在慧尖内置 Broker（127.0.0.1:2022）上，因此收不到任何网关消息：绑定请求（001）无人应答（固件每 5 秒重发不止血），也不会有设备/网关卡片出现。诊断码: {verdict}。修复：到 设置→设备与服务→MQTT 核对条目——地址 127.0.0.1、端口 2022、用户名 ha_mqtt（默认密码 huijian2022，与加载项配置一致）。若要让慧尖自动把条目改回内置端点：先重启「慧尖 LoRa 网关」加载项（重启会重写引导标记），再回来点「提交」重试。慧尖每 30 分钟自动复查，恢复后本卡片自动消失。"
+    },
+    "mqtt_bootstrap_pending": {
+      "title": "慧尖 MQTT 自动配置未完成",
+      "description": "慧尖加载项已声明要用内置 Broker（127.0.0.1:2022）自动配置 HA 的 MQTT 集成，但尚未成功——LoRa 网关的上报到不了 HA。系统自动重试（间隔 5 分钟起指数递增、封顶 1 小时）；也可点此提交修复立即重试一轮。若反复失败：确认慧尖加载项处于运行状态，并查看 HA 日志中的 mqtt_bootstrap 行定位原因（常见：MQTT 条目被禁用、原 broker 仍被 Supervisor 托管、凭据被拒）。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "慧尖网关设置",
+        "menu_options": {
+          "add_gateway": "添加 LoRa 网关（绑定网关序列号）",
+          "options": "高级选项（小程序直连令牌/端口、发现间隔、调试日志）"
+        }
+      },
+      "options": {
+        "title": "配置选项",
+        "description": "配置网关的高级选项",
+        "data": {
+          "discovery_interval": "设备发现间隔（秒）",
+          "auto_discovery": "自动发现设备",
+          "debug_logging": "调试日志",
+          "ws_gateway_enabled": "允许慧尖小程序局域网直连（监听 ws://0.0.0.0:端口/ws）",
+          "ws_gateway_port": "小程序 WS 网关端口（默认 9001；小程序/固件固定拨 9001，改动后局域网直连将不可用）",
+          "ws_gateway_token": "小程序握手令牌（8-62 位 A-Za-z0-9_-；留空 = 不认证）",
+          "expose_cover_as_curtain": "以窗帘身份暴露开窗器（仅在需要桥接到 vivo HomeBridge 等第三方生态时开启——此类桥的设备枚举只接受窗帘类目；保存后条目自动重载生效）"
+        }
+      },
+      "add_gateway": {
+        "title": "添加网关",
+        "description": "输入要绑定到本条目的网关序列号（示例：{example_sn}）",
+        "data": {
+          "gateway_sn": "网关序列号",
+          "gateway_name": "网关名称（可选）"
+        }
+      }
+    },
+    "error": {
+      "required": "网关序列号不能为空",
+      "invalid_sn_format": "序列号格式无效，必须至少10位字母数字",
+      "already_configured": "该网关已被其他配置条目使用",
+      "invalid_ws_token": "令牌无效：需 8-62 位字母/数字/下划线/连字符（留空表示不认证）",
+      "ws_port_reserved": "该端口被本加载项自身占用（2022=MQTT Broker / 10998=Web UI / 8123=Home Assistant / 1883=外部 broker 惯用口），请换其它端口"
+    }
+  },
+  "services": {
+    "start_pairing": {
+      "name": "开始配对",
+      "description": "启动网关配对模式"
+    },
+    "refresh_devices": {
+      "name": "刷新设备",
+      "description": "触发设备重新发现"
+    },
+    "set_position": {
+      "name": "设置位置",
+      "description": "设置窗帘位置"
+    },
+    "check_gateway_status": {
+      "name": "检查网关状态",
+      "description": "检查网关的在线状态和连接情况"
+    },
+    "rename_device": {
+      "name": "重命名设备",
+      "description": "重命名子设备名称，支持自定义房间/位置名称"
+    },
+    "migrate_devices": {
+      "name": "迁移设备",
+      "description": "将子设备从旧网关迁移到新网关（该服务当前暂不可用）"
+    },
+    "transfer_device": {
+      "name": "转移设备",
+      "description": "将单个设备从一个网关转移到另一个网关"
+    },
+    "unignore_gateway": {
+      "name": "取消忽略网关",
+      "description": "移除发现卡片上误点「忽略」的网关的忽略记录（v1.7.12 起忽略持久化跨重启，误点会导致该网关永不出卡）。取消后该网关下一次上报即重新出现发现卡片"
+    }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "opened": "窗户打开",
+      "closed": "窗户关闭"
+    }
+  }
+}
