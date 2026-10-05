@@ -113,15 +113,31 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         重跑 bootstrap 引导；标记消失即落地（清修复条目并中止），
         仍在则如实回显"尚未成功"，让用户结合日志/HA MQTT 条目状态处置。
+
+        v1.7.60：同一入口承接「MQTT 通道失效」修复条目（mqtt_channel_broken）
+        ——那种形态下标记早已被删，判据必须换成 verify_builtin_channel 的常驻
+        核验（标记判据会误报"已修好"）。
         """
         from .mqtt_bootstrap import (ensure_mqtt_connection,
                                      has_bootstrap_marker,
-                                     _clear_takeover_issue)
+                                     verify_builtin_channel,
+                                     _clear_takeover_issue,
+                                     _clear_channel_issue,
+                                     CHANNEL_ISSUE_ID)
+        issue_id = str((self.context or {}).get("issue_id") or "")
         if user_input is not None:
             try:
                 await ensure_mqtt_connection(self.hass)
-            except Exception:  # noqa: BLE001 — ConfigEntryNotReady 等统一按标记判定
+            except Exception:  # noqa: BLE001 — ConfigEntryNotReady 等统一按判定结果走
                 pass
+            if issue_id == CHANNEL_ISSUE_ID:
+                verdict = await verify_builtin_channel(self.hass)
+                if verdict in ("ok", "no_endpoint"):
+                    _clear_channel_issue(self.hass)
+                    return self.async_abort(reason="mqtt_bootstrap_fixed")
+                return self.async_show_form(
+                    step_id="repair",
+                    errors={"base": "mqtt_bootstrap_still_pending"})
             if not await has_bootstrap_marker(self.hass):
                 _clear_takeover_issue(self.hass)
                 return self.async_abort(reason="mqtt_bootstrap_fixed")

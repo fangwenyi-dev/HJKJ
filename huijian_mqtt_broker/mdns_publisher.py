@@ -10,6 +10,8 @@
   2. huijian.local 主机名 A 记录（LoRa 网关 hostname 解析）
 """
 
+import json
+import os
 import socket
 import sys
 import time
@@ -21,9 +23,76 @@ try:
         from zeroconf import IPVersion
     except ImportError:
         IPVersion = None
+    # v1.7.60：撞名专用异常（旧版 zeroconf 无此类型时降级为 None，
+    # 由 describe_failure 的"异常无文本"兜底分支覆盖）
+    try:
+        from zeroconf import NonUniqueNameException
+    except ImportError:
+        NonUniqueNameException = None
 except ImportError:
     print("[mDNS] zeroconf 库未安装，mDNS 不可用", file=sys.stderr)
     sys.exit(1)
+
+
+#: 状态文件（无凭据，HA 配置目录＝容器可见）：给集成侧出"修复/提示卡"用。
+STATUS_FILENAME = "window_controller_gateway_mdns_status.json"
+
+
+def _status_path():
+    for base in ("/homeassistant", "/config"):
+        if os.path.isdir(base):
+            return os.path.join(base, STATUS_FILENAME)
+    return None
+
+
+def write_status(state, local_ip, port, owner=""):
+    """写 mDNS 状态供 HA 侧可见（失败只降级，绝不反噬广播主流程）。"""
+    path = _status_path()
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"state": state, "local_ip": local_ip, "port": port,
+                       "owner": owner, "ts": int(time.time())}, f,
+                      ensure_ascii=False)
+    except OSError as e:
+        print(f"[mDNS] 状态文件写入失败（不影响广播）: {e}", file=sys.stderr)
+
+
+def describe_failure(exc, local_ip, port, owner=""):
+    """注册失败 → (状态码, 人话)。
+
+    v1.7.60 根因修复：**撞名（NonUniqueNameException）是无文本异常**——旧实现
+    f"服务注册失败: {e}" 打出空白行，现场只见看门狗每 10 秒刷屏、零归因。
+    且撞名是**永久失败**（名字被另一台占着，重试永远不会成功），必须响亮点名
+    占位者与二选一的处置。非撞名的空文本异常也带上类型名，杜绝空白错误。
+    """
+    if NonUniqueNameException is not None and isinstance(exc, NonUniqueNameException):
+        return ("name_conflict",
+                f"NAMECONFLICT mDNS 名字冲突：huijian.local / "
+                f"huijian-mqtt._mqtt._tcp.local. 已被局域网内另一台设备占用"
+                f"（占位者：{owner or '未解析到'}）——本机 {local_ip} 的 mDNS 自动"
+                f"发现不会生效，走 mDNS 的 LoRa 网关只会连上占位者那台 HA。"
+                f"二选一：关掉其中一台的慧尖加载项，或把网关的 MQTT 服务器地址"
+                f"改成本机 IP {local_ip}:{port}（本机 broker 照常可用）")
+    msg = str(exc).strip()
+    if not msg:
+        msg = (f"{type(exc).__name__}（异常无文本；若局域网内还有第二台慧尖"
+               f"加载项，优先怀疑名字冲突）")
+    return ("error", f"服务注册失败: {msg}")
+
+
+def _query_owner(zc, timeout_ms=2000):
+    """解析当前占着 huijian-mqtt 名字的对端（拿来点名"被谁占用"）。"""
+    try:
+        info = zc.get_service_info("_mqtt._tcp.local.",
+                                   "huijian-mqtt._mqtt._tcp.local.",
+                                   timeout=timeout_ms)
+        if info and info.addresses:
+            return f"{socket.inet_ntoa(info.addresses[0])}:{info.port}"
+    except Exception:  # noqa: BLE001 — 诊断面失败不影响主流程
+        pass
+    return ""
 
 
 def get_local_ip():
@@ -101,6 +170,7 @@ def main():
         print(f"[mDNS] _mqtt._tcp 服务已注册: huijian-mqtt._mqtt._tcp.local. @ {local_ip}:{mqtt_port}")
         print(f"[mDNS] huijian.local → {local_ip}")
         print(f"[mDNS] mDNS 广播中，LoRa 网关可通过 huijian.local:{mqtt_port} 连接")
+        write_status("ok", local_ip, mqtt_port)
 
         # 保持运行，mDNS 广播持续在线。
         # v1.6.3：每 30 秒复查本机 IP——DHCP 续租/换网后旧地址仍被广播，
@@ -129,15 +199,22 @@ def main():
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        # v1.6.3：注册/重注册失败退出非零，让看门狗接管重试
-        # （旧实现吞异常后正常退出 0，广播静默消失且无人重启）
-        print(f"[mDNS] 服务注册失败: {e}", file=sys.stderr)
+        # v1.7.6x：注册/重注册失败退出非零，让看门狗接管重试（旧实现吞异常后
+        # 正常退出 0，广播静默消失且无人重启）。
+        # v1.7.60：撞名单独识别——它是**永久失败**，重试不可能成功，必须响亮
+        # 点名占位者（旧日志 "服务注册失败: " 后空白，见 describe_failure）。
+        state, reason = describe_failure(e, local_ip, mqtt_port,
+                                         owner=_query_owner(zeroconf))
+        print(f"[mDNS] {reason}", file=sys.stderr)
+        if state == "name_conflict":
+            write_status(state, local_ip, mqtt_port,
+                         owner=_query_owner(zeroconf))
         try:
             zeroconf.unregister_service(service_info)
             zeroconf.close()
         except Exception:
             pass
-        sys.exit(2)
+        sys.exit(3 if state == "name_conflict" else 2)
     finally:
         if sys.exc_info()[0] is None or isinstance(sys.exc_info()[1], KeyboardInterrupt):
             try:

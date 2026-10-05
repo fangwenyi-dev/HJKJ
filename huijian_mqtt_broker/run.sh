@@ -704,9 +704,13 @@ echo "[mDNS] 使用 Python zeroconf 广播 mDNS 服务..."
 # 启动 mDNS 广播（v1.6.3 看门狗监督）：
 # 旧实现单发启动 + 3 秒存活检查，进程因网络抖动/IP 变更/异常退出后
 # 广播永久消失（LoRa 网关再也发现不了 huijian.local），且无人重启。
-# 现由子 shell 循环监督：异常退出 10 秒后重启；正常退出（主动停止）则结束。
+# 现由子 shell 循环监督：异常退出按退避重试；正常退出（主动停止）则结束。
+# v1.7.60：恒频 10 秒改为**指数退避**（10→20→…→封顶 600 秒）。撞名
+# （exit 3，见 mdns_publisher.describe_failure）是永久失败——重试不可能成功
+# （名字被同局域网另一台慧尖加载项占着），旧实现在现场以 10 秒节拍永久刷屏。
 if [ -f /usr/bin/mdns_publisher.py ] && command -v python3 >/dev/null 2>&1; then
     (
+        MDNS_RETRY=0
         while true; do
             # v1.7.12（第 6 轮审计 F1，v1.6.3 C3 同族补漏）：子 shell 若继承
             # set -e，裸 `python3; RC=$?` 在进程非零退出的瞬间即被 errexit
@@ -718,8 +722,15 @@ if [ -f /usr/bin/mdns_publisher.py ] && command -v python3 >/dev/null 2>&1; then
                 echo "[mDNS] 广播进程正常退出，不再重启"
                 break
             fi
-            echo "[mDNS] 广播进程异常退出 (code ${RC})，10 秒后重启..."
-            sleep 10
+            MDNS_RETRY=$((MDNS_RETRY + 1))
+            BACKOFF=$((10 * (1 << (MDNS_RETRY - 1))))
+            [ "${BACKOFF}" -gt 600 ] && BACKOFF=600
+            if [ "${RC}" -eq 3 ]; then
+                echo "[mDNS] 广播因**名字冲突**退出（同局域网另一台慧尖加载项占着 huijian.local）——重试不会成功，请按上一行提示二选一处理；${BACKOFF} 秒后再探一次（连续第 ${MDNS_RETRY} 次）"
+            else
+                echo "[mDNS] 广播进程异常退出 (code ${RC})，${BACKOFF} 秒后重启（连续第 ${MDNS_RETRY} 次）"
+            fi
+            sleep "${BACKOFF}"
         done
     ) &
     MDNS_PID=$!
@@ -895,12 +906,27 @@ if [ "${AUTO_SETUP}" = "true" ]; then
         else
             echo "[自动配置] 警告: 无法写入 MQTT 引导标记（jq 不可用或写入失败）"
         fi
+        # v1.7.60 常驻端点文件（**无凭据**，落地后不删）：集成侧"引导落地后"
+        # 的常驻不变量核验依据——标记是一次性的（首落即删），旧实现此后对
+        # "MQTT 条目被官方 Mosquitto/EMQX 抢走/改向/禁用"永不复查，现场表现
+        # 为网关侧 001 每 5s 风暴无人应答、HA 侧零归因。本文件让 HA 能持续
+        # 自检「MQTT 条目是否仍指向内置 broker」并出修复卡。
+        ENDPOINT_PATH="${HA_CONFIG_DIR}/window_controller_gateway_mqtt_endpoint.json"
+        if jq -n --arg broker "127.0.0.1" --argjson port "${MQTT_PORT}" \
+            '{broker:$broker, port:$port}' > "${ENDPOINT_PATH}" 2>/dev/null; then
+            chmod 644 "${ENDPOINT_PATH}" 2>/dev/null || true
+            echo "[自动配置] 内置端点文件已写入: ${ENDPOINT_PATH}"
+        else
+            echo "[自动配置] 警告: 无法写入内置端点文件（常驻核验将不可用）"
+        fi
     else
         echo "[自动配置] 警告: HA 配置目录未找到，跳过 MQTT 引导标记"
     fi
 else
-    # 自动配置已关闭：清理历史标记（含凭据），避免集成侧读到过期数据无限重试
+    # 自动配置已关闭：清理历史标记（含凭据）与常驻端点文件，避免集成侧读到
+    # 过期数据无限重试/误报通道故障
     rm -f "${HA_CONFIG_DIR}/window_controller_gateway_mqtt_bootstrap.json" 2>/dev/null || true
+    rm -f "${HA_CONFIG_DIR}/window_controller_gateway_mqtt_endpoint.json" 2>/dev/null || true
 fi
 
 # ---------- 7b. Broker 连接数与存活状态后台采集（Web UI 本地读取，不依赖 HA API） ----------

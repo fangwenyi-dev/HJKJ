@@ -29,7 +29,7 @@ from .services import register_services
 from .api import async_setup_api
 from .hub_client import (HUB_DEFAULT_BASE, HUB_DEFAULT_INSTALL_KEY, HubClient,
                          resolve_hub_base)
-from .utils import is_mqtt_loaded, iter_devices
+from .utils import is_mqtt_loaded, iter_devices, async_write_instance_uuid_file
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -347,6 +347,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for _stale in ("_platforms_forwarded", "_bg_tasks", "unsub_listeners"):
             _prev_data.pop(_stale, None)
 
+    # v1.7.60：实例指纹落盘（HA 配置目录，跨容器可见）。容器侧发现代理在
+    # "HA 的 MQTT 客户端收不到任何上报"时用同一指纹做 001 兜底应答；写在
+    # 两分支之前——等待条目与已配置条目都要保证该文件存在。
+    await async_write_instance_uuid_file(hass)
+
     # ---- 无网关 SN：最小设置，等待后续配置 ----
     if not gateway_sn:
         _LOGGER.info("网关 SN 未配置，进入等待模式（可通过选项页或自动发现添加）")
@@ -502,7 +507,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         hass, TOPIC_GATEWAY_RSP, _heartbeat_listener, 1
                     )
                     hass.data[DOMAIN][entry.entry_id]["_unsub_heartbeat"] = _unsub_heartbeat
-                    _LOGGER.info("已启动网关心跳监听器，等待网关上电...")
+                    # v1.7.60：就绪判据拆两态——订阅只依赖"集成已加载"，但
+                    # "能听见"还要求客户端真连上 broker。旧日志把两者混为一谈
+                    # （恒打"已启动…等待网关上电"），现场"一条都收不到"时
+                    # 日志全绿、零归因。未连接时改打带修复方向的节流 WARNING。
+                    from .utils import is_mqtt_connected
+                    if is_mqtt_connected(hass):
+                        _LOGGER.info("已启动网关心跳监听器，等待网关上电...")
+                    else:
+                        log_throttled(
+                            hass, "_hb_not_connected_logged", entry.entry_id,
+                            600.0, _LOGGER.warning,
+                            "MQTT 集成已加载但客户端未连上 Broker——心跳订阅已挂"
+                            "（连接恢复后自动生效），此前收不到任何网关上报。"
+                            "若长时间如此：到 设置→设备与服务→MQTT 核对该条目"
+                            "指向与凭据（应然 127.0.0.1:2022）。每 10 分钟去重"
+                        )
                     _subscribed_now = True
                 except Exception as sub_e:  # noqa: BLE001
                     _LOGGER.warning(
@@ -564,7 +584,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         return
                     if unsub:
                         data_now["_unsub_heartbeat"] = unsub
-                        _LOGGER.info("MQTT 就绪，已补装网关心跳监听器，等待网关上电...")
+                        # v1.7.60：同首装分支的诚实化——订阅挂上 ≠ 能听见
+                        from .utils import is_mqtt_connected
+                        if is_mqtt_connected(hass):
+                            _LOGGER.info("MQTT 就绪，已补装网关心跳监听器，等待网关上电...")
+                        else:
+                            _LOGGER.warning(
+                                "MQTT 集成已加载但客户端未连上 Broker——心跳监听器"
+                                "已补装，连接恢复前收不到任何网关上报；请核对"
+                                "设置→设备与服务→MQTT 条目指向（应然 "
+                                "127.0.0.1:2022）"
+                            )
 
                 _arm_task = hass.async_create_task(
                     _arm_heartbeat_when_mqtt_ready(),

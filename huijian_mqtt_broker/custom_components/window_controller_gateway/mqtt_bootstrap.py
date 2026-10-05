@@ -40,6 +40,21 @@ _LOGGER = logging.getLogger(__name__)
 
 BOOTSTRAP_FILENAME = "window_controller_gateway_mqtt_bootstrap.json"
 
+#: 常驻端点文件（**无凭据**）：run.sh 每次启动写入。引导标记是一次性的
+#: （落地即删），本文件给集成提供"常驻核验"的依据——只要它存在，就说明
+#: 这台机器应该存在一条指向内置 broker 的 MQTT 连接，可据此巡检不变量。
+ENDPOINT_FILENAME = "window_controller_gateway_mqtt_endpoint.json"
+
+#: 内置 broker 定值（mosquitto.conf listener 2022 / run.sh 写标记同源）。
+BUILTIN_BROKER = "127.0.0.1"
+BUILTIN_PORT = 2022
+
+#: mDNS 广播状态文件（容器侧 mdns_publisher.py 写，无凭据）：同局域网存在
+#: 第二台慧尖加载项时名字（huijian.local）被先注册者独占，本机广播永久失败
+#: ——集成侧据此出提示卡，别让"网关永远只连另一台 HA"成为无迹之谜。
+MDNS_STATUS_FILENAME = "window_controller_gateway_mdns_status.json"
+MDNS_ISSUE_ID = "mdns_name_conflict"
+
 # 模块级锁：多个 entry / 配置流并发触发时只创建一次 MQTT 条目。
 # 与 persist.py 相同的模式：HA 单事件循环内安全；asyncio.Lock 延迟绑定事件循环。
 _create_lock: Optional[asyncio.Lock] = None
@@ -96,6 +111,135 @@ async def has_bootstrap_marker(hass: HomeAssistant) -> bool:
     except Exception:  # noqa: BLE001 — 探针失败不改变主判定
         _LOGGER.debug("检查 MQTT 引导标记失败（按不存在处理）", exc_info=True)
         return False
+
+
+def _read_json_sync(path: str) -> Optional[Dict[str, Any]]:
+    """通用 JSON 文件读取；缺失/损坏 → None。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_endpoint_sync(path: str) -> Optional[Dict[str, Any]]:
+    """读常驻端点文件；缺失/损坏/无 broker 字段 → None（无判定依据）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("broker"):
+        return None
+    try:
+        port = int(data.get("port") or BUILTIN_PORT)
+    except (TypeError, ValueError):
+        port = BUILTIN_PORT
+    return {"broker": str(data["broker"]), "port": port}
+
+
+async def async_read_endpoint(hass: HomeAssistant) -> Optional[Dict[str, Any]]:
+    try:
+        path = hass.config.path(ENDPOINT_FILENAME)
+    except Exception:  # noqa: BLE001 — 无 config 面（测试替身）：按无判定依据
+        return None
+    executor = getattr(hass, "async_add_executor_job", None)
+    try:
+        if callable(executor):
+            return await executor(_read_endpoint_sync, path)
+        return _read_endpoint_sync(path)
+    except Exception:  # noqa: BLE001 — 只读探针失败不误报
+        return None
+
+
+async def async_read_mdns_status(hass: HomeAssistant) -> Optional[Dict[str, Any]]:
+    """读容器侧 mDNS 状态文件（缺失/损坏 → None，不误报）。"""
+    try:
+        path = hass.config.path(MDNS_STATUS_FILENAME)
+    except Exception:  # noqa: BLE001
+        return None
+    executor = getattr(hass, "async_add_executor_job", None)
+    try:
+        if callable(executor):
+            data = await executor(_read_json_sync, path)
+        else:
+            data = _read_json_sync(path)
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _mdns_guard(hass: HomeAssistant) -> None:
+    """mDNS 撞名提示卡（v1.7.60，用户裁定的 B 方案：不改名、只响亮）。
+
+    同局域网两台慧尖加载项抢 `huijian.local`，先注册者独占——**走 mDNS 自动
+    发现的网关只会连上那一台**，本机永远收不到网关（现场 .184/.91 双实例实测：
+    huijian.local → .192.168.1.91，服务实例 server 也是 .91）。撞名是永久失败，
+    容器侧已退避；这里把"为什么本机没有网关"升为 HA 里可见的提示卡。
+    """
+    status = await async_read_mdns_status(hass)
+    try:
+        from homeassistant.helpers import issue_registry as ir
+        if status and status.get("state") == "name_conflict":
+            ir.async_create_issue(
+                hass, DOMAIN, MDNS_ISSUE_ID,
+                is_fixable=False,
+                severity="warning",
+                translation_key=MDNS_ISSUE_ID,
+                translation_placeholders={
+                    "owner": str(status.get("owner") or "未知"),
+                    "local_ip": str(status.get("local_ip") or "未知"),
+                },
+            )
+        else:
+            ir.async_delete_issue(hass, DOMAIN, MDNS_ISSUE_ID)
+    except Exception as err:  # noqa: BLE001 — 可见性面失败不影响自愈主流程
+        _LOGGER.warning("mDNS 撞名提示卡更新失败（丢可见性）: %s", err)
+
+
+async def verify_builtin_channel(hass: HomeAssistant) -> str:
+    """只读核验「内置通道」不变量：HA 的 MQTT 客户端此刻真连在内置 broker 上吗。
+
+    v1.7.60 根因修复件。旧实现的自愈**完全依赖一次性引导标记**：标记首次
+    落地即被删除（_remove_marker），此后 healer 见不到标记直接退出——
+    MQTT 条目被官方 Mosquitto/EMQX 抢走、被用户改向、被 Supervisor 覆盖、
+    或密码失配时，慧尖永不复查、永不告警、永不自愈。现场形态：网关仍在
+    上报（broker 侧可见），HA 侧零订阅者 ⇒ 001 无人应答（固件每 5s 重发
+    不止血）+ 发现卡片永不出现，且日志全绿。本函数给"通道健康"一个
+    可周期核验的真源。
+
+    返回（全部为只读判定）：
+    - ``no_endpoint``  ：无端点文件（HACS 独立安装/关掉自动配置）→ 无判定依据，
+      按"不打断既有语义"处理（收尾退出，不报警）
+    - ``ok``           ：存在启用条目、地址匹配、客户端已连接
+    - ``no_entry``     ：端点文件在，但没有任何启用中的 MQTT 条目
+    - ``mismatch``     ：条目在，但指向的 broker:port 不是内置端点
+    - ``disconnected`` ：条目地址正确，但客户端尚未连上（broker 未起/凭据被拒）
+    """
+    endpoint = await async_read_endpoint(hass)
+    if not endpoint:
+        return "no_endpoint"
+    exp_broker, exp_port = endpoint["broker"], int(endpoint["port"])
+    try:
+        entries = [e for e in hass.config_entries.async_entries("mqtt")
+                   if not getattr(e, "disabled_by", None)]
+    except Exception:  # noqa: BLE001 — 判定面不可读时不误报
+        return "no_endpoint"
+    if not entries:
+        return "no_entry"
+    first = entries[0]
+    try:
+        cur_broker = str((first.data or {}).get("broker") or "")
+        cur_port = int((first.data or {}).get("port") or 0)
+    except (TypeError, ValueError):
+        cur_broker, cur_port = "", 0
+    if cur_broker != exp_broker or cur_port != exp_port:
+        return "mismatch"
+    from .utils import is_mqtt_connected
+    if not is_mqtt_connected(hass):
+        return "disconnected"
+    return "ok"
 
 
 async def _wait_for_mqtt_client(hass: HomeAssistant) -> bool:
@@ -486,6 +630,10 @@ BOOTSTRAP_RETRY_INTERVAL = 300.0
 # 用户条目高频施加 takeover 压力，首次触顶一次性 WARNING 收口症状。
 BOOTSTRAP_RETRY_MAX_INTERVAL = 3600.0
 TAKEOVER_ISSUE_ID = "mqtt_bootstrap_pending"
+#: 常驻通道核验（v1.7.60）：引导落地后 MQTT 条目仍可能被改走/失效——
+#: 独立修复条目 id 与巡检节拍（低频巡查，不再对用户条目高频施压）。
+CHANNEL_ISSUE_ID = "mqtt_channel_broken"
+CHANNEL_VERIFY_INTERVAL = 1800.0
 
 
 def _retry_delay(rounds: int) -> float:
@@ -552,6 +700,58 @@ def _clear_takeover_issue(hass: HomeAssistant) -> None:
         _LOGGER.warning("清除 MQTT 引导修复条目失败（卡片可能滞留）: %s", err)
 
 
+def _report_channel_issue(hass: HomeAssistant, verdict: str) -> None:
+    """通道不变量被破坏 → HA 修复条目（可一键重试），不自动改写用户条目。
+
+    v1.7.60 定线：**只报障 + 一键修，不主动接管**。条目可能承载用户/其他
+    加载项的连接（官方 Mosquitto/EMQX），静默改写是破坏性动作（v1.7.30 已
+    就"接管破坏面"定过案）；本修复只负责让故障可见可修——修复流走
+    config_flow.async_step_repair，可执行的动作是"重启慧尖加载项后重试"
+    （重启会重写引导标记，接管分支即可把条目改回内置端点）。
+    """
+    try:
+        from homeassistant.helpers import issue_registry as ir
+        ir.async_create_issue(
+            hass, DOMAIN, CHANNEL_ISSUE_ID,
+            is_fixable=True,
+            severity="warning",
+            translation_key=CHANNEL_ISSUE_ID,
+            translation_placeholders={"verdict": verdict},
+        )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("创建 MQTT 通道修复条目失败（丢可见性，不影响自愈）: %s", err)
+
+
+def _clear_channel_issue(hass: HomeAssistant) -> None:
+    try:
+        from homeassistant.helpers import issue_registry as ir
+        ir.async_delete_issue(hass, DOMAIN, CHANNEL_ISSUE_ID)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("清除 MQTT 通道修复条目失败（卡片可能滞留）: %s", err)
+
+
+async def _channel_guard(hass: HomeAssistant, verdict: str) -> None:
+    """通道不变量违反时的留痕 + 修复条目（v1.7.60）。
+
+    文案给足可执行修复：应然端点、默认凭据、以及"重启加载项后重试"的路径
+    （重启重写引导标记 → 接管分支把条目改回内置端点）。绝不反噬主流程。
+    """
+    detail = {
+        "no_entry": "HA 里没有启用中的 MQTT 配置条目",
+        "mismatch": "HA 的 MQTT 条目指向了别的 Broker",
+        "disconnected": "MQTT 条目地址正确但客户端未连上内置 Broker（未起/凭据被拒）",
+    }.get(verdict, verdict)
+    _LOGGER.warning(
+        "MQTT 通道核验未通过：%s——网关上报将无人接收（001 无人应答、"
+        "设备/网关卡片不出）。应然端点 %s:%s；修复后无需重启 HA。若需慧尖"
+        "把条目改回内置端点：重启慧尖加载项（会重写引导标记）后在「修复」"
+        "卡点重试。本留痕每 %d 分钟巡查一次",
+        detail, BUILTIN_BROKER, BUILTIN_PORT,
+        max(1, int(CHANNEL_VERIFY_INTERVAL // 60)),
+    )
+    _report_channel_issue(hass, verdict)
+
+
 def _enabled_huijian_entry_count(hass: HomeAssistant) -> int:
     """未禁用的慧尖条目数（v1.7.31 A-3，BUG-5 统一口径）。
 
@@ -576,8 +776,10 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
     新行为：条目 setup 时拉起本任务（每 hass 单实例、幂等，多条目并发调用
     安全）：只要引导标记还在（自动配置未落地）就重试 ensure——v1.7.29 恒频
     300s，v1.7.30 ④ 改指数退避（300s 起、×2、封顶 1h，首次触顶一条
-    WARNING），未落地不放弃、破坏面不再高频施压；标记删除（落地）即清修复
-    条目退出；慧尖条目全卸/hass 停机也退出，不悬挂。ensure 内部模块级锁保证
+    WARNING），未落地不放弃、破坏面不再高频施压；**v1.7.60：标记删除后不再
+    直接退出**——转为每 30 分钟只读核验「MQTT 客户端是否仍连在内置 broker」
+    （verify_builtin_channel），不变量被破坏时留 WARNING + 修复条目常驻可见，
+    直到再次成立或慧尖条目全卸/hass 停机才收尾。ensure 内部模块级锁保证
     并发创建只发生一次；ConfigEntryNotReady（内置 broker 未起）按"稍后再试"
     语义吞掉，交给下一轮。
     """
@@ -597,8 +799,26 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                     return  # 宿主停机 / 启用条目已清空（v1.7.31 A-3：
                             # 禁用不再把 healer 骗成永续巡查——BUG-5 同口径）
                 if not await has_bootstrap_marker(hass):
+                    # v1.7.60 根因修复：引导落地 ≠ 通道健康。标记是一次性的
+                    # （首落即删），旧实现此处直接 return——此后 MQTT 条目被
+                    # 官方 Mosquitto/EMQX 抢走、被改向、被 Supervisor 覆盖或
+                    # 凭据失配时，慧尖永不复查/告警/自愈。现场形态：网关仍在
+                    # 上报（broker 侧可见），HA 侧零订阅者 ⇒ 001 无人应答
+                    # （固件 5s 重发不止血）+ 发现卡永不出，日志全绿。
+                    # 改为常驻低频核验：不变量成立（或无判定依据）才收尾。
+                    verdict = await verify_builtin_channel(hass)
+                    # 标记已删 = 引导已落地，旧"引导未落地"卡片语义终结
                     _clear_takeover_issue(hass)
-                    return  # 引导已落地（标记被删）
+                    # mDNS 撞名提示（独立于通道核验：即便通道全绿，第二台 HA
+                    # 也永远收不到走 mDNS 自动发现的网关）
+                    await _mdns_guard(hass)
+                    if verdict in ("ok", "no_endpoint"):
+                        _clear_channel_issue(hass)
+                        return  # 引导已落地且通道核验通过（或无判定依据）
+                    await _channel_guard(hass, verdict)
+                    if not await _interruptible_sleep(hass, CHANNEL_VERIFY_INTERVAL):
+                        return
+                    continue
                 rounds += 1
                 delay = _retry_delay(rounds)
                 if delay >= BOOTSTRAP_RETRY_MAX_INTERVAL and not capped_warned:
@@ -620,8 +840,9 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                         int(delay), err)
                 if not await has_bootstrap_marker(hass):
                     _LOGGER.info("MQTT 引导自愈落地（标记已删除）")
-                    _clear_takeover_issue(hass)
-                    return
+                    # v1.7.60：收尾（clear + 退出）统一由循环顶部的常驻通道
+                    # 核验分支决定——落地 ≠ 通道健康，不得在此直接退出。
+                    continue
                 _report_takeover_issue(hass)
                 # v1.7.31（A-1）：单发 sleep(封顶 3600s) 改切片——one-shot
                 # 长睡对停机信号无感，会把 async_stop 各阶段的 block_till_done

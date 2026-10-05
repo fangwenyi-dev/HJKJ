@@ -60,6 +60,14 @@
     }
   },
   "issues": {
+    "mdns_name_conflict": {
+      "title": "网关自动发现被另一台 HA 占用（同局域网第二台慧尖加载项）",
+      "description": "本机（{local_ip}）的 mDNS 广播注册失败：huijian.local 已被局域网内另一台设备占用（占位者：{owner}）——走 mDNS 自动发现的 LoRa 网关只会连上那一台 HA，本机永远看不到它们的上报。处理二选一：①关掉其中一台的慧尖加载项（一个家只留一台）；②把网关的 MQTT 服务器地址改成 {local_ip}:2022（本机 broker 照常可用）。改完重启对应加载项使状态刷新。"
+    },
+    "mqtt_channel_broken": {
+      "title": "慧尖网关失联：HA 的 MQTT 连接不在内置 Broker 上",
+      "description": "网关仍在上报，但 Home Assistant 的 MQTT 客户端没有连在慧尖内置 Broker（127.0.0.1:2022）上，因此收不到任何网关消息：绑定请求（001）无人应答（固件每 5 秒重发不止血），也不会有设备/网关卡片出现。诊断码: {verdict}。修复：到 设置→设备与服务→MQTT 核对条目——地址 127.0.0.1、端口 2022、用户名 ha_mqtt（默认密码 huijian2022，与加载项配置一致）。若要让慧尖自动把条目改回内置端点：先重启「慧尖 LoRa 网关」加载项（重启会重写引导标记），再回来点「提交」重试。慧尖每 30 分钟自动复查，恢复后本卡片自动消失。"
+    },
     "mqtt_bootstrap_pending": {
       "title": "慧尖 MQTT 自动配置未完成",
       "description": "慧尖加载项已声明要用内置 Broker（127.0.0.1:2022）自动配置 HA 的 MQTT 集成，但尚未成功——LoRa 网关的上报到不了 HA。系统自动重试（间隔 5 分钟起指数递增、封顶 1 小时）；也可点此提交修复立即重试一轮。若反复失败：确认慧尖加载项处于运行状态，并查看 HA 日志中的 mqtt_bootstrap 行定位原因（常见：MQTT 条目被禁用、原 broker 仍被 Supervisor 托管、凭据被拒）。"

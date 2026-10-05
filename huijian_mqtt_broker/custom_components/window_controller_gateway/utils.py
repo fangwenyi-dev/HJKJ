@@ -4,6 +4,7 @@ import functools
 import inspect
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Dict, Any, Optional, Tuple
@@ -370,6 +371,48 @@ def is_mqtt_connected(hass: HomeAssistant) -> bool:
         return bool(async_connected(hass))
     except (ImportError, AttributeError):
         return is_mqtt_loaded(hass)
+
+
+#: 实例指纹落盘文件名（写着跨容器共享的 HA 配置目录里）。
+#: 消费者是加载项容器内的 gateway_discovery_proxy（HA MQTT 失聪时的兜底应答），
+#: 它必须用与正式 handler/耳朵**逐字一致**的 uuid——文件是唯一跨容器通道。
+INSTANCE_UUID_FILENAME = "window_controller_gateway_instance.json"
+
+
+def _write_instance_uuid_file_sync(path: str, payload: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+async def async_write_instance_uuid_file(hass: HomeAssistant) -> None:
+    """把实例指纹写入 HA 配置目录（容器侧兜底应答读取，v1.7.60）。
+
+    背景：HA 的 MQTT 客户端一旦没连在内置 broker 上（条目被别的 broker 抢走/
+    禁用/凭据失配），全部"耳朵"都收不到网关上报——容器内的发现代理是唯一还能
+    看到 broker 真值的组件，但它的 001 兜底应答必须带 HA 的实例指纹（固件按
+    uuid 认服务端；两个指纹会让固件把兜底应答当另一台服务器）。指纹公式仍在
+    utils.gateway_instance_uuid 单一真源，本函数只负责把它落盘。
+
+    失败只降级（容器侧不代答），绝不反噬 setup——性能与安全都不依赖本文件
+    （uuid 会随 001 应答发给网关，非机密）。
+    """
+    try:
+        path = hass.config.path(INSTANCE_UUID_FILENAME)
+    except Exception:  # noqa: BLE001 — 无 config 面（测试替身）时静默降级
+        return
+    payload = {"uuid": gateway_instance_uuid(hass)}
+    executor = getattr(hass, "async_add_executor_job", None)
+    try:
+        if callable(executor):
+            await executor(_write_instance_uuid_file_sync, path, payload)
+        else:
+            _write_instance_uuid_file_sync(path, payload)
+    except Exception as e:  # noqa: BLE001 — 落盘失败不反噬 setup
+        _LOGGER.debug("实例指纹落盘失败（容器侧兜底应答将降级为不代答）: %s", e)
 
 
 async def async_wait_mqtt_loaded(
