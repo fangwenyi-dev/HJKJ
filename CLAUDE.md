@@ -23,14 +23,14 @@ git push origin v1.7.x
 git push gitee v1.7.x        # 若本地缺该 tag：先 git fetch origin tag v1.7.x --force
 
 # 4. 等待 CI 启动后检查状态（GitHub）
-gh run list --repo fangwenyi-dev/ha-gateway-plugin --limit 3
+gh run list --repo fangwenyi-dev/HJKJ --limit 3
 #    gh 未认证时可用只读 REST（公开仓）：
-#    https://api.github.com/repos/fangwenyi-dev/ha-gateway-plugin/actions/runs?per_page=5
+#    https://api.github.com/repos/fangwenyi-dev/HJKJ/actions/runs?per_page=5
 #    以及镜像可拉性：GET https://ghcr.io/token?scope=repository:<org>/<arch-IMAGE_NAME>:pull&service=ghcr.io
 #    再 HEAD https://ghcr.io/v2/<org>/<arch-IMAGE_NAME>/manifests/<版本>
 
 # 5. 如果有失败，查看详情并修复
-gh run view <run-id> --repo fangwenyi-dev/ha-gateway-plugin --log-failed
+gh run view <run-id> --repo fangwenyi-dev/HJKJ --log-failed
 ```
 
 **Gitee Release 已自动化（2026-10-06，语音侧并入商店仓那一刀的 D4）**：`ci.yaml` 的
@@ -98,7 +98,7 @@ v1.6.0 的 "entity" 字面量回归曾骗过全部 38 个测试，教训记录�
 ---
 
 ### GitHub 推送通道：SSH（2026-09-22 定案，实测通过）
-**origin 已切 SSH**：`git@github.com:fangwenyi-dev/ha-gateway-plugin.git`。
+**origin 已切 SSH**：`git@github.com:fangwenyi-dev/HJKJ.git`。
 本机 `~/.ssh/config` 把 `github.com` 指向 `ssh.github.com:443`（22 端口被本网络
 拒，必须走 443）。**禁止把 origin 改回 HTTPS**。
 
@@ -120,7 +120,7 @@ git@ssh.github.com` 回 `Hi fangwenyi-dev!`。
 ### Gitee 凭据（现行生效：2026-09-17 恢复双推；remote 仍不带 token）
 ```bash
 # remote 保持干净 URL（.git/config 不落任何密钥）
-git remote set-url gitee https://gitee.com/fangwenyi-dev/ha-gateway-plugin.git
+git remote set-url gitee https://gitee.com/fangwenyi-dev/HJKJ.git
 ```
 **两条已验证的认证路径（均无需 URL 内嵌 token）：**
 1. **Windows 侧推送（2026-09-17 再次实测可用）**：Git Credential Manager 已存
@@ -130,7 +130,7 @@ git remote set-url gitee https://gitee.com/fangwenyi-dev/ha-gateway-plugin.git
 2. **WSL/agent 侧推送**：一次性注入 token，不落盘到 remote 配置：
    ```bash
    TOK=$(cat /mnt/c/Users/fangwenyi/.gitee_token | tr -d '\r\n')
-   GIT_TERMINAL_PROMPT=0 git push "https://oauth2:${TOK}@gitee.com/fangwenyi-dev/ha-gateway-plugin.git" main
+   GIT_TERMINAL_PROMPT=0 git push "https://oauth2:${TOK}@gitee.com/fangwenyi-dev/HJKJ.git" main
    ```
 GitHub 侧现已改 SSH（见上节「GitHub 推送通道」，Windows 与 WSL 均优先 SSH）；
 仅在确实要走 HTTPS 时才用 `gh auth token` 注入一次性 URL（WSL 无 GCM 交互）。

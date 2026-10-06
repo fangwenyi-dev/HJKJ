@@ -110,9 +110,14 @@ def test_image_field_domain_whitelist_and_template():
 
 
 def test_homepage_and_repo_name_aligned():
-    """config.yaml url / repository.yaml url 与本仓实名一致（防双远端改名漂移）。"""
+    """config.yaml url / repository.yaml url 与本仓实名一致（防双远端改名漂移）。
+
+    2026-10-06 仓自 ha-gateway-plugin 迁到 HJKJ，这条钉当时就是用来逼我们把
+    "改 URL＝换加载项身份"这件事想清楚再动的——它红了，我们改了钉、也改了正文，
+    不是绕过去。钉死实名而不是正则放宽，下次谁再漂移仍然会红。
+    """
     m = re.search(r"^url:\s*'?([^'\n]+)'?", CFG, re.M)
-    assert m and m.group(1).strip().endswith("ha-gateway-plugin")
+    assert m and m.group(1).strip().endswith("HJKJ")
     import yaml
     repo = yaml.safe_load((ROOT.parent / "repository.yaml").read_text(encoding="utf-8"))
-    assert repo["url"].strip("/").endswith("ha-gateway-plugin")
+    assert repo["url"].strip("/").endswith("HJKJ")

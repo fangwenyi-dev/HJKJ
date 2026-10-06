@@ -1,37 +1,38 @@
 # 慧尖 LoRa 网关一体化插件
 
-[![版本](https://img.shields.io/github/v/release/fangwenyi-dev/ha-gateway-plugin?color=blue)](https://github.com/fangwenyi-dev/ha-gateway-plugin/releases)
+[![版本](https://img.shields.io/github/v/release/fangwenyi-dev/HJKJ?color=blue)](https://github.com/fangwenyi-dev/HJKJ/releases)
 
 慧尖开窗器 LoRa 网关的 Home Assistant 一体化插件：**内置 Mosquitto Broker（端口 2022）+ mDNS 广播 + 网关集成 + 管理 Web UI + 小程序局域网直连**，装一个插件即可获得全部能力，无需再装官方 MQTT 加载项。
 
-> ## 【迁移公告 · 2026-10-06】本仓库地址已变更
+> ## 【迁仓说明 · 2026-10-06】这里就是唯一商店仓
 >
-> 慧尖加载项的唯一商店仓现在是 **`https://github.com/fangwenyi-dev/HJKJ`**
-> （Gitee 容灾 `https://gitee.com/fangwenyi-dev/HJKJ`）。你现在看到的这张卡
-> （`ha-gateway-plugin`）**即日起冻结停更**，不会再有版本推送。
+> 本仓 `https://github.com/fangwenyi-dev/HJKJ`（Gitee 容灾
+> `https://gitee.com/fangwenyi-dev/HJKJ`）是慧尖两个加载项（LoRa 网关 / HA语音插件）
+> 唯一的发布源。旧地址 `ha-gateway-plugin` 与 `huijian-gateway-plugin-yy` 已冻结停更，
+> 不会再有版本推送——**从旧卡用过来的，照下面四步迁一次**；新装用户直接看「安装」小节。
 >
 > **为什么必须重装、不能"改个名就继承"**：Supervisor 给加载项编的身份是
 > `sha1(你当初添加的那个仓库地址)[:8] + "_" + config.yaml 里的 slug`
 > （`supervisor/store/utils.py:12-15`、`supervisor/store/data.py:240`），`/data`
 > 也按这个全名开目录（`supervisor/apps/app.py:758-760`）。换地址＝换身份＝
-> 开一个新的空数据目录，所以旧卡不会自动指向新仓。
+> 开一个新的空数据目录，所以旧卡不会自动指到这里。
 >
 > **迁移顺序别颠倒**：两个实例会抢宿主 2022 与 10998 端口，第二个起不来。
 >
-> 1. 先打开本加载项「配置」页，把已填的值抄下来（只存在加载项自己的 `/data`，不随迁移走）。
-> 2. 卸载本加载项；商店 ⋮ → 存储库，删除 `ha-gateway-plugin` 这个地址。
+> 1. 先在旧卡的本加载项「配置」页，把已填的值抄下来（只存在加载项自己的 `/data`，不随迁移走）。
+> 2. 卸载旧加载项；商店 ⋮ → 存储库，删除 `ha-gateway-plugin` 这个地址。
 > 3. 添加 `https://github.com/fangwenyi-dev/HJKJ`，安装「慧尖 LoRa 网关」，回填配置，启动。
 > 4. 重启一次 HA Core。
 >
 > **不会丢**：网关实体与子设备重命名（在 HA 实体注册表里）、成员称呼（写在 HA 的
-> `/config`，不在加载项 `/data`）。**会丢**：本加载项「配置」页的值，需要重填。
+> `/config`，不在加载项 `/data`）。**会丢**：旧加载项「配置」页的值，需要重填。
 
 ## 安装
 
 1. **添加仓库**：设置 → 加载项 → 加载项商店 → 右上角 ⋮ → 存储库，添加
-   `https://github.com/fangwenyi-dev/ha-gateway-plugin`
+   `https://github.com/fangwenyi-dev/HJKJ`
    （国内网络若商店迟迟刷不出卡片，可改用 Gitee 镜像源
-   `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`，内容逐字同步。）
+   `https://gitee.com/fangwenyi-dev/HJKJ`，内容逐字同步。）
 2. **安装**：商店搜索「慧尖」→ 进入卡片点「安装」→「启动」。
 3. **重启一次 HA**（仅首次安装必须）：集成代码随加载项落盘、HA 启动时加载。
 

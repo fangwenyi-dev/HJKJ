@@ -10,7 +10,7 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/debian-base:7.8.3
 FROM ${BUILD_FROM}
 
 # OCI 元数据（builder split-action 不传 --label，按文档走 Dockerfile LABEL）
-LABEL org.opencontainers.image.source="https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy"
+LABEL org.opencontainers.image.source="https://github.com/fangwenyi-dev/HJKJ"
 
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=0.0.0

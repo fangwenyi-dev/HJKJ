@@ -9,9 +9,14 @@
 #
 # ⚠ name 只决定商店卡标题。Supervisor 给加载项编的身份是
 #   f"{sha1(用户注册的那个 URL)[:8]}_{config.yaml 里的 slug}"
-#   （supervisor/store/utils.py:12-15 + store/data.py:240）⇒ **本仓的 GitHub 仓名与
-#   URL 都不许改**：换 URL＝换 hash＝网关侧全体已装用户 slug 变＝要求所有人重装，
-#   且旧仓在有人装着的时候根本删不掉（store/__init__.py:247-251）。
+#   （supervisor/store/utils.py:12-15 + store/data.py:240）⇒ **本仓 URL 定死在 HJKJ，
+#   往后也不许再改**：换 URL＝换 hash＝全体已装用户 slug 变＝要求所有人重装，且旧仓
+#   在有人装着的时候根本删不掉（store/__init__.py:247-251）。
+#   2026-10-06 已经付过一次这个代价：仓自 ha-gateway-plugin 迁到本 HJKJ，网关侧 hash
+#   由 386f32f8 变成 c2df40f3，老用户按加载项 README 的迁移公告重装（一次性切换，
+#   用户点名裁定）。同一条 hash 机制也是「语音原仓 huijian-gateway-plugin-yy 不能删」
+#   的原因之一——它的 Releases 是 huijian_voice/firmware.lock.json 里 30 条固件 URL
+#   的运行时宿主，删仓会静默炸 OTA。
 name: 慧尖科技
-url: 'https://github.com/fangwenyi-dev/ha-gateway-plugin'
+url: 'https://github.com/fangwenyi-dev/HJKJ'
 maintainer: fangwenyi-dev

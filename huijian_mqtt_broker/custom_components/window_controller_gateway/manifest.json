@@ -3,8 +3,8 @@
   "name": "慧尖开窗器网关",
   "version": "1.7.65",
   "config_flow": true,
-  "documentation": "https://github.com/fangwenyi-dev/ha-gateway-plugin",
-  "issue_tracker": "https://github.com/fangwenyi-dev/ha-gateway-plugin/issues",
+  "documentation": "https://github.com/fangwenyi-dev/HJKJ",
+  "issue_tracker": "https://github.com/fangwenyi-dev/HJKJ/issues",
   "requirements": [],
   "dependencies": [
     "http"

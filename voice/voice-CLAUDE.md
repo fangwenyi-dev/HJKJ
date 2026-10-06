@@ -2,7 +2,8 @@
 
 三端拓扑：本仓（VO 加载项+集成）｜小程序 `E:\AI\ha-yy\weichat-huijian-hz`｜
 固件 `E:\AI\0513gujian`。姊妹商店仓：网关
-`E:\AI\huijian-gateway-plugin`（ha-gateway-plugin）。
+`E:\AI\huijian-gateway-plugin`（2026-10-06 起语音与网关同仓发布，商店仓实名
+`HJKJ`，Gitee 同名镜像 `fangwenyi-dev/HJKJ`）。
 
 ## 铁律
 - **禁止自动 commit/push**——仅用户明确指令时执行；推送必须**双推**

@@ -1,21 +1,22 @@
-# 慧尖 HA 网关插件仓库
+# 慧尖科技 · Home Assistant 加载项商店仓
 
-慧尖开窗器 LoRa 网关的 Home Assistant 一体化插件。**安装一个插件即可获得全部能力**，无需额外安装集成。
+一个商店仓、两个加载项，各自独立镜像、独立版本号、独立发版链。
 
 ## 可用插件
 
 | 插件 | 版本 | 说明 |
 |------|------|------|
 | [慧尖 LoRa 网关](./huijian_mqtt_broker/) | 以 [CHANGELOG](CHANGELOG.md)/config.yaml 为准 | 内置 Mosquitto Broker + mDNS 广播 + 网关集成 + 小程序 WS 直连，安装即用 |
+| [慧尖HA语音插件](./huijian_voice/) | 以 [CHANGELOG](CHANGELOG.md)/config.yaml 为准 | 局域网语音服务器，本地 STT/TTS/NLU，执行走 HA 意图 REST |
 
 ## 安装方法
 
 1. 在 HA 中打开 **设置 → 加载项 → 加载项商店 → ⋮ → 仓库**
 2. 添加仓库地址（**二选一**，勿同加——同 slug 会在商店重复出现）：
-   - GitHub：`https://github.com/fangwenyi-dev/ha-gateway-plugin`
+   - GitHub：`https://github.com/fangwenyi-dev/HJKJ`
    - 国内 GitHub 拉取失败/超时（Supervisor 日志 `store.git … unexpected eof`
      / `StoreGitError`）时用 Gitee 镜像（逐提交同步）：
-     `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`
+     `https://gitee.com/fangwenyi-dev/HJKJ`
    已安装加载项日常运行不依赖 GitHub（镜像由国内加速源 ghcr.1ms.run 提供，运行纯局域网；冷 tag 首次拉取可能需数分钟到小时级镜像预热）。
 3. 在加载项商店中找到「慧尖 LoRa 网关」并安装
 4. 点击启动 — 全部自动完成：

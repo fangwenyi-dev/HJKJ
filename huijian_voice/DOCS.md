@@ -3,28 +3,31 @@
 慧尖设备的**本地语音服务器**：识别（STT）、理解（NLU）、执行（HA 意图）、播报（TTS）
 全部在局域网内完成，断网可用。零必填配置——安装、启动、配对，三件事。
 
-> ## 【迁移公告 · 2026-10-06】本仓库地址已变更
+> ## 【迁仓说明 · 2026-10-06】这里就是唯一商店仓
 >
-> 慧尖加载项的唯一商店仓现在是 **`https://github.com/fangwenyi-dev/HJKJ`**
-> （Gitee 容灾 `https://gitee.com/fangwenyi-dev/HJKJ`）。你现在看到的这张卡
-> （`ha-gateway-plugin`）**即日起冻结停更**，不会再有版本推送。
+> 本仓 `https://github.com/fangwenyi-dev/HJKJ`（Gitee 容灾
+> `https://gitee.com/fangwenyi-dev/HJKJ`）是慧尖两个加载项（LoRa 网关 / HA语音插件）
+> 唯一的发布源。语音侧先后挂过两个地址（`huijian-gateway-plugin-yy`，后并入
+> `ha-gateway-plugin`），**两个都已冻结停更**，不会再有版本推送。
 >
 > **为什么必须重装、不能"改个名就继承"**：Supervisor 给加载项编的身份是
 > `sha1(你当初添加的那个仓库地址)[:8] + "_" + config.yaml 里的 slug`
 > （`supervisor/store/utils.py:12-15`、`supervisor/store/data.py:240`），`/data`
 > 也按这个全名开目录（`supervisor/apps/app.py:758-760`）。换地址＝换身份＝
-> 开一个新的空数据目录，所以旧卡不会自动指向新仓。
+> 开一个新的空数据目录，所以旧卡不会自动指到这里。
 >
 > **迁移顺序别颠倒**：两个实例会抢宿主 8000 与 8001 端口，第二个起不来。
 >
-> 1. 先打开本加载项「配置」页，把已填的值抄下来（只存在加载项自己的 `/data`，不随迁移走）。
-> 2. 卸载本加载项；商店 ⋮ → 存储库，删除停更的旧地址。
+> 1. 先在旧卡的「配置」页把已填的值抄下来（只存在加载项自己的 `/data`，不随迁移走）。
+> 2. 卸载旧加载项；商店 ⋮ → 存储库，删掉停更的旧地址（`huijian-gateway-plugin-yy`
+>    或 `ha-gateway-plugin`）。
 > 3. 添加 `https://github.com/fangwenyi-dev/HJKJ`，安装「慧尖HA语音插件」，回填配置，启动。
 > 4. 重启一次 HA Core。
 >
 > **不会丢**：卫星固件与小程序里的端点（仍是 `ws://<HA>:8000/...`，端口没变，不用重填）、
-> 自动落盘的 `huijian_ai` 集成（在 HA 的 `/config` 里，不在加载项 `/data`）。
-> **会丢**：本加载项「配置」页的值，以及 `/data` 里的东西——**含已下载的语音模型
+> 自动落盘的 `huijian_ai` 集成（在 HA 的 `/config` 里，不在加载项 `/data`）、以及已发布
+> 固件的下载（`huijian-gateway-plugin-yy` 的 Releases 永久保留，OTA 照旧）。
+> **会丢**：旧加载项「配置」页的值，以及它 `/data` 里的东西——**含已下载的语音模型
 > （约 1.3 GB，需重新下载，或按「模型」页的 import 投放口再投一次）**。
 
 > 本加载项与「慧尖 LoRa 网关」加载项同仓不同镜像，独立升级，互不影响。
@@ -53,11 +56,12 @@
 
 ## 安装（3 步）
 
-1. 加载项商店添加仓库 `https://github.com/fangwenyi-dev/ha-gateway-plugin`
-   （2026-10-06 起语音与网关同仓发布，一张卡两个加载项；**旧地址
-   `huijian-gateway-plugin-yy` 已停用，别再加**；GitHub 拉不动时改用 Gitee 镜像源
-   `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`），逐提交同步，
-   二选一勿同加）→ 安装「慧尖HA语音插件」→ 启动。
+1. 加载项商店添加仓库 `https://github.com/fangwenyi-dev/HJKJ`
+   （一张卡两个加载项：慧尖 LoRa 网关 + 慧尖HA语音插件；旧地址
+   `ha-gateway-plugin` 与 `huijian-gateway-plugin-yy` **均已停更，别再添加**；
+   GitHub 拉不动时改用 Gitee 容灾源 `https://gitee.com/fangwenyi-dev/HJKJ`，
+   逐提交同步，**二选一、勿同加**——两个地址在 Supervisor 里是两张独立的卡）
+   → 安装「慧尖HA语音插件」→ 启动。
 2. 首启自动下载语音模型（约 1.3 GB；离线环境见「模型」页的 import 投放口）。
 3. **重启一次 HA Core**（加载自动落盘的 huijian_ai 集成）。
 
@@ -132,7 +136,7 @@ OpenAI 兼容端点：
   加载项照常运行（镜像走阿里云 ACR、运行纯局域网，均不依赖 GitHub），只是
   看不到新版本、商店不刷新。处置按序：
   ① 慧尖系仓库换 Gitee 镜像源（逐提交同步内容一致）：「仓库」里删 GitHub
-  源、加 `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`——**二选一，勿同加**
+  源、加 `https://gitee.com/fangwenyi-dev/HJKJ`——**二选一，勿同加**
   （同一 URL 重复添加会让商店出现两张同加载项卡）；
   ② 给 HA 主机设静态 DNS（223.5.5.5 / 119.29.29.29）可缓解 DNS 污染型失败；
   ③ 第三方仓库（如 AlexxIT、songloft）无国内镜像可换：可暂时从「仓库」列表

@@ -1534,7 +1534,7 @@
             // GitHub 先入列：同版本时优先取其条目（html_url 详情页更全）。
             const all = [];
             try {
-                const ghResp = await fetchT(INGRESS_BASE + 'api/github/repos/fangwenyi-dev/ha-gateway-plugin/releases?per_page=100', { cache: 'no-store' }, 20000);
+                const ghResp = await fetchT(INGRESS_BASE + 'api/github/repos/fangwenyi-dev/HJKJ/releases?per_page=100', { cache: 'no-store' }, 20000);
                 if (ghResp.ok) {
                     const d = await ghResp.json();
                     if (Array.isArray(d)) all.push(...d);
@@ -1545,7 +1545,7 @@
                 // 数超过 per_page 后，第一页只有最旧 100 条（0918 实锤：首页最大
                 // v1.7.15，人工补齐的 v1.7.25~30 全在窗外），徽章 Gitee 面永远
                 // 看不到新版。direction=desc 让最新进第一页（实测首页即 v1.7.30）。
-                const giteeResp = await fetchT(INGRESS_BASE + 'api/gitee/repos/fangwenyi-dev/ha-gateway-plugin/releases?per_page=100&direction=desc', { cache: 'no-store' }, 20000);
+                const giteeResp = await fetchT(INGRESS_BASE + 'api/gitee/repos/fangwenyi-dev/HJKJ/releases?per_page=100&direction=desc', { cache: 'no-store' }, 20000);
                 if (giteeResp.ok) {
                     const d = await giteeResp.json();
                     if (Array.isArray(d)) all.push(...d);
@@ -1630,7 +1630,7 @@
                         '<br>若跳转后提示「App huijian_mqtt_broker does not exist in the store」，' +
                         '说明本加载项已与加载项商店失去关联（安装后被删除仓库，或商店刷新失败——国内网络访问 GitHub 不通时常见）。' +
                         '恢复方法：设置 → 加载项 → 加载项商店 → ⋮ → 仓库，重新添加 ' +
-                        'https://github.com/fangwenyi-dev/ha-gateway-plugin 并更新商店，再回到本页重试。</div>';
+                        'https://github.com/fangwenyi-dev/HJKJ 并更新商店，再回到本页重试。</div>';
                 } else {
                     content.innerHTML = '<div class="update-box update-ok"><div class="update-info">' +
                         '<div class="update-title">✅ 已是最新版本 v' + CURRENT_VERSION + '</div>' +

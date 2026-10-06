@@ -630,9 +630,10 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
           GITEE_REPO: ${{ github.repository }}  # gitee 侧假定同名仓（双远端规矩）。
-          # 并入本仓后它解析成 fangwenyi-dev/ha-gateway-plugin ⇒ 语音的 Gitee Release
-          # 从此发到网关镜像仓（一个商店仓＝一个 Gitee 镜像仓＝一张卡）；旧 -yy 镜像仓
-          # 过渡期只读保留，不再新增 Release。
+          # 迁到 HJKJ 后它解析成 fangwenyi-dev/HJKJ ⇒ 语音的 Gitee Release 发到
+          # HJKJ 镜像仓（一个商店仓＝一个 Gitee 镜像仓＝一张卡）；旧 -yy 镜像仓
+          # 降为固件 Release 仓（firmware.lock.json 30 条 URL 的运行时宿主），
+          # 加载项 Release 不再往它发。ha-gateway-plugin 镜像仓整体冻结。
           COMMIT: ${{ github.sha }}
           # v1.7.12（第 6 轮审计 I-4）：prepare 已生成过 CHANGELOG 段/兜底
           # 正文——直传复用，不再两处独立解析（漂移源 + 缺段崩 job）

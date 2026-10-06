@@ -13,8 +13,8 @@ HA 中 **设置 → 加载项 → 加载项商店 → ⋮ → 仓库**，添加�
 > 2026-10-06 起语音与网关**同仓发布**，下表两个 URL 都指向合并后的商店仓；
 > 旧仓 `huijian-gateway-plugin-yy` 不再新增版本，别再添加它的地址。
 
-| 默认（GitHub） | `https://github.com/fangwenyi-dev/ha-gateway-plugin` |
-| GitHub 拉取失败/超时（Gitee 镜像，逐提交同步） | `https://gitee.com/fangwenyi-dev/ha-gateway-plugin` |
+| 默认（GitHub） | `https://github.com/fangwenyi-dev/HJKJ` |
+| GitHub 拉取失败/超时（Gitee 镜像，逐提交同步） | `https://gitee.com/fangwenyi-dev/HJKJ` |
 
 > **二选一，勿同时添加**（同 slug 会在商店重复出现）。
 > Supervisor 日志若刷 `supervisor.store.git … unexpected eof while reading`
@@ -26,5 +26,5 @@ HA 中 **设置 → 加载项 → 加载项商店 → ⋮ → 仓库**，添加�
 
 - `huijian_voice/` — 慧尖HA语音插件（加载项 + huijian_ai 集成自动落盘）
 - 说明与排障：[huijian_voice/DOCS.md](huijian_voice/DOCS.md) ｜ [变更日志](CHANGELOG.md)
-- 姊妹仓：慧尖 LoRa 网关加载项 `https://github.com/fangwenyi-dev/ha-gateway-plugin`
-  （Gitee 镜像 `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`）
+- 姊妹仓：慧尖 LoRa 网关加载项 `https://github.com/fangwenyi-dev/HJKJ`
+  （Gitee 镜像 `https://gitee.com/fangwenyi-dev/HJKJ`）

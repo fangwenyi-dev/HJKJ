@@ -3,6 +3,50 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [结构变更] 2026-10-06 · 迁仓改造：仓实名改 HJKJ，URL 钉与运行时取数一起改口（**不发版**）
+
+公告落地后把仓本体指到新地址。`fangwenyi-dev/ha-gateway-plugin` → `fangwenyi-dev/HJKJ`
+逐处判过"该改 / 该留"，不是一把 sed：
+
+- **改（文案与元数据）**：`repository.yaml` 的 `url:`（商店清单自述）、两个 `config.yaml`
+  的 `url:`（卡片主页链接，各 1 处）、`huijian_mqtt_broker/README.md` 4 处、
+  `huijian_voice/DOCS.md` 3 处、`manifest.json` 的 documentation/issue_tracker 2 处、
+  `CLAUDE.md` 6 处命令样例、`voice/voice-README.md` 4 处、`voice/voice-CLAUDE.md` 的姊妹仓指认、
+  `huijian_voice/Dockerfile` 的 OCI `image.source` LABEL。
+- **改（运行时，不是文案）**：`huijian_mqtt_broker/www/js/huijian.js:1537,1548` 是 Web UI
+  「检查更新」真正打的 GitHub/Gitee Releases API，`:1633` 是失败时给用户看的"请添加 XX 地址"
+  文案。这四处不改的话，面板会永远在**不再发布的旧仓** Release 列表里找版本，并把用户往回指。
+- **顺手补**：根 `README.md` 的「可用插件」表只有网关一行——`7c5652f` 那刀没改这张表，
+  语音加载项在仓根 README 上根本没出现。补上第二行，标题改「慧尖科技 · Home Assistant
+  加载项商店仓」。
+- **留（刻意的，附理由）**：`huijian_voice/config.yaml` 的 `image:`、`ci-voice.yaml:366,533` 的
+  `ACR_REPO`、`scripts/verify_release.py:46` 继续指 `huijian-gateway-plugin-yy`——那是阿里云
+  控制台实建的 ACR 命名空间，改了就是指向一个不存在的镜像仓；`test_release_consistency.py:89`
+  与 `test_store_schema.py:108` 两条钉正是要它"与用户控制台实建仓逐字一致（空仓 push 前
+  registry 不认，勿改着玩）"。`firmware.lock.json` 30 条固件 URL 同理指 yy。
+  历史 CHANGELOG 条目一字不动。
+- **补一条钉（这次漏网的正是这一层）**：新增
+  `huijian_mqtt_broker/tests/test_store_repo_alignment.py` 两条判据——拿
+  `repository.yaml` 现读的仓名反查 `huijian.js` 的 GitHub/Gitee Releases 取数点，
+  以及失败文案里让用户添加的地址。期望值不硬编码仓名，免得扫描型守卫扫到自己。
+  变异自证：只把 GitHub 那条 API 改回旧仓 ⇒ 取数点那条转红、文案那条仍绿（对，因为
+  只动了 API 没动文案）；还原后 `git diff` 对暂存区为空。网关基线 1657 → **1659
+  passed**。
+- **钉**：`test_store_schema.py::test_homepage_and_repo_name_aligned` 的两处
+  `endswith("ha-gateway-plugin")` 改成 `endswith("HJKJ")`，并把"这次为什么能动它"写进
+  docstring——这条钉的意义就是逼改 URL 的人先承认换 hash 的代价；我们承认了、也付了，
+  不是把它调松。
+- **CI 不用改地址**：两个 workflow 的 `GITEE_REPO` 都取 `${{ github.repository }}`
+  （`ci.yaml:499`、`ci-voice.yaml:632`，注释写着"gitee 侧同名仓＝双远端规矩"）⇒ 仓名一变
+  自动跟着变，前提是 Gitee 真有同名仓且**公开**；ghcr 包名取 `${GITHUB_REPOSITORY_OWNER}`
+  ⇒ owner 不变、镜像路径不动，用户 `image:` 无需改。
+- **上一条里我写错的一句，这里纠正**：我写「三份文件均为纯 CRLF 无混合行尾」——那描述的是
+  **工作树**，不是仓的不变量。用 `tr -dc '\r' | wc -c` 数（先前用 `grep -c $'\r'` 的读数是废的，
+  GNU grep 把 `\r` 当字面 `r` 匹配）：`66e8d9f`/`cda2bca`/`803de14` 三个时间点上 md blob 的 CR
+  都是 **0**，本仓入库一律 LF，工作树的 CRLF 是 `core.autocrlf=true` 签出时加的。
+  归一行尾后重测上一条：`+22/0`、`+24/0`、`+29/0`，已推送的公告提交 `803de14` 同样 +22/0
+  ⇒「纯插入」这句成立，作废的只有「纯 CRLF」那半句。
+
 ## [结构变更] 2026-10-06 · 商店仓迁往 HJKJ：旧卡挂迁移公告（**不发版**，只动两份对外文档 + 本日志）
 
 唯一商店仓改为 `https://github.com/fangwenyi-dev/HJKJ`（Gitee 容灾 `https://gitee.com/fangwenyi-dev/HJKJ`），
