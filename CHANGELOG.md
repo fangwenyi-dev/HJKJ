@@ -136,6 +136,25 @@ URL 就能同时看到两个加载项——那张卡的分组键是**注册 URL 
   **本刀不改它**（改 URL＝现有设备取不到固件），代价是**旧仓的 Release 资产永远不能删**——
   这条约束写进未做清单，要迁走得先把资产镜像到新仓再改锁文件，是独立一刀。
 
+## [1.7.66] - 2026-10-06 · 迁仓收尾：Web UI 的更新检查改指 HJKJ
+
+- **修（随镜像走的用户可见行为）**：`www/js/huijian.js:1537,1548,1633`——「检查更新」原本硬打
+  `fangwenyi-dev/ha-gateway-plugin` 的 GitHub/Gitee Releases API。迁仓后那个仓冻结停更，
+  面板会永远报已是最新，失败文案还把用户往旧地址指回去。现指 `fangwenyi-dev/HJKJ`。
+- **另一处随镜像走**：`custom_components/window_controller_gateway/manifest.json` 的
+  documentation/issue_tracker 同步改指 HJKJ（HA 集成页展示的这两个链接会跟着走）。
+- **新增守卫**：`tests/test_store_repo_alignment.py` 两条判据，拿 `repository.yaml` 现读的仓名
+  反查 JS 的 Releases 取数点与帮助文案里的地址；期望值不硬编码仓名（防扫描型守卫扫到自己）。
+  变异自证：只把 GitHub 那条 API 改回旧仓 ⇒ 取数点那条转红、文案那条仍绿；还原后对暂存区零 diff。
+- **为什么单发一版，而不是覆盖 ghcr 上已发布的 1.7.65 tag**：JS 与 manifest 都烤在镜像里，
+  覆盖 tag 会让先前装过 1.7.65 的人本地 digest 与 tag 不一致，而且他们永远不会把这次修正
+  当更新收到——那正是改了但没人拿到的形状。
+- **语音侧本版不 bump**：改动只落在 `DOCS.md`/`config.yaml` 的 `url:`（商店侧文案）与
+  Dockerfile 的 OCI provenance LABEL，无用户可见行为变化；1.1.41 镜像继续从 ACR 供迁移过来的用户拉。
+- 门禁：网关 1659 passed（基线 1657 + 新 2 条）、语音 2736 passed/8 skipped、变异矩阵 69 臂
+  整跑失守 0、ruff（CI 同参）与 node --check 通过、仓级结构校验（根 `repository.yaml` 在位 +
+  加载项候选恰好 2 个 + slug 不重 + translation 带 zh-Hans/zh-CN/en）通过。
+
 ## [1.7.65] - 2026-10-06
 
 两条线并成一刀发版：**① 第四轮独立复核的 4 条遗留项收口**（`docs/verify-2026-10-06-v1764.md` 对 v1.7.64 判"真修 14/14、新增缺陷 0"，另登记 4 条"非本批引入"项——我逐条自证**全部为真**，其中两条是真能炸的产品缺陷）；**② 云通道命令参数校验改为直接委托 WS 侧同一实现**（补上属性名白名单 / 值域 / 整数形态三道闸）。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**。
