@@ -105,8 +105,13 @@ def test_image_field_domain_whitelist_and_template():
     assert host in _IMAGE_WHITELIST, f"镜像域 {host} 不在白名单 {list(_IMAGE_WHITELIST)}"
     assert host == _ACR_HOST, "主源必须是自有 ACR（透传站已退役，禁回退）"
     assert "{arch}" not in img, "ACR 路线=单仓多架构 index，image 不该再有 {arch}"
-    assert img == f"{_ACR_HOST}/fangwenyi-dev/huijian-gateway-plugin-yy", \
+    assert img == f"{_ACR_HOST}/fangwenyi-dev/hjkj", \
         "ACR 路径必须与用户控制台实建仓逐字一致（空仓 push 前 registry 不认，勿改着玩）"
+    # 2026-10-06 用户定线：语音 ACR 主源换到新建的 `fangwenyi-dev/hjkj`（与商店仓同名，
+    # 控制台类型=公开，满足 Release 内"tag 一出必须可匿名拉"的就绪不变量）。
+    # 单值钉的性质不变——它仍是防"手滑改回透传站/改错仓名"的防线，只是钉到了新地址。
+    # ⚠ 旧仓 `huijian-gateway-plugin-yy` **永不删**：已装用户手上的旧版本按它自己
+    #   config.yaml 里的旧 image 解析，删了就没法回滚或重装旧版本。
 
 
 def test_homepage_and_repo_name_aligned():

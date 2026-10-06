@@ -47,6 +47,7 @@ from .nlu.fast_path import (END_DIALOGUE_INTENT, FLAG_ANAPHORA_STRIPPED,
                             is_whole_house, split_compound)
 from .nlu import targets as T
 from .nlu import corrector
+from .nlu import homophone
 from . import capability
 from .nlu.canonical import canonical
 from .nlu import music
@@ -1171,6 +1172,23 @@ class Pipeline:
         created = await self._voice_creation(text, origin)
         if created is not None:
             return created
+
+        # L1 Tier A（2026-10-06 远场批）：清单同音改写。远场低 SNR 下 SenseVoice 的
+        # 失效形态是"拼音判对、字选错"（悬窗→旋窗/玄窗/选窗），这类错误抬电平/开降噪/
+        # 追加手工纠错表都治不到，只有把本家清单当词表先验才接得住。
+        # 位置刻意在创建承接与确认环**之后**、复合切分**之前**：创建句存的是用户原话
+        # （「当我说X」的 X 不该被我们的词表改写），确认回答走原车道，而从链发/
+        # fp∥klar/查询族/LLM 兜底起的整条控制面吃同一份归一文本。
+        # 先验只取**这台 HA 真有的叫法**，且与「点名设备查无」子闸同源（`_device_names`
+        # ∪ `_real_areas`）：不读进程级全局词表（单测夹具抑制 sync_vocab，全局态随收集
+        # 顺序时好时坏＝本仓记过的"全局态泄漏"同型坑），更不取静态通用词表（那会把
+        # 「门所」归成本家没有的「门锁」，重犯 `_admissible` v1.1.27 的规矩）。
+        # 两处清单都拿不到 ⇒ 空表 ⇒ 本层整条不生效，现网行为逐值不变。
+        text, _homophones = homophone.rewrite(
+            text, T.tokens_of(self._device_names()) + self._real_areas())
+        if _homophones:
+            logger.info("[级联] 清单同音改写 %s",
+                        "、".join(f"「{a}」→「{b}」" for a, b in _homophones))
 
         # P2-12 复合句：分句全命中才链发，否则原样回退单发路径
         chain = await self._try_compound(text, origin)

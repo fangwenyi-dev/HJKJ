@@ -334,14 +334,21 @@ def test_indeterminate_failure_does_not_replay_fallback():
     assert ex2.calls == ["klar", "t0"], "明确失败时降级照旧（本钉要会咬人）"
 
 
-def _changelog_chain_problems(vers):
+def _changelog_chain_problems(vers, titles=None):
     """CHANGELOG 版本链体检（纯函数，便于反向验证）。
 
     规则：① 自上而下必须严格递减；② **同一条 (major,minor) 线内** patch 必须连续
     （+1）——这正是"插新段时吃掉上一段标题"的侦测面（1.0.87 实发形：段没了、
     CI 提取正文越界把上一版一起塞进 release）；③ 允许 minor/major 进位
     （1.0.99 → 1.1.0），但新线首段 patch 必须为 0，否则该线更早的段位缺失，同属
-    吃标题形态。旧实现只按 patch 数值连续判，遇到正常的 minor 进位会误报缺档。"""
+    吃标题形态。旧实现只按 patch 数值连续判，遇到正常的 minor 进位会误报缺档。
+
+    ③ 的例外（2026-10-06 加，**只加约束不放宽**）：迁仓后两条线各自要开新代次且
+    不从 .0 起（网关 1.7.66→1.8.1、语音 1.1.41→1.2.1——上一版发在旧仓、没进本文件）。
+    旧规则表达不了这个现实，但它要防的事故（吃标题）必须照样抓得住 ⇒ 改成
+    **要求显式声明**：新线首段的段标题里必须含「开 x.y 代次」且代次号与该段版本号一致。
+    拿不到标题（`titles=None`，如既有反向钉那样只传版本串）、未声明、声明的代次号不对
+    ⇒ **一律判红**。放行条件比原规则更严，不是更松。"""
     def tup(v):
         a, b, c = v.split(".")
         return int(a), int(b), int(c)
@@ -355,7 +362,11 @@ def _changelog_chain_problems(vers):
             if older[2] + 1 != newer[2]:
                 bad.append(vers[i])
         elif newer[2] != 0:
-            bad.append(f"{vers[i - 1]}（新开版本线却非 x.y.0，该线更早段位缺失）")
+            declared = ""
+            if titles is not None and i - 1 < len(titles):
+                declared = str(titles[i - 1] or "")
+            if f"开 {newer[0]}.{newer[1]} 代次" not in declared:
+                bad.append(f"{vers[i - 1]}（新开版本线却非 x.y.0，该线更早段位缺失）")
     return bad
 
 
@@ -368,6 +379,16 @@ def test_changelog_chain_guard_catches_swallowed_head():
     assert _changelog_chain_problems(["1.1.0", "1.0.99", "1.0.98"]) == []    # minor 进位合法
     assert _changelog_chain_problems(["1.1.2", "1.1.1", "1.1.0", "1.0.99"]) == []
     assert _changelog_chain_problems(["1.0.99"]) == []
+    # —— 代次跳必须**显式声明**（2026-10-06 加；四条都要成立，缺一条就是放宽）——
+    assert _changelog_chain_problems(["1.2.1", "1.1.41"]) != [], \
+        "拿不到标题时不得放行代次跳（否则既有反向钉被静默放宽）"
+    assert _changelog_chain_problems(["1.2.1", "1.1.41"], ["商店仓首发", "旧版"]) != [], \
+        "未声明「开 x.y 代次」的跳版必须判红"
+    assert _changelog_chain_problems(["1.2.1", "1.1.41"], ["开 1.3 代次：商店仓首发", "旧版"]) != [], \
+        "声明的代次号与版本号不一致必须判红"
+    assert _changelog_chain_problems(["1.2.1", "1.1.41"],
+                                     ["版号线开 1.2 代次：商店仓语音线首发", "旧版"]) == [], \
+        "显式声明且代次号一致 ⇒ 放行"
 
 
 def test_changelog_sections_wellformed_and_within_ci_cap():
@@ -391,12 +412,14 @@ def test_changelog_sections_wellformed_and_within_ci_cap():
     assert "# 慧尖HA语音插件 变更日志" in src, \
         "语音并入块标题不见了：本钉失去作用域，宁可红也不全文件扫"
     src = src[src.index("# 慧尖HA语音插件 变更日志"):]
-    heads = re.findall(r"(?m)^## \[(\d+\.\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})", src)
+    heads = re.findall(r"(?m)^## \[(\d+\.\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})(.*)", src)
     assert heads, "语音并入块内无任何版本段标题"
-    for v0, _d in heads[:8]:
+    for v0, _d, _t in heads[:8]:
         assert re.match(r"^\d+\.\d+\.\d+$", v0), v0
     assert heads[0][0] == ver, "CHANGELOG 首段不是当前版本 %s" % ver
-    缺 = _changelog_chain_problems([h[0] for h in heads[:6]])
+    # 标题一起传进去：代次跳（新线首段非 x.y.0）只有在段标题里**显式声明**「开 x.y 代次」
+    # 才放行——不传标题＝不可验证＝判红，见 _changelog_chain_problems 的四条反向钉。
+    缺 = _changelog_chain_problems([h[0] for h in heads[:6]], [h[2] for h in heads[:6]])
     assert not 缺, "版本段缺档（上一版标题被吃掉？）：" + ", ".join(缺)
     lines = src.split("\n")
     start = next(i for i, l in enumerate(lines) if l.startswith("## [" + ver + "]"))

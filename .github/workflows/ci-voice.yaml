@@ -363,7 +363,7 @@ jobs:
       ACR: crpi-92gcrmsz8v7vvdy1.cn-shanghai.personal.cr.aliyuncs.com
       # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner），
       # 并入商店仓后**故意保留旧名**：改 ACR 仓名＝全体已装用户按 image 拉不到更新。
-      ACR_REPO: fangwenyi-dev/huijian-gateway-plugin-yy
+      ACR_REPO: fangwenyi-dev/hjkj
       VERSION: ${{ needs.prepare.outputs.version }}
       OWNER: ${{ github.repository_owner }}
     steps:
@@ -528,9 +528,11 @@ jobs:
         # 或 CI push-acr 兜底。轮询上限 40min。
         env:
           ACR: crpi-92gcrmsz8v7vvdy1.cn-shanghai.personal.cr.aliyuncs.com
-          # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner），
-          # 并入商店仓后**故意保留旧名**：改 ACR 仓名＝全体已装用户按 image 拉不到更新。
-          ACR_REPO: fangwenyi-dev/huijian-gateway-plugin-yy
+          # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner）。
+          # 2026-10-06 用户定线：ACR 主源换到新建的 `fangwenyi-dev/hjkj`（控制台类型=公开，
+          # 与本 job 的匿名就绪校验一致）。**旧仓 `huijian-gateway-plugin-yy` 永不删**——
+          # 已装用户手上的旧版本仍按它自己 config.yaml 里的旧 image 解析，删了就没法回滚/重装。
+          ACR_REPO: fangwenyi-dev/hjkj
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -eu

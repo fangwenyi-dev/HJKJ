@@ -390,6 +390,27 @@ _dyn_domains: dict[str, tuple[str, ...]] = {}
 _dyn_lookup: tuple[str, ...] = ()
 
 
+def tokens_of(names) -> tuple:
+    """把一组友好名按**生产同一拆词规则**展开成可比对的叫法集合。
+
+    给同音改写层当先验来源用：先验必须只关于"这台 HA 真有什么"，且必须与
+    「点名设备查无」子闸用**同一份清单**（`pipeline._device_names()`），否则两处
+    裁决各自依据不同快照 ⇒ 同句因档位而异即漂移源。
+    刻意不走本模块进程级全局词表——单测夹具故意抑制 sync_vocab，全局态会随收集
+    顺序时好时坏（本仓记过的"全局态泄漏"同型坑）。静态通用词表（空调/门锁…）
+    也不许参与：那会把「门所」这类通用词错字归一成**本家没有**的设备名，等于重犯
+    `_admissible` v1.1.27 立过的规矩（「打开摄像机」→洗碗机）。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in names or ():
+        for t in _name_tokens(str(n or "")):
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+    return tuple(out)
+
+
 def clear_vocab() -> None:      # 测试隔离
     global _dyn_vocab, ALL_DEVICES, ALL_SET, _ALL_MIN2, _dyn_areas
     global _dyn_domains, _dyn_lookup, _dyn_set, _installed_domains

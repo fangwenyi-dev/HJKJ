@@ -105,7 +105,11 @@ def test_legitimate_shapes_still_execute():
         "办公室的射灯打开",
     ]
     for utt in ok_cases:
-        kl = Lane({utt: _kl(utt)})
+        # 桩刻意用 `single=`（任何文本都回同一计划）而不是按原句查表：本文件判的是
+        # **「点名设备查无」这道闸**，不是"级联有没有把原句一字不动地转给引擎"。
+        # v1.1.42 加了清单同音改写层后，「社灯」这类句子在进入引擎前就已被归一成
+        # 「射灯」——按原句查表的桩会把这轮变成"引擎无命中"，红得毫无信息量。
+        kl = Lane(single=_kl(utt))
         ex = RecExecutor()
         _arun(_pipe(kl=kl, ex=ex, ha=HA(HOME)).handle(utt, origin="o"))
         assert ex.plans, f"合法句被本闸误拦: 「{utt}」"
@@ -118,12 +122,12 @@ def test_near_homophone_rescue_is_the_load_bearing_path():
     只动清单不动句子 ⇒ 变异"撤掉近音放行"必定当场红（互含/静态表两臂都够不着它）。"""
     utt = "关掉床投灯"
     ex = RecExecutor()
-    _arun(_pipe(kl=Lane({utt: _kl(utt)}), ex=ex, ha=HA(HOME)).handle(utt, origin="o"))
+    _arun(_pipe(kl=Lane(single=_kl(utt)), ex=ex, ha=HA(HOME)).handle(utt, origin="o"))
     assert ex.plans, "装了床头灯，同音的「床投灯」被误拦"
 
     without = {k: v for k, v in HOME.items() if k != "light.chuang_tou_deng"}
     ex2 = RecExecutor()
-    r2 = _arun(_pipe(kl=Lane({utt: _kl(utt)}), ex=ex2,
+    r2 = _arun(_pipe(kl=Lane(single=_kl(utt)), ex=ex2,
                      ha=HA(without)).handle(utt, origin="o"))
     assert not ex2.plans, f"没装床头灯却照样执行（近音判据越权）: {ex2.plans}"
     assert "没有找到对应的设备" in r2.text, r2.text

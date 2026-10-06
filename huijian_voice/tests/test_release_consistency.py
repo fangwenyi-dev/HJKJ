@@ -82,11 +82,12 @@ def test_zh_hans_and_zh_cn_identical():
 def test_slug_and_naming():
     cfg = _config()
     assert cfg["slug"] == "huijian_voice"
-    # v1.0.1：ACR 单仓多架构路线下镜像仓名=仓库名（用户在 ACR 控制台实建的
-    # huijian-gateway-plugin-yy），"镜像名含 slug 词根"的 ghcr 时代规矩由
-    # test_store_schema 的逐字路径钉桩接管；ghcr 灾备仓仍守 huijian-voice 词根
-    # （见 DOCS FAQ 灾备串）。
-    assert cfg["image"].endswith("/fangwenyi-dev/huijian-gateway-plugin-yy")
+    # v1.0.1：ACR 单仓多架构路线下镜像仓名=用户在 ACR 控制台实建的仓名，
+    # "镜像名含 slug 词根"的 ghcr 时代规矩由 test_store_schema 的逐字路径钉桩接管；
+    # ghcr 灾备仓仍守 huijian-voice 词根（见 DOCS FAQ 灾备串）。
+    # 2026-10-06：控制台实建仓由 `huijian-gateway-plugin-yy` 换成 `hjkj`（与商店仓同名），
+    # 逐字判据在 test_store_schema，这里只跟着改兜底等值，不放宽。
+    assert cfg["image"].endswith("/fangwenyi-dev/hjkj")
     assert cfg["arch"] == ["amd64", "aarch64"]
     # v1.0.69（深审⑪契约变更）：watchdog 判据 tcp://→http:// GET。tcp 由内核
     # backlog 完成 SYN 即算活——事件循环整冻（LLM 无限挂/池饿死族）时

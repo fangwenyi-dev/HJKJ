@@ -43,7 +43,7 @@ ACCEPT = ",".join([
 ])
 CTX = ssl.create_default_context()
 REG = "crpi-92gcrmsz8v7vvdy1.cn-shanghai.personal.cr.aliyuncs.com"
-ACR_REPO = "fangwenyi-dev/huijian-gateway-plugin-yy"
+ACR_REPO = "fangwenyi-dev/hjkj"
 GHCR_REPO = "fangwenyi-dev/huijian-voice"
 
 
