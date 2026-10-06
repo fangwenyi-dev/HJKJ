@@ -306,7 +306,14 @@ jobs:
         uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.06.0
         with:
           architectures: ${{ env.ARCHITECTURES }}
-          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          # 与 build job 同因同解（run 37464996301 的第二次红就在这格）：多架构索引包
+          # `huijian-voice` 的 linked repo 同样绑在旧仓 yy，GITHUB_TOKEN 对它没有
+          # write_package ⇒ manifest 推送 403，而它的**上游 build 已经全绿**、镜像已上 ghcr，
+          # 失败面正好卡在"子镜像在、索引不在"这一层。上一批我只修了 build 那一处就发版，
+          # 是"同类洞只修一处"的老毛病——现由
+          # test_release_consistency.py::test_all_ghcr_registry_passwords_prefer_pat
+          # 逐格看守（全文件扫，不是逐处手抄）。
+          container-registry-password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
           image-name: ${{ env.IMAGE_NAME }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}

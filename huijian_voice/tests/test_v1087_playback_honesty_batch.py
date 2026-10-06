@@ -393,12 +393,11 @@ def test_changelog_chain_guard_catches_swallowed_head():
 
 def test_changelog_sections_wellformed_and_within_ci_cap():
     """CHANGELOG 结构钉（本批实发教训：插 1.0.87 段时把 1.0.86 的标题整行吃掉，
-    结果 CI 提取 1.0.87 正文越界把上一版记录一起塞进 release）。三条：
-    ① 每个版本段标题格式合法且**版本链连续不缺档**（从当前版往下 6 档，
-       minor/major 进位合法，判据见 _changelog_chain_problems）；
-    ② 当前版本段必须能被 CI 的同形 awk 干净切出（下一段标题即边界）；
-    ③ 当前版本段 ≤80 行——CI 用 `head -80` 截正文，超了就把段尾（含诚实账）
-       静默丢掉，客户看到的 release 比仓库记录少一截。"""
+    结果 CI 提取 1.0.87 正文越界把上一版记录一起塞进 release）。①每个版本段标题格式
+    合法且**版本链连续不缺档**（从当前版往下 6 档，minor/major 进位合法，判据见
+    _changelog_chain_problems）；②当前版本段必须能被 CI 的同形 awk 干净切出——即后面
+    一定还有下一个 `## [` 当收口，没有就等于正文一路吃到文件尾。
+    （原③「段 ≤80 行」已搬家：见下方注释与 test_release_consistency 的真上限两条钉。）"""
     import re
     src = (ROOT.parent / "CHANGELOG.md").read_text(encoding="utf-8")
     ver = (ROOT / "config.yaml").read_text(encoding="utf-8")
@@ -425,8 +424,18 @@ def test_changelog_sections_wellformed_and_within_ci_cap():
     start = next(i for i, l in enumerate(lines) if l.startswith("## [" + ver + "]"))
     end = next((i for i in range(start + 1, len(lines))
                 if lines[i].startswith("## [")), len(lines))
-    assert end - start <= 80, (
-        "当前版本段 %d 行 > CI head -80 —— release 正文会被静默截尾" % (end - start))
+    # ③ 原来在这里硬写 `assert end - start <= 80`——那个 80 是从 **Gitee** 那条链抄来的
+    # 常量，而 GitHub 那条链当时是 `head -50`。这正是"67 行正文时本钉绿、客户拿到的
+    # Release 却少了 17 行"的来历：钉守的是想象里的上限，不是真上限。
+    # 改法不是把 80 抬成 120（那只是把下一个坑的坐标先写好），而是**整条判据搬家**到
+    # test_release_consistency.py::test_release_body_carries_whole_current_section——
+    # 它去工作流里**实读** head 上限取最小值，另有 caps_do_not_drift 钉两条链等长。
+    # 本钉因此只保留①②（段标题格式/版本链不缺档/当前版能被干净切出），end-start
+    # 仍算出来，是给②的边界形状用的。
+    assert lines[start].startswith("## [" + ver + "]") and end < len(lines), (
+        "当前版本段后面再没有别的 `## [` 标题——CI 那条 awk 的收口分支永不触发，"
+        "正文会一路吃到文件尾（v1.0.87 吃掉上一版标题的同形事故形状）")
+
 
 
 def test_honest_phrasing_for_indeterminate():

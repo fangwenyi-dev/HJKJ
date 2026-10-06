@@ -398,3 +398,26 @@ def test_release_body_caps_do_not_drift():
     caps = _ci_body_caps()
     assert len(caps) == 2, f"CHANGELOG 提取链应有两条（GitHub/Gitee），实见 {len(caps)} 条"
     assert len(set(caps)) == 1, f"两条链 head 上限漂移 {caps}——同一版正文两边不等长"
+
+
+# ── ghcr 凭据按类扫描（v1.2.1 首发第二次红之后新增）────────────────────
+def test_all_ghcr_registry_passwords_prefer_pat():
+    """本仓语音线**每一处** ghcr 口令入参都必须 PAT 优先。
+
+    为什么是"逐格扫"而不是"钉某一行"：上一批我只把 build job 那一处从裸 GITHUB_TOKEN
+    改成 `${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}` 就去发版，结果 manifest job
+    那处漏了 ⇒ run 37464996301 第二格又红（子镜像已上 ghcr、多架构索引 403，卡在
+    "子镜像在、索引不在"这一层）。同一个根因在这个文件里有**两个**落点，
+    逐处手抄的修法结构性守不住第三处。
+    反向判据两条：任一 site 调回裸 token ⇒ 红；site 总数 < 2 ⇒ 红
+    （总数那条是防"把漏的那处整行删掉就绿了"——build/manifest 两处都在，才是本仓形状）。
+    """
+    wf = _WF.read_text(encoding="utf-8")
+    sites = re.findall(r"^\s*container-registry-password:\s*(\S.*)$", wf, re.M)
+    assert len(sites) >= 2, (
+        f"ghcr 口令入参应有 build＋manifest 至少两处，实见 {len(sites)} 处——"
+        "少一处不是修好了，是被删了")
+    bad = [i for i, s in enumerate(sites, 1) if "secrets.GHCR_PAT ||" not in s]
+    assert not bad, (
+        f"第 {bad} 处 ghcr 口令不是 PAT 优先（{[sites[i - 1] for i in bad]}）："
+        "ghcr 三个语音包 linked repo 仍绑旧仓 yy，仓库级 GITHUB_TOKEN 对其无 write_package")
