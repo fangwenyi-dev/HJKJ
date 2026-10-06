@@ -546,6 +546,11 @@ jobs:
           body = ""
           if os.path.exists("CHANGELOG.md"):
               log = io.open("CHANGELOG.md", encoding="utf-8").read()
+              # 只在网关半区里找：语音并入块以下有 13 个重号（1.0.x/1.1.x），不切边界时
+              # 「网关历史版本重发」会取到语音正文（与语音侧那三处同一形状，反向对称）。
+              _blk = "# 慧尖HA语音插件 变更日志"
+              if _blk in log:
+                  log = log[:log.index(_blk)]
               if "## [%s]" % ver in log:
                   i = log.index("## [%s]" % ver)
                   rest = log[i + 1:]

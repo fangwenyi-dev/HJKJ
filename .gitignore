@@ -42,6 +42,9 @@ screenshots/
 # 误引环境变量建出的空目录树（cmd 重定向 %SystemDrive% 未展开）
 %SystemDrive%/
 
+# 会话期 scratch（探针/复现脚本与其产物）——本刀就靠它挡 `git add -A`
+.qoder-tmp-*/
+
 # 密钥/凭据文件永不入库（2026-09-24：三个 CAM 密钥 CSV 被下载到仓根，差一次
 # `git add -A` 就会推到 GitHub + Gitee 两个公开远端。仓内当前零个已跟踪的
 # csv/key/pem，所以这几条规则不会误伤任何受版文件。）

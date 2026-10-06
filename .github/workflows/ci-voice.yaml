@@ -199,6 +199,8 @@ jobs:
           
           if [ -f CHANGELOG.md ]; then
             awk -v ver="${{ steps.version.outputs.version }}" '
+              /^# 慧尖HA语音插件 变更日志/{ inv=1 }
+              !inv { next }
               /^## \[/{ found=0 }
               $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
               /^## \[/{ if(found) exit }
@@ -507,6 +509,8 @@ jobs:
           set -eu
           VER='${{ needs.prepare.outputs.version }}'
           awk -v ver="$VER" '
+            /^# 慧尖HA语音插件 变更日志/{ inv=1 }
+            !inv { next }
             /^## \[/{ found=0 }
             $0 ~ "^## \\["ver"]" { found=1; print; next }
             /^## \[/{ if(found) exit }
@@ -660,6 +664,12 @@ jobs:
           body = ""
           if os.path.exists("CHANGELOG.md"):
               log = io.open("CHANGELOG.md", encoding="utf-8").read()
+              # 2026-10-06 D3：先切进语音块再找段。两条号线共用一份文件后有 13 个重号
+              # （1.0.7-1.0.9、1.1.0-1.1.9，网关早年也用过这些号），不切块时语音 1.1.5
+              # 会命中网关的同号正文，把别人的排障记录发成自己的 Release。
+              _blk = "# 慧尖HA语音插件 变更日志"
+              if _blk in log:
+                  log = log[log.index(_blk):]
               if f"## [{ver}]" in log:
                   i = log.index(f"## [{ver}]")
                   rest = log[i + 1:]

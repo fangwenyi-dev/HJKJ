@@ -10,7 +10,7 @@
 URL 就能同时看到两个加载项——那张卡的分组键是**注册 URL 的 sha1 前 8 位**，不是标题文字
 （`supervisor/store/utils.py:12-15` + `store/data.py:240`：slug = `f"{仓hash}_{config.yaml 的 slug}"`）。
 
-- **搬入**：语音侧 316 个受版文件用 `git archive` 逐字节搬入（sha256 全量比对 0 差异）——
+- **搬入**：语音侧 316 个受版文件用 `git archive` 搬入，**工作区字节**逐文件 sha256 比对 0 差异。⚠ 但**入库后的 blob 不是逐字节相同**：本仓 `.gitattributes` 有 `* text eol=lf` 而语音仓没有，63 份文件的 blob 被归一成 LF（工作区不变，只有 Docker `COPY` 进镜像的字节变了）；另有 6 份是我**主动改过**的（`huijian_voice/config.yaml` 的 `url:` + 5 个测试文件）⇒ 提交信息里「加载项内容零改动」这句**说过头了**，复测（对抗复核）当场抓出，见下方补记。——
   `huijian_voice/` 312 个、`scripts/` 3 个发版工具、`docs/internal/MODIFICATION_RECORD.md`；
   语音仓级文档落 `voice/`。语音原仓 `huijian-gateway-plugin-yy` 本刀**一字未改**，过渡期两仓并存。
 - **为什么网关侧零冲击**：宿主选网关仓 ⇒ 网关 URL 不变 ⇒ 全体已装用户 slug 一字不变；
@@ -19,7 +19,8 @@ URL 就能同时看到两个加载项——那张卡的分组键是**注册 URL 
   （`store/__init__.py:247-251` 抛 `Can't remove … used by installed apps`）。
   ⚠ 由此得一条硬规矩：**本仓的 GitHub 仓名与 URL 都不许改**——改了就是把网关侧也弄成重装。
 - **发版链**：新增 `.github/workflows/ci-voice.yaml`（从语音仓逐字搬来，只动六处：触发方式、
-  concurrency 组名、tag 前缀 `vo-`、Gitee 目标仓说明、ACR 路径注释两处）。组名必须区别于
+  concurrency 组名、tag 前缀 `vo-`（**四个落点**：闸口 refs、GitHub tag_name/name、Gitee 三处）、
+  Gitee 目标仓说明、ACR 路径注释两处）。组名必须区别于
   网关那条，否则同仓两条发版链互相排队阻塞。**ACR 本身不用动**：`ACR_REPO` 是硬编码字符串、
   与 GitHub 仓名无耦合，改它反而让全体已装用户按 `image:` 拉不到更新。
 - **ci-voice 暂只 `workflow_dispatch`**：本仓尚未配 `ACR_USER` / `ACR_PASS`（语音镜像主源是
@@ -39,6 +40,28 @@ URL 就能同时看到两个加载项——那张卡的分组键是**注册 URL 
 ③ 旧语音仓的归档/只读与用户公告文案；④ **真机验证**——在 .91 或 .184 添加一次聚合仓 URL，
 确认一张卡出两个加载项且两者都能装/更新；⑤ 两套测试同进程混跑会互相遮蔽 conftest
 （语音侧 10+ 处裸 `from conftest import`），已按现状写进 CLAUDE.md 的约束，消雷要改导入方式。
+
+**复测补记（2026-10-06 对抗复核，四条全部成立并已修）**：发"完成"结论前派了一个专司推翻的代理，
+它抓出四处我自己没看到的，逐条自己复现后修：
+
+- **P1 两条号线有 13 个重号**（`1.0.7-1.0.9`、`1.1.0-1.1.9`——网关早年用过同样的号）。四处
+  CHANGELOG 抽取（语音 prepare/release/gitee 三处 + 网关新 gitee 一处）都是"取第一个匹配"，
+  于是**语音 1.1.5 的 Release 正文会取到网关的 1.1.5**（实测：合并文件里 1.1.5 先命中
+  `2026-08-26` 网关段，语音自己那段在 `2026-09-22`）。修法＝四处一律切到自己那半区
+  （awk 加 `inv` 门、python 按块标题切边界），并在 **Linux gawk（CI 同款）**上实测：
+  `1.1.5`→语音正文、`1.1.41`→语音、`1.7.65`→语音侧落空。本机 MSYS gawk 会把 `\[` 降级成
+  字符类，跑同一条 awk 直接取空——**这条判据不能在 Windows 上验**。
+- **P1 我新写的 sha 等待闸没牙**：把循环收尾 `exit 1` 改成 `exit 0`（探测失败也放行＝Release
+  静默指到镜像仓旧提交），全量 1655 条照绿——因为既有钉只判 `commits/${COMMIT}` 字样在不在。
+  补行为级钉 `test_gitee_sha_wait_gate_fails_loudly_not_silently`（判闸在、放行分支绑 200、
+  超时收尾必须是 `exit 1` 且前一句是 `::error`），两臂变异实测都红：收尾改 exit 0 → 1 failed、
+  放行不绑 200 → 1 failed，基线 9 passed，还原 md5 一致。
+- **P2 用户面文档还在教人加旧地址**：`huijian_voice/DOCS.md` 两处、`voice/voice-README.md`
+  两处 ⇒ 已改指合并后仓库并注明"旧仓不再新增版本"。
+- **P2 设备 OTA 资产仍挂在旧仓**：`huijian_voice/firmware.lock.json` 有 30 条
+  `…/huijian-gateway-plugin-yy/releases/download/…`，且被 `Dockerfile:51` COPY 进镜像。
+  **本刀不改它**（改 URL＝现有设备取不到固件），代价是**旧仓的 Release 资产永远不能删**——
+  这条约束写进未做清单，要迁走得先把资产镜像到新仓再改锁文件，是独立一刀。
 
 ## [1.7.65] - 2026-10-06
 

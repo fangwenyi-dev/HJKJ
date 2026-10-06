@@ -10,8 +10,11 @@ HA 中 **设置 → 加载项 → 加载项商店 → ⋮ → 仓库**，添加�
 
 | 网络环境 | 仓库 URL |
 |---|---|
-| 默认（GitHub） | `https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy` |
-| GitHub 拉取失败/超时（Gitee 镜像，逐提交同步） | `https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy` |
+> 2026-10-06 起语音与网关**同仓发布**，下表两个 URL 都指向合并后的商店仓；
+> 旧仓 `huijian-gateway-plugin-yy` 不再新增版本，别再添加它的地址。
+
+| 默认（GitHub） | `https://github.com/fangwenyi-dev/ha-gateway-plugin` |
+| GitHub 拉取失败/超时（Gitee 镜像，逐提交同步） | `https://gitee.com/fangwenyi-dev/ha-gateway-plugin` |
 
 > **二选一，勿同时添加**（同 slug 会在商店重复出现）。
 > Supervisor 日志若刷 `supervisor.store.git … unexpected eof while reading`

@@ -29,8 +29,10 @@
 
 ## 安装（3 步）
 
-1. 加载项商店添加本仓库（GitHub 拉不动时改用 Gitee 镜像源
-   `https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy`，逐提交同步，
+1. 加载项商店添加仓库 `https://github.com/fangwenyi-dev/ha-gateway-plugin`
+   （2026-10-06 起语音与网关同仓发布，一张卡两个加载项；**旧地址
+   `huijian-gateway-plugin-yy` 已停用，别再加**；GitHub 拉不动时改用 Gitee 镜像源
+   `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`），逐提交同步，
    二选一勿同加）→ 安装「慧尖HA语音插件」→ 启动。
 2. 首启自动下载语音模型（约 1.3 GB；离线环境见「模型」页的 import 投放口）。
 3. **重启一次 HA Core**（加载自动落盘的 huijian_ai 集成）。
@@ -106,8 +108,8 @@ OpenAI 兼容端点：
   加载项照常运行（镜像走阿里云 ACR、运行纯局域网，均不依赖 GitHub），只是
   看不到新版本、商店不刷新。处置按序：
   ① 慧尖系仓库换 Gitee 镜像源（逐提交同步内容一致）：「仓库」里删 GitHub
-  源、加 `https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy`
-  （网关仓库为 …/ha-gateway-plugin）——**二选一，勿同加**（同 slug 会重复）；
+  源、加 `https://gitee.com/fangwenyi-dev/ha-gateway-plugin`——**二选一，勿同加**
+  （同一 URL 重复添加会让商店出现两张同加载项卡）；
   ② 给 HA 主机设静态 DNS（223.5.5.5 / 119.29.29.29）可缓解 DNS 污染型失败；
   ③ 第三方仓库（如 AlexxIT、songloft）无国内镜像可换：可暂时从「仓库」列表
   移除消除刷屏，需要更新时再加回；Supervisor 本身会自动周期重试。
