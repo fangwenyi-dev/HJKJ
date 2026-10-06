@@ -136,6 +136,21 @@ URL 就能同时看到两个加载项——那张卡的分组键是**注册 URL 
   **本刀不改它**（改 URL＝现有设备取不到固件），代价是**旧仓的 Release 资产永远不能删**——
   这条约束写进未做清单，要迁走得先把资产镜像到新仓再改锁文件，是独立一刀。
 
+## [1.8.1] - 2026-10-06 · 版号线开 1.8 代次（迁仓后首个代次号；**相对 1.7.66 零功能改动**）
+
+用户口令：1.7.66 直接升到 **1.8.1**，今后从 1.8.x 往上走。**1.8.0 不发**，代次号从 1.8.1 起算。
+
+- 本版内容就是 1.7.66 的全部内容（Web UI 更新检查与集成 manifest 改指 HJKJ），**没有新增功能、
+  没有行为改动**。写明白是怕代次号跳变被误读成"1.8 有一批新东西"。
+- 版号 lockstep 四处共 **10 处字面量**一次改全、残留 0：`config.yaml`(1)、
+  `www/version.json`(2：addon+integration)、`www/index.html`(6：`CURRENT_VERSION` +
+  `css/huijian.css`/`js/starsky.js`/`js/qr.js`/`js/huijian.js` 四处 `?v=` cache-bust
+  + `img/logo.png`)、`custom_components/window_controller_gateway/manifest.json`(1)。
+  这四张字段由 `test_audit_round6::test_version_files_consistent` 与
+  `test_audit_round8::TestVersionFields`（含 `?v=` 那条）钉着，bump 漏改当场红。
+- 发布位：唯一商店仓 `github.com/fangwenyi-dev/HJKJ`（商店卡 hash `c2df40f3`）+ Gitee 同名容灾仓
+  （已公开，匿名 ls-remote 与 raw 取字节都验过）。旧仓 `ha-gateway-plugin` 冻结，不再发任何版本。
+
 ## [1.7.66] - 2026-10-06 · 迁仓收尾：Web UI 的更新检查改指 HJKJ
 
 - **修（随镜像走的用户可见行为）**：`www/js/huijian.js:1537,1548,1633`——「检查更新」原本硬打
