@@ -14,7 +14,7 @@ hotwords**；`ys_log_probs` 返回空数组；`modified_beam_search` 被实现�
 与置信度。唯一可落地的先验位置是**解码后的词表改写**。
 
 判据口径：本文件的"清单"是夹具里显式传入的名字集合，与生产同源
-（`pipeline._device_names()` ∪ `_real_areas()`）。**全篇不改任何进程级全局态**——
+（`prior_names(pipeline._device_names())` ∪ `_real_areas()`；v1.2.2 刀1 起先验只收设备名段）。**全篇不改任何进程级全局态**——
 首版用 `T.sync_vocab/clear_vocab` 铺地形，被全量回归证明会随收集顺序时好时坏
 （正是 `_device_names` 注释里记过的"全局态泄漏"同型坑）。
 """
@@ -35,7 +35,8 @@ def _arun(coro):
     return asyncio.run(coro)
 
 
-# 日志真名派生的地形（友好名拆词后含 悬窗/开窗器/推拉窗/内开窗/平开窗/展厅）
+# 日志真名派生的地形（friendly_name 一律 `<设备名> <能力后缀>`；prior_names 取首段
+# ⇒ 先验含 悬窗/推拉窗/内开窗/平开窗/展厅，不含 开窗器/开启）
 HOME = {
     "cover.xuan": {"attributes": {"friendly_name": "悬窗 开窗器"}},
     "cover.tuila": {"attributes": {"friendly_name": "推拉窗 开窗器"}},
@@ -45,7 +46,7 @@ HOME = {
     "media_player.zt": {"attributes": {"friendly_name": "展厅"}},
 }
 XUAN = "cover.xuan"
-PRIOR = T.tokens_of([e["attributes"]["friendly_name"] for e in HOME.values()])
+PRIOR = H.prior_names([e["attributes"]["friendly_name"] for e in HOME.values()])
 
 
 def _plan(utt, intent="ControlWindow"):
@@ -175,8 +176,16 @@ def test_static_generic_words_are_never_the_prior():
 
 
 def test_prior_source_is_the_same_inventory_the_gate_uses():
-    """先验必须来自 `_device_names()`（友好名按生产规则拆词），不是别的快照。"""
-    assert "悬窗" in PRIOR and "开窗器" in PRIOR, f"友好名拆词后应含 悬窗: {PRIOR}"
+    """先验必须来自 `_device_names()`（经 `prior_names` 取**设备名段**），不是别的快照。
+
+    v1.2.2 刀1 把这一格从"整份拆词"收成"只取首段"：`悬窗 开窗器` 的先验名是 `悬窗`，
+    能力段 `开窗器` **不再进**（它会与 `开启/确认/力度` 一起被收进来，而本层产物是继续
+    参与级联的文本——归一目标成了动作词/属性名，改的就是"这句话是什么行为"）。
+    完整防线见 `test_v122_prior_window_family.py`。
+    """
+    assert "悬窗" in PRIOR and "推拉窗" in PRIOR and "内开窗" in PRIOR, \
+        f"设备名段没进先验: {PRIOR}"
+    assert "开窗器" not in PRIOR, f"能力段重新混进先验: {PRIOR}"
     assert not any(len(t) == 1 for t in PRIOR), "单字/序号档不进先验（长度下限）"
 
 
@@ -222,4 +231,5 @@ def test_hook_position_after_creation_before_compound():
     assert i_create < i_hook < i_chain, (
         "改写点必须排在创建承接之后（创建句存用户原话）、复合切分之前（链两腿同口径）")
     assert src.count("homophone.rewrite(") == 1, "改写点全链单点，多处调用会各自漂移"
-    assert "T.tokens_of(self._device_names())" in src, "先验来源必须与查无子闸同一份清单"
+    assert "homophone.prior_names(self._device_names())" in src, \
+        "先验来源必须与查无子闸同一份清单（同一个 _device_names()），且只取设备名段"

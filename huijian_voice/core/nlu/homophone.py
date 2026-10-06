@@ -55,6 +55,35 @@ def _syl(word: str):
     return tuple(s)
 
 
+def prior_names(raw_names) -> tuple:
+    """本层先验宇宙的唯一构造口：HA `friendly_name` 清单 → **可当目标的本家名**。
+
+    为什么不能把 `targets.tokens_of()` 的整份拆词结果直接当先验：现网清单的形状一律是
+    `<设备名> <能力后缀>`（2026-10-05 办公 .91 真快照实证：`悬窗 ① 开启`、`推拉窗 ③ 关闭`、
+    `开窗器 123f-020A 速度`、`射灯 确认`、`V3 音量`）。整片拆词会把**动作词与属性名**
+    （开启/暂停/关闭/力度/状态/电池电压/音量/确认）一起收进"本家名字"里。本层的产物是
+    **改写后的文本**，它还要继续走确认环、复合切分、直调与集成展开——归一目标一旦是
+    `确认/关闭/开启` 这类控制词，改的就不是"哪台设备"而是"这句话是什么行为"。
+    v1.1.17「摄像机→洗碗机」立的规矩（`_admissible`：不得凭空造本家没有的目标）在这里
+    同族，只是入口换到了词表层。
+
+    规则＝只取**首个空格前那段**；段本身非汉字或长度越界 ⇒ 整条不参与（由
+    `homophone_index` 的 `_HAN`/长度闸门执行）。方向性＝**收窄只会漏改，不会多改**，
+    所以丢掉 `媒体播放器` 这类"名字本身带空格"的救正是我们要的偏向。
+    去重保序：`返回 tuple` 供 `_INDEX_CACHE` 按对象身份缓存。
+    """
+    out, seen = [], set()
+    for w in raw_names or ():
+        w = str(w or "").strip()
+        if not w:
+            continue
+        seg = w.split(maxsplit=1)[0]
+        if seg and seg not in seen:
+            seen.add(seg)
+            out.append(seg)
+    return tuple(out)
+
+
 def homophone_index(names):
     """音节串 → {本家写法}。只收纯汉字、2~8 字、一字一音节的名。
 

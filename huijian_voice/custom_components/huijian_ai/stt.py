@@ -61,6 +61,16 @@ class HuijianSttEntity(BaseEntity):
         self.opus_encoder = opuslib.Encoder(
             self.opus_sample_rate, self.opus_channels, opuslib.APPLICATION_VOIP
         )
+        # v1.2.2 刀2：上行这一跳的码率**从来没设过**，跑的是 libopus 编译期默认。
+        # 本机读回实测（`_measure_uplink_opus.py`，真 16k 语音往返）：默认＝bitrate 17000 /
+        # complexity 9 / 平均实码率 14560 bps，4–8 kHz 擦音段相对原信号 **−1.42 dB**；
+        # 显式 48000＋complexity 10 → −0.68 dB（净赚 0.74 dB，而 3 m 的距离损失是 ~26 dB
+        # 量级，所以这一格是"白送但不解远场"，别当疗效卖）。
+        # `application` 保持 VOIP：换 AUDIO 的实测差只有 0.08 dB，落在测量噪声内，
+        # 不拿一次读数当结论去动一个会改变整条语音模型偏置的开关。
+        # 带宽代价可忽略：设备→集成本来就是裸 PCM（256 kbps），这一跳是集成→加载项。
+        self.opus_encoder.bitrate = 48000
+        self.opus_encoder.complexity = 10
 
     @property
     def supported_languages(self):

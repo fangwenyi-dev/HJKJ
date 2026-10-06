@@ -1179,13 +1179,18 @@ class Pipeline:
         # 位置刻意在创建承接与确认环**之后**、复合切分**之前**：创建句存的是用户原话
         # （「当我说X」的 X 不该被我们的词表改写），确认回答走原车道，而从链发/
         # fp∥klar/查询族/LLM 兜底起的整条控制面吃同一份归一文本。
-        # 先验只取**这台 HA 真有的叫法**，且与「点名设备查无」子闸同源（`_device_names`
-        # ∪ `_real_areas`）：不读进程级全局词表（单测夹具抑制 sync_vocab，全局态随收集
+        # 先验来源＝`prior_names(_device_names()) ∪ _real_areas()`：清单与「点名设备查无」
+        # 子闸同源（同一个 `_device_names()`，本刀**不**动它的裁决语义），但先验只收每条
+        # friendly_name 的**设备名段**（`prior_names` 取首段，理由与现网实证见其 docstring）。
+        # v1.2.2 之前这里喂的是 `T.tokens_of(...)` 的整份拆词——现网真清单实证那会把
+        # `开启/关闭/确认/力度/音量` 这类**动作词与属性名**当本家名收进先验，而本层产物
+        # 是继续参与级联的文本 ⇒ 改的可能是"这句话是什么行为"。收窄只会漏改，不会多改。
+        # 不读进程级全局词表（单测夹具抑制 sync_vocab，全局态随收集
         # 顺序时好时坏＝本仓记过的"全局态泄漏"同型坑），更不取静态通用词表（那会把
         # 「门所」归成本家没有的「门锁」，重犯 `_admissible` v1.1.27 的规矩）。
         # 两处清单都拿不到 ⇒ 空表 ⇒ 本层整条不生效，现网行为逐值不变。
         text, _homophones = homophone.rewrite(
-            text, T.tokens_of(self._device_names()) + self._real_areas())
+            text, homophone.prior_names(self._device_names()) + self._real_areas())
         if _homophones:
             logger.info("[级联] 清单同音改写 %s",
                         "、".join(f"「{a}」→「{b}」" for a, b in _homophones))
