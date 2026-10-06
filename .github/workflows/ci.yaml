@@ -282,7 +282,14 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           context: "huijian_mqtt_broker"
-          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          # 迁仓到 HJKJ 后 ghcr 三个包仍【绑在旧仓】（账号下、linked repo=ha-gateway-plugin），
+          # HJKJ 的 GITHUB_TOKEN 推不动：denied: permission_denied: write_package。
+          # 首选 GHCR_PAT（账号级 write:packages，与包绑哪个仓无关）；没配该 secret 时
+          # 回落 GITHUB_TOKEN ⇒ 将来在旧包上给 HJKJ 授了 Write，删掉 GHCR_PAT 链路自动
+          # 回到零长期令牌形态，不必改本文件。
+          # ⚠ 用 PAT 推【新建】包不会继承仓库可见性（会建成 private）；本仓安全的前提是
+          #   三个包已存在且 public（2026-10-06 实测 `gh api user/packages` 三条 visibility=public）。
+          container-registry-password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
           image: ${{ matrix.image }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
@@ -300,7 +307,8 @@ jobs:
         uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.06.0
         with:
           architectures: ${{ env.ARCHITECTURES }}
-          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          # 同 build：多架构索引包 huijian-mqtt-broker 也绑在旧仓，PAT 优先、回落 GITHUB_TOKEN
+          container-registry-password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
           image-name: ${{ env.IMAGE_NAME }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
