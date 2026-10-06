@@ -385,8 +385,11 @@ jobs:
     continue-on-error: true
     env:
       ACR: crpi-92gcrmsz8v7vvdy1.cn-shanghai.personal.cr.aliyuncs.com
-      # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner），
-      # 并入商店仓后**故意保留旧名**：改 ACR 仓名＝全体已装用户按 image 拉不到更新。
+      # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner）。
+      # 2026-10-06 用户定线换到新库 `fangwenyi-dev/hjkj`，与 release job 的「Wait for ACR
+      # mirror readiness」同值——这两处**必须成对**，漏一处就是"推到没人读的仓"或
+      # "校验探的是另一个库"。为什么必须一起换、旧库为何永不删，理由写在 readiness
+      # 那格的注释里（单一出处，不在此重复一遍以免两处各自演化）。
       ACR_REPO: fangwenyi-dev/hjkj
       VERSION: ${{ needs.prepare.outputs.version }}
       OWNER: ${{ github.repository_owner }}

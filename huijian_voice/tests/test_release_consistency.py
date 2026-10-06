@@ -421,3 +421,30 @@ def test_all_ghcr_registry_passwords_prefer_pat():
     assert not bad, (
         f"第 {bad} 处 ghcr 口令不是 PAT 优先（{[sites[i - 1] for i in bad]}）："
         "ghcr 三个语音包 linked repo 仍绑旧仓 yy，仓库级 GITHUB_TOKEN 对其无 write_package")
+
+
+def test_acr_endpoint_matches_image_in_every_ci_site():
+    """`config.yaml image:` 与 ci-voice.yaml 里**每一处** ACR 主机/仓名必须同源。
+
+    为什么按处扫而不是只看 config：ACR 换库是"三处一起改"的成对动作——客户按 image 拉、
+    push-acr 按 ACR_REPO 推、release 的 readiness 步按 ACR_REPO 探。任何一处漏改的失败形状
+    都**不是报错**：推到人没人读的仓，或者 readiness 探着旧库给新版发 GO（旧库当时确实还
+    留着 1.1.42，探它必然秒过）。原有两条单值钉（test_store_schema / test_slug_and_naming）
+    只钉 config 那一处，CI 两处从来没有被机器看过。
+    判据三条：ACR_REPO **恰有两处**且互等（少于两处＝有人整行删掉了，也要红）；两处都等于
+    image 去掉 host 后的路径；所有 `ACR:` 主机等于 image 的 host。
+    """
+    img = _config()["image"]
+    host, _, path = img.partition("/")
+    wf = _WF.read_text(encoding="utf-8")
+    repos = re.findall(r"^\s*ACR_REPO:\s*(\S+)\s*$", wf, re.M)
+    assert len(repos) == 2, (
+        f"ACR_REPO 应恰有 push-acr＋readiness 两处，实见 {len(repos)} 处——"
+        "少一处不是修好了，是被删了或改成了动态取数")
+    assert len(set(repos)) == 1, f"两处 ACR_REPO 漂移：{repos}"
+    assert repos[0] == path, (
+        f"CI 推/探的仓 {repos[0]} ≠ 客户 image 指的仓 {path}——"
+        "换库只换一边＝推到没人读的仓，或拿另一个库的绿给本版背书")
+    hosts = set(re.findall(r"^\s*ACR:\s*(\S+)\s*$", wf, re.M))
+    assert hosts and hosts == {host}, (
+        f"CI 里的 ACR 主机 {sorted(hosts)} 与 image 的 host {host} 不同源")
