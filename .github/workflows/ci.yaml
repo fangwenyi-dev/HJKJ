@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force_republish:
+        description: '明知故犯地重发已存在的版本号 tag（覆盖已发布镜像与 Release）；不勾则 prepare 的发布闸会跳过本轮'
+        type: boolean
+        default: false
 
 env:
   ARCHITECTURES: '["amd64", "aarch64"]'
@@ -201,6 +206,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
+      publish: ${{ steps.gate.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
         # v1.7.12（审计 I-3）：changelog 兜底路径要 `git log --oneline -10`，
@@ -221,6 +227,59 @@ jobs:
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "提取到版本号: $VERSION"
+
+      - name: 发布闸口——本版本号已发布过且非本次提交即跳过
+        id: gate
+        # 为什么要有这道闸（2026-10-06 迁仓后实测到的副作用）：本仓一条 main 被两个
+        # 加载项共用，而本 workflow 的触发是 `push: branches:[main]` 无 paths 过滤 ⇒
+        # 语音侧每推一次，网关链就跟着重跑一轮。没有闸时它会**把已发布的版本号原地
+        # 重新 build 并覆盖 ghcr**：实测 v1.8.1 的 index digest 从 09432e77d014… 变成
+        # 3a4b8de90a91…，而版本号没变 ⇒ 已装用户永远收不到"有更新"，却在自己下次
+        # 重装时拿到另一份字节。这就是"重推了但没人需要它"。
+        # 判据分三档（与语音侧 ci-voice.yaml 同形，但**语义是跳过不是拦停**）：
+        #   tag 不存在            → 这是一次真发版，放行；
+        #   tag 指向本次 commit    → 只是重跑失败的构建，放行；
+        #   tag 指向别的 commit    → 本次 push 不是网关发版（多半是对端推的），
+        #                            **响亮跳过**：::warning:: + publish=false，
+        #                            下游 build/e2e/manifest/warm/release/gitee 全 skip。
+        # 为什么不像语音侧那样 exit 1：那边"版本号没涨就推 main"是人在犯错，红是应该的；
+        # 这边是**对端正常发版顺带触发**，每推一次红一次会把红变成噪音，反而没人看红。
+        # 真要覆盖已发布版本：workflow_dispatch 勾 force_republish。
+        # ls-remote 必须 `|| true` 且无输出时**降级放行**——闸口不得比它守的事更脆
+        # （临时网络/鉴权抖动若把闸打死，正常发版也发不出去）。
+        run: |
+          set -u
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="v$VERSION"
+          REFS=$(git ls-remote origin 2>/dev/null || true)
+          if [ -z "$REFS" ]; then
+            echo "::warning title=发布闸降级::git ls-remote origin 无输出，本轮跳过存在性判定（按放行处理）"
+            echo "publish=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          DIRECT=$(awk -v r="refs/tags/$TAG" '$2==r{print $1}' <<<"$REFS")
+          # 附注标签的 refs/tags/vX 指向 tag 对象而非 commit，必须一起看 peeled 的 ^{}
+          # ——否则同一 commit 的重跑会被误判成"指向他处"而漏发。
+          PEELED=$(awk -v r="refs/tags/$TAG^{}" '$2==r{print $1}' <<<"$REFS")
+          TARGET="${PEELED:-$DIRECT}"
+          if [ -z "$TARGET" ]; then
+            echo "tag $TAG 未发布过 → 本轮是真发版，放行"
+            echo "publish=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "已存在 tag $TAG -> ${TARGET:0:8}"
+          if [ "$TARGET" = "${{ github.sha }}" ]; then
+            echo "::notice title=重跑同一 commit::$TAG 指向本次提交，按重跑放行"
+            echo "publish=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ "${{ inputs.force_republish }}" = "true" ]; then
+            echo "::warning title=强制重发::正在覆盖已发布的 $TAG（原指向 ${TARGET:0:8}）"
+            echo "publish=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "::warning title=本轮跳过网关发布::$TAG 已发布且指向 ${TARGET:0:8}，本次提交 ${{ github.sha }} 未涨网关版本号（多半是语音侧的 push 触发了本链）。要发网关请先升 huijian_mqtt_broker/config.yaml 的 version；确属故意覆盖则用 workflow_dispatch 勾 force_republish。"
+          echo "publish=false" >> $GITHUB_OUTPUT
 
       - name: Generate changelog
         id: changelog
@@ -271,6 +330,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     needs: [prepare, init]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -301,6 +361,7 @@ jobs:
     name: Manifest
     # e2e 为 v1.6.23 起的硬门禁（详见 e2e job 注释）
     needs: [prepare, init, build, e2e]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Publish multi-arch manifest
@@ -368,6 +429,7 @@ jobs:
   warm-mirrors:
     name: Warm CN mirrors
     needs: [prepare, manifest]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 30
@@ -453,6 +515,7 @@ jobs:
   release:
     name: Release
     needs: [prepare, manifest]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -476,6 +539,7 @@ jobs:
   e2e:
     name: E2E real stack
     needs: [prepare]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -501,6 +565,7 @@ jobs:
   gitee-release:
     name: Gitee Release
     needs: [prepare, release]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     env:
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}

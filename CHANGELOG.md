@@ -3,6 +3,40 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [结构变更] 2026-10-06 · 网关发布闸：版本号未涨的 push 一律响亮跳过（用户选 B）
+
+实测副作用：一条 main 共用两个加载项，而 `ci.yaml` 的触发是 `push: branches:[main]` 且无
+`paths:` 过滤 ⇒ 语音侧每推一次，网关链跟着重跑，并把**已发布的版本号原地重新 build、覆盖 ghcr**。
+证据：`huijian-mqtt-broker` 的 `1.8.1` index digest 从我 12:1x 记的 `09432e77d014…` 变成 13:2x
+复测的 `3a4b8de90a91…`，版本号却没变 ⇒ 已装用户永远收不到「有更新」，下次重装却拿到另一份字节。
+这就是「重推了但没人需要它」。
+
+- 闸放在 `prepare`（紧接版本真源那步之后），输出 `publish`；六个会写产物的 job
+  （build / e2e / manifest / warm-mirrors / release / gitee-release）统一挂
+  `if: needs.prepare.outputs.publish == 'true'`。`lint` / `prepare` / `init` 不挂——前两个不写产物，
+  且 init 挂了就没人算 matrix。
+- **语义是「响亮跳过」，不是语音侧那种 `exit 1` 拦停**：同判据、不同处置。语音侧拦停是对的
+  （那边「版本号没涨就推 main」是人在犯错）；这边触发者是对端的正常发版，每推一次红一次会把红
+  变成噪音，反而没人看红。跳过走 `::warning title=本轮跳过网关发布::`，不静默。
+- 三档判据照语音侧：tag 不存在 → 真发版放行；tag 指向本次 commit → 重跑放行；指向别的 commit → 跳过。
+  附注标签必须一起看 peeled 的 `refs/tags/vX^{}`，否则同一 commit 的重跑会被误判成「指向他处」。
+- 降级方向选**放行**：`git ls-remote` 无输出时按 `publish=true` 处理——闸口不得比它守的事更脆，
+  一次网络抖动不该吃掉一次真发版。
+- 故意重发的出口：`workflow_dispatch` 加 `force_republish`（boolean），与语音侧同名同义。
+- 新结构钉 `huijian_mqtt_broker/tests/test_v181_publish_gate.py` 5 条，**一律 YAML 解析、不 grep
+  源码字符串**（否则注释里写满 `publish == 'true'` 就能把它喂绿）；含反向半边「凡 `needs` 含
+  prepare 且不在 {lint, prepare, init} 的 job 必须挂闸」⇒ 以后新加发布型 job 忘了挂闸会红。
+  变异自证两处：摘掉 e2e 的闸 → 反向那条红；把跳过改成 `exit 1` → 语义那条红；还原后 `cmp`
+  字节级一致。（第一次变异脚本把中文放进 `b'…'` 字面量，Python 解析期就死了，那轮「5 passed」
+  什么都没证——重做时中文走 str 再 encode 才算真注进去。）
+- 本刀**不 bump 版本号**（版本号没涨正是这道闸要保护的那种 push）。行为验证要等下一次对端 push：
+  预期 prepare 绿 + 六个 job skip + 一条 warning，且 `1.8.1` 的 digest 不再变。**本轮只证到
+  「结构在、变异会红」，还没证到真跑一次跳过。**
+- 本刀另有一处自伤记录：把带反引号的中文塞进 bash 双引号的 `python -c` 里，反引号被当命令替换
+  执行了（`git ls-remote` 真的跑了一次，只读无害），CHANGELOG 那段被写坏成满篇空格。已
+  `git checkout -- CHANGELOG.md` 回滚重做。教训：中文/反引号一律走 Write 工具落文件，
+  命令行里只留 ASCII 路径。
+
 ## [结构变更] 2026-10-06 · 迁仓改造：仓实名改 HJKJ，URL 钉与运行时取数一起改口（**不发版**）
 
 公告落地后把仓本体指到新地址。`fangwenyi-dev/ha-gateway-plugin` → `fangwenyi-dev/HJKJ`
