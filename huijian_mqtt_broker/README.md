@@ -1,6 +1,6 @@
 # 慧尖 LoRa 网关一体化插件
 
-[![版本](https://img.shields.io/github/v/release/fangwenyi-dev/HJKJ?color=blue)](https://github.com/fangwenyi-dev/HJKJ/releases)
+[![version](https://img.shields.io/badge/version-v1.8.1-blue)](https://github.com/fangwenyi-dev/HJKJ/releases/tag/v1.8.1)
 
 慧尖开窗器 LoRa 网关的 Home Assistant 一体化插件：**内置 Mosquitto Broker（端口 2022）+ mDNS 广播 + 网关集成 + 管理 Web UI + 小程序局域网直连**，装一个插件即可获得全部能力，无需再装官方 MQTT 加载项。
 

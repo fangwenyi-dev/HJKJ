@@ -588,6 +588,12 @@ class TestVersionFields:
         assert mf["version"] == want
         assert vj["addon_version"] == want == vj["integration_version"]
         assert f"CURRENT_VERSION = '{want}'" in INDEX
+        # 第 5 张：README 版本徽章。迁仓到 HJKJ 后本仓一条 release 命名空间被两个
+        # 加载项共用（实测 /releases/latest 现在是语音的 vo-1.2.1），"latest 型"徽章
+        # 会把网关卡片显示成语音版本号 ⇒ 徽章改成静态钉死版本号，漏 bump 当场红。
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        assert f"badge/version-v{want}-blue" in readme, \
+            "README 版本徽章未随 bump 更新（仍写着别的版本＝网关卡片显示错版本号）"
 
     def test_asset_cache_bust_query(self):
         """v1.7.1 实锤教训：现场容器已是 1.7.0（update 实体实证），但用户
