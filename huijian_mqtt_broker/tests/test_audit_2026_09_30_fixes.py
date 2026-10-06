@@ -484,10 +484,18 @@ def test_b1_force_rebuild_dict_carries_last_update():
 
 
 def test_b1_consumers_treat_missing_last_update_as_fresh():
-    """前提核验：消费端仍是 None=新鲜 语义——若这条变了，B-1 的影响面要重估。"""
+    """前提核验：消费端仍是 None/0=新鲜 语义——若这条变了，B-1 的影响面要重估。
+
+    v1.8.2 起时效判据收进 `utils.device_is_stale`（cover 不再就地写 `if _lu and`），
+    原形状检查会随重构失效。这里按该钉自己的提示（"本钉需重写"）升级为
+    **语义 + 路由**双查：既验假值=新鲜的语义仍在，也验 cover 确实走统一判据，
+    防止有人绕过 helper 各写一套。
+    """
     src = (PKG / "cover.py").read_text(encoding="utf-8")
-    assert re.search(r"if\s+_lu\s+and", src), \
-        "cover 的时效判据形态变了（`_lu and ...` 是 None=新鲜 的成因），本钉需重写"
+    assert "device_is_stale(" in src, "cover 不再走统一时效判据（B-1 前提需重估）"
+    from custom_components.window_controller_gateway.utils import device_is_stale
+    assert device_is_stale({}) is False, "缺时间戳不再=新鲜：B-1 影响面要重估"
+    assert device_is_stale({"last_update": 0}) is False, "0 哨兵不再=新鲜"
 
 
 def _battery_sensor(device):

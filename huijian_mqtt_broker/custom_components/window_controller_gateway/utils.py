@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, Tuple
 from homeassistant.core import HomeAssistant
 
 from .const import (DOMAIN, PROTOCOL_HEAD, TOPIC_GATEWAY_REQ_FORMAT,
-                    CONF_GATEWAY_SN, GLOBAL_IGNORED_GATEWAYS)
+                    CONF_GATEWAY_SN, GLOBAL_IGNORED_GATEWAYS, SENSOR_TIMEOUT_MINUTES)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -765,3 +765,37 @@ def get_device_gateway_mapping(hass: HomeAssistant, device_sn: str) -> Optional[
     except Exception as e:
         _LOGGER.error("获取设备网关映射失败: %s", e)
     return None
+
+
+def device_is_stale(device: dict) -> bool:
+    """子设备 15 分钟时效闸（v1.8.2：优先用内存态单调钟）。
+
+    改前判据是 `time.time() - last_update > 15min`，而同库 `_lifecycle.py:244-247`
+    早已判定"超时判据不许用墙钟"（NTP 校时/用户改时间/时区切换会跳变，导致误判
+    离线或无限延长超时窗口），且同文件 cover.py 的合并窗口也已用 monotonic——
+    即这条时效闸是全库唯一还在用墙钟的超时判据。
+
+    为什么不是直接把 `last_update` 换成 monotonic：`last_update` 要参与语义
+    （重启回填时"信任关机快照 15 分钟"的起点，见 device_manager 回填注释），
+    而 monotonic 基线是**本次开机**，跨重启相减是垃圾值。故按 `_lifecycle.
+    last_gateway_report_time` 的既有纪律：单调钟只活在内存，作为孪生字段
+    `last_update_mono` 与墙钟同时写；读侧有孪生值就用它，没有（历史形态/
+    测试夹具/改前落盘的数据）就回落墙钟。
+
+    回落路径与 cover 改前逐值一致（cover 原本就是 `if _lu and …` 的假值=新鲜）；
+    与 sensor 改前有一处**有意的差别**：sensor 原写 `is not None`，故 `last_update=0`
+    （本仓夹具表示"无时间戳"的哨兵值）在 sensor 侧原会被判"1970 年⇒陈旧"，现统一为
+    新鲜。生产写点恒为 `time.time()`，取不到 0，所以这条只影响夹具形态。
+    """
+    limit_s = SENSOR_TIMEOUT_MINUTES * 60
+    mono = device.get("last_update_mono")
+    if mono:
+        return (time.monotonic() - mono) > limit_s
+    wall = device.get("last_update")
+    if not wall:
+        # 假值（None 或 0）= 无有意义时间戳 ⇒ 新鲜。这是本仓既有约定，不是新加的：
+        # cover 的判据本就写作 `if _lu and …`，而 0 是测试夹具表示"无时间戳"的哨兵值
+        # （test_audit_round6 多处 `"last_update": 0`）。改成 `is not None` 会把 0 判成
+        # "1970 年 ⇒ 陈旧"，实发把 test_no_timestamp_treated_fresh 打红过。
+        return False
+    return (time.time() - wall) > limit_s

@@ -32,7 +32,6 @@ from .const import (
     DEVICE_STATUS_CLOSED,
     DEVICE_STATUS_UNKNOWN,
     DEVICE_STATUS_CONNECTED,
-    SENSOR_TIMEOUT_MINUTES,
     CONF_EXPOSE_COVER_AS_CURTAIN,
     DEFAULT_EXPOSE_COVER_AS_CURTAIN,
 )
@@ -40,7 +39,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-from .utils import get_entity_registry
+from .utils import device_is_stale, get_entity_registry
 
 
 class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEntity):
@@ -151,8 +150,7 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
             # "open" 持续动作。恢复值（async_added_to_hass）在重启时刻获得
             # 时间戳，语义=「信任关机快照 15 分钟」，与 v1.6.8 恢复设计
             # 自洽；无时间戳的设备（历史形态/测试夹具）视为新鲜。
-            _lu = device.get("last_update")
-            if _lu and (time.time() - _lu) > SENSOR_TIMEOUT_MINUTES * 60:
+            if device_is_stale(device):
                 return None
             status = device.get("status")
             if status == DEVICE_STATUS_CLOSED:
@@ -272,8 +270,7 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
         if not device:
             return None
         # 与 is_closed 同款时效闸：网关长期失联时不输出陈旧位置
-        _lu = device.get("last_update")
-        if _lu and (time.time() - _lu) > SENSOR_TIMEOUT_MINUTES * 60:
+        if device_is_stale(device):
             return None
         r_travel = (device.get("attributes") or {}).get("r_travel")
         try:
@@ -305,8 +302,7 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
             # 无闸，失联设备于是出现「圆点灰未知 + 状态:打开 + 位置 65%」并存，
             # 且 Web 面板滑块仍可拖。同判据收敛（None=新鲜的历史形态语义不变，
             # 见 is_closed 处的 v1.6.19 注释）。
-            _lu = device.get("last_update")
-            if _lu and (time.time() - _lu) > SENSOR_TIMEOUT_MINUTES * 60:
+            if device_is_stale(device):
                 attrs["device_status"] = DEVICE_STATUS_UNKNOWN
                 attrs["position_stale"] = True
                 return attrs

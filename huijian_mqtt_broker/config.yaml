@@ -1,5 +1,5 @@
 name: 慧尖 LoRa 网关
-version: "1.8.1"
+version: "1.8.2"
 slug: huijian_mqtt_broker
 description: 慧尖开窗器 LoRa 网关一体化插件，内置 Mosquitto Broker + 网关集成，安装即用
 url: 'https://github.com/fangwenyi-dev/HJKJ'

@@ -1,6 +1,5 @@
 """开窗器网关传感器平台"""
 import logging
-import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
@@ -18,7 +17,7 @@ from .base_entity import WindowControllerBaseEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-from .utils import get_entity_registry
+from .utils import device_is_stale, get_entity_registry
 
 
 class WindowControllerBatterySensor(WindowControllerBaseEntity, SensorEntity):
@@ -90,9 +89,7 @@ class WindowControllerBatterySensor(WindowControllerBaseEntity, SensorEntity):
         # 旧顺序下属性一空就直接 return ⇒ _attr_native_value 永不更新，
         # 补了 last_update 也照样冻结在迁移前的值、失联不转 unknown。
         # 与同文件状态传感器（:170 起的"先做陈旧判定"）同口径。
-        last_update = device.get("last_update")
-        if last_update is not None and \
-                (time.time() - last_update) > SENSOR_TIMEOUT_MINUTES * 60:
+        if device_is_stale(device):
             self._attr_native_value = None
             _LOGGER.debug("设备 %s 电池电压数据超时（超过 %d 分钟无上报）",
                           self.device_sn, SENSOR_TIMEOUT_MINUTES)
@@ -173,9 +170,7 @@ class WindowControllerStatusSensor(WindowControllerBaseEntity, SensorEntity):
         if not device:
             return
         # v1.6.12：先做陈旧判定——陈旧值（status/r_travel 都是缓存）不再回写
-        last_update = device.get("last_update")
-        if last_update is not None and \
-                (time.time() - last_update) > SENSOR_TIMEOUT_MINUTES * 60:
+        if device_is_stale(device):
             self._attr_native_value = None
             _LOGGER.debug("设备 %s 状态数据超时（超过 %d 分钟无上报）",
                           self.device_sn, SENSOR_TIMEOUT_MINUTES)

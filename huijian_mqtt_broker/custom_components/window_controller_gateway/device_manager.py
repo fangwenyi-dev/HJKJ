@@ -247,7 +247,7 @@ class WindowControllerDeviceManager:
                         "type": DEVICE_TYPE_WINDOW_OPENER,
                         "status": DEVICE_STATUS_UNKNOWN,
                         "attributes": {},
-                        "last_update": time.time(),
+                        "last_update": time.time(), "last_update_mono": time.monotonic(),
                     }
                     _LOGGER.info("同步加载设备到内存: %s", device_sn)
                     
@@ -596,7 +596,7 @@ class WindowControllerDeviceManager:
                     "reported_type": reported_type,
                     "status": "connected",
                     "attributes": {},
-                    "last_update": time.time()
+                    "last_update": time.time(), "last_update_mono": time.monotonic()
                 }
                 _LOGGER.info("已更新设备 %s 在设备管理器中的信息", device_sn)
                 
@@ -697,7 +697,7 @@ class WindowControllerDeviceManager:
             # v1.7.12（审计 DM-F1 同族收口）：创建即新鲜——003 绑定等设备
             # 入库后可能迟迟没有首条 005/002 更新，缺 last_update 会被
             # sensor/cover 的"None=新鲜"判据永久豁免时效契约
-            "last_update": time.time()
+            "last_update": time.time(), "last_update_mono": time.monotonic()
         }
         
         self.devices[device_sn] = device_info
@@ -952,6 +952,7 @@ class WindowControllerDeviceManager:
                 if status is not None:
                     self.devices[device_sn]["status"] = status
                 self.devices[device_sn]["last_update"] = time.time()
+                self.devices[device_sn]["last_update_mono"] = time.monotonic()
                 if attributes:
                     # 直接更新属性，后收到的上报会覆盖先前的值
                     # 这样确保使用最后上报的r_travel值代表窗户当前状态
@@ -983,6 +984,7 @@ class WindowControllerDeviceManager:
                     # 上报的设备（配对即断电）状态/电量永久冻结永不超时，
                     # v1.6.12 #7 的 15 分钟时效契约对该形态恒不生效。
                     self.devices[device_sn]["last_update"] = time.time()
+                    self.devices[device_sn]["last_update_mono"] = time.monotonic()
                     if attributes:
                         if "attributes" not in self.devices[device_sn]:
                             self.devices[device_sn]["attributes"] = {}
@@ -998,6 +1000,7 @@ class WindowControllerDeviceManager:
                 if device_sn in self.devices:
                     self.devices[device_sn]["status"] = DEVICE_STATUS_ERROR
                     self.devices[device_sn]["last_update"] = time.time()
+                    self.devices[device_sn]["last_update_mono"] = time.monotonic()
             except Exception:
                 _LOGGER.debug("记录设备错误状态失败，可忽略")
             

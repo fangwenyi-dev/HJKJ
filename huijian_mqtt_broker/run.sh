@@ -826,22 +826,42 @@ if [ "${INSTALL_INTEGRATION}" = "true" ]; then
                 # broker（§8）尚未启动，整个加载项连 Mosquitto 一起起不来。
                 # 改为"拷到同目录临时名 → mv 原子换名"，失败回滚并降级告警。
                 _STAGE="${INTEGRATION_DST}.new.$$"
+                _OLD="${INTEGRATION_DST}.old.$$"
+                # v1.8.2（A1 修复）：旧写法 cp 成功后先 `rm -rf "${INTEGRATION_DST}"`
+                # 再 mv——那条 rm -rf 是 set -e 生效区里的裸命令，删不干净（/config 只读
+                # 重挂、EIO、`.nfsXXXX` 忙）就会当场杀死 run.sh，而 mosquitto 要到 §8 才
+                # 启动 ⇒ broker + mDNS + Web UI + 集成一起下线，正是本块注释声称要根治的
+                # 事故形态。且 mv 失败分支只 `rm -rf "${_STAGE}"`＝把唯一好副本也删了，
+                # 注释里承诺的"失败回滚"根本没有回滚源。现在：旧目录改名让位（不删），
+                # 任一步失败都能把 _OLD 放回原位；块内所有 rm/cp 一律带兜底，set -e 杀不掉。
                 if cp -r "${INTEGRATION_SRC}" "${_STAGE}"; then
-                    rm -rf "${INTEGRATION_DST}"
-                    if mv "${_STAGE}" "${INTEGRATION_DST}"; then
+                    if { [ ! -e "${INTEGRATION_DST}" ] || mv "${INTEGRATION_DST}" "${_OLD}"; } \
+                       && mv "${_STAGE}" "${INTEGRATION_DST}"; then
                         echo "[集成] 集成代码已安装到 ${INTEGRATION_DST}（原子换防）"
+                        rm -rf "${_OLD}" 2>/dev/null || true
                     else
-                        echo "[集成] 警告: 换名失败，集成目录可能缺失——本次不阻断启动"
-                        rm -rf "${_STAGE}"
+                        _ROLLBACK_FAILED=""
+                        if [ -e "${_OLD}" ]; then
+                            mv "${_OLD}" "${INTEGRATION_DST}" 2>/dev/null || _ROLLBACK_FAILED=1
+                        fi
+                        rm -rf "${_STAGE}" 2>/dev/null || true
+                        if [ -n "${_ROLLBACK_FAILED}" ]; then
+                            echo "[集成] 警告: 换名与回滚均失败，集成目录可能缺失——本次不阻断启动"
+                        else
+                            echo "[集成] 警告: 换名失败，已回滚到旧版本集成，本次不阻断启动"
+                        fi
                     fi
                 else
                     echo "[集成] 警告: 拷贝集成代码失败（磁盘/权限？），保留旧版本继续启动"
-                    rm -rf "${_STAGE}"
+                    rm -rf "${_STAGE}" 2>/dev/null || true
                 fi
 
                 if [ "${BACKUP_PERSIST}" = "true" ]; then
-                    cp "/tmp/window_controller_gateway_data.json.bak" "${PERSIST_FILE}"
-                    echo "[集成] 已恢复持久化数据文件"
+                    if cp "/tmp/window_controller_gateway_data.json.bak" "${PERSIST_FILE}" 2>/dev/null; then
+                        echo "[集成] 已恢复持久化数据文件"
+                    else
+                        echo "[集成] 警告: 持久化数据恢复失败（磁盘/权限？）——沿用当前文件继续启动"
+                    fi
                 fi
             fi
 
