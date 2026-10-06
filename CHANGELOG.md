@@ -236,6 +236,24 @@ URL 就能同时看到两个加载项——那张卡的分组键是**注册 URL 
    **语义 + 路由**双查（假值=新鲜仍成立 + cover 必须走 `device_is_stale`），
    既没删钉也没弱化——反倒多了一条"不许绕过统一判据各写一套"。
 
+### 发版实况补记（写完后发生）
+
+- CI run 37497261755 = **9 绿 1 红**：Lint/Prepare/Init/E2E/Build×2/Manifest/Warm/Release 全绿，
+  红的是 `Gitee Release`。两次 attempt 同一根因，且**不是逻辑错**：
+  `urllib.error.URLError: <urlopen error _ssl.c:983: The handshake operation timed out>`
+  ——runner 到 gitee.com 的 TLS 握手超时（同一 job 两小时前建 v1.8.1 时是通的）。
+- 该 job 本身幂等（"Create or sync"），但**没有对瞬时网络做有界重试**，一超时就把整条
+  run 判红。⇒ 待办硬化：给那次 POST 包一层 retry（只包 URLError/超时，不包 4xx）。
+- 已按本仓既有手工配方补建 Gitee Release：multipart 原始字节带正文（中文走 python 显式
+  utf-8，不经命令行）⇒ **id=1186577**，正文与本地 CHANGELOG 段 **md5 逐字相等**
+  （`271157559b721868…`），匿名页 200，Gitee 自动建的附注 tag `7a2fdd78` 剥开指 `1262928`。
+- 其余产物（本轮实测）：GitHub Release `v1.8.2` = Latest、轻量 tag 指 `1262928`；
+  ghcr 六组合全 200 且每包 `1.8.2` 与 `latest` **digest 相同**；cosign SAN 校验两架构
+  都出 `Verification for …:latest --` 成功形态（迁仓后连续第二轮绿，前一轮的"下轮才可能绿"
+  判断已兑现）。
+- **发布闸的"放行"分支由此拿到首个真跑证据**：版本号涨了 ⇒ 闸放行、真发版；上一版
+  （1004a81，版本号未涨）是 skip。两个分支都验过。
+
 ## [1.8.1] - 2026-10-06 · 版号线开 1.8 代次（迁仓后首个代次号；**相对 1.7.66 零功能改动**）
 
 用户口令：1.7.66 直接升到 **1.8.1**，今后从 1.8.x 往上走。**1.8.0 不发**，代次号从 1.8.1 起算。
