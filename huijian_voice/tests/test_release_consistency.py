@@ -330,3 +330,71 @@ def test_version_chain_single_source():
             f"{f} 存在独立 dev 兜底版本链"
     src = (ROOT / "core" / "const.py").read_text(encoding="utf-8")
     assert "def addon_version" in src
+
+
+# ── Release 正文完整性（v1.2.1 发版前自复核新增）──────────────────────
+# 起因：prepare 的提取链是 `awk ... | head -50`，本版正文实提取 **67 行** ⇒ GitHub
+# Release 会被**静默**削掉后 17 行（job 全绿、只是客户看到半篇）；而 gitee-release
+# 那条同形 awk 是 `head -80`，同一版正文两边不等长。数字本身不是判据，判据是
+# 「整段必须在闸口射程内」＋「两条链不许各说各话」——所以钉去工作流里**实读**上限，
+# 而不是在本文件再抄一个常量（抄了就成了第三个会漂移的地方）。
+_VOICE_BANNER = "# 慧尖HA语音插件 变更日志"
+_WF = ROOT.parent / ".github" / "workflows" / "ci-voice.yaml"
+
+
+def _extract_voice_section(ver):
+    """逐行复刻 CI 那条 awk 的口径：横幅之后才认、每个 `## [` 先清 found、
+    命中本版本行起收集、再遇 `## [` 收口。返回行列表（含标题行）。"""
+    import io
+    with io.open(str(ROOT.parent / "CHANGELOG.md"), encoding="utf-8", newline="") as fh:
+        lines = fh.read().split("\n")
+    inv = found = False
+    out = []
+    for ln in lines:
+        ln = ln.rstrip("\r")
+        if ln.startswith(_VOICE_BANNER):
+            inv = True
+        if not inv:
+            continue
+        if ln.startswith("## ["):
+            if found:
+                break
+            found = ln == f"## [{ver}]" or ln.startswith(f"## [{ver}] ")
+            if found:
+                out.append(ln)
+            continue
+        if found:
+            out.append(ln)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def _ci_body_caps():
+    """工作流里 CHANGELOG 提取链的 head 上限（按出现顺序）。"""
+    wf = _WF.read_text(encoding="utf-8")
+    caps = [int(m) for m in re.findall(r"CHANGELOG\.md \| head -(\d+)", wf)]
+    assert caps, "找不到 CHANGELOG 提取链的 head 上限——提取形状变了，本钉失去对象"
+    return caps
+
+
+def test_release_body_carries_whole_current_section():
+    """行为钉：本版 CHANGELOG 整段必须落在**最小**闸口上限之内。
+    变异自证：把 ci-voice.yaml 任一 `head -120` 调回 `head -50` ⇒ 本钉转红；
+    整段缺失（正文回落成 git log 流水）同样红。"""
+    ver = _config()["version"]
+    section = _extract_voice_section(ver)
+    assert section, (
+        f"CHANGELOG 语音区没有 [{ver}] 段——Release 正文会静默回落成 git log 流水")
+    cap = min(_ci_body_caps())
+    assert len(section) <= cap, (
+        f"本版正文 {len(section)} 行 > 闸口 head -{cap} ⇒ Release 会静默截断到第 {cap} 行；"
+        "抬上限或压缩正文，二选一，别让它悄悄少半段")
+
+
+def test_release_body_caps_do_not_drift():
+    """两条同形 awk 链（GitHub 侧 / Gitee 侧）上限必须同值。
+    钉的是"等长"而非"等于某个数"——真要改就一起改，只改一处当场红。"""
+    caps = _ci_body_caps()
+    assert len(caps) == 2, f"CHANGELOG 提取链应有两条（GitHub/Gitee），实见 {len(caps)} 条"
+    assert len(set(caps)) == 1, f"两条链 head 上限漂移 {caps}——同一版正文两边不等长"

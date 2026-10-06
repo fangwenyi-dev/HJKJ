@@ -5,12 +5,14 @@ name: Build and Release (huijian_voice)
 # 触发方式、concurrency 组名、tag 前缀 vo-（三处）、Gitee 目标仓说明、ACR 路径注释。
 # 判据/门禁/超时/脚本引用一字未改（跨境上传劣化、zstd 转码、tag 闸口那几段都是实发教训）。
 #
-# ⚠ 触发暂只留 workflow_dispatch：本仓尚未配 ACR_USER / ACR_PASS（语音镜像主源是阿里云
-#   ACR）。配好之前就开 push 触发的表现是——push-acr 因 continue-on-error 静默失败，
-#   当场红的是 release job 里那道「Wait for ACR readiness」，长得像跨境链路坏了。
-#   两个 secret 配齐后把下面这两行加回来即可恢复"改号即发版"：
-#     push:
-#       branches: [main]
+# ⚠ 触发**保持只走 workflow_dispatch**（原注释说"本仓尚未配 ACR_USER / ACR_PASS"——该前提
+#   已过期：两个 secret 于 2026-10-06 10:35 配齐）。**但不因此恢复 push 触发**，理由换成
+#   更硬的一条：并入同仓后 push 触发＝**任何一次推 main 都会连带发语音版**。
+#   10-06 实发：语音这批改动推上去，网关 ci.yaml（push 触发、当时 config 已备到 1.8.1 未发）
+#   被同一推顺带发出 v1.8.1——扳机不该由"改了另一个加载项"的人扣。两线共用一仓时，
+#   谁发版必须显式表态：`gh workflow run ci-voice.yaml --ref main`。
+#   若将来要恢复"改号即发版"，前提是先给 ci.yaml/ci-voice.yaml 各加 `paths:` 过滤，
+#   并把它当成一次独立决策，而不是顺手取消注释。
 on:
   workflow_dispatch:
     inputs:
@@ -195,6 +197,14 @@ jobs:
         id: changelog
         run: |
           # 将 changelog 写入临时文件，避免 echo -e 破坏中文编码（Gitee 乱码根因）
+          #
+          # ⚠ `head -120`（原 50）＝v1.2.1 发版前自复核抓出的**静默截断**：本版正文实提取已远超 50
+          # 行，50 会让 GitHub Release 悄悄少掉后半段——不报错、不失败，只是客户看到的
+          # 正文缺半段；而同文件 gitee-release 那条同形 awk 原用 `head -80`，反而完整，
+          # 两处上限各说各话正是这次暴露出来的东西。闸口不变量改由
+          # test_release_consistency.py::test_release_body_carries_whole_current_section
+          # 机器把关（它实读工作流里的上限与 CHANGELOG 实段行数比较，并钉两处上限不许漂移），
+          # 免得"只放宽数字"再过一版就复现。
           CHANGELOG_FILE="/tmp/changelog.md"
           
           if [ -f CHANGELOG.md ]; then
@@ -205,7 +215,7 @@ jobs:
               $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
               /^## \[/{ if(found) exit }
               found { print }
-            ' CHANGELOG.md | head -50 > "$CHANGELOG_FILE"
+            ' CHANGELOG.md | head -120 > "$CHANGELOG_FILE"
           fi
           
           if [ ! -s "$CHANGELOG_FILE" ]; then
@@ -255,7 +265,14 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           context: "huijian_voice"
-          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          # 2026-10-06 实发教训（run 37460561301）：语音 ghcr 三个包（huijian-voice /
+          # amd64- / aarch64-）仍**绑在旧仓** huijian-gateway-plugin-yy，HJKJ 的
+          # GITHUB_TOKEN 推不动 ⇒ `denied: permission_denied: write_package`，Build 双架构
+          # 当场红、下游全 skipped（无 tag 无 Release，干净失败）。与网关线同因同解：
+          # 首选 GHCR_PAT（账号级 write:packages，与包绑哪个仓无关），没配时回落
+          # GITHUB_TOKEN ⇒ 将来给旧包授了 HJKJ 的 Write，删掉该 secret 链路自动回到零长期令牌形态。
+          # ⚠ 用 PAT 推【新建】包不会继承仓库可见性；这三个包已存在且 public，故安全。
+          container-registry-password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
           image: ${{ matrix.image }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
@@ -515,7 +532,9 @@ jobs:
             $0 ~ "^## \\["ver"]" { found=1; print; next }
             /^## \[/{ if(found) exit }
             found { print }
-          ' CHANGELOG.md | head -80 > /tmp/release-body.md
+          # 与 prepare 同闸口同值（见 prepare job 里整段正文被 head -50 截断的实发教训）：
+          # 两条 awk 是受控重复，那**上限也必须重复一致**，否则 Gitee 全文、GitHub 半篇。
+          ' CHANGELOG.md | head -120 > /tmp/release-body.md
           if [ ! -s /tmp/release-body.md ]; then
             { echo "## v$VER"; echo ""; git log --oneline -10 --format='- %h: %s'; } > /tmp/release-body.md
           fi

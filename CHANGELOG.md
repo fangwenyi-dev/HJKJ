@@ -3149,7 +3149,37 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 一臂（`_syl` 长度等式）记档为与 `_HAN` 互为冗余带。撤掉 v1.1.35 近音放行闸仍双钉转红
 ⇒ 新层**没有**把它吸成死码。
 
-**四、仍未验（别当已解决）**：真 `/api/states` 全量清单回放、办公 .91 逐字来源、3 m 档真实
+**四、首发那一刀：ghcr 包仍绑旧仓 ⇒ `write_package` 拒绝（run 37460561301，无 tag 无 Release 无镜像）**
+
+`ea768e4` dispatch 后 **Build amd64 / Build aarch64 双双红**，manifest / push-acr / release / gitee
+全 skipped ⇒ 什么都没被**部分**发布（干净失败）。致命行不是同屏那条 cosign SAN 报错（它
+`ALLOW_FAILURE: true`，只是警告），而是
+
+    denied: permission_denied: write_package  # 推 ghcr.io/fangwenyi-dev/amd64-huijian-voice:1.2.1
+
+语音三个 ghcr 包（`huijian-voice` / `amd64-` / `aarch64-`）的 **linked repo 仍是旧仓 yy**，迁过来的
+HJKJ 用 `GITHUB_TOKEN` 对旧仓名下的包没有写权限。与网关线同因同解（`ci.yaml` 早就是这两行）：
+`container-registry-password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}`——PAT 是**账号级**
+`write:packages`，与包绑在哪个仓无关；没配时回落 `GITHUB_TOKEN`，将来给旧包授了 HJKJ 的 Write
+便可删掉该 secret、链路自动回到零长期令牌形态。**用 PAT 推「新建」包不会继承仓库可见性**
+（会建成 private），本修法安全的前提是三个包已存在且 public（2026-10-06 本机
+`gh api user/packages` 逐条核过 visibility）。
+
+顺带纠正该文件顶部一句过期前提（「本仓尚未配 ACR_USER / ACR_PASS」——两个 secret 于 10:35 配齐），
+但 **push 触发保持不开**，理由换成更硬的一条：两线共用一仓后 push 触发＝任何一次推 main 都会连带发
+语音版；10-06 已实发过一次反向事故（语音这批推上去，网关 `ci.yaml` 被同一推顺带发出 v1.8.1）。
+语音发版的显式扳机＝`gh workflow run ci-voice.yaml --ref main`。
+
+
+**同一次自复核还抓出「正文被静默截断」**：prepare 的提取链是 `awk … | head -50`，而本版正文
+实提取已远超 50 行 ⇒ GitHub Release 会悄悄少掉后半段（**job 全绿**、客户只看到半篇）；同文件
+gitee-release 那条同形 awk 是 `head -80`，两条链对同一版给出**不等长**的正文。修法＝两条统一
+`head -120` ＋ 两条钉：`test_release_body_carries_whole_current_section`（整段必须落在**最小**
+闸口射程内，并顺带守住「整段缺失 ⇒ 正文静默回落成 git log 流水」那条降级）、
+`test_release_body_caps_do_not_drift`（两条链等长）。钉去工作流里**实读**上限，不在测试里再抄
+一个会漂移的常量。变异三臂已跑：两处调回 50 ⇒ carries 红；只把 Gitee 改 200 ⇒ 只有漂移臂红、
+carries 保持绿（分向判据，不是「越红越好」）；抹掉本版段标题 ⇒ carries 红。
+**五、仍未验（别当已解决）**：真 `/api/states` 全量清单回放、办公 .91 逐字来源、3 m 档真实
 rms/地板/起话率、烧录与真机 dry 轮。**边界**：本层抬的是"幸存轮"正确率，救不到"整轮不起话"
 那批（受设备侧绝对闸 450/120 约束，日志里不产行）。对外口径上限＝"提升远场可懂度与设备名命中率"，
 **不是**"3 米已解决"。
