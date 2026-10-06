@@ -61,6 +61,14 @@ T1763H = "tests/test_v1763_healer_resident.py"
 T1763R = "tests/test_v1763_repairs_flow.py"
 T1763W = "tests/test_v1763_fast_e2e_wiring.py"
 T1763M = "tests/test_v1763_mdns_watchdog.py"
+# v1.7.64 / v1.7.65 两批复核收口批的被改文件与判据文件（第四轮复核 N3：把这些
+# 一次性人工自证的臂固化进来，否则"钉本身是否还是真钉"没人复检）
+COVER = "custom_components/window_controller_gateway/cover.py"
+NUMBER = "custom_components/window_controller_gateway/number.py"
+PANEL_JS = "www/js/huijian.js"
+T1764 = "tests/test_audit_2026_10_05_round3_fixes.py"
+T1746F = "tests/test_v1746_panel_unique_funcs.py"
+T1765 = "tests/test_audit_2026_10_06_round4_fixes.py"
 IGNORE = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
 TIMEOUT = 900
 
@@ -382,6 +390,199 @@ ARMS = [
      "test_backoff_expression_runs_in_range", "red",
      "N-1 近似原形：封顶被抬高 ⇒ 溢出档位不再落 [10,600]（sleep 负数/0 忙循环家族）",
      T1763M),
+    # ── v1.7.64 收口批（第三轮复核 + 对抗复核 A-1~A-4 + 自伤 1 处）──────────
+    # 第四轮独立复核（docs/verify-2026-10-06-v1764.md）N3 点名：这 14 臂当时只是
+    # 一次性人工自证（写在 CHANGELOG 叙述里），矩阵本身零覆盖 ⇒ "钉是否还是真钉"
+    # 没有持续复检。下面把它们固化进来；锚点 count!=1 会直接报 count=N（防锚漂移）。
+    ("r3_cover_isfinite_dropped", COVER,
+     "                    position = float(r_travel)\n"
+     "                    if math.isfinite(position):\n"
+     "                        return position <= 0\n"
+     "            except (ValueError, TypeError, OverflowError):\n",
+     "                    return float(r_travel) <= 0\n"
+     "            except (ValueError, TypeError):\n",
+     "test_is_closed_does_not_raise_or_claim_open_on_non_finite", "red",
+     "#3 原形：inf/nan 转换不抛错而 `inf<=0`/`nan<=0` 皆 False ⇒ 垃圾位置被判成「打开」，"
+     "且大整数进 float() 的 OverflowError 没人接",
+     T1764),
+    ("r3_cover_class_gate_site_unguarded", COVER,
+     "                    attributes[\"r_travel\"] = max(0, min(100, int(pos)))\n"
+     "        except (ValueError, TypeError, OverflowError):\n",
+     "                    attributes[\"r_travel\"] = max(0, min(100, int(pos)))\n"
+     "        except (ValueError, TypeError):\n",
+     "test_no_numeric_conversion_left_without_overflow_gate", "red",
+     "#3 类扫描钉的活体自证：restore 回填处摘掉 OverflowError，全仓类扫描必须当场红",
+     T1764),
+    ("r3_http_shape_gate_dropped", HUBC,
+     "            body = await resp.json()\n"
+     "            if not isinstance(body, dict):\n"
+     "                raise HubHttpError(path, resp.status, \"bad_body\")\n"
+     "            return body\n",
+     "            return await resp.json()\n",
+     "test_http_rejects_non_object_200_body", "red",
+     "#6 原形：200 + null/[] 原样 return ⇒ 调用方在 try 之外 .get() 炸 AttributeError，"
+     "面板 500 / 保活 task 死",
+     T1764),
+    ("r3_bad_body_copy_dropped", PANEL_JS,
+     "                case 'bad_body':\n"
+     "                    // v1.7.64（#6）：加载项自己产生的码——hub 回了 200 但响应体不是\n"
+     "                    // 对象（云函数返回空时云托管照样回 200 + null）。未知码走 default\n"
+     "                    // 回空串＝整条不显示，用户点了「添加家人/移除」会看到毫无反应。\n"
+     "                    return '云端返回的响应看不懂（不是预期对象），这次操作可能没生效——请稍后重试；反复出现请把本条上报';\n",
+     "",
+     "test_op_error_covers_every_code_the_plugin_can_emit", "red",
+     "#6 下游自伤原形：新码没上面板码表，未知码走 default 回空串＝点了没反应"
+     "（守它的是从生产代码派生的码值宇宙，不是手写清单）",
+     T1746F),
+    ("r3_op_failed_copy_dropped", PANEL_JS,
+     "                case 'op_failed':\n"
+     "                    // v1.7.65（第四轮复核 N2）：_set_op_error 的**兜底值**——调用方传进\n"
+     "                    // 来的 err 是空时才落到这里。它天生\"没原因\"，所以文案必须承认这点，\n"
+     "                    // 并把人指到能拿到原因的地方（HA 日志），而不是假装知道是网络问题。\n"
+     "                    return '这次操作没成功，云端也没给出原因——请稍后重试；反复出现请看 HA 日志的 hub 相关行';\n",
+     "",
+     "test_op_error_covers_every_code_the_plugin_can_emit", "red",
+     "N2 原形：函数体兜底码 op_failed 不在派生宇宙/不在码表 ⇒ 调用方传空即静默",
+     T1746F),
+    ("r3_alias_snapshot_outside_lock", HUBC,
+     "        async with self._alias_write_lock():\n"
+     "            table = dict(self.member_aliases)\n",
+     "        table = dict(self.member_aliases)\n"
+     "        async with self._alias_write_lock():\n",
+     "test_concurrent_renames_keep_both_names", "red",
+     "#5 原形：读-改-写快照做在锁外 ⇒ 并发改名各整份覆盖，先完成那次静默丢失",
+     T1764),
+    ("r3_alias_load_outside_lock", HUBC,
+     "        async with self._alias_write_lock():\n"
+     "            if self._aliases_loaded:\n"
+     "                return\n"
+     "            self.member_aliases = await asyncio.to_thread(load_member_aliases, self.config_dir)\n"
+     "            self._aliases_loaded = True\n",
+     "        self.member_aliases = await asyncio.to_thread(load_member_aliases, self.config_dir)\n"
+     "        self._aliases_loaded = True\n",
+     "test_concurrent_renames_survive_cold_alias_file_read", "red",
+     "A-2 原形：#5 修不到底——冷启动时第二次读盘晚于第一次提交返回，把内存整份覆盖成"
+     "「落盘前的旧快照」，先完成那次改名在内存与磁盘一起丢",
+     T1764),
+    ("r3_positive_int_cap_dropped", HUBC,
+     "        n = int(value)\n"
+     "        float(n)   # 超出 float 可表示范围（≈1.8e308）＝后续浮点算术必抛，按不可用处理\n",
+     "        n = int(value)\n",
+     "test_positive_int_rejects_float_unrepresentable", "red",
+     "A-1 源头闸原形：JSON 大整数原样放行，产物进浮点算术后炸长连主循环与 status_view",
+     T1764),
+    ("r3_member_ttl_guard_dropped", HUBC,
+     "        try:\n"
+     "            return int(self.member_code_ttl_s() - (time.time() - self._member_code_at))\n"
+     "        except (OverflowError, ValueError):\n"
+     "            # v1.7.64（对抗复核 A-1）：与上方 bind_code_expires_in 的 v1.7.61 S1 出口\n"
+     "            # 守卫同形——这条是同族漏网，非有限/过大的 ttl 或签发时刻会让 int() 抛\n"
+     "            # OverflowError 直接炸穿 status_view（面板 500）\n"
+     "            return -1\n",
+     "        return int(self.member_code_ttl_s() - (time.time() - self._member_code_at))\n",
+     "test_member_code_expires_in_matches_owner_sibling_guard", "red",
+     "A-1 视图层原形：同族 bind_code_expires_in 有出口守卫、成员码这条没有 ⇒ "
+     "非有限值炸穿 status_view（面板 500）",
+     T1764),
+    ("r3_cleanup_swallow_restored", DMGR,
+     "        for res in await asyncio.gather(*list(self._background_tasks),\n"
+     "                                        return_exceptions=True):\n",
+     "        for _t in list(self._background_tasks):\n"
+     "            try:\n"
+     "                await _t\n"
+     "            except asyncio.CancelledError:\n"
+     "                pass\n"
+     "        for res in await asyncio.gather(*list(self._background_tasks),\n"
+     "                                        return_exceptions=True):\n",
+     "test_cleanup_cancellation_propagates_outward", "red",
+     "#8 原形：逐条 await + 吞 CancelledError ⇒ cleanup 自身被取消时传不出去，"
+     "HA 停机/重载只能等超时",
+     T1764),
+    ("r3_cleanup_swallow_c6_pin", DMGR,
+     "        for res in await asyncio.gather(*list(self._background_tasks),\n"
+     "                                        return_exceptions=True):\n",
+     "        for _t in list(self._background_tasks):\n"
+     "            try:\n"
+     "                await _t\n"
+     "            except asyncio.CancelledError:\n"
+     "                pass\n"
+     "        for res in await asyncio.gather(*list(self._background_tasks),\n"
+     "                                        return_exceptions=True):\n",
+     "test_c6_cleanup_callers_do_not_swallow_cancellation", "red",
+     "同一条旧码必须让**扩面后的 C-6 判据**也红（判据宇宙含 cleanup 本体；"
+     "只红行为钉不红判据钉＝判据有作用面漏洞）",
+     AUDIT),
+    ("r3_unload_swallow_restored", INIT,
+     "    if _bg:\n"
+     "        try:\n"
+     "            results = await asyncio.gather(*_bg, return_exceptions=True)\n",
+     "    if _bg:\n"
+     "        for _t in _bg:\n"
+     "            try:\n"
+     "                await _t\n"
+     "            except asyncio.CancelledError:\n"
+     "                _LOGGER.debug(\"后台任务已取消\")\n"
+     "        try:\n"
+     "            results = await asyncio.gather(*_bg, return_exceptions=True)\n",
+     "test_unload_entry_cancellation_propagates", "red",
+     "A-3 原形：async_unload_entry 里同形吞取消 ⇒ 卸载被硬跑到结尾返回 True，"
+     "HA 以为干净卸载",
+     T1764),
+    ("r3_unload_swallow_c6_pin", INIT,
+     "    if _bg:\n"
+     "        try:\n"
+     "            results = await asyncio.gather(*_bg, return_exceptions=True)\n",
+     "    if _bg:\n"
+     "        for _t in _bg:\n"
+     "            try:\n"
+     "                await _t\n"
+     "            except asyncio.CancelledError:\n"
+     "                _LOGGER.debug(\"后台任务已取消\")\n"
+     "        try:\n"
+     "            results = await asyncio.gather(*_bg, return_exceptions=True)\n",
+     "test_c6_cleanup_callers_do_not_swallow_cancellation", "red",
+     "同一条旧码必须让判据也红（teardown 宇宙 = cleanup / async_unload_entry / "
+     "async_remove_entry 本体都在扫）",
+     AUDIT),
+    ("r3_slider_touch_evidence_dropped", PANEL_JS,
+     "            if (!el) return false;\n"
+     "            if (document.activeElement === el) return true;\n"
+     "            const at = USER_INPUT_AT.get(el);\n"
+     "            return !!at && (Date.now() - at) < USER_INPUT_HOLD_MS;\n",
+     "            return !!el && document.activeElement === el;\n",
+     "test_user_interacting_recognises_touch_drag_in_node", "red",
+     "#9 原形：只认 activeElement——iOS Safari 触摸拖动不给非文本控件移焦 ⇒ "
+     "手机上等于没修，滑块被 30s 无感刷新覆写",
+     T1764),
+    # ── v1.7.65（第四轮复核 N4：同族第 7、8 处）────────────────────────
+    ("r4_number_set_value_unguarded", NUMBER,
+     "        try:\n"
+     "            value_int = int(value)\n"
+     "        except (ValueError, TypeError, OverflowError) as err:\n"
+     "            raise HomeAssistantError(\n"
+     "                f\"设置{self._entity_label}失败：无效的值 {value!r}\") from err\n"
+     "        value_int = max(SPEED_MIN, min(SPEED_MAX, value_int))\n",
+     "        value_int = max(SPEED_MIN, min(SPEED_MAX, int(value)))\n",
+     "test_set_native_value_rejects_junk_instead_of_crashing", "red",
+     "N4a 原形：number.set_value 入参来自 YAML（.inf/.nan 都是合法 float 字面量），"
+     "无闸即服务调用当场炸——同文件设定值回显早就接住了",
+     T1765),
+    ("r4_endpoint_port_unguarded", MB,
+     "    try:\n"
+     "        exp_broker, exp_port = endpoint[\"broker\"], int(endpoint[\"port\"])\n"
+     "    except (KeyError, TypeError, ValueError, OverflowError) as err:\n"
+     "        # v1.7.65（第四轮复核 N4，同族第 8 处）：端点文件 port 被写成 `1e999`（JSON\n"
+     "        # 合法）→ float('inf')，`int(inf)` 抛 OverflowError。下方 :312 的**条目侧**\n"
+     "        # 早在 v1.7.61 S2 就接住了这个，端点侧漏。逃出去会被 healer / repairs 的宽\n"
+     "        # 兜底折成 probe_error 或\"仍坏\"——判词不准（真坏的是端点文件），按 C-7 口径\n"
+     "        # 归 endpoint_broken：不清卡，且卡片能把人指到\"端点文件读不出\"。\n"
+     "        _LOGGER.warning(\"端点文件 port 字段不可解析（按端点坏处理，不折成无结论）: %r\", err)\n"
+     "        return \"endpoint_broken\"\n",
+     "    exp_broker, exp_port = endpoint[\"broker\"], int(endpoint[\"port\"])\n",
+     "test_endpoint_bad_port_is_endpoint_broken_not_escape", "red",
+     "N4b 原形：端点文件 port=1e999→inf 时 int() 抛 OverflowError 逃出判定面，"
+     "被宽兜底折成 probe_error（判词不准：真坏的是端点文件）",
+     T1765),
 ]
 
 

@@ -59,6 +59,7 @@ from .const import (
     CONF_WS_GATEWAY_ENABLED,
     CONF_WS_GATEWAY_PORT,
     CONF_WS_GATEWAY_TOKEN,
+    CONTROL_ATTR_DOMAINS,
     DEFAULT_WS_GATEWAY_ENABLED,
     DEFAULT_WS_GATEWAY_PORT,
     DEFAULT_WS_GATEWAY_TOKEN,
@@ -80,10 +81,48 @@ from .utils import log_throttled
 
 _LOGGER = logging.getLogger(__name__)
 
-# 固件线值格式：只放行十进制整数/小数。与 hub_client._VALUE_RE **必须逐字同串**——
-# 两条通道（LAN / 云）对同一个 value 的合法性判据不一致时，会出现"云拒 LAN 放行"
-# 或反之的分裂行为，而调用方只看得到一次成功一次失败。由跨仓契约钉对账两个模式串。
+# 固件线值格式：只放行十进制整数/小数。本协议四个出站属性的域全是**整数**，所以
+# 格式闸之后还要过 _INT_VALUE_RE 与域表（v1.7.65）。
+# 历史上云侧 hub_client 自己抄了一份同串的模式，靠注释"必须逐字同串"维系——
+# v1.7.65 起云侧直接委托本模块（validate_control_params → 本文件），两条通道同一实现。
 _VALUE_RE = re.compile(r"-?\d+(\.\d+)?")
+# 命令值必须是整数形态（上报侧才有小数，如 r_travel 行程分数；下行四个属性都是整数域）
+_INT_VALUE_RE = re.compile(r"-?\d+")
+
+
+def validate_control_command(attribute: Any, value: Any) -> Optional[str]:
+    """004 control 的唯一判据（WS 与云共用）。返回可下发的线值字符串，不合格返回 None。
+
+    **返回的是入参原样字符串，不做归一化**：`"0100"` 仍按 `"0100"` 透传，
+    与既有"值原样进 004"的语义逐字节一致——本函数只新增拒绝，不重写已通过的值。
+
+    拒绝次序（每条都是真实缺陷，不是防御性装饰）：
+      1. attribute 不在域表全集内 → 拒。此前任意非空字符串都放行，而本仓
+         `send_ws_raw_004` 的 docstring 自陈"不做语义解释…本方法同样不校验"、
+         control_ack 的 ok 又是**发布级**语义 ⇒ 属性名打错一个字母照样发布并回
+         **ok:true 假成功**，界面显示"速度已设置"而设备从没收到过这条命令。
+      2. 空串 / bool / 非 str-int-float → 拒（v1.7.12 F6：dict/list 经 str() 出 Python repr）。
+      3. 不过十进制格式 → 拒（v1.7.18 BUG-16；v1.7.52 取消 str 豁免，'NaN' 就是从那道缝穿的）。
+      4. 非整数形态 → 拒（四个属性的值域都是整数：const 的 SPEED_MIN/MAX 与
+         COMMAND_VALUE_* 全整数，number 实体 step=1——小数只出现在上报侧）。
+      5. 不在该属性值域内 → 拒。范围此前**只有小程序一侧在夹**（pctParam 0..100），
+         任何绕开小程序直连 WS 的调用方送 speed=150 会一路发布出去。
+    """
+    if not isinstance(attribute, str) or attribute not in CONTROL_ATTR_DOMAINS:
+        return None
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if not isinstance(value, (str, int, float)):
+        return None
+    value_s = str(value)
+    if not _VALUE_RE.fullmatch(value_s) or not _INT_VALUE_RE.fullmatch(value_s):
+        return None
+    lo, hi, extra = CONTROL_ATTR_DOMAINS[attribute]
+    n = int(value_s)
+    if n in extra or lo <= n <= hi:
+        return value_s
+    return None
+
 
 # 小程序 WS 服务器在 hass.data[DOMAIN] 中的单例键（跨 config entry 共享：
 # 一台 HA 只监听一个端口，网关/设备视图聚合全部已完成设置的 entry）
@@ -520,23 +559,16 @@ class WsGatewayServer:
         # 设备端两者都不是合法命令值）——同口径拒绝，不透传脏值
         if value == "" or isinstance(value, bool):
             return ack(False, "missing fields")
-        # v1.7.12（第 6 轮审计 F6）：仅 str/int/float 可转固件线值——dict/list
-        # 等经 str() 会产出 Python repr（单引号/True 字面量）固件不可解析，
-        # 而小程序已收到 ok=true 的假成功回执，属脏值透传面。白名单拒绝。
-        if not isinstance(value, (str, int, float)):
-            return ack(False, "invalid value")
-        value_s = str(value)
-        # v1.7.18（第 7 轮审计 BUG-16）：数值形态须再过线值格式校验——
-        # inf/nan 与 1e+308/1e999 等 str() 出设备不可解析的字面量照样透传
-        # 004 且 control_ack ok=true（假成功）。
-        # **本批把 str 的豁免取消**：豁免是个真实缺陷——小程序云通道的 params.value
-        # 恒为 String(value)，所以 `NaN` 经 String() 得到字符串 'NaN' 正好从豁免缝里
-        # 穿过去，一路透传 004 到固件并拿到 ok=true 的假成功。合法值域逐条核过
-        # （w_travel ∈ 0/100/101/200 与位置 0-100、rwp_wind_lock_mode ∈ 0/1、
-        # rwp_winact_speed/strength ∈ 0-100）**全部是十进制串** ⇒ 不再豁免 str
-        # 不会挡掉任何合法命令。范围校验仍留在客户端与固件（这里只管可解析性，
-        # 不把三处各写一份的范围逻辑复制到网关这条路上）。
-        if not _VALUE_RE.fullmatch(value_s):
+        # v1.7.12（第 6 轮审计 F6）＋ v1.7.18（BUG-16）＋ v1.7.52（取消 str 豁免）
+        # 三道闸的判据自 v1.7.65 起收敛进 validate_control_command（WS 与云同一实现），
+        # 失败文案仍逐字沿用 'invalid value'——小程序 LAN_ACK_TEXT 已把它映射成中文，
+        # 换码会让正要上线的那版小程序看到裸兜底。
+        # 关于"范围校验仍留在客户端与固件（不把范围逻辑在三处各写一份）"这条旧定案：
+        # 本批没有复制第三份，而是把域表放进 const.py 由两条通道共读一份 ⇒ 三处变一处，
+        # 同时补上两条此前无人拦的路：属性名打错照样 ok:true 的假成功面、以及
+        # 直连 WS 的调用方送 speed=150 一路透传。
+        value_s = validate_control_command(attribute, value)
+        if value_s is None:
             return ack(False, "invalid value")
         data = self._device_gateway(dev_sn)
         if data is not None:

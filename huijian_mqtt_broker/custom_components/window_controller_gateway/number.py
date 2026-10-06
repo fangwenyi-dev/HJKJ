@@ -10,6 +10,7 @@ import logging
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -145,7 +146,18 @@ class WindowControllerRangeNumber(WindowControllerBaseEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """滑动条拖动回调：立即更新显示，防抖后只发送最终值"""
-        value_int = max(SPEED_MIN, min(SPEED_MAX, int(value)))
+        # v1.7.65（第四轮复核 N4，同族第 7 处）：入参来自自动化 YAML / 服务调用，
+        # `.inf`、`.nan` 都是合法 float 字面量——`int(inf)` 抛 OverflowError、
+        # `int(nan)` 抛 ValueError，旧代码无闸 ⇒ 服务调用当场炸穿。同文件 :122 的
+        # 设定值回显早在 v1.7.61 A-6 就接住了这两个，入参侧是同族漏网。
+        # 口径照 cover.async_set_cover_position：非法值**如实拒**，不回退默认档
+        # （回退＝把"想设 150"静默执行成别的档位，v1.6.19 B-LOW11 同判）。
+        try:
+            value_int = int(value)
+        except (ValueError, TypeError, OverflowError) as err:
+            raise HomeAssistantError(
+                f"设置{self._entity_label}失败：无效的值 {value!r}") from err
+        value_int = max(SPEED_MIN, min(SPEED_MAX, value_int))
         # 立即更新界面显示（拖动过程中滑块跟随，不阻塞交互）
         self._attr_native_value = float(value_int)
         self.async_write_ha_state()

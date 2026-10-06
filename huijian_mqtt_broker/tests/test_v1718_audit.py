@@ -361,13 +361,16 @@ class TestWsLifecycle:
                 return True
 
         s._entries_data = lambda: [("G", {"mqtt_handler": _H()})]
+        # v1.7.65 起本用例的属性名从占位的 "position" 换成真属性 "w_travel"：
+        # 域表落地后 position 不再是本协议的出站属性，用它会因"未知属性"被拒——
+        # 那样断言照样绿，但验的就不再是这道**格式**闸了（判据要对着它声称的东西）。
         for bad in (math.inf, -math.inf, math.nan, 1e308):
             out = await s._cmd_control({"gwSn": "G", "devSn": "D",
-                                        "attribute": "position", "value": bad})
+                                        "attribute": "w_travel", "value": bad})
             assert out == {"type": "control_ack", "ok": False, "msg": "invalid value",
-                           "attribute": "position"}, f"{bad!r} 未被拒绝"
+                           "attribute": "w_travel"}, f"{bad!r} 未被拒绝"
         out = await s._cmd_control({"gwSn": "G", "devSn": "D",
-                                    "attribute": "position", "value": 50})
+                                    "attribute": "w_travel", "value": 50})
         assert out["ok"] is True, "正常 int 线值不受影响"
         # ── v1.7.52 改判：取消 str 豁免 ─────────────────────────────
         # 本批原先在这里断言 `attribute:"state", value:"open"` 必须放行（"str 值维持
@@ -380,18 +383,29 @@ class TestWsLifecycle:
         # 而豁免放过的正是 'NaN'：小程序云通道送的是 String(value)，NaN → 'NaN'
         # 恰好从豁免缝穿到固件并拿到 ok:true 假成功。所以现在一律过十进制格式闸。
         out = await s._cmd_control({"gwSn": "G", "devSn": "D",
-                                    "attribute": "state", "value": "open"})
+                                    "attribute": "w_travel", "value": "open"})
         assert out["ok"] is False and out["msg"] == "invalid value", \
             "非十进制线值必须拒（'NaN'/'open' 这类从 str 豁免缝里穿过去）"
+        # v1.7.65：属性名占位从 "state" 换成真属性 "w_travel"——域表落地后 state 属
+        # "未知属性"，会被两道闸各拒一次，那条断言就不再专验格式闸了。
+        # 未知属性本身由 tests/test_control_attr_domain.py 逐条钉。
         out = await s._cmd_control({"gwSn": "G", "devSn": "D",
                                     "attribute": "w_travel", "value": "NaN"})
         assert out["ok"] is False and out["msg"] == "invalid value", \
             "'NaN' 不得再靠 str 豁免透传 004 并回 ok:true"
         # 合法字符串线值（小程序实际下发的就是 String() 形态）不受影响
-        for good in ("0", "100", "101", "200", "50", "-1"):
+        for good in ("0", "100", "101", "200", "50"):
             out = await s._cmd_control({"gwSn": "G", "devSn": "D",
                                         "attribute": "w_travel", "value": good})
             assert out["ok"] is True, f"合法十进制串 {good!r} 被误拒"
+        # 本批把 "-1" 从"合法十进制串"改判成**越界**：-1 是上报侧的"未知"哨兵
+        # （device_ws_view 用它表示没收到过 r_travel），从来不是任何下行命令的合法值；
+        # 原样透传给设备只会得到"窗不动却回 ok:true"。改判由域表负责，此处显式钉住，
+        # 免得下个版本把它当成回归。
+        out = await s._cmd_control({"gwSn": "G", "devSn": "D",
+                                    "attribute": "w_travel", "value": "-1"})
+        assert out["ok"] is False and out["msg"] == "invalid value", \
+            "-1 已改判为越界（上报侧哨兵当命令下发就是假成功）"
 
 
 # ==================== BUG-9：remove_entry 清持久忽略 ====================

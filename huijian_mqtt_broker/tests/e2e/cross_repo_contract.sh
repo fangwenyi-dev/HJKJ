@@ -272,14 +272,15 @@ for lit in w_travel rwp_wind_lock_mode rwp_winact_speed rwp_winact_strength; do
 done
 
 # ㉔ 取消 str 豁免的**前提**必须两侧同时成立：
-#    ① 两条通道（LAN _cmd_control / 云 validate_control_params）的格式模式逐字同串，
-#       否则同一个 value 会出现"云拒 LAN 放行"的分裂行为；
+#    ① 两条通道对同一个 value 的判据必须**同一实现**（v1.7.65 起云侧直接委托 ws_gateway；
+#       此前是两份拷贝靠注释"模式串必须同串"维系，而各自漏检的东西不同——云侧从不校验
+#       属性名与值域，"同串"根本挡不住 attribute 打错字回 ok:true）；
 #    ② 小程序实际下发的值全是十进制串，否则格式闸会静默挡掉真命令。
-#    两侧各自**抽取字面量再比对**（不写正则去匹配整行——那会被转义与注释坑掉）。
-pat_hub=$(grep -oE '_VALUE_RE = re.compile\(r"[^"]+"\)' "$PYHUB" | head -1)
-pat_ws=$(grep -oE '_VALUE_RE = re.compile\(r"[^"]+"\)' "$WSGW" | head -1)
-check "两条通道的线值格式模式逐字同串（不一致＝云拒 LAN 放行的分裂行为）" \
-  "test -n '$pat_hub' && test -n '$pat_ws' && [ '$pat_hub' = '$pat_ws' ]"
+check "两条通道判据同一实现：云侧委托 ws_gateway.validate_control_command" \
+  "grep -qF 'from .ws_gateway import validate_control_command' '$PYHUB' && grep -qE '^def validate_control_command' '$WSGW'"
+# 反向钉：不许再出现"云侧自己抄一份格式闸"（抄回去＝分裂行为重新开门）
+check "反钉：hub_client 不得再自带 _VALUE_RE 副本" \
+  "! grep -qE '^_VALUE_RE = re.compile' '$PYHUB'"
 
 non_decimal=""
 for v in $(grep -oE "^const VALUE_[A-Z_]+ = '[^']*'" "$WSJS" | sed "s/^const //; s/ = '/=/; s/'$//"); do
@@ -293,6 +294,28 @@ check "小程序下发的 VALUE_* 全是十进制串（取消 str 豁免的合�
 n_val=$(grep -cE "^const VALUE_[A-Z_]+ = " "$WSJS")
 check "VALUE_* 抽取量 ≥4（防空扫假绿：锚点漂移会让上一条钉空判通过）" \
   "[ $n_val -ge 4 ]"
+
+# ㉕ 属性全集**双向**相等（v1.7.65 域表）：加载项 CONTROL_ATTR_DOMAINS 的键必须恰好等于
+#    小程序实际会下发的那组属性，清单从两侧**真源码**抽取（不手写——手写的清单只证明我自己）。
+#    单向"小程序的都在表里"挡不住两类事故：表里少一个 → 真命令被新闸挡掉（用户点不动）；
+#    表里多一个 → 那个属性没人会发，却仍留在"发得出去"的面上。
+mp_attrs=$(grep -oE "^const ATTR_[A-Z_]+ = '[^']*'" "$WSJS" | sed "s/.*= '//; s/'$//" | sort -u)
+dom_attrs=""
+for nm in $(sed -n '/^CONTROL_ATTR_DOMAINS/,/^}/p' "$CONST" | grep -oE 'ATTRIBUTE_[A-Z_]+' | sort -u); do
+  lit=$(grep -oE "^${nm}: Final = \"[^\"]+\"" "$CONST" | sed 's/.*"\(.*\)".*/\1/')
+  [ -n "$lit" ] && dom_attrs="$dom_attrs
+$lit"
+done
+dom_attrs=$(printf '%s\n' "$dom_attrs" | sed '/^$/d' | sort -u)
+n_mp=$(printf '%s\n' "$mp_attrs" | sed '/^$/d' | wc -l)
+n_dom=$(printf '%s\n' "$dom_attrs" | sed '/^$/d' | wc -l)
+if [ "$mp_attrs" = "$dom_attrs" ] && [ "$n_mp" -ge 4 ] && [ "$n_dom" -ge 4 ]; then
+  attr_verdict=ok
+else
+  attr_verdict="不等或抽取为空(mp=$n_mp,dom=$n_dom)：小程序=$(echo $mp_attrs | tr '\n' ' ') 域表=$(echo $dom_attrs | tr '\n' ' ')"
+fi
+check "属性全集双向相等：小程序下发 == 加载项域表键，且两侧各抽到 ≥4 条（$attr_verdict）" \
+  "test ok = '$attr_verdict'"
 
 echo
 echo "跨仓契约: $pass passed, $fail failed"

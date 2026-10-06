@@ -226,7 +226,7 @@ async def main():
                   st == 200 and body.get("ok"), "%s %s" % (st, body))
             st, body = await http_json("POST", "/cmd", {
                 "instanceId": client.instance_id, "openid": OPENID, "sn": "A1B2",
-                "action": "control", "params": {"attribute": "position", "value": "100"}})
+                "action": "control", "params": {"attribute": "w_travel", "value": "100"}})
             # 断言必须是"这条命令真走到了 agent"：只判 err!=offline 会被 forbidden 蒙过
             # （身份没自愈时 /cmd 先撞 owns()＝403 forbidden，同样"不是 offline"——首轮实发假绿）
             check("C 自愈后 /cmd 真下发到本机（回执来自长连那侧）",
@@ -253,7 +253,7 @@ async def main():
                   got.get("D1A") == "GW-D1" and got.get("D2B") == "GW-D2", str(got))
             st, body = await http_json("POST", "/cmd", {
                 "instanceId": client.instance_id, "openid": OPENID, "sn": "D2B",
-                "action": "control", "params": {"attribute": "position", "value": "100"}})
+                "action": "control", "params": {"attribute": "w_travel", "value": "100"}})
             check("D 第二台网关的设备也能被远程控制（不再只有第一条）",
                   body.get("err") not in ("offline", "forbidden"),
                   "%s %s" % (st, json.dumps(body, ensure_ascii=False)[:160]))
@@ -310,13 +310,13 @@ async def main():
 
             st, cmd = await http_json("POST", "/cmd", {
                 "instanceId": fam_id, "openid": E_MOM, "sn": "DEV1", "action": "control",
-                "params": {"attribute": "position", "value": "100"}})
+                "params": {"attribute": "w_travel", "value": "100"}})
             check("E4 member 发控制命令鉴权通过（无长连时回 offline，不是 403）",
                   st == 200 and (cmd or {}).get("err") == "offline",
                   "%s %s" % (st, json.dumps(cmd, ensure_ascii=False)[:160]))
             st, denied = await http_json("POST", "/cmd", {
                 "instanceId": fam_id, "openid": E_STRANGER, "sn": "DEV1", "action": "control",
-                "params": {"attribute": "position", "value": "100"}})
+                "params": {"attribute": "w_travel", "value": "100"}})
             check("E4b 陌生人仍被拒（放宽只放宽到 member）",
                   st == 403 and (denied or {}).get("err") == "forbidden",
                   "%s %s" % (st, json.dumps(denied, ensure_ascii=False)[:160]))

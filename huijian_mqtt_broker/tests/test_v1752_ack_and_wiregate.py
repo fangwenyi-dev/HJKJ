@@ -27,7 +27,10 @@ KNOWN_INBOUND_ATTRS = {"voltage", "r_travel", "rwp_wind_lock_mode",
 
 # 取消 str 豁免的依据：本协议**不存在**字符串线值。合法值取自 const 与
 # send_ws_raw_004 的 docstring（"w_travel 的 100/0/101/200/0-100、rwp_wind_lock_mode 0/1"）
-GOOD_WIRE = ["0", "1", "50", "100", "101", "200", "-1", "3", "99"]
+# v1.7.65 起这批值还要过 CONTROL_ATTR_DOMAINS 的值域闸；"-1" 已从本清单移出——
+# 它是视图层的"从未收到上报"哨兵，不是任何下行命令的取值（改判理由见
+# tests/test_control_attr_domain.py::test_minus_one_is_a_report_sentinel_not_a_command_value）。
+GOOD_WIRE = ["0", "1", "50", "100", "101", "200", "3", "99"]
 BAD_WIRE = ["NaN", "nan", "inf", "Infinity", "1e999", "0x10", "open", " 12", "12 ",
             "100;reboot", "1.2.3", "+5", "5f", ""]
 
@@ -114,14 +117,20 @@ async def test_rejected_value_is_never_published_to_the_device():
 
 
 # ── 二、两条通道的格式闸同源 ────────────────────────────────────────
-def test_both_channels_share_the_same_wire_value_format_rule():
-    """LAN（_cmd_control）与云（validate_control_params）对同一个 value 的判据必须同串。
+def test_both_channels_share_one_implementation_not_two_copies():
+    """两条通道的判据必须是**同一实现**（v1.7.65 起云侧委托 ws_gateway）。
 
-    不一致会出现"云拒 LAN 放行"或反之的**分裂行为**：同一个小程序动作在局域网里能调、
-    出门用流量就失败（或反之），而用户只看得到一次成功一次失败，查不到根因。
+    旧钉比的是 `wg._VALUE_RE.pattern == hc._VALUE_RE.pattern`。那种比法只能证明两段
+    正则抄得一样，而两侧真正漏掉的东西各不相同（云侧从不校验属性名，也不校验值域），
+    于是它一路绿着放过了"attribute 打错字照样回 ok:true"这条真缺陷。
+    本批把判据收敛成一份 ⇒ 这里只钉"不许再出现第二份拷贝"；两条通道**入口链**的
+    行为等价性由 tests/test_control_attr_domain.py::test_two_entry_points_return_identical_verdict
+    逐条矩阵钉（比函数比自己恒真，那条不算验证）。
     """
-    assert wg._VALUE_RE.pattern == hc._VALUE_RE.pattern, \
-        "两条通道的线值格式模式漂移: %r vs %r" % (wg._VALUE_RE.pattern, hc._VALUE_RE.pattern)
+    assert not hasattr(hc, "_VALUE_RE"), \
+        "hub_client 又自带了一份线值格式闸＝两条通道重新分叉"
+    assert hc.validate_control_params("w_travel", "50") == "50"
+    assert hc.validate_control_params("position", "50") is None
 
 
 @pytest.mark.parametrize("bad", BAD_WIRE)

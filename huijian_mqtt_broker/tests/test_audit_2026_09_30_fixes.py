@@ -224,11 +224,13 @@ def test_a2_well_formed_params_still_executes(tmp_path):
         return True
 
     client.control_fn = control
+    # v1.7.65：占位属性 "position" 换成真属性 "w_travel"——域表落地后 position 属未知属性，
+    # 这条"合法 params 照常执行"的反向半条会因为它而红，而红的不是它要防的那个形态。
     res = asyncio.run(client._handle_cmd({
         "action": "control", "sn": "A1",
-        "params": {"attribute": "position", "value": "100"}}))
+        "params": {"attribute": "w_travel", "value": "100"}}))
     assert res["ok"] is True, res
-    assert touched == [("A1", "position", "100")]
+    assert touched == [("A1", "w_travel", "100")]
 
 
 def test_a2_receive_loop_wraps_handler_so_one_poison_frame_cannot_drop_link():
@@ -2925,15 +2927,23 @@ def _c6_swallows(node):
     ② 盲区 `async with contextlib.suppress(CancelledError)`：旧实现只扫 `ast.With`，
       而 `async with` 是 `AsyncWith` 另一种节点，写成 async with 就整条跳过。
     ③ 盲区 `except* CancelledError: pass`：`TryStar` 根本不是 `Try` 节点。
+
+    v1.7.65（第四轮复核 N1）补第四型：**裸 `except:` 与 `except BaseException:` 一样
+    能吞掉 CancelledError**，旧实现写的是 `if h.type is None: continue`——把最宽的那种
+    吞直接放过。本仓当前零处裸 except（grep 实证），而 CI 的 ruff 参数（F,E9,B）不含
+    E722 拦不住它 ⇒ 属"将来在 cleanup 链上写裸 except 会全绿漏过"的判据盲区。
     """
     if isinstance(node, (ast.Try, ast.TryStar)):
         for h in node.handlers:
-            if h.type is None or "CancelledError" not in ast.unparse(h.type):
+            bare = h.type is None
+            caught = "BaseException" if bare else ast.unparse(h.type)
+            if "CancelledError" not in caught and "BaseException" not in caught:
                 continue
             if any(isinstance(n, ast.Raise)
                    for stmt in h.body for n in ast.walk(stmt)):
                 continue
-            return "第 %d 行 try/except CancelledError 不传" % node.lineno
+            return "第 %d 行 %s 捕取消却不传" % (
+                node.lineno, "裸 except" if bare else caught.split(".")[-1])
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         for item in node.items:
             ce = ast.unparse(item.context_expr)

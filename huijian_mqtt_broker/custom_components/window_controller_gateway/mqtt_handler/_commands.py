@@ -216,9 +216,14 @@ class _CommandsMixin:
                                   payload["data"]["attribute"], raw_value)
                     return False
                 if value < SPEED_MIN or value > SPEED_MAX:
-                    value = max(SPEED_MIN, min(SPEED_MAX, value))
-                    _LOGGER.warning("%s 参数超出范围(%d-%d)，已裁剪为 %d",
-                                    payload["data"]["attribute"], SPEED_MIN, SPEED_MAX, value)
+                    # v1.7.65：越界由"裁剪后下发"改成**拒绝下发**，与本文件 set_position 分支
+                    # 的 v1.6.19 B-LOW11 定案同口径——"想设 150"被静默执行成 100 是反向动作，
+                    # 而调用方已经拿到成功回执。此前 speed/strength 是四个可调属性里唯一还在
+                    # 裁剪的两个，与 const.CONTROL_ATTR_DOMAINS（越界即拒）形成同一仓库内的
+                    # 判据分歧：服务路径放行、WS/云路径拒绝。
+                    _LOGGER.error("%s 参数超出范围(%d-%d)，拒绝下发: %s",
+                                  payload["data"]["attribute"], SPEED_MIN, SPEED_MAX, value)
+                    return False
                 payload["data"]["value"] = str(value)
             elif command in ("wind_lock_tilt", "wind_lock_flat"):
                 # 风锁模式控制 - 内倒模式(value=0) / 平开模式(value=1)

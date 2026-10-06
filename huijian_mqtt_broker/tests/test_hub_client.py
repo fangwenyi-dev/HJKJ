@@ -54,11 +54,16 @@ def test_cred_brief_never_echoes_plaintext():
 
 
 def test_validate_control_params_matches_lan_semantics():
+    # 本批起"与 LAN 同语义"是由构造保证的（云侧直接委托 ws_gateway 的同一实现），
+    # 这里逐条列的是**值域**判据本身。
     assert hc.validate_control_params("w_travel", "100") == "100"
     assert hc.validate_control_params("w_travel", 100) == "100"
-    assert hc.validate_control_params("w_travel", 1.5) == "1.5"
-    assert hc.validate_control_params("w_travel", -1) == "-1"
-    # 拒：空属性 / 空串值 / bool / 容器 / nan / inf / 科学计数（设备不可解析）
+    # v1.7.65 改判两条（理由见 tests/test_control_attr_domain.py 的 ⑥ 段）：
+    # 四个出站属性值域全是整数，小数不再放行；-1 是视图层"从未收到上报"的哨兵。
+    assert hc.validate_control_params("w_travel", 1.5) is None
+    assert hc.validate_control_params("w_travel", -1) is None
+    # 拒：未知属性 / 空串值 / bool / 容器 / nan / inf / 科学计数（设备不可解析）
+    assert hc.validate_control_params("position", "100") is None
     assert hc.validate_control_params("", "100") is None
     assert hc.validate_control_params("w_travel", "") is None
     assert hc.validate_control_params("w_travel", None) is None

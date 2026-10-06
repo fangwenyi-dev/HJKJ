@@ -313,6 +313,26 @@ class TestControlParamReject:
                                           {"speed": "1e999"}) is False
         assert pub.published == []
 
+    @pytest.mark.asyncio
+    async def test_speed_strength_out_of_range_rejected_not_clamped(self, monkeypatch):
+        """v1.7.65：speed/strength 的越界由"裁剪后下发"改成拒绝——与本类 set_position
+        的 B-LOW11 定案同口径。留裁剪等于留一条"用户要 150、设备收到 100、回执成功"的
+        静默反向动作，而且与本仓新域表（越界即拒）在同一个仓库里判据分裂。
+        """
+        handler, pub = _mk_handler(monkeypatch)
+        for command, key in (("set_speed", "speed"), ("set_strength", "strength")):
+            assert await handler.send_command(DEV_SN, command, {key: 150}) is False, command
+            assert await handler.send_command(DEV_SN, command, {key: -5}) is False, command
+        assert pub.published == [], "越界不得下发（裁剪成 100/0 再发就是反向动作）"
+        # 反向半条：合法值照常下发，且**不裁剪**（否则"一律拒"也能过上面几条）
+        assert await handler.send_command(DEV_SN, "set_speed", {"speed": 0}) is True
+        assert pub.published[-1][1]["data"]["value"] == "0"
+        assert await handler.send_command(DEV_SN, "set_speed", {"speed": 100}) is True
+        assert pub.published[-1][1]["data"]["value"] == "100"
+        assert await handler.send_command(DEV_SN, "set_strength", {"strength": 37}) is True
+        assert pub.published[-1][1]["data"]["attribute"] == c.ATTRIBUTE_WINACT_STRENGTH
+        assert pub.published[-1][1]["data"]["value"] == "37"
+
 
 # ============ A-MED3 / D-F3：_persist_token 三分支 ============
 class TestPersistToken:

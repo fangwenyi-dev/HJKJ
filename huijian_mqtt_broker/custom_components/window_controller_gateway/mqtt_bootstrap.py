@@ -293,7 +293,16 @@ async def verify_builtin_channel(hass: HomeAssistant) -> str:
     state, endpoint = await _probe_endpoint(hass)
     if state != "ok":
         return state   # missing → no_endpoint；broken → endpoint_broken
-    exp_broker, exp_port = endpoint["broker"], int(endpoint["port"])
+    try:
+        exp_broker, exp_port = endpoint["broker"], int(endpoint["port"])
+    except (KeyError, TypeError, ValueError, OverflowError) as err:
+        # v1.7.65（第四轮复核 N4，同族第 8 处）：端点文件 port 被写成 `1e999`（JSON
+        # 合法）→ float('inf')，`int(inf)` 抛 OverflowError。下方 :312 的**条目侧**
+        # 早在 v1.7.61 S2 就接住了这个，端点侧漏。逃出去会被 healer / repairs 的宽
+        # 兜底折成 probe_error 或"仍坏"——判词不准（真坏的是端点文件），按 C-7 口径
+        # 归 endpoint_broken：不清卡，且卡片能把人指到"端点文件读不出"。
+        _LOGGER.warning("端点文件 port 字段不可解析（按端点坏处理，不折成无结论）: %r", err)
+        return "endpoint_broken"
     try:
         raw_entries = hass.config_entries.async_entries("mqtt")
     except Exception as e:  # noqa: BLE001 — 判定面不可读：不是"通过"，是"没探到"

@@ -76,6 +76,26 @@ SPEED_MAX: Final = 100  # rwp_winact_* 系列参数共用范围上限（速度/�
 COMMAND_VALUE_WIND_LOCK_TILT: Final = "0"   # 内倒模式
 COMMAND_VALUE_WIND_LOCK_FLAT: Final = "1"    # 平开模式
 
+# ── 控制属性域表（v1.7.65）──────────────────────────────────────────
+# 004 **出站**属性的全集与各自合法线值域。判据全部取自本仓可自证的源码，不含推测：
+#   · 本文件 ATTRIBUTE_* 四个名字（出站只有这四个；入站属性是 voltage / r_travel /
+#     rwp_wind_lock_mode / rwp_winact_speed / rwp_winact_strength，见
+#     mqtt_handler/_ctypes.py 的属性 elif 链与 tests/test_v1718_audit.py 的 v1.7.52 定案）；
+#   · mqtt_handler/_commands.py 的命令映射：set_position 0-100 且**越界拒绝下发**
+#     （v1.6.19 B-LOW11：0 是真实语义"关窗"，静默回退＝反向动作）、
+#     wind_lock_tilt/flat＝0/1、set_speed/set_strength＝SPEED_MIN..SPEED_MAX；
+#   · 同文件 `send_ws_raw_004` 的 docstring 自陈"不做语义解释…本方法同样不校验"，
+#     而 control_ack 的 ok 是**发布级**语义 ⇒ 属性名打错一个字母时加载项照样回
+#     ok:true、界面显示"速度已设置"而设备从没收到过这条命令（本表要堵的就是这一面）。
+# 形状：(下限, 上限, 额外离散值元组)。**WS 与云两条通道唯一**的属性/值域判据
+# 由 ws_gateway.validate_control_command 读本表得出；两处再各写一份就会分裂。
+CONTROL_ATTR_DOMAINS: Final = {
+    ATTRIBUTE_W_TRAVEL: (0, 100, (101, 200)),  # 101=停止、200=内倒（COMMAND_VALUE_STOP/TOGGLE）
+    ATTRIBUTE_WIND_LOCK_MODE: (0, 1, ()),
+    ATTRIBUTE_WINACT_SPEED: (SPEED_MIN, SPEED_MAX, ()),
+    ATTRIBUTE_WINACT_STRENGTH: (SPEED_MIN, SPEED_MAX, ()),
+}
+
 # ==================== 状态相关 ====================
 STATE_PAIRING: Final = "pairing"
 STATE_CONNECTED: Final = "connected"

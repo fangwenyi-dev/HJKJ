@@ -3,6 +3,30 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.7.65] - 2026-10-06
+
+两条线并成一刀发版：**① 第四轮独立复核的 4 条遗留项收口**（`docs/verify-2026-10-06-v1764.md` 对 v1.7.64 判"真修 14/14、新增缺陷 0"，另登记 4 条"非本批引入"项——我逐条自证**全部为真**，其中两条是真能炸的产品缺陷）；**② 云通道命令参数校验改为直接委托 WS 侧同一实现**（补上属性名白名单 / 值域 / 整数形态三道闸）。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**。
+
+**一、N4a `number.async_set_native_value` 入参无闸（数值溢出同族第 7 处）**：`int(value)` 裸奔——自动化 YAML 写 `.inf` 抛 `OverflowError`、`.nan`/`"abc"` 抛 `ValueError`，全部原样逃给服务调用方；同文件 :122 的设定值**回显**早在 v1.7.61 A-6 就接住了这两个，入参侧是同族漏网。修法：如实拒成 `HomeAssistantError`（异常链 `from err` 留住原因），**不回退默认档**——把"想设 150"静默执行成别的档位是反向动作（v1.6.19 B-LOW11 同判）。反向臂钉住正常路径未被误伤（150→钳 100、-5→钳 0、30→30）。
+
+**二、N4b `verify_builtin_channel` 的端点 port 在 try 之外（同族第 8 处）**：端点文件被写成 `port: 1e999`（JSON 合法）→ `float('inf')` → `int(inf)` 抛 `OverflowError` 逃出判定面。同函数 :312 的**条目侧** v1.7.61 S2 就接住了，端点侧漏。现状**不崩**——healer 与 repairs 的宽兜底会接住，但把"端点文件坏了"说成 `probe_error` / "仍坏"，**判词不准、人也被指错方向**。修法：按 C-7 口径归 `endpoint_broken`（不清卡，卡片能指到端点文件）+ WARNING 留痕；反向臂证明 port 正常时仍继续往下判到 `no_entry`，没被新闸截住。
+
+**三、N1 C-6 判据放过最宽的一种吞**：`_c6_swallows` 旧写 `if h.type is None: continue`——裸 `except:` 恰好能吞掉 `CancelledError` 却被直接放过；`except BaseException: pass` 同理。本仓当前零处裸 except（grep 实证），而 CI 的 ruff 参数（F,E9,B）不含 E722 拦不住它 ⇒ 属"将来在 teardown 链上写裸 except 会全绿漏过"的判据盲区。修法：裸 except 与 `BaseException` 一并纳入命中（"捕了再 raise 合法"口径保留），配 5 条合成源码形状臂自证（吞取消报 / 条件再抛不报 / `async with suppress` 报 / `except*` 报 / 窄捕 `ValueError` 不牵连）。
+
+**四、N2 兜底码 `op_failed` 两头都不在**：`_set_op_error` 体内 `value or "op_failed"`，而派生码宇宙只扫**调用点实参**、面板码表也没有它 ⇒ 今天 14 个调用点都传非空所以不可触达，但一旦有人写成 `_set_op_error(F, e.err)` 而 `err` 为 None，用户又是一次"点了没反应"。修法：派生扩到函数体兜底常量 + 面板补 `case 'op_failed'`（文案承认"云端没给出原因"并把人指到 HA 日志，不假称网络问题）+ node 真跑。**自记一处**：我第一版把这条派生分支挂在 `if not isinstance(n, ast.Call): continue` 之后 ⇒ 永远走不到的**死分支**，加了等于没加还全绿；补上"该分支必须真的贡献码"的死分支自证才现形。
+
+**五、N3 变异臂固化**：v1.7.64 那 14 条"针对性变异自证"当时只是 CHANGELOG 里的一次性人工叙述，仓内矩阵零覆盖（第四轮复核 grep 证实）。本批把 14 条 + 本批 2 条（N4a/N4b）共 **16 臂固化进 `tests/mutation_matrix.py`**（53 → 69），锚点逐条 `count=1` 核验、变异后语法逐条过 `ast.parse`（红必须红在行为上，不是红在"解析不了"）。
+
+**六、云通道参数校验＝WS 通道同一实现（并行会话那条线，我按小程序真源码复核后并入）**：此前 `hub_client.validate_control_params` 抄了一份 `ws_gateway` 的格式闸，靠注释"模式串必须逐字同串"维系，而两份拷贝各自漏检——**云侧从不校验 attribute 是不是本协议的属性名，也不校验值域**。顺着 `_make_hub_control → mqtt_handler.send_ws_raw_004` 读到实现：该函数 docstring 自陈"不做语义解释…本方法同样不校验"，而 `control_ack` 的 `ok` 是**发布级**语义 ⇒ 属性名打错一个字母，hub 原样把命令送下来、加载项照样回 `ok:true`、界面显示"速度已设置"而设备从没收到过。修法：`const.CONTROL_ATTR_DOMAINS`（四个出站属性 + 各自线值域）为唯一真源，`ws_gateway.validate_control_command` 读它，云侧直接委托；反钉 `hub_client` 不得再自带 `_VALUE_RE` 副本（抄回去＝分裂行为重新开门）。同批把 `_cmd_control` 的 speed/strength 越界由"裁剪后下发"改成**拒绝下发**，与 set_position 的 B-LOW11 定案同口径（此前它是四个可调属性里唯一还在裁剪的两个，与域表形成"服务路径放行、WS/云路径拒绝"的判据分歧）。**跨语言侧我逐条核过小程序真源码**：`utils/ws-gateway.js` 的四个 `ATTR_*` 字面量与 const 逐字一致；`utils/gw-router.js` 云/LAN 两条路都先过 `pctParam`（`Math.round` + 0..100 夹 + 非有限回 null 不发）再 `String()`，固定动作值是 `'0'/'100'/'101'/'200'` 与 `'0'/'1'` ⇒ 全部落在新域内，**零误伤**。契约脚本同步升级：㉔ 从"两串逐字相等"改成"必须同一实现 + 不许再抄副本"，㉕ 新增属性全集**双向相等**（两侧都从真源码抽取，单向"小程序的都在表里"挡不住"表少一个＝真命令被挡"与"表多一个＝没人发却仍发得出去"两类事故），并带抽取量下限防空扫。
+
+**七、两处口径差（记录，不在本批动）**：① "两条通道同一实现"覆盖 WS 与云；LAN 的 MQTT 服务路径 `_cmd_control` 仍会把 `35.5` 截断成 35 放行（真实调用方都给整数：小程序 round、number `step=1`，打不到）。② 小程序 `utils/ws-gateway.js:71-74` 的注释还写着"加载项对 set_speed/set_strength 是 `int()` 后**裁剪**"，本批已改成拒绝——那是**小程序仓**的注释漂移，要改得动那个仓，本批未碰。
+
+**判据**：新增 `tests/test_audit_2026_10_06_round4_fixes.py` **20 条**（N4a 五型垃圾入参 + 正常值反向臂、N4b 六型坏 port + 正常 port 反向臂、C-6 判据形状五臂、`op_failed` node 真跑）；并行会话新增 `tests/test_control_attr_domain.py` **138 条**（属性×值矩阵逐条判"接受/拒绝"，钉住"两条通道同一实现"与"表里不许多也不许少"）；既有钉升级：`_codes_the_plugin_can_emit`（码值宇宙收函数体兜底常量 + 死分支自证）、`_c6_swallows`（裸 except / BaseException / AsyncWith / TryStar）、`test_c6_*`（teardown 宇宙 + 上限自检）。
+
+**门禁**：pytest **1655**（基线 1498 + 本批 20 + 并行会话 138，零 fail 零 skip）；ruff（CI 同参 F,E9,B）/ compileall / `node --check`×3 / `bash -n`（run.sh + 10 个 e2e shell）全绿；仓内**变异矩阵 69 臂（应红 68）失守 0**；**跨仓契约真跑 112 passed / 0 failed**（对真 hub 仓 `E:/AI/huijian-cloud-hub` + 真小程序仓 `E:/AI/ha-yy/weichat-huijian-hz`，含新加的 ㉔/ 与反钉）；矩阵锚点全表复核 64 条静态臂 `count` 正确、5 条 DYN 臂由整跑覆盖；版本位 config.yaml / manifest.json / version.json×2 / index.html（CURRENT_VERSION + 5 处缓存位）＝1.7.65 字节级替换，行尾未翻。
+
+**未验边界（逐格点名）**：v1.7.64 遗留的三条一条没闭——① 真机点两张「修复」卡；② C-6 常驻 healer 跑满 1800s（CI e2e 的 soak 是 500 条 ~12s）；③ C-2 回声竞态实测。本批再新增一条：④ **云通道三道闸的真机下行未验**——矩阵与契约脚本都是单元/静态层，没在真 hub 上真发一条"属性名打错"的命令看它是否回 `invalid_params`；⑤ A-2/A-3 的并发与取消面仍是"本机显式调度实测 + 逻辑链"，未在真 HA 停机竞态里复现。
+
 ## [1.7.64] - 2026-10-06
 
 第三轮只读复核（`docs/bug-audit-2026-10-05-round3.md`）残余条目的判决与收口批：报告 6 条待决 **5 真 2 假**——真 5 条全修，假 2 条留证不改（含它自己给的一条"可选加固"）。发版前派"尝试推翻"代理回攻，抓回 **4 条确证缺陷（A-1~A-4：我这批"修不到底"的、同类仍漏的、判据自身假阳性与盲区的）+ 我自己引入的 1 处自伤**，全部本机复现后收口。配套 hub / 小程序**零改动**；线协议零字段变更，**无发版顺序约束**；本批纯缺陷收口，无新功能。

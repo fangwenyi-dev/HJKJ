@@ -142,18 +142,33 @@ def _codes_the_plugin_can_emit():
     毫无反应，而全量 1481 条当时全绿。
     """
     codes = set()
+    from_body = set()      # 只来自 _set_op_error 函数体的码（用于分支自证）
     for p in sorted((ROOT / "custom_components" / "window_controller_gateway").rglob("*.py")):
         tree = ast.parse(p.read_text(encoding="utf-8"))
         for n in ast.walk(tree):
-            if not isinstance(n, ast.Call):
-                continue
-            fname = n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", None)
-            if fname == "_set_op_error" and len(n.args) >= 2:
-                codes |= _str_consts_in_slot_arg(n.args[1])
-            elif fname == "HubHttpError" and len(n.args) >= 3:
-                # 第三实参 = err；调用方普遍写 `e.err or "<兜底码>"`，err 非空时直接进槽
-                codes |= _str_consts_in_slot_arg(n.args[2])
-    return codes
+            if isinstance(n, ast.Call):
+                fname = n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", None)
+                if fname == "_set_op_error" and len(n.args) >= 2:
+                    codes |= _str_consts_in_slot_arg(n.args[1])
+                elif fname == "HubHttpError" and len(n.args) >= 3:
+                    # 第三实参 = err；调用方普遍写 `e.err or "<兜底码>"`，err 非空时直接进槽
+                    codes |= _str_consts_in_slot_arg(n.args[2])
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and n.name == "_set_op_error":
+                # v1.7.65（第四轮复核 N2）：函数体里的**兜底常量**也是可落进槽的码
+                # （`self.last_op_error = value or "op_failed"`）。只扫调用点实参的话，
+                # 这类"调用方传空才生效"的码永远不在宇宙里 ⇒ 将来某处写成
+                # `_set_op_error(F, e.err)` 而 err 为 None，用户又是一次"点了没反应"。
+                # docstring 也是字符串常量，必须先摘掉——否则宇宙里混进一句话。
+                stmts = list(n.body)
+                if stmts and isinstance(stmts[0], ast.Expr) \
+                        and isinstance(stmts[0].value, ast.Constant):
+                    stmts = stmts[1:]
+                for stmt in stmts:
+                    for c in ast.walk(stmt):
+                        if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                            from_body.add(c.value)
+    return codes | from_body, from_body
 
 
 def test_op_error_covers_every_code_the_plugin_can_emit():
@@ -162,12 +177,17 @@ def test_op_error_covers_every_code_the_plugin_can_emit():
     取值来源两类：① hub 的真实 err（no_owner/members_full/rate_limited/registry_full/
     superseded/bad_secret/unknown_instance/unknown_member/owner_cannot_leave）——此前被压成
     一个笼统的 bindcode_rejected，面板只能说"稍后再试"，而 no_owner 的正解是"先自己扫码
-    成为主人"，重试永远不会成功；② 本地降级值（网络失败/老 hub）+ 本地形状闸产生的码。
-    ② 现在从生产代码 AST 派生（见 `_codes_the_plugin_can_emit` 为什么要派生）。
+    成为主人"，重试永远不会成功；② 本地降级值（网络失败/老 hub）+ 本地形状闸产生的码
+    + `_set_op_error` 体内的兜底常量。② 全部从生产代码 AST 派生（见
+    `_codes_the_plugin_can_emit` 为什么要派生）。
     """
     body = _single_func_body(JS, "hubOpErrorText")
-    derived = _codes_the_plugin_can_emit()
+    derived, from_body = _codes_the_plugin_can_emit()
     assert derived, "派生集为空＝扫描锚点漂移，本钉在扫空气"
+    # 分支自证：函数体兜底那条必须**真的**贡献了码。上一版把它挂在
+    # `if not isinstance(n, ast.Call): continue` 之后 ⇒ 永远走不到，加了等于没加
+    # 还全绿（第四轮复核实测 op_failed 不在宇宙里）。
+    assert from_body, "派生的『_set_op_error 函数体兜底常量』分支没贡献任何码＝死分支"
     for code in sorted(derived):
         if code == "members_unsupported":
             # 唯一例外：它是**持续状态**而不是故障，由成员区自己说清
