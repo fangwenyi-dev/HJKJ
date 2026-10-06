@@ -548,6 +548,12 @@ def test_concurrent_renames_survive_cold_alias_file_read(tmp_path, monkeypatch):
     调度是**显式**的，不靠 gather 的运气：先让 A 进到读盘（已提交线程池），再让 B
     进到读盘（此刻磁盘仍是空表），B 的读盘慢半拍返回那份旧快照。修后 B 拿锁时
     `_aliases_loaded` 已为真、直接复用，第二次读盘根本不会发生。
+
+    v1.7.65（矩阵整跑复验）：末条断言是**与线程池调度无关**的判据，别删。此前只靠
+    「落盘少了一条改名」判红，那是计时依赖的——第二次的线程要被负载拖到第一次落盘之后
+    才真读盘，它拿到的就是新快照，去掉锁的实现照样全绿；整跑时 `r3_alias_load_outside_lock`
+    就是这么假绿了一次（同一臂单跑 10/10 必红）。B 一定在 A 置起 `_aliases_loaded`
+    之前跑到判 flag 那一格，所以「变异后必 2 次读盘」不看时序。
     """
     client = _alias_client(tmp_path)
     real_load = hc.load_member_aliases
@@ -573,6 +579,8 @@ def test_concurrent_renames_survive_cold_alias_file_read(tmp_path, monkeypatch):
     assert real_load(str(tmp_path)) == {MID_A: "爸爸", MID_B: "妈妈"}, \
         "锁外的第二次读盘把先完成那次改名抹掉了（A-2 回潮）"
     assert client.member_aliases == {MID_A: "爸爸", MID_B: "妈妈"}
+    assert len(reads) == 1, \
+        "第二次读盘发生了：锁内二次判没生效，读盘与赋 flag 不再是同一原子段（A-2 回潮）"
 
 
 def _unload_harness(tmp_path, monkeypatch, runtime):

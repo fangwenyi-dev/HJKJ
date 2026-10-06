@@ -25,6 +25,8 @@
 
 **门禁**：pytest **1655**（基线 1498 + 本批 20 + 并行会话 138，零 fail 零 skip）；ruff（CI 同参 F,E9,B）/ compileall / `node --check`×3 / `bash -n`（run.sh + 10 个 e2e shell）全绿；仓内**变异矩阵 69 臂（应红 68）失守 0**；**跨仓契约真跑 112 passed / 0 failed**（对真 hub 仓 `E:/AI/huijian-cloud-hub` + 真小程序仓 `E:/AI/ha-yy/weichat-huijian-hz`，含新加的 ㉔/ 与反钉）；矩阵锚点全表复核 64 条静态臂 `count` 正确、5 条 DYN 臂由整跑覆盖；版本位 config.yaml / manifest.json / version.json×2 / index.html（CURRENT_VERSION + 5 处缓存位）＝1.7.65 字节级替换，行尾未翻。
 
+**发版后自记（本批唯一的证据缺口，已闭）**：上面门禁那句「变异矩阵 69 臂 失守 0」在提交时**没有整跑复验**过——各臂是单跑自证后收进矩阵的。发布后第一次整跑（2026-10-06 12:12，`python tests/mutation_matrix.py`）就报 `r3_alias_load_outside_lock` **失守 1**（变异后判据仍 `1 passed`）。追下去坏在**判据自己**，不在产品码：那一臂只靠「落盘少了一条改名」判红，而这条判据是计时依赖的——第二次读盘的线程池任务若被负载拖到第一次落盘之后才真读盘，它拿到的就是新快照，去掉锁的实现照样全绿（同一臂单跑 10/10 必红，而整跑当时正连着起 69 个 pytest 进程）。修法：`test_concurrent_renames_survive_cold_alias_file_read` 补一条**与时序无关**的判据 `len(reads) == 1`——修后 B 必定在锁内二次判上直接复用、第二次读盘根本不发生；变异后 B 必定在 A 置起 `_aliases_loaded` 之前跑到判 flag 那一格 ⇒ 必定 2 次读盘。复验：12 路 CPU 负载下变异 6/6 红、修后 6/6 绿；矩阵整跑两遍（干净 3m44s、持续 10 路负载 4m23s）均 **69 臂（应红 68）失守 0**；pytest **1655 passed** 零 fail 零 skip；ruff（CI 同参 F,E9,B）All checks passed。**产品码本批未动一行**。
+
 **未验边界（逐格点名）**：v1.7.64 遗留的三条一条没闭——① 真机点两张「修复」卡；② C-6 常驻 healer 跑满 1800s（CI e2e 的 soak 是 500 条 ~12s）；③ C-2 回声竞态实测。本批再新增一条：④ **云通道三道闸的真机下行未验**——矩阵与契约脚本都是单元/静态层，没在真 hub 上真发一条"属性名打错"的命令看它是否回 `invalid_params`；⑤ A-2/A-3 的并发与取消面仍是"本机显式调度实测 + 逻辑链"，未在真 HA 停机竞态里复现。
 
 ## [1.7.64] - 2026-10-06
