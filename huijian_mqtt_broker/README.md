@@ -4,6 +4,28 @@
 
 慧尖开窗器 LoRa 网关的 Home Assistant 一体化插件：**内置 Mosquitto Broker（端口 2022）+ mDNS 广播 + 网关集成 + 管理 Web UI + 小程序局域网直连**，装一个插件即可获得全部能力，无需再装官方 MQTT 加载项。
 
+> ## 【迁移公告 · 2026-10-06】本仓库地址已变更
+>
+> 慧尖加载项的唯一商店仓现在是 **`https://github.com/fangwenyi-dev/HJKJ`**
+> （Gitee 容灾 `https://gitee.com/fangwenyi-dev/HJKJ`）。你现在看到的这张卡
+> （`ha-gateway-plugin`）**即日起冻结停更**，不会再有版本推送。
+>
+> **为什么必须重装、不能"改个名就继承"**：Supervisor 给加载项编的身份是
+> `sha1(你当初添加的那个仓库地址)[:8] + "_" + config.yaml 里的 slug`
+> （`supervisor/store/utils.py:12-15`、`supervisor/store/data.py:240`），`/data`
+> 也按这个全名开目录（`supervisor/apps/app.py:758-760`）。换地址＝换身份＝
+> 开一个新的空数据目录，所以旧卡不会自动指向新仓。
+>
+> **迁移顺序别颠倒**：两个实例会抢宿主 2022 与 10998 端口，第二个起不来。
+>
+> 1. 先打开本加载项「配置」页，把已填的值抄下来（只存在加载项自己的 `/data`，不随迁移走）。
+> 2. 卸载本加载项；商店 ⋮ → 存储库，删除 `ha-gateway-plugin` 这个地址。
+> 3. 添加 `https://github.com/fangwenyi-dev/HJKJ`，安装「慧尖 LoRa 网关」，回填配置，启动。
+> 4. 重启一次 HA Core。
+>
+> **不会丢**：网关实体与子设备重命名（在 HA 实体注册表里）、成员称呼（写在 HA 的
+> `/config`，不在加载项 `/data`）。**会丢**：本加载项「配置」页的值，需要重填。
+
 ## 安装
 
 1. **添加仓库**：设置 → 加载项 → 加载项商店 → 右上角 ⋮ → 存储库，添加
