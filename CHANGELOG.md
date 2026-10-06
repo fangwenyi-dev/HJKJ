@@ -3,6 +3,35 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [结构变更] 2026-10-06 · 商店仓迁往 HJKJ：旧卡挂迁移公告（**不发版**，只动两份对外文档 + 本日志）
+
+唯一商店仓改为 `https://github.com/fangwenyi-dev/HJKJ`（Gitee 容灾 `https://gitee.com/fangwenyi-dev/HJKJ`），
+本仓 `ha-gateway-plugin` 与语音原仓 `huijian-gateway-plugin-yy` 即日起冻结停更。上一条里
+「本仓 GitHub 仓名与 URL 都不许改」的硬规矩由用户点名推翻，改走**一次性切换**：接受已装用户重装
+（网关 `386f32f8_` → `c2df40f3_`），旧仓在有人装着时删不掉（`store/__init__.py:247-251`），故留作冻结态。
+`huijian-gateway-plugin-yy` 降级为**固件 Release 仓**——`huijian_voice/firmware.lock.json` 有 30 条 URL
+指向它的 GitHub/Gitee Releases（`core/const.py:43` + `core/firmware_store.py` 开机消费），
+**那些 Releases 是运行时依赖，不是历史包袱，删仓会静默炸 OTA**。
+
+- **公告落点按源码选**：Supervisor 的卡片正文读加载项目录里的 `README.md`
+  （`supervisor/apps/model.py:689-695`，作 `long_description`），「文档」页读同目录 `DOCS.md`
+  （`:636-638`）。⇒ 网关侧写 `huijian_mqtt_broker/README.md`（该目录没有 DOCS.md，文档页本来是空的），
+  语音侧写 `huijian_voice/DOCS.md`。⚠ 顺带发现 `huijian_voice/README.md` 是 0 字节空文件
+  （`7c5652f` 搬进来时就是空的）⇒ 语音卡片的「更多信息」正文一直空白，待补。
+- **不 bump 任何版本号**：公告走详情页正文，与「有可用更新」无关；bump 反而会让老用户先收到
+  一次指向旧代码的更新提示。Store 数据每次刷新重读，`data_store` 取的是仓里的最新值
+  （`supervisor/apps/app.py:379-381`），所以不动版本号也能触达。
+- 文案写死「先卸后装」的顺序并给了理由：两实例会同抢宿主端口（网关 2022/10998、语音 8000/8001，
+  两边都 `host_network: true`），先装新的只会让第二个起不来。
+- 数据面按核实结果分档，不写含糊话：**随身份一起换新**的是加载项自己的 `/data`
+  （`path_data = path_apps_data/{仓hash}_{slug}`）与「配置」页的值；**保留**的是 HA `/config` 里的
+  东西——`window_controller_gateway` 集成落盘（`run.sh:782,795`）、成员称呼 alias
+  （`hub_client.py:260-261` `member_alias_path(config_dir)`）、以及 HA 实体注册表里的子设备重命名。
+  mosquitto 密码文件在 `/etc/mosquitto/passwd`（容器内，每次启动按 options 重建，`run.sh:68-74`），
+  填回同样的值即等价。语音侧 `/data` 里另有约 1.3 GB 模型，重装要重下或走「模型」页 import 投放口。
+- 两份文档改完各自仍是**纯 CRLF、无混合行尾**（138 / 190 行），diff 为 +22/-0 与 +24/-0 的纯插入。
+  本条只动 md，产品码、镜像、CI 一字未改。
+
 ## [结构变更] 2026-10-06 · 语音加载项并入本商店仓（**不发版**，两个加载项内容零改动）
 
 一个商店仓、两个加载项：`huijian_mqtt_broker/`（慧尖 LoRa 网关，1.7.x）与 `huijian_voice/`
