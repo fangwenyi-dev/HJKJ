@@ -605,9 +605,14 @@ class TestProxyAndCI:
         assert ci.count("版本提取失败") >= 2, "I-1：VERSION 空值 fail-fast 丢失"
         assert "tests/e2e/*.sh" in ci, "I-2：e2e 脚本未入 bash -n 语法门"
         assert "fetch-depth: 20" in ci, "I-3：changelog 兜底 git log 深度不足"
-        # I-4 原钉点（Gitee job 以 PREPARED 复用 prepare 产物）随 gitee-release
-        # job 于 2026-09-16 用户裁定停推 Gitee 时整段下线——负向防复活：
-        assert "PREPARED:" not in ci, "Gitee job 已下线，PREPARED 引用不得残留"
+        # I-4 的原始不变量＝"Gitee 正文复用 prepare 产物，不在两处独立解析"。2026-09-16
+        # 停推裁定把 gitee-release job 整段下线时，这条被改成负向防复活（PREPARED 不得
+        # 出现）；裁定 2026-09-17 即被推翻，而 2026-10-06 D4 把 job 自动化回来之后，
+        # 负向钉守的正是我们要的东西 ⇒ 翻回正向：gitee-release job 段内必须出现 PREPARED
+        # 引用，且必须来自 prepare 产物（不是自己再解析一遍 CHANGELOG 当主源）。
+        seg = ci[ci.index("  gitee-release:"):]
+        assert "PREPARED: ${{ needs.prepare.outputs.changelog }}" in seg, \
+            "I-4：Gitee 正文必须复用 prepare 产物（两处独立解析＝漂移源）"
         assert "body: ${{ needs.prepare.outputs.changelog }}" in ci, \
             "GitHub Release 正文仍须直取 prepare 产物（I-4 单一解析源不变）"
 

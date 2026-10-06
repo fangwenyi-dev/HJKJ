@@ -1,0 +1,339 @@
+"""v4.2 ASR 双引擎选择/回落/换绑/输出路径测试（SenseVoice 默认 + Paraformer 兼容档）。
+
+钉桩点（2026-09-13 换引擎定案的行为契约）：
+  ① stt.local_model 默认 sensevoice，model_key 随配置解析（_loop_models 消费）；
+  ② 主档缺失/构建失败 → 自动回落 Paraformer（fail-open），回落态 stale_kind=True；
+  ③ 主档补就绪后 rebind_primary 原地换绑；推理在飞必须跳过（不断会话）；
+  ④ SenseVoice 路径：剥离 <|zh|> 类标签、不补尾静音（离线模型无 600ms 整块丢尾坑）；
+  ⑤ Paraformer 路径：1s 尾部补静音定案原样保留（回归 2026-09-08 丢尾事故）；
+     且**无 _hj_kind 标记的替身默认走此路径**（test_concurrency_guards 兼容）。
+"""
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core import asr as asr_mod                      # noqa: E402
+from core.asr import AsrEngine, KEY_PF, KEY_SV       # noqa: E402
+
+
+class S:
+    def __init__(self, **kw):
+        self.d = kw
+
+    def get(self, k, default=None):
+        return self.d.get(k, default)
+
+
+class Store:
+    def __init__(self, ready_keys=(), ensure_noop=True):
+        self.ready = set(ready_keys)
+        self.ensure_calls = []
+        self.async_calls = []
+        self.base = Path("/models")
+
+    def model_dir_for(self, key):
+        return self.base / key if key in self.ready else None
+
+    def ensure(self, key):
+        self.ensure_calls.append(key)
+        return key in self.ready
+
+    def ensure_async(self, key, force=False):
+        self.async_calls.append(key)
+
+
+class PfStream:
+    def __init__(self):
+        self.chunks = []
+        self.finished = False
+
+    def accept_waveform(self, rate, data):
+        self.chunks.append((rate, len(data)))
+
+    def input_finished(self):
+        self.finished = True
+
+
+class PfRec:
+    kind = "paraformer"
+
+    def __init__(self):
+        self.stream = PfStream()
+        self.decoded = 0
+
+    def create_stream(self):
+        self.stream = PfStream()
+        return self.stream
+
+    def is_ready(self, s):
+        if self.decoded == 0:
+            self.decoded += 1
+            return True
+        return False
+
+    def decode_stream(self, s):
+        pass
+
+    def get_result_all(self, s):
+        return type("R", (), {"text": "打开客厅▁射灯"})()
+
+    def reset(self, s):
+        pass
+
+
+class SvStream:
+    def __init__(self):
+        self.accepted = 0
+
+    def accept_waveform(self, rate, data):
+        self.accepted += len(data)
+
+    result = type("R", (), {"text": "<|zh|><|NEUTRAL|><|Speech|><|woitn|>打开客厅的射灯"})()
+
+
+class SvRec:
+    kind = "sensevoice"
+
+    def __init__(self):
+        self.stream = None
+
+    def create_stream(self):
+        self.stream = SvStream()
+        return self.stream
+
+    def decode_stream(self, s):
+        pass
+
+    def reset(self, s):
+        pass
+
+
+def make_engine(settings, store, fail_kinds=()):
+    eng = AsrEngine(settings, store)
+
+    def fake_build(kind, d):
+        if kind in fail_kinds:
+            raise RuntimeError(f"boom {kind}")
+        rec = SvRec() if kind == "sensevoice" else PfRec()
+        rec._hj_kind = kind
+        return rec
+
+    eng._build_recognizer = fake_build
+    return eng
+
+
+PCM = b"\x01\x00" * 8000   # 0.5s s16le@16k
+
+
+def test_default_kind_and_model_key():
+    eng = make_engine(S(), Store())
+    assert eng._primary_kind() == "sensevoice"
+    assert eng.model_key == KEY_SV
+    eng2 = make_engine(S(**{"stt.local_model": "paraformer"}), Store())
+    assert eng2.model_key == KEY_PF
+    eng3 = make_engine(S(**{"stt.local_model": "瞎写的值"}), Store())
+    assert eng3.model_key == KEY_SV, "未知值必须安全回默认 sensevoice"
+
+
+def test_sv_loads_by_default():
+    store = Store(ready_keys={KEY_SV})
+    eng = make_engine(S(), store)
+    assert eng.ensure_loaded() is True
+    assert eng.loaded_kind() == "sensevoice"
+    assert store.ensure_calls == []
+
+
+def test_fallback_to_paraformer_when_sv_broken():
+    store = Store(ready_keys={KEY_SV, KEY_PF})
+    eng = make_engine(S(), store, fail_kinds=("sensevoice",))
+    assert eng.ensure_loaded() is True, "主档坏了也必须能识别（fail-open）"
+    assert eng.loaded_kind() == "paraformer"
+    assert eng.stale_kind() is True
+
+
+def test_missing_primary_dir_defers_download_and_fails_open():
+    """v1.1.13（F3 根修）：主档目录缺失此前走**同步** ensure——在请求热路径的
+    executor 线程里跑分钟级跨境下载，设备侧 T_AWAITING=20s 先超时 ⇒ 无应答也无报错。
+    现只查在盘，缺失转交后台补取（main._loop_models 本就在带退避重下），当轮快败。
+    fail-open 到 Paraformer 的既有行为必须原样保住。"""
+    store = Store(ready_keys={KEY_PF})          # sv 目录缺
+    eng = make_engine(S(), store)
+    assert eng.ensure_loaded() is True, "主档缺失仍要能识别（fail-open 不回归）"
+    assert store.ensure_calls == [], "热路径不得再触发同步下载（分钟级挂死的根因）"
+    assert store.async_calls == [KEY_SV], "缺失必须转交后台补取，否则永远没人下"
+    assert eng.loaded_kind() == "paraformer"
+
+
+def test_hot_path_does_not_block_on_slow_download():
+    """反向钉（比调用序列更贴近"别挂死"这个真实诉求）：把同步 ensure 换成"睡 5 秒"，
+    主档+回落档目录都缺 ⇒ 快败路径必须远早于 5s 返回。若有人把同步下载接回热路径，
+    本钉在时限处直接红（家网实锤形态：每轮语音挂在该线程，面板与语音侧同哑）。"""
+    store = Store(ready_keys=set())
+    store.ensure = lambda key: (time.sleep(5.0), key in store.ready)[1]
+    eng = make_engine(S(), store)
+    t0 = time.perf_counter()
+    assert eng.ensure_loaded() is False, "两档都不在盘＝本轮无结果"
+    took = time.perf_counter() - t0
+    assert took < 1.0, f"热路径被同步下载挂死（{took:.1f}s）——F3 回归"
+    assert store.async_calls == [KEY_SV, KEY_PF], "快败仍要把两档都推给后台补下"
+
+
+def test_both_dirs_missing_sets_named_reason():
+    """空结果必须带得出具名分因：设备侧此前只能看到 text:""，与真静音逐字节同形。"""
+    store = Store(ready_keys=set())
+    eng = make_engine(S(), store)
+    assert eng.ensure_loaded() is False
+    assert "模型资产缺失" in eng.last_reason and KEY_SV in eng.last_reason
+
+
+def test_rebind_primary_after_main_arrives():
+    store = Store(ready_keys={KEY_PF})
+    eng = make_engine(S(), store)
+    assert eng.ensure_loaded() and eng.loaded_kind() == "paraformer"
+    store.ready.add(KEY_SV)                     # 后台下载完成
+    eng._busy = 1
+    assert eng.rebind_primary() is False, "推理在飞不得换绑"
+    eng._busy = 0
+    assert eng.rebind_primary() is True
+    assert eng.loaded_kind() == "sensevoice"
+    assert eng.stale_kind() is False
+
+
+def test_explicit_paraformer_never_falls_sideways():
+    store = Store(ready_keys={KEY_SV, KEY_PF})
+    eng = make_engine(S(**{"stt.local_model": "paraformer"}), store)
+    assert eng.ensure_loaded() is True
+    assert eng.loaded_kind() == "paraformer"
+    assert eng.stale_kind() is False, "显式选 paraformer 时它就是主档，无换绑诉求"
+
+
+def test_sv_transcribe_strips_tags_and_no_tail_pad():
+    eng = make_engine(S(), Store(ready_keys={KEY_SV}))
+    eng.ensure_loaded()
+    text = eng._local_transcribe(PCM)
+    assert text == "打开客厅的射灯"
+    assert "<|" not in text and "|" not in text
+    assert eng._rec.stream.accepted == 8000, "SenseVoice 不补 1s 尾静音（离线模型无丢尾坑）"
+
+
+def test_pf_transcribe_keeps_tail_padding_and_markerless_compat():
+    eng = make_engine(S(**{"stt.local_model": "paraformer"}), Store(ready_keys={KEY_PF}))
+    eng.ensure_loaded()
+    text = eng._local_transcribe(PCM)
+    assert text == "打开客厅 射灯", "▁→空格处理保留"
+    last = eng._rec.stream.chunks[-1]
+    assert last == (16000, 16000), "尾部必须有 1s 整静音块（2026-09-08 丢尾事故钉桩）"
+    assert eng._rec.stream.finished is True
+    # 无标记替身（并发守卫同款注入）默认走 pf 路径
+    eng._rec = PfRec()
+    assert eng._local_transcribe(PCM) != "", "无 _hj_kind 的替身必须兼容旧路径"
+
+
+def test_lock_entry_pins_sensevoice_int8():
+    lock = json.loads((Path(__file__).resolve().parents[1] / "models.lock.json")
+                      .read_text(encoding="utf-8"))
+    e = lock["asr_sensevoice_small"]
+    assert e["required_files"] == ["model.int8.onnx", "tokens.txt"], "绝不钉 fp32 model.onnx"
+    assert e["sha256"] == "f6b2a72ebcb1ac7a764d4cfccd886e6bcb2a95c4657c2199d0ba95ed4b9ea71a"
+    assert e["urls"][0].startswith("https://gh-proxy.com/"), "第一源必须国内可达"
+    assert lock["asr_paraformer_bilingual"]["default_provider"] is False
+    assert lock["asr_paraformer_bilingual"]["required_files"], "回落档文件不得删"
+
+
+def test_settings_defaults_local_model_present_for_merge():
+    """存量 settings.json 无 local_model 键——升级后必须靠 DEFAULTS 深合并拿到默认。"""
+    from core.settings import DEFAULTS
+    assert DEFAULTS["stt"]["local_model"] == "sensevoice"
+    assert DEFAULTS["stt"]["provider"] == "local_paraformer", "provider 值空间兼容 pin 不得改"
+
+
+def _readiness_snippet(code_text, rel):
+    """从 shell 脚本里摘出就绪判据那段 `python -c '...'` 本体（不复制逻辑）。"""
+    import re
+    m = re.search(r"'(import json,os,sys.*?print\(\"yes\".*?\)\s*)'", code_text, re.S)
+    assert m, f"{rel}: 摘不到就绪判据片段（脚本结构变了要同步本钉）"
+    return m.group(1)
+
+
+def _run_readiness(snippet, health, lock):
+    """按脚本同样的方式真跑一次：health JSON 走 stdin、HJ_LOCK 指临时 lock。"""
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                 encoding="utf-8") as lf:
+        _json.dump(lock, lf)
+        lock_path = lf.name
+    try:
+        env = dict(_os.environ, HJ_LOCK=lock_path)
+        out = _sp.run([sys.executable, "-c", snippet],
+                      input=_json.dumps(health), capture_output=True,
+                      text=True, encoding="utf-8", env=env, timeout=30)
+        return (out.stdout or "").strip()
+    finally:
+        _os.unlink(lock_path)
+
+
+def test_e2e_need_is_derived_from_lock_not_hardcoded():
+    """两 e2e 脚本的 models 就绪等待集必须**从 models.lock 派生**（default_provider:true）。
+
+    v1.1.10 补把它写死成 melo 字面量，同一版的 CHANGELOG 却声称"对默认档翻转免疫"
+    ——换个默认档就又漂一次（本次审计实证）。派生后同时与代码主档对账：
+    ASR=KEY_SV、TTS=PROVIDER_MODEL_KEYS[DEFAULTS.tts.provider]。"""
+    import json
+    root = Path(__file__).resolve().parents[1]
+    from core.settings import DEFAULTS
+    from core.tts import PROVIDER_MODEL_KEYS
+    lock = json.loads((root / "models.lock.json").read_text(encoding="utf-8"))
+    want = {k for k, v in lock.items()
+            if isinstance(v, dict) and v.get("default_provider")}
+    assert want == {KEY_SV, PROVIDER_MODEL_KEYS[DEFAULTS["tts"]["provider"]]}, want
+    for rel in ("tests/e2e/run_e2e.sh", "tests/e2e/run_local.sh"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert "default_provider" in src, f"{rel}: need 集未从 lock 派生（写死的键会漂）"
+        for hard in (KEY_SV, "tts_melo_zh_en", "tts_kokoro_multilang"):
+            assert hard not in src, f"{rel}: need 集仍写死 {hard}"
+        # v1.1.36（2026-10-01）：就绪门必须看**引擎真装态**。
+        # ⚠ 这条第一轮写成 `assert "asr_loaded" in src` —— 被我自己写的注释逐字
+        # 满足，把整段闸表达式删掉全量仍零红（独立复核实证 M11 全绿＝假绿）。
+        # 现改为**跑判据本体**：把脚本里那段 python 片段抽出来，喂两种 health JSON，
+        # 只有真装态才许放行。文本匹配一律只在剥掉注释的代码行上做。
+        code = "\n".join(ln for ln in src.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        snippet = _readiness_snippet(code, rel)
+        cases = [
+            ({"models_ready": {k: True for k in want},
+              "asr_loaded": False, "tts_loaded": True}, "", "包解好但引擎没装载必等"),
+            ({"models_ready": {k: True for k in want},
+              "asr_loaded": True, "tts_loaded": False}, "", "同上（TTS 侧）"),
+            ({"models_ready": {k: True for k in want},
+              "asr_loaded": True, "tts_loaded": True}, "yes", "真装态才放行"),
+        ]
+        for health, expect, why in cases:
+            got = _run_readiness(snippet, health, lock)
+            assert got == expect, f"{rel}: {why}（实得 {got!r}）"
+
+
+def test_e2e_scripts_wait_on_need_not_full_lock():
+    """v1.0.28 CI 实红（run 34364440982，E2E 25min 超时）：两 e2e 脚本的 models
+    就绪等待集必须是「运行期 need」——paraformer 降回落档后新装根本不主动下载，
+    等 lock 全清单 all() 恒假。
+
+    v1.1.17 随脚本改派生形同步改写：need 由 models.lock 的 default_provider 派生
+    （见 test_e2e_need_is_derived_from_lock_not_hardcoded），本钉只守**不得退回全清单等待**。"""
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("tests/e2e/run_e2e.sh", "tests/e2e/run_local.sh"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert "HJ_LOCK" in src and "models.lock.json" in src, \
+            f"{rel}: need 派生接线丢失（等待集又变成本地常量？）"
+        # 只判**代码行**：注释里记着这句历史（"all(models_ready.values()) 恒 false"），
+        # 扫到注释会把钉弄红一次、红过的钉就会被删掉（本仓 v1.1.12 的教训）。
+        code = "\n".join(ln for ln in src.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert "models_ready.values()" not in code and "m.values()" not in code, \
+            f"{rel}: 退回『等 lock 全清单』旧式（新装永不就绪）"

@@ -1,4 +1,17 @@
 # https://developers.home-assistant.io/docs/apps/repository#repository-configuration
-name: 慧尖 HA 网关插件仓库
+#
+# 一个商店仓 · 两个加载项（2026-10-06 语音侧并入自 huijian-gateway-plugin-yy）：
+#   huijian_mqtt_broker/  慧尖 LoRa 网关   镜像 ghcr.1ms.run（v1.7.x）
+#   huijian_voice/        慧尖HA语音插件   镜像阿里云 ACR  （v1.1.x）
+# 两者独立镜像、独立版本号、独立发版链（.github/workflows/ci.yaml 与 ci-voice.yaml）。
+# 并的是**商店仓**，不是加载项——语音侧 v4.1「不并入 LoRa 网关加载项」定案仍然成立
+# （镜像体积/重启爆炸半径/发布节奏/资源隔离/产品边界五理由针对的是"合成一个加载项"）。
+#
+# ⚠ name 只决定商店卡标题。Supervisor 给加载项编的身份是
+#   f"{sha1(用户注册的那个 URL)[:8]}_{config.yaml 里的 slug}"
+#   （supervisor/store/utils.py:12-15 + store/data.py:240）⇒ **本仓的 GitHub 仓名与
+#   URL 都不许改**：换 URL＝换 hash＝网关侧全体已装用户 slug 变＝要求所有人重装，
+#   且旧仓在有人装着的时候根本删不掉（store/__init__.py:247-251）。
+name: 慧尖科技
 url: 'https://github.com/fangwenyi-dev/ha-gateway-plugin'
 maintainer: fangwenyi-dev

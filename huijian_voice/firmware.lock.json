@@ -1,0 +1,135 @@
+{
+  "_doc": "ESP32 卫星固件发布锁（OTA 方案 Phase 2）。releases 每条=一个可下发版本：version(x.y.z)/file(public 目录内落盘名)/urls(按容灾顺序 gh-proxy 代理→GitHub 直连→Gitee 兜底，私有仓须内嵌一次性访问串)/sha256(64hex 必填，缺=拒下载)/size/notes_zh(对外话术，受内部文档禁发约束)/min_compatible。镜像内置文件之外，/data/firmware/firmware.lock.json 同名整文件优先（现场热修不重打镜像）。版本值以固件仓 release 实测为准，禁止凭记忆填写。",
+  "releases": [
+    {
+      "version": "2.1.74",
+      "file": "huijian-s3-2.1.74.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.29/huijian-s3-2.1.74.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.29/huijian-s3-2.1.74.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.29/huijian-s3-2.1.74.bin"
+      ],
+      "sha256": "5bc7db28b9b4f02270874ecb6e6bc58f2e8df864252c4b3927d13518cd1532fc",
+      "size": 2580832,
+      "notes_zh": "修两处 P1：① BLE 走 CMD21 做 OTA 准备时在 NimBLE 回调里阻塞约 4 秒（协议收发锁被按住、断连与应答全停摆）——改为排回主任务执行，受理帧语义逐字不变；② ML307 联网启动 `StartNetwork()` 因上游等待段被整段注释成空壳而永不返回（其后模组信息打印与板级初始化全部不可达）——摘掉自旋壳，改由事件驱动。**出货构型零行为变化**（①仅 BLE OTA 路径、②对应板型不在出货线）。同时带上 v2.1.72（播报收尾归属窗丢唤醒）与 v2.1.73（会话腿 AFE 失败可表达）台架复测。台架（v3 板 gujian-s3-aec-v3 / COM25）：版本行 2.1.74、I2C 探针 1 条、task_wdt 0、Guru/Backtrace/abort 0/0/0、SRAM free 147KB(39.9%)；近讲/−12dB 各 6 轮唤醒 12/12、延时 1.47–1.67s、崩溃 0；归属窗专项 6 轮窗内 4/4 受理。bin 为 v2.1.74 发布构建（app 镜像 2,580,832B，版本戳与 md5 与固件仓 release 正文逐字对账），由固件仓镜像至本公开 release",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.72",
+      "file": "huijian-s3-2.1.72.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.27/huijian-s3-2.1.72.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.27/huijian-s3-2.1.72.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.27/huijian-s3-2.1.72.bin"
+      ],
+      "sha256": "86dd358ed3203ed1488da2d7e2c1e40bd82eaab0b5506ef68f5ec4917945bf1b",
+      "size": 2579936,
+      "notes_zh": "修「播报刚说完马上喊唤醒词喊不醒（要说两次）」：根因不是唤醒率/AEC/音量，而是播报收尾约 3 秒的归属窗把已检出的唤醒词静默丢弃（那一刻状态判定误认成「已在听」直接 return，而麦已关、没人接这句话）；台架同段音频对照=窗外 6/6 全醒、窗内 2/2 全丢。现改为收尾窗内唤醒即打断并重开一轮，并新增一条自证日志行。**出货默认值零变化**。bin 为 v2.1.72 发布构建（app 镜像 2,579,936B，版本戳与 md5 均与固件仓 release 正文逐字对账），由固件仓镜像至本公开 release",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.71",
+      "file": "huijian-s3-2.1.71.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.26/huijian-s3-2.1.71.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.26/huijian-s3-2.1.71.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.26/huijian-s3-2.1.71.bin"
+      ],
+      "sha256": "6ff1cc2b4bc1da1888664d9ddc9a7eb53c822c5c92a66a304c2d91cd4e6d401d",
+      "size": 2579744,
+      "notes_zh": "麦克风链四条真 bug 修复（出货默认值零变化）：空闲期写 AEC 开关不再物化约 26KB 内部 RAM；音量写与 I2C 探针串行化、探针一次化且失败不缓存（消除超时连环导致的崩溃与整机失聪）；麦列前置增益改吃到达序缓冲（此前打在回采列上）；音频读失败如实返回 0 且采集任务不再自删（一次瞬时读错不再等于永久失聪）；TWDT 启动噪声清零。bin 为 v2.1.71 发布构建（app 镜像 2,579,744B，版本戳与 md5 均与固件仓 release 正文逐字对账），由固件仓镜像至本公开 release",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.70",
+      "file": "huijian-s3-2.1.70.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.25/huijian-s3-2.1.70.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.25/huijian-s3-2.1.70.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.25/huijian-s3-2.1.70.bin"
+      ],
+      "sha256": "3638f6dad707d15031d7f3d10d027f2d0efe7b22e2b4d7ec5a2fdbccc5a534da",
+      "size": 2579264,
+      "notes_zh": "证据面批（不改音频行为、不动出货默认值）：三处自证行订正 + S6c 守卫改「钉结构+反向」+ AGC 旋钮 A/B 记账——让现场日志说真话、把台架结论入账；并入 2.1.68 的 F7 上行尾包修复（弱网「说了没反应」整轮 20 秒根因）与 2.1.69 死旋钮收口。bin 为 v2.1.70 发布构建（app 镜像，版本戳 2.1.70 已核），由固件仓镜像至本公开 release",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.67",
+      "file": "huijian-s3-2.1.67.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.13/huijian-s3-2.1.67.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.13/huijian-s3-2.1.67.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.13/huijian-s3-2.1.67.bin"
+      ],
+      "sha256": "d44b22962667c0c2e80f399c7e9a80501ba9ea08c12f7f06777eb552923bc9c2",
+      "size": 2578192,
+      "notes_zh": "播报不吞首字（设备侧接管 HA 先到的播报流；台架实测请求可晚到 2.67s，接管窗已由 2s 放宽到 5s，冷启动首轮不再丢约 1.1s 头部）+ 固件版本号自报纠正（2.1.65 的 bin 一直自报 2.1.64，面板与升级判据错位一号）+ 删除已无调用方的 BLE 改名上报链；建议升级。本条目起 OTA 载荷改为 **app 镜像**（2.1.66 登记的是产线用的合并出厂镜像，超设备槽容量、下发必被拒，故不入账）。bin 由固件仓 v2.1.67(私仓) 镜像至本公开 release",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.65",
+      "file": "huijian-s3-2.1.65.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.8/huijian-s3-2.1.65.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.8/huijian-s3-2.1.65.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.1.8/huijian-s3-2.1.65.bin"
+      ],
+      "sha256": "f95514e2bac03558f1acd3df2113aa9d9d815ecb3e6f04ded9b868eaec310fcd",
+      "size": 8786984,
+      "notes_zh": "远场/嘈杂实测出货档：共享单AFE(SE关)+设备侧AEC+双麦MMR+端点闸1500。**本条是产线合并出厂镜像**（含 bootloader+分区表+otadata，8,786,984B 远超设备 OTA 槽 4,128,768B）——urls 只作**近场领取/产线烧录**用，OTA 下发会被容量闸当场拦下（OTA 请走 2.1.67 app 镜像）；bin 由固件仓 v2.1.65(私仓) 镜像至本公开 release",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.48",
+      "file": "huijian-s3-2.1.48.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.82/huijian-s3-2.1.48.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.82/huijian-s3-2.1.48.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.82/huijian-s3-2.1.48.bin"
+      ],
+      "sha256": "9a4c2685884ee35631a831ade8476fb4238d06f317bdea772ceb0a7de3a0b9e7",
+      "size": 2859488,
+      "notes_zh": "无应答自愈补播：HA 忙时那句唤醒自动重放，不必重说",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.47",
+      "file": "huijian-s3-2.1.47.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.81/huijian-s3-2.1.47.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.81/huijian-s3-2.1.47.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.81/huijian-s3-2.1.47.bin"
+      ],
+      "sha256": "3286b5ecefdb2758cd9bc7231ab8cf265bd713a87c95a441b4c141fe2bb2db0f",
+      "size": 2858944,
+      "notes_zh": "连续对话开关生效、语速自适应、长播报完整，建议升级",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.44",
+      "file": "huijian-s3-2.1.44.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.76/huijian-s3-2.1.44.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.76/huijian-s3-2.1.44.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.76/huijian-s3-2.1.44.bin"
+      ],
+      "sha256": "34385d817e51fb7b12705d4d1257fec76dd07a6b54c5528833d326d38144f212",
+      "size": 2858112,
+      "notes_zh": "语速自适应+长播报完整+省电地雷拆除，建议升级",
+      "min_compatible": "2.1.36"
+    },
+    {
+      "version": "2.1.43",
+      "file": "huijian-s3-2.1.43.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.75/huijian-s3-2.1.43.bin",
+        "https://github.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.75/huijian-s3-2.1.43.bin",
+        "https://gitee.com/fangwenyi-dev/huijian-gateway-plugin-yy/releases/download/v1.0.75/huijian-s3-2.1.43.bin"
+      ],
+      "sha256": "043c0e88aea13f8cf09dd729a217bd408fe911f3af4417d2e8ef04f71848269c",
+      "size": 2858112,
+      "notes_zh": "长播报与常聆听稳定性增强，建议升级",
+      "min_compatible": "2.1.36"
+    }
+  ]
+}

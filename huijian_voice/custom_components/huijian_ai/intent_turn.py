@@ -1,0 +1,965 @@
+import asyncio
+import logging
+from contextvars import ContextVar
+from typing import Any, Literal
+
+import voluptuous as vol
+from homeassistant.components.button.const import DOMAIN as BUTTON_DOMAIN
+from homeassistant.components.button.const import \
+    SERVICE_PRESS as SERVICE_PRESS_BUTTON
+from homeassistant.components.cover.const import DOMAIN as COVER_DOMAIN
+from homeassistant.components.input_button import DOMAIN as INPUT_BUTTON_DOMAIN
+from homeassistant.components.lock.const import DOMAIN as LOCK_DOMAIN
+from homeassistant.components.valve.const import DOMAIN as VALVE_DOMAIN
+from homeassistant.const import (ATTR_ENTITY_ID, SERVICE_CLOSE_COVER,
+                                 SERVICE_CLOSE_VALVE, SERVICE_LOCK,
+                                 SERVICE_OPEN_COVER, SERVICE_OPEN_VALVE,
+                                 SERVICE_TURN_OFF, SERVICE_TURN_ON,
+                                 SERVICE_UNLOCK)
+from homeassistant.core import State
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import intent
+from homeassistant.util.json import JsonObjectType
+
+from .intent_helper import (EntityInfo, HaDeviceItem, HaTargetItem,
+                            match_intent_entities, target_parameter_type,
+                            validate_slots_safely)
+from .intent_window_const import normalize_chinese_numbers
+
+_LOGGER = logging.getLogger(__name__)
+
+# 第四轮审计 P1（turn 族逐台真值）：本轮服务调用的失败原因收集桶。
+# contextvars 天然按任务隔离——handler 是共享单例，用实例属性会跨并发请求串台。
+# handle_match_target 包装器安装/复位，_run_then_background 追加。
+# （intent_lock 已按"逐台真值"根修；turn 族此前只 log，失败设备照进
+# control_targets、整单 success:True，谎报直达用户耳朵。）
+_CALL_FAILURES: ContextVar[list | None] = ContextVar(
+    "huijian_turn_call_failures", default=None)
+
+
+class TurnDeviceIntentBase(intent.IntentHandler):
+    """Base class for TurnDeviceOn and TurnDeviceOff intent handlers.
+
+    Handles device control with special handling for window devices.
+    When LLM routes window commands to TurnDeviceOn/Off (instead of ControlWindow),
+    this class separates window targets from non-window targets and handles them
+    using button press logic for correct multi-button handling.
+
+    Attributes:
+        service_timeout: Timeout for service calls in seconds.
+    """
+
+    service_timeout = 5
+
+    async def _async_handle(
+        self,
+        intent_obj: intent.Intent,
+        slots: dict[str, Any],
+        service: Literal["turn_on", "turn_off", "huijian_pause"],
+    ) -> JsonObjectType:
+        """Handle TurnDeviceOn/TurnDeviceOff or PauseDevice (huijian_pause) intent.
+
+        Args:
+            intent_obj: Home Assistant intent object.
+            slots: Intent slots containing target information.
+            service: "turn_on", "turn_off", or v1.0.42 "huijian_pause".
+
+        Returns:
+            JSON object with success status and control targets.
+        """
+        targets: list[HaTargetItem] = slots.get("target", {}).get("value", [])
+
+        window_device_list: list[tuple[str | None, str | None]] = []
+        non_window_targets: list[HaTargetItem] = []
+
+        for target in targets:
+            area_name = target.get("area", "")
+            window_devices: list[HaDeviceItem] = []
+            non_window_devices: list[HaDeviceItem] = []
+
+            for device in target.get("devices", []):
+                domains = device.get("domains", [])
+                name = device.get("name")
+                # v1.0.42：暂停走通用实体路径（cover 停走由 _handle_pause_match 处理），
+                # 不进窗户按钮按压逻辑。
+                if self._is_window_target(domains, name) and service != "huijian_pause":
+                    window_devices.append(device)
+                else:
+                    non_window_devices.append(device)
+
+            for wd in window_devices:
+                window_device_list.append((area_name, wd.get("name")))
+
+            if non_window_devices:
+                non_window_targets.append(
+                    {
+                        "area": area_name,
+                        "devices": non_window_devices,
+                    }
+                )
+
+        window_control_targets: list[dict[str, str]] = []
+        window_errors: list[str] = []
+        # v1.1.38（外部审计 #4 复现成立）：窗侧**部分失败**原来在这条转发链上被吞掉——
+        # `_handle_window_device` 对 2 扇窗成 1 扇败返回
+        # {"success": True, "message": "…但N扇未成功：…"}，而旧代码在 success 支只取
+        # control_targets、message 直接丢，末尾又回 `{"success": True, "control_targets": …}`
+        # ⇒ LLM 折算 ok=True/err=""、executor.speech 播「已打开」、场景回放 fold 回绿，
+        # 三条消费链全静默（直呼 ControlWindow 那条读 message 所以没事＝两条执行器口径不一致）。
+        window_partials: list[str] = []
+
+        for area_name, device_name in window_device_list:
+            result = await self._handle_window_device(
+                intent_obj, area_name, device_name, service
+            )
+            if result and result.get("success"):
+                _pe = str(result.get("partial_error") or "").strip()
+                if _pe and _pe not in window_partials:
+                    window_partials.append(_pe)
+                ct = result.get("control_targets", [{}])[0]
+                window_control_targets.append(
+                    {
+                        "name": ct.get("name", device_name or "窗户"),
+                        "area": area_name or "",
+                    }
+                )
+            else:
+                window_errors.append(
+                    f"{device_name or '窗户'} in {area_name or 'any area'}"
+                )
+
+        if not non_window_targets:
+            if window_control_targets:
+                out = {"success": True, "control_targets": window_control_targets}
+                if window_partials:
+                    # 字段名与直呼路径一致：executor/话术与 fold_action_ok 都读 partial_error
+                    out["partial_error"] = "；".join(window_partials)
+                return out
+            return {
+                "success": False,
+                "error": f"Window control failed: {', '.join(window_errors)}",
+            }
+
+        error_msg, candidate_entities = await match_intent_entities(
+            intent_obj, non_window_targets
+        )
+        if error_msg:
+            if window_control_targets:
+                result = {"success": True, "control_targets": window_control_targets}
+                if window_errors:
+                    result["partial_error"] = f"Window: {', '.join(window_errors)}"
+                return result
+            return error_msg
+        if not candidate_entities:
+            # 永不抛——未捕获异常=HTTP 500，加载项侧 message 被洗空、话术只剩
+            # 空括号（2026-09-11 真机实锤：客户 HA 内存里的老集成 assert 炸 500）。
+            return {"success": False, "error": "No available devices found"}
+
+        candidate_entities = self._filter_button_entities(candidate_entities, service)
+
+        dedup_device_ids: set[str] = set()
+        for item in candidate_entities:
+            if item.state.domain not in (BUTTON_DOMAIN, INPUT_BUTTON_DOMAIN):
+                device_id = item.entity.device_id
+                if device_id:
+                    dedup_device_ids.add(device_id)
+        deduped: list[EntityInfo] = []
+        for item in candidate_entities:
+            device_id = item.entity.device_id
+            if (
+                device_id
+                and device_id in dedup_device_ids
+                and item.state.domain in (BUTTON_DOMAIN, INPUT_BUTTON_DOMAIN)
+            ):
+                _LOGGER.info(
+                    "Skipping button '%s' (device_id=%s) - "
+                    "device already handled by non-button entity",
+                    item.name,
+                    device_id,
+                )
+                continue
+            deduped.append(item)
+        candidate_entities = deduped
+
+        control_targets = list(window_control_targets)
+        entity_key_map = set()
+        unsupported: list[str] = []
+        call_failed: list[str] = []
+        for item in candidate_entities:
+            _LOGGER.info(
+                f"Operate target: area={item.area_name} name={item.name} id={item.entity.id}"
+            )
+            ok = await self.handle_match_target(intent_obj, item.state, service)
+            if ok is False:
+                # v1.0.42 PauseDevice：不可暂停的域（灯/开关/锁…）不冒动、不谎报。
+                unsupported.append(item.name or item.state.entity_id)
+                continue
+            if isinstance(ok, str):
+                # 第四轮审计 P1：服务调用失败/超时的这台**不进** control_targets，
+                # 也不许整单报成功（旧形只 log，谎报直达用户耳朵）。
+                _LOGGER.warning(
+                    "服务调用未成功（如实记账，不进成功面）：%s → %s",
+                    item.name or item.state.entity_id, ok,
+                )
+                call_failed.append(f"{item.name or item.state.entity_id}：{ok}")
+                continue
+            entity_key = f"{item.area_name}-{item.name}"
+            if entity_key not in entity_key_map:
+                entity_key_map.add(entity_key)
+                control_targets.append({"name": item.name, "area": item.area_name})
+
+        if not control_targets and (unsupported or call_failed):
+            # v1.1.27：窗侧失败并入主返回——旧版只在"窗成灯败"分支消费
+            # window_errors，「关掉窗和灯」窗败灯成时返回体里毫无痕迹。
+            window_tail = (
+                "；窗控失败：" + "；".join(window_errors) if window_errors else ""
+            )
+            # 暂停语义话术原样保留（有钉）；其余服务（开关/锁…）域不支持时给通用话术——
+            # v1.1.24：域不支持本服务的候选现在走"跳过"路径（见 handle_match_target），
+            # 全部候选都被跳过时才算失败，且话术不能再挂"暂停"字样。
+            parts: list[str] = []
+            if unsupported:
+                parts.append(
+                    ("暂不支持暂停该设备：" if service == "huijian_pause"
+                     else "这些设备不支持该操作：") + "、".join(unsupported[:3])
+                )
+            if call_failed:
+                parts.append("这些设备没操作成功：" + "；".join(call_failed[:3]))
+            return {"success": False, "error": "；".join(parts) + window_tail}
+        result: dict[str, Any] = {
+            "success": True,
+            "control_targets": control_targets,
+        }
+        if window_errors or call_failed:
+            # 窗侧/调用失败（全败或部分败）一律并入主返回：失败腿不得只播"成功"。
+            segs: list[str] = []
+            if window_errors:
+                segs.append(f"Window: {', '.join(window_errors)}")
+            if call_failed:
+                segs.append("Failed: " + "；".join(call_failed))
+            result["partial_error"] = "；".join(segs)
+        return result
+
+    # v1.0.42 家电族：暂停语义的域→服务表（"停下当前动作"而非关机回舱）。
+    _PAUSE_CALLS = {
+        "vacuum": ("vacuum", "pause"),
+        "media_player": ("media_player", "media_pause"),
+        "cover": ("cover", "stop_cover"),
+    }
+
+    async def _handle_pause_match(
+        self, intent_obj: intent.Intent, state: State
+    ) -> bool:
+        """True=已派发暂停；False=该域无暂停语义（调用方不执行、计入失败面）。"""
+        pair = self._PAUSE_CALLS.get(state.domain)
+        if pair is None:
+            _LOGGER.info(
+                "Pause unsupported for %s (domain=%s)", state.entity_id, state.domain
+            )
+            return False
+        hass = intent_obj.hass
+        await self._run_then_background(
+            hass.async_create_task(
+                hass.services.async_call(
+                    pair[0],
+                    pair[1],
+                    {ATTR_ENTITY_ID: state.entity_id},
+                    context=intent_obj.context,
+                    blocking=True,
+                )
+            )
+        )
+        return True
+
+    async def handle_match_target(
+        self, intent_obj: intent.Intent, state: State, service: str
+    ) -> bool | str | None:
+        """逐台真值的唯一出口（第四轮审计 P1）。
+
+        None=已确认下发；False=该域不支持该服务（原语义，调用方计入"不支持"）；
+        str=服务调用**失败/未确认**的原因（调用方计入失败名单，绝不进
+        control_targets、绝不整单报成功）。"""
+        bucket: list[str] = []
+        token = _CALL_FAILURES.set(bucket)
+        try:
+            result = await self._handle_match_target(intent_obj, state, service)
+        finally:
+            _CALL_FAILURES.reset(token)
+        if result is False:
+            return False
+        return bucket[-1] if bucket else None
+
+    async def _handle_match_target(
+        self, intent_obj: intent.Intent, state: State, service: str
+    ) -> bool | None:
+        hass = intent_obj.hass
+        # v1.0.42 PauseDevice：暂停语义只对有"暂停"概念的设备成立
+        # （vacuum.pause / media_player.media_pause / cover.stop_cover）。
+        # 其余域返回 False——上层既不执行也不谎报成功（显式 False 是唯一
+        # 失败信号，既有分支隐式 None 一律视为成功，零回归）。
+        if service == "huijian_pause":
+            return await self._handle_pause_match(intent_obj, state)
+        if state.domain in (BUTTON_DOMAIN, INPUT_BUTTON_DOMAIN):
+            await self._run_then_background(
+                hass.async_create_task(
+                    hass.services.async_call(
+                        state.domain,
+                        SERVICE_PRESS_BUTTON,
+                        {ATTR_ENTITY_ID: state.entity_id},
+                        context=intent_obj.context,
+                        blocking=True,
+                    )
+                )
+            )
+            return
+
+        if state.domain == COVER_DOMAIN:
+            # on = open
+            # off = close
+            if service == SERVICE_TURN_ON:
+                service_name = SERVICE_OPEN_COVER
+            else:
+                service_name = SERVICE_CLOSE_COVER
+
+            await self._run_then_background(
+                hass.async_create_task(
+                    hass.services.async_call(
+                        COVER_DOMAIN,
+                        service_name,
+                        {ATTR_ENTITY_ID: state.entity_id},
+                        context=intent_obj.context,
+                        blocking=True,
+                    )
+                )
+            )
+            return
+
+        if state.domain == LOCK_DOMAIN:
+            # on = lock
+            # off = unlock
+            if service == SERVICE_TURN_ON:
+                service_name = SERVICE_LOCK
+            else:
+                service_name = SERVICE_UNLOCK
+
+            await self._run_then_background(
+                hass.async_create_task(
+                    hass.services.async_call(
+                        LOCK_DOMAIN,
+                        service_name,
+                        {ATTR_ENTITY_ID: state.entity_id},
+                        context=intent_obj.context,
+                        blocking=True,
+                    )
+                )
+            )
+            return
+
+        if state.domain == VALVE_DOMAIN:
+            # on = opened
+            # off = closed
+            if service == SERVICE_TURN_ON:
+                service_name = SERVICE_OPEN_VALVE
+            else:
+                service_name = SERVICE_CLOSE_VALVE
+
+            await self._run_then_background(
+                hass.async_create_task(
+                    hass.services.async_call(
+                        VALVE_DOMAIN,
+                        service_name,
+                        {ATTR_ENTITY_ID: state.entity_id},
+                        context=intent_obj.context,
+                        blocking=True,
+                    )
+                )
+            )
+            return
+
+        if state.domain == "climate":
+            if not hass.services.has_service("climate", "set_hvac_mode"):
+                raise intent.IntentHandleError(
+                    f"Climate entity {state.entity_id} does not support set_hvac_mode"
+                )
+            if service == SERVICE_TURN_ON:
+                hvac_modes = state.attributes.get("hvac_modes", [])
+                target_mode = None
+                for preferred in (
+                    "heat_cool",
+                    "heat",
+                    "cool",
+                    "auto",
+                    "fan_only",
+                    "dry",
+                ):
+                    if preferred in hvac_modes:
+                        target_mode = preferred
+                        break
+                if not target_mode:
+                    raise intent.IntentHandleError(
+                        f"Climate entity {state.entity_id} has no available hvac mode"
+                    )
+                await self._run_then_background(
+                    hass.async_create_task(
+                        hass.services.async_call(
+                            "climate",
+                            "set_hvac_mode",
+                            {ATTR_ENTITY_ID: state.entity_id, "hvac_mode": target_mode},
+                            context=intent_obj.context,
+                            blocking=True,
+                        )
+                    )
+                )
+            else:
+                await self._run_then_background(
+                    hass.async_create_task(
+                        hass.services.async_call(
+                            "climate",
+                            "set_hvac_mode",
+                            {ATTR_ENTITY_ID: state.entity_id, "hvac_mode": "off"},
+                            context=intent_obj.context,
+                            blocking=True,
+                        )
+                    )
+                )
+            return
+
+        if state.domain == "alarm_control_panel":
+            if service == SERVICE_TURN_ON:
+                service_name = "alarm_arm_away"
+            else:
+                service_name = "alarm_disarm"
+            await self._run_then_background(
+                hass.async_create_task(
+                    hass.services.async_call(
+                        "alarm_control_panel",
+                        service_name,
+                        {ATTR_ENTITY_ID: state.entity_id},
+                        context=intent_obj.context,
+                        blocking=True,
+                    )
+                )
+            )
+            return
+
+        if state.domain == "vacuum":
+            if service == SERVICE_TURN_ON:
+                service_name = "start"
+            else:
+                service_name = "return_to_base"
+            await self._run_then_background(
+                hass.async_create_task(
+                    hass.services.async_call(
+                        "vacuum",
+                        service_name,
+                        {ATTR_ENTITY_ID: state.entity_id},
+                        context=intent_obj.context,
+                        blocking=True,
+                    )
+                )
+            )
+            return
+
+        if state.domain == "water_heater":
+            if not hass.services.has_service("water_heater", "set_operation_mode"):
+                raise intent.IntentHandleError(
+                    f"Water heater entity {state.entity_id} does not support set_operation_mode"
+                )
+            if service == SERVICE_TURN_ON:
+                modes = state.attributes.get("operation_modes", [])
+                target_mode = next((m for m in modes if m != "off"), None)
+                if not target_mode:
+                    raise intent.IntentHandleError(
+                        f"Water heater entity {state.entity_id} has no available operation mode"
+                    )
+                await self._run_then_background(
+                    hass.async_create_task(
+                        hass.services.async_call(
+                            "water_heater",
+                            "set_operation_mode",
+                            {
+                                ATTR_ENTITY_ID: state.entity_id,
+                                "operation_mode": target_mode,
+                            },
+                            context=intent_obj.context,
+                            blocking=True,
+                        )
+                    )
+                )
+            else:
+                await self._run_then_background(
+                    hass.async_create_task(
+                        hass.services.async_call(
+                            "water_heater",
+                            "set_operation_mode",
+                            {ATTR_ENTITY_ID: state.entity_id, "operation_mode": "off"},
+                            context=intent_obj.context,
+                            blocking=True,
+                        )
+                    )
+                )
+            return
+
+        if not hass.services.has_service(state.domain, service):
+            # v1.1.24（场景「我有点热」1/3 动作失败根因，HA 系统日志实锤：
+            # "Service turn_on does not support entity select.xiaomi_mc9_aeaf_fan_level"）：
+            # 宽域目标（加载项动态词表的域并集含 select/number 等不可 turn_on 的域）会把
+            # 该域实体一起带进候选——旧式 raise 让**一个** select 把整条动作判失败。
+            # 按"不适用"返回 False：调用方跳过并继续，其余实体照常执行。
+            _LOGGER.info(
+                "Skip entity %s: domain %s does not support service %s",
+                state.entity_id, state.domain, service,
+            )
+            return False
+
+        # Fall back to homeassistant.turn_on/off
+        service_data: dict[str, Any] = {ATTR_ENTITY_ID: state.entity_id}
+        _LOGGER.info("Operate target fallback: service=%s name=%s", service, service_data)
+        await self._run_then_background(
+            # 第四轮审计 C7：改用 HA 公开面 async_create_task（旧形用的
+            # async_create_task_internal 属非公开 API，跨版本随时可撤）。
+            hass.async_create_task(
+                hass.services.async_call(
+                    state.domain,
+                    service,
+                    service_data,
+                    context=intent_obj.context,
+                    blocking=True,
+                ),
+                f"intent_call_service_{state.domain}_{service}",
+            )
+        )
+
+    async def _run_then_background(self, task: asyncio.Task[Any]) -> None:
+        """Run task with timeout to (hopefully) catch validation errors.
+
+        After the timeout the task will continue to run in the background.
+
+        第四轮审计 P1：本方法被 handle_match_target 包装器装了失败收集桶
+        （_CALL_FAILURES，contextvars 按任务隔离）——失败/超时/取消在此**记账**，
+        调用方按真值决定该台是否进 control_targets（旧形只 log，失败设备照进
+        control_targets、整单 success:True；intent_lock 已同款根修，turn 族漏改）。
+        """
+        try:
+            done, pending = await asyncio.wait({task}, timeout=self.service_timeout)
+            if pending:
+                _LOGGER.error("Service call timed out: %s", task.get_name())
+
+                def _log_exception(t: asyncio.Task) -> None:
+                    if t.cancelled():
+                        return
+                    exc = t.exception()
+                    if exc:
+                        _LOGGER.error(
+                            "Background service call %s eventually failed: %s",
+                            t.get_name(), exc, exc_info=exc,
+                        )
+
+                task.add_done_callback(_log_exception)
+                self._record_call_failure(f"服务调用超时未确认（{task.get_name()}）")
+            elif done:
+                # v1.0.90（现场 18:09:11.983 与 10:25:41.742 复现的根因）：
+                # `asyncio.wait` **不会**取回已完成任务的异常，超时支有
+                # _log_exception 而"秒失败"支什么都没有 ⇒ 面积扇出里每个不支持
+                # 该 service 的实体（media_player.turn_off 这类
+                # ServiceNotSupported）都刷成 HA 全局
+                # `Error doing job: Task exception was never retrieved`，
+                # 把真因埋在一堆无主异常里（且本集成"永不抛全折叠"的纪律在此
+                # 漏了一半）。补齐另一半：异常在此消费并点名，不再进全局错误流。
+                for t in done:
+                    if t.cancelled():
+                        self._record_call_failure(
+                            f"服务调用被取消（{t.get_name()}）")
+                        continue
+                    exc = t.exception()
+                    if exc is not None:
+                        _LOGGER.warning(
+                            "服务调用失败（已消费，不再产生未取回异常）%s: %s",
+                            t.get_name(), exc,
+                        )
+                        self._record_call_failure(str(exc))
+        except asyncio.CancelledError:
+            _LOGGER.debug("Service call was cancelled: %s", task.get_name())
+            task.cancel()
+            await asyncio.wait({task}, timeout=5)
+            raise
+
+    @staticmethod
+    def _record_call_failure(reason: str) -> None:
+        """把失败原因记进本轮的收集桶（无桶=不在 handle_match_target 包装器内）。"""
+        bucket = _CALL_FAILURES.get()
+        if bucket is not None:
+            bucket.append(str(reason or "服务调用未确认"))
+
+    @staticmethod
+    def _is_window_target(domains: list[str], name: str | None) -> bool:
+        """Check if a device target is a window device.
+
+        Detects window devices by checking either:
+        1. Domain contains "window" or "windows"
+        2. Name contains any window type keyword from WINDOW_NAME_MAPPING
+
+        Args:
+            domains: List of domain strings from LLM.
+            name: Device name from LLM.
+
+        Returns:
+            True if the target is a window device, False otherwise.
+        """
+        # v1.1.27：帘族（帘/纱窗/百叶）与含"窗"家电（机器人）**先于域提示**判定
+        # ——它们不是按压窗控设备（intent_window_const.extract_window_name 顶部
+        # 同款短路，单一事实源）。旧版把排除表放在域提示之后且只挡"窗帘"：
+        # 「关纱窗/关百叶窗」被当窗控、extract 返 None 又被升级成"本区所有窗"
+        # （关一扇变关一排）；含窗家电在域提示为 window 时同型误入。
+        if name:
+            from .intent_device_shared import WINDOW_EXCLUDE_KEYWORDS
+
+            name_lower = name.lower().strip()
+            for ex in WINDOW_EXCLUDE_KEYWORDS:
+                if ex.lower() in name_lower:
+                    return False
+        if any(
+            d.lower() in ("window", "windows")
+            for d in (domains if isinstance(domains, list) else [])
+        ):
+            return True
+        if name:
+            from .intent_window_const import WINDOW_NAME_MAPPING
+
+            name_lower = name.lower().strip()
+            for key, value in WINDOW_NAME_MAPPING.items():
+                if key.lower() in name_lower or value.lower() in name_lower:
+                    return True
+        return False
+
+    async def _handle_window_device(
+        self,
+        intent_obj: intent.Intent,
+        area_name: str | None,
+        device_name: str | None,
+        service: str,
+    ) -> JsonObjectType | None:
+        """Handle window device control via button press.
+
+        Routes window commands to the appropriate button press logic.
+        For generic window names ("窗户", "窗"), finds all window buttons in the area.
+        For specific window types, finds the matching button entity.
+
+        Args:
+            intent_obj: Home Assistant intent object.
+            area_name: Area name where the window is located.
+            device_name: Device name from LLM (may be specific or generic).
+            service: "turn_on" or "turn_off".
+
+        Returns:
+            JSON object with success status if successful, None otherwise.
+        """
+        from .intent_window_const import (extract_window_name,
+                                          find_all_window_buttons_by_action,
+                                          find_window_buttons,
+                                          is_bare_window_name,
+                                          is_generic_window_name,
+                                          is_curtain_family)
+        from .intent_window_control import _all_window_result, _press_multi_buttons
+
+        action = "open" if service == "turn_on" else "close"
+
+        window_name = extract_window_name(device_name or "")
+
+        # v1.1.27：裸窗字（窗户/窗/窗子）改用 is_bare_window_name 判定——旧的
+        # 等值判定（device_name == extract 结果）在「窗子」上永不成立（extract
+        # 已归一成「窗户」），整句被当"具名窗"走精确单按钮路径：「窗子」被
+        # original_name 精确过滤全剔=failed，「窗」只按一扇而非本区全部。
+        # 与 ControlWindow 主路径（intent_window_control:455）同源同判。
+        is_all_ref = bool(window_name) and is_bare_window_name(device_name)
+        # v1.1.27-r2（金标复测）两道收紧：
+        #   ① 帘族（纱窗/百叶/帘）绝不按窗控——extract 顶层已裁，但
+        #      is_generic_window_name 含"窗"字会把帘族判成泛称，按钮对地形实测
+        #      被按成「关一扇＝同屋窗钮全按」；
+        #   ② 无区域不得升级成"全屋盲按"——只认显式全屋词（所有/全部/全都/每个），
+        #      与 ControlWindow 的泛称闸（intent_window_control:445）同口径。
+        generic_ref = (not window_name and is_generic_window_name(device_name)
+                       and not is_curtain_family(device_name))
+        _dn = device_name or ""
+        whole_house = any(w in _dn for w in ("所有", "全部", "全都", "每个"))
+        if (is_all_ref or generic_ref) and (area_name or whole_house):
+            buttons = find_all_window_buttons_by_action(
+                intent_obj.hass, area_name or "", action
+            )
+            if buttons:
+                # H4（2026-09-23 深审）：v1.0.52 A-F2 把 _press_multi_buttons 改
+                # 返回 (results, failed_msgs) 并给 window_control 两处解包，此处
+                # 第三消费者漏改——tuple 整体塞进 "buttons" 字段且无条件 success，
+                # 0/N 全败也播「已关闭所有窗户」。**改返回形态必须 grep 全消费点**
+                # （报告 §三 一族病第 3 次实锤，本钉含消费点计数断言）。
+                results, failed_msgs = await _press_multi_buttons(
+                    intent_obj.hass, intent_obj.context, action, buttons
+                )
+                _LOGGER.info(
+                    "Window all-devices via TurnDeviceOn: action=%s, area=%s, buttons=%s",
+                    action,
+                    area_name,
+                    results,
+                )
+                out = _all_window_result(area_name, action, results, failed_msgs)
+                out.setdefault("control_targets",
+                               [{"name": "窗户", "area": area_name or ""}])
+                return out
+            return None
+
+        if not window_name:
+            # extract 返 None 且**不是**泛称 = 具体名没识别上（ASR 丢字/旧版漏识）
+            # 或帘族（门帘/纱窗/百叶…）：绝不升级成本区全窗（一扇变一排，同
+            # intent_window_control:445 的如实拒收），交回上层如实失败或走非窗路径。
+            _LOGGER.info(
+                "Window name %r unrecognized - refusing all-window escalation",
+                device_name,
+            )
+            return None
+
+        button_map = find_window_buttons(
+            intent_obj.hass, window_name, area_name, original_name=device_name
+        )
+
+        # v1.0.71（开错房间事故）：曾有"本区没找到→摘掉区域重找"回捞——它把
+        # **别屋同名窗**当目标，静默跨区误执行。ControlWindow 主路径 2026-09-21
+        # 事故复盘已删同款；本转发路径同族同修：用户点名的区域是硬约束，
+        # 区内没有就如实失败，绝不拿别人家的窗凑数。
+        if action in button_map:
+            button_entity_id = button_map[action]
+            try:
+                await intent_obj.hass.services.async_call(
+                    BUTTON_DOMAIN,
+                    SERVICE_PRESS_BUTTON,
+                    {ATTR_ENTITY_ID: button_entity_id},
+                    context=intent_obj.context,
+                    blocking=True,
+                )
+                _LOGGER.info(
+                    "Window specific via TurnDeviceOn: pressed %s for %s in %s",
+                    button_entity_id,
+                    window_name,
+                    area_name,
+                )
+                return {
+                    "success": True,
+                    "control_targets": [{"name": window_name, "area": area_name or ""}],
+                }
+            except Exception as err:
+                _LOGGER.error(
+                    "Window specific via TurnDeviceOn: press failed %s: %s",
+                    button_entity_id,
+                    err,
+                )
+                return None
+
+        return None
+
+    @staticmethod
+    def _get_button_base_name(name: str) -> str:
+        name_lower = name.lower()
+        action_keywords = ["内倒", "内岛", "开启", "打开", "关闭", "停止", "暂停",
+                           "open", "close", "stop", "pause", "开", "关"]
+        for kw in action_keywords:
+            if name_lower.endswith(f" {kw}"):
+                return name[: -(len(kw) + 1)]
+        # 处理纯动作名称（无"设备名 "前缀的网关按钮）
+        # 网关集成因 has_entity_name=True，实体名可能只有 "开启" 而非 "设备名 开启"
+        _PURE_ACTION_NAMES = {
+            "开启",
+            "打开",
+            "open",
+            "关闭",
+            "close",
+            "暂停",
+            "停止",
+            "pause",
+            "stop",
+            "内倒",
+            "内岛",
+        }
+        if name_lower in _PURE_ACTION_NAMES:
+            return "__action__"
+        # 处理动词+名词复合动作名（如"开窗"→"开"、"关窗"→"关"）
+        # 提高对非标准命名的容错率
+        for kw in ("开", "关"):
+            if name_lower.startswith(kw) and len(name_lower) <= 2:
+                return "__action__"
+        return name
+
+    @staticmethod
+    def _button_matches_action(name: str, keywords: list[str]) -> bool:
+        name_lower = name.lower()
+        for kw in keywords:
+            if name_lower.endswith(f" {kw}") or name_lower == kw:
+                return True
+        # 处理复合动作名：如 "开启" → startswith("开")，匹配 "开" 关键词
+        # 处理网关 has_entity_name=True 场景下纯动作名的匹配
+        for kw in keywords:
+            if len(kw) == 1 and name_lower.startswith(kw):
+                return True
+        return False
+
+    def _filter_button_entities(
+        self, entities: list[EntityInfo], service: str
+    ) -> list[EntityInfo]:
+        result: list[EntityInfo] = []
+        button_groups: dict[str, list[EntityInfo]] = {}
+
+        for item in entities:
+            if item.state.domain not in (BUTTON_DOMAIN, INPUT_BUTTON_DOMAIN):
+                result.append(item)
+                continue
+
+            name_lower = item.name.lower()
+            if "内倒" in name_lower or "内岛" in name_lower:
+                _LOGGER.info(
+                    "Skipping tilt button '%s' - use ControlWindow instead", item.name
+                )
+                continue
+
+            base_name = self._get_button_base_name(item.name)
+            if base_name not in button_groups:
+                button_groups[base_name] = []
+            button_groups[base_name].append(item)
+
+        for base_name, group in button_groups.items():
+            if len(group) == 1:
+                result.append(group[0])
+            else:
+                if service == SERVICE_TURN_ON:
+                    preferred = next(
+                        (
+                            e
+                            for e in group
+                            if self._button_matches_action(
+                                e.name, ["开", "开启", "打开", "open"])
+                        ),
+                        None,
+                    )
+                else:
+                    preferred = next(
+                        (
+                            e
+                            for e in group
+                            if self._button_matches_action(
+                                e.name, ["关", "关闭", "close"])
+                        ),
+                        None,
+                    )
+
+                if preferred:
+                    result.append(preferred)
+                else:
+                    result.extend(group)
+
+        return result
+
+
+class TurnDeviceOnIntent(TurnDeviceIntentBase):
+    intent_type = "TurnDeviceOn"
+    description = (
+        "Turns on/opens/presses a device. "
+        "Use for: lights (e.g., '打开卧室筒灯'), buttons (e.g., '按场景按钮'), "
+        "covers/curtains (e.g., '打开窗帘'), climate/lock/valve/vacuum/alarm. "
+        "NOTE: Window commands (开窗/关窗) are automatically forwarded to ControlWindow. "
+        "Target format: target=[{devices: [{domains: ['light'], name: '筒灯'}], area: '卧室'}]."
+    )
+    service_timeout = 10
+
+    @property
+    def slot_schema(self) -> dict | None:
+        """Return a slot schema."""
+        return {
+            vol.Required("target"): target_parameter_type(),
+        }
+
+    async def async_handle(self, intent_obj: intent.Intent) -> JsonObjectType:  # type: ignore
+        """Get the current state of exposed entities."""
+        slots, fail = validate_slots_safely(self, intent_obj, "TurnDeviceOn")
+        if fail is not None:
+            return fail
+        _LOGGER.info("TurnDeviceOn slots=%s", slots)
+        # 归一化中文数字（如"五号"->"5号"），提高实体匹配成功率
+        slots = self._normalize_slots_device_names(slots)
+        return await super()._async_handle(intent_obj, slots, "turn_on")
+
+    @staticmethod
+    def _normalize_slots_device_names(slots: dict) -> dict:
+        """递归归一化 slots 中所有设备名称里的中文数字。"""
+        slots = dict(slots)
+        targets = slots.get("target", {}).get("value", [])
+        if targets:
+            slots["target"] = {"value": list(targets)}
+            for ti, target in enumerate(targets):
+                target = dict(target)
+                slots["target"]["value"][ti] = target
+                devices = target.get("devices", [])
+                if devices:
+                    target["devices"] = list(devices)
+                    for di, device in enumerate(devices):
+                        device = dict(device)
+                        target["devices"][di] = device
+                        if device.get("name"):
+                            device["name"] = normalize_chinese_numbers(device["name"])
+        return slots
+
+
+class TurnDeviceOffIntent(TurnDeviceIntentBase):
+    intent_type = "TurnDeviceOff"
+    description = (
+        "Turns off/closes a device. "
+        "Use for: lights (e.g., '关闭卧室筒灯'), covers/curtains (e.g., '关闭窗帘'), "
+        "climate/lock/valve/vacuum/alarm. "
+        "NOTE: Window commands (开窗/关窗) are automatically forwarded to ControlWindow. "
+        "Target format: target=[{devices: [{domains: ['light'], name: '筒灯'}], area: '卧室'}]."
+    )
+    service_timeout = 10
+
+    @property
+    def slot_schema(self) -> dict | None:
+        """Return a slot schema."""
+        return {
+            vol.Required("target"): target_parameter_type(),
+        }
+
+    async def async_handle(self, intent_obj: intent.Intent) -> JsonObjectType:  # type: ignore
+        """Get the current state of exposed entities."""
+        slots, fail = validate_slots_safely(self, intent_obj, "TurnDeviceOff")
+        if fail is not None:
+            return fail
+        _LOGGER.info("TurnDeviceOff slots=%s", slots)
+        slots = TurnDeviceOnIntent._normalize_slots_device_names(slots)
+        return await super()._async_handle(intent_obj, slots, "turn_off")
+
+
+class PauseDeviceIntent(TurnDeviceIntentBase):
+    """v1.0.42 家电族：暂停正在运行的设备（扫地机器人/电视/窗帘）。
+
+    复用 TurnDevice 的目标解析与实体匹配链，只把动作换成各域的 pause/stop
+    服务；灯/开关/锁等无"暂停"语义的域由 handle_match_target 显式判 False，
+    上层据此回 success:False（话术层如实告知不支持），不会误当成功。"""
+
+    intent_type = "PauseDevice"
+    description = (
+        "Pauses a running device: vacuum pause, media_player media_pause, "
+        "cover stop. Use for '暂停扫地机器人'/'电视暂停'/'窗帘停下'. "
+        "Target format: same as TurnDeviceOn."
+    )
+    service_timeout = 10
+
+    @property
+    def slot_schema(self) -> dict | None:
+        return {
+            vol.Required("target"): target_parameter_type(),
+        }
+
+    async def async_handle(self, intent_obj: intent.Intent) -> JsonObjectType:  # type: ignore
+        """Pause a running device (vacuum/media_player/cover)."""
+        slots, fail = validate_slots_safely(self, intent_obj, "PauseDevice")
+        if fail is not None:
+            return fail
+        _LOGGER.info("PauseDevice slots=%s", slots)
+        slots = TurnDeviceOnIntent._normalize_slots_device_names(slots)
+        return await super()._async_handle(intent_obj, slots, "huijian_pause")

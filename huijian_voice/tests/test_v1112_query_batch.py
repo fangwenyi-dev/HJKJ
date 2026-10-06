@@ -1,0 +1,387 @@
+# -*- coding: utf-8 -*-
+"""v1.1.2 查询族批次钉（2026-09-21 真机对账 + 查询覆盖面探针实锤）。
+
+探针口径：49 句问句跑本地两棵引擎（命令档 FastPath + 查询档 QueryZone），
+真机实体表只读拉取。结果 28 句未答，并揪出两类比"漏答"更坏的缺陷：
+
+① **安全级·问一句动一次设备**（与「内倒→雷达」同 severity 同纪律）：
+   「客厅射灯关了吗」→ ^关了 命中字面表 → TurnDeviceOff 真的把灯关掉；
+   「射灯开了吗/射灯开着吗」→ TurnDeviceOn；「平开窗关了吗/窗户关了吗」→
+   ControlWindow close（按窗钮）。根因两处叠加：_is_complex_query 的疑问判据
+   只收 为什么|怎么|如何|是不是|有没有|能否|可以.*吗，不收**状态疑问尾**
+   （V+吗/V+没有/是开着还是关着）；查询族的状态分支尾巴表只有 8 个固定写法。
+   祈使侧反向钉死：「帮我把灯打开好吗」这类礼貌请求的 吗 已被
+   normalize_polite/_ECHO_TONE 剥掉，必须照旧执行——新闸不许把请求判成问句。
+
+② **答错比不答坏**：聚合计数忽略设备类别——「哪些窗开着」答"开着12个设备，
+   比如HUIJIAN-BB28 麦克风开关…"（把 switch 全算进去），「还有几盏灯亮着」同
+   样；「客厅有多少灯开着」答"客厅的个设备都关着呢"（量词丢失+类别丢失）。
+   根因：_count_answer 的设备词取自一个"可选组 + {0,4} 任意字"的 search，
+   最左匹配下组经常是空 → 退化成全域计数。
+
+③ 漏答族：状态疑问尾巴不全、日期问句（星期几/几号/什么时候）、设备关着时问
+   属性（"射灯亮度多少"→ 该答"射灯是关着的"而不是"这句话我还不会"）、
+   人感传感器不存在时给通用兜底而不是如实说明。
+"""
+import asyncio
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HERE))
+os.environ.setdefault("HUIJIAN_DATA", tempfile.mkdtemp(prefix="hv_v1112_"))
+os.environ.setdefault("HUIJIAN_NLU_DATA", str(HERE / "nlu_data"))
+
+from core.nlu.fast_path import FastPath                      # noqa: E402
+from core.nlu.query import QueryZone                         # noqa: E402
+from core.settings import Settings                           # noqa: E402
+
+
+class FakeScenes:
+    def needs_blocking(self):
+        return False
+
+    def refresh_soon(self):
+        pass
+
+    async def refresh(self, force=False):
+        pass
+
+    def check(self, text):
+        return None
+
+    async def verify_or_refresh(self, phrase):
+        return False
+
+
+class Ha:
+    """固定实体表：一间办公室 + 一盏关着的射灯 + 两扇窗 + 一颗人感。"""
+
+    _areas = {}
+    _entity_area = {}
+
+    ENTS = [
+        {"entity_id": "light.she_deng", "state": "off",
+         "attributes": {"friendly_name": "办公室射灯"}},
+        {"entity_id": "cover.ping_kai_chuang", "state": "open",
+         "attributes": {"friendly_name": "办公室平开窗 开窗器",
+                        "current_position": 40}},
+        {"entity_id": "cover.tui_lachuang", "state": "closed",
+         "attributes": {"friendly_name": "书房推拉窗 开窗器", "current_position": 0}},
+        {"entity_id": "switch.bb28_mic", "state": "on",
+         "attributes": {"friendly_name": "HUIJIAN-BB28 麦克风开关"}},
+        {"entity_id": "switch.bangongshi_chazuo", "state": "on",
+         "attributes": {"friendly_name": "办公室插座"}},
+        {"entity_id": "binary_sensor.office_pir", "state": "on",
+         "attributes": {"friendly_name": "办公室人感", "device_class": "occupancy"}},
+        {"entity_id": "sensor.t_ws", "state": "30.0",
+         "attributes": {"friendly_name": "办公室温湿度传感器 温度",
+                        "device_class": "temperature", "unit_of_measurement": "°C"}},
+    ]
+
+    async def states(self):
+        return {e["entity_id"]: e for e in self.ENTS}
+
+    async def find_entities(self, area="", domains=()):
+        out = []
+        for e in self.ENTS:
+            dom = e["entity_id"].split(".")[0]
+            if domains and dom not in domains:
+                continue
+            nm = (e.get("attributes") or {}).get("friendly_name") or ""
+            if area and area not in nm:
+                continue
+            out.append(e)
+        return out
+
+    async def get_config(self):
+        return {"time_zone": "Asia/Shanghai"}
+
+
+@pytest.fixture()
+def fp():
+    return FastPath(FakeScenes(), None, Settings(Path(os.environ["HUIJIAN_DATA"]) / "v112.json"))
+
+
+@pytest.fixture()
+def qz():
+    return QueryZone(Ha(), Settings(Path(os.environ["HUIJIAN_DATA"]) / "v112q.json"))
+
+
+def _m(fp, t):
+    return asyncio.run(fp.match(t))
+
+
+def _q(qz, t):
+    return asyncio.run(qz.answer(t))
+
+
+# ── ① 安全闸：状态疑问句绝不进命令档 ────────────────────────────
+QUESTION_NOT_COMMAND = [
+    "客厅射灯关了吗", "办公室射灯开了吗", "射灯开着吗", "办公室射灯现在开着吗",
+    "射灯关了没有", "平开窗关了吗", "窗户关了吗", "灯还亮着吗",
+    "办公室平开窗现在是开着的吗", "书房窗是不是开着", "办公室射灯是开着还是关着",
+    "窗帘拉上了吗", "办公室射灯现在什么状态", "查询办公室平开窗状态",
+    "空调是不是关着的",
+    # v1.1.17 收口（审计实测：同一张表仍在放行，命令档会**真的动设备**）：
+    # ①V没V 形；②方言尾「不」；③疑问尾后跟时间副词；④问号跟在语气词之后
+    "射灯关没关", "办公室射灯开没开", "窗户关着不",
+    "办公室窗户关了吗现在", "射灯关了吗？", "灯关了没？",
+]
+
+
+@pytest.mark.parametrize("sentence", QUESTION_NOT_COMMAND)
+def test_state_questions_never_become_commands(fp, sentence):
+    """问一句关一次设备＝本批最高优先缺陷；命令档必须一律不接管。"""
+    p = _m(fp, sentence)
+    assert p is None, f"{sentence} 被命令档接成 {p.intent} {p.args}"
+
+
+# 反向：祈使/请求句不得被新闸误杀（"吗"作为礼貌尾已被剥掉）
+IMPERATIVE_STILL_COMMAND = [
+    ("把办公室射灯关了", "TurnDeviceOff"),
+    ("关闭办公室射灯", "TurnDeviceOff"),
+    ("办公室射灯关掉", "TurnDeviceOff"),
+    ("帮我把办公室射灯打开好吗", "TurnDeviceOn"),
+    ("打开办公室平开窗", "ControlWindow"),
+    ("关闭办公室平开窗", "ControlWindow"),
+    ("所有灯都关啦", "TurnDeviceOff"),
+    ("把窗帘拉上", None),
+    # v1.1.17 复审：V没V 若**不锚句尾**，祈使句中段的"关没关紧/开没开过"会被当问句
+    # 吞掉（实测两条整句从命令档掉光=该做的不做）。锚尾后必须照旧执行。
+    ("把那个关没关紧的窗关上", "ControlWindow"),
+    ("开没开过的灯都打开", "TurnDeviceOn"),
+]
+
+
+@pytest.mark.parametrize(("sentence", "intent"), IMPERATIVE_STILL_COMMAND)
+def test_commands_still_execute_after_the_gate(fp, sentence, intent):
+    p = _m(fp, sentence)
+    assert p is not None, f"{sentence} 被疑问闸误杀（命令档不再接管）"
+    if intent:
+        assert p.intent == intent, (sentence, p.intent, p.args)
+
+
+@pytest.mark.parametrize(("sentence", "want"), [
+    ("办公室平开窗现在是开着的吗", "开着"),
+    ("办公室射灯是开着还是关着", "关着"),
+    ("办公室射灯现在什么状态", "关着"),
+    ("查询办公室平开窗状态", "开着"),
+    ("射灯开着吗", "关着"),
+    ("平开窗关了吗", "开着"),
+])
+def test_state_questions_get_answers(qz, sentence, want):
+    """拦下来只是第一步：这些句子必须真的被答出来。"""
+    ans = _q(qz, sentence)
+    assert ans and want in ans, (sentence, ans)
+
+
+# ── ② 聚合计数：类别过滤必须生效（答错比不答坏）─────────────────
+@pytest.mark.parametrize(("sentence", "must", "must_not"), [
+    ("哪些窗开着", "扇", ["麦克风", "BB28", "插座"]),
+    ("还有几盏灯亮着", "灯", ["麦克风", "BB28"]),
+    ("办公室有多少灯开着", "盏灯", ["个设备都关着呢"]),
+    ("家里有几个设备没关", "设备", []),
+])
+def test_count_answer_respects_device_class(qz, sentence, must, must_not):
+    ans = _q(qz, sentence)
+    assert ans, sentence
+    assert must in ans, (sentence, ans)
+    for bad in must_not:
+        assert bad not in ans, (sentence, ans, bad)
+
+
+def test_count_answer_grammar_has_no_dangling_measure_word(qz):
+    """「客厅的个设备都关着呢」这类漏量词句子不能出现在带类别的问句里。"""
+    for s in ("办公室有多少灯开着", "办公室几盏灯亮着"):
+        ans = _q(qz, s)
+        assert ans and "的个设备" not in ans and "个设备都关着" not in ans, (s, ans)
+
+
+# ── ③ 日期时间问句 ─────────────────────────────────────────────
+@pytest.mark.parametrize(("sentence", "must"), [
+    ("今天星期几", "星期"),
+    ("现在什么时候", "点"),
+    ("今天几号", "号"),
+    ("现在几点了", "点"),
+])
+def test_date_and_time_questions(qz, sentence, must):
+    ans = _q(qz, sentence)
+    assert ans and must in ans, (sentence, ans)
+
+
+# ── ④ 设备关着时问属性：如实说"关着的"，不是"这句话我还不会"─────
+@pytest.mark.parametrize("sentence", ["办公室射灯亮度多少", "射灯现在多亮", "办公室射灯色温多少"])
+def test_attribute_query_on_off_device_states_it_is_off(qz, sentence):
+    ans = _q(qz, sentence)
+    assert ans and ("关着" in ans or "没开" in ans or "开着" in ans), (sentence, ans)
+
+
+# ── ⑤ 人感传感器不存在时如实说明（存在时正常答）─────────────────
+def test_presence_answer_works_with_sensor(qz):
+    ans = _q(qz, "办公室有没有人")
+    assert ans and "人" in ans, ans
+
+
+def test_presence_without_hardware_says_so(qz):
+    qz.ha.ENTS = [e for e in Ha.ENTS
+                  if (e.get("attributes") or {}).get("device_class") != "occupancy"]
+    try:
+        ans = _q(qz, "卧室有没有人")
+    finally:
+        qz.ha.ENTS = Ha.ENTS
+    assert ans and ("人感" in ans or "传感器" in ans or "没" in ans), ans
+
+
+# ── 变异靶：新闸必须"能红"（关掉判据即本文件当场红）───────────────
+def test_gate_is_anchorable(fp, monkeypatch):
+    from core.nlu import fast_path as F
+    assert getattr(F, "STATE_QUESTION_TAIL", None) is not None, "疑问尾表被删=闸失效"
+    assert F.STATE_QUESTION_TAIL.search("射灯关了吗")
+
+
+# ── v1.1.18 复审：查询族必须按"用户说的是哪台"回答（线上实锤）──────────
+DECOY = [
+    {"entity_id": "light.kong_tiao_indicator", "state": "off",
+     "attributes": {"friendly_name": "办公室空调 Indicator Light"}},
+    {"entity_id": "light.ban_gong_shi_she_deng", "state": "on",
+     "attributes": {"friendly_name": "办公室射灯"}},
+]
+
+
+def test_state_answer_respects_spoken_device():
+    """问「办公室射灯」不得答成同域的别的灯（线上实测答成了空调指示灯）。"""
+    qz = QueryZone(_HaWith(DECOY), Settings(Path(os.environ["HUIJIAN_DATA"]) / "q18.json"))
+    ans = asyncio.run(qz.answer("办公室射灯现在什么状态"))
+    assert ans and "射灯" in ans, ans
+    assert "Indicator" not in ans, f"答成了别的灯：{ans}"
+
+
+def test_state_answer_area_mismatch_names_where():
+    """说的区域里没有、全屋按名有 ⇒ 报出实体名（自带房间），两支都不许多猜。
+
+    v1.1.40（发版前对抗复核）拆成两臂：「本区没有这台」是**否定断言**，只有拿到
+    实体→房间映射时才许说。本替身原先根本没有 `_entity_area`，而它的
+    `find_entities` 只按"名字含区域词"旁路（=`ha_client.py:594` 在映射缺失时的
+    真形）⇒ 它是**降级形态**，旧判据等于让降级态去断言"客厅没有射灯"（客厅那台
+    若只叫「射灯」就会被漏）。不变量升级为：两支都必须认出实际那台；
+    只有映射可用那一臂才许出现「没有叫」。
+    """
+    ans = asyncio.run(QueryZone(
+        _HaWith(DECOY), Settings(Path(os.environ["HUIJIAN_DATA"]) / "q18b.json")
+    ).answer("客厅射灯关了吗"))
+    assert ans, '有实体可答却回了空（线上表现为「这句话我还不会」）'
+    assert "办公室射灯" in ans, f"没认出实际那台（v1.1.18 原意）：{ans}"
+    assert "没有叫" not in ans, f"房间映射拿不到却断言本区没有：{ans}"
+    assert "None" not in ans, f"把 None 念进播报：{ans}"
+
+    bound = _HaWith(DECOY)
+    bound._entity_area = {"light.kong_tiao_indicator": "办公室",
+                          "light.ban_gong_shi_she_deng": "办公室"}
+    ans2 = asyncio.run(QueryZone(
+        bound, Settings(Path(os.environ["HUIJIAN_DATA"]) / "q18b2.json")
+    ).answer("客厅射灯关了吗"))
+    assert ans2 and "没有叫" in ans2 and "办公室射灯" in ans2, \
+        f"映射可用时「本区没有」这句丢了（v1.1.18 口径回归）：{ans2}"
+
+
+def test_state_answer_absent_device_says_not_found():
+    """全屋都没有这个名字 ⇒ 如实说没找到（不再掉兜底"我还不会"）。"""
+    qz = QueryZone(_HaWith(DECOY), Settings(Path(os.environ["HUIJIAN_DATA"]) / "q18c.json"))
+    ans = asyncio.run(qz.answer("卧室吊灯关了吗"))
+    assert ans and "没找到" in ans, ans
+
+
+class _HaWith:
+    """按 find_entities(area, domains) 过滤的只读替身。"""
+
+    _areas = {}          # QueryZone._find_area 读 ha._areas（真客户端有）
+
+    def __init__(self, ents):
+        self.ents = ents
+
+    async def find_entities(self, area="", domains=(), name_contains=""):
+        out = []
+        for e in self.ents:
+            dom = e["entity_id"].split(".", 1)[0]
+            if domains and dom not in domains:
+                continue
+            if area and area not in str((e.get("attributes") or {}).get("friendly_name") or ""):
+                continue
+            out.append(e)
+        return out
+
+
+def test_count_answer_keeps_the_number():
+    """计数文案必须带数字：线上实测念成「办公室的盏灯都关着呢」（数字丢了）。"""
+    from core.nlu.query import say_name            # noqa: F401
+    ents = [{"entity_id": "light.a", "state": "off",
+             "attributes": {"friendly_name": "办公室射灯"}},
+            {"entity_id": "light.b", "state": "off",
+             "attributes": {"friendly_name": "办公室台灯"}}]
+    qz = QueryZone(_HaWith(ents), Settings(Path(os.environ["HUIJIAN_DATA"]) / "q18d.json"))
+    ans = asyncio.run(qz.answer("办公室有多少灯开着"))
+    assert ans and "2盏灯" in ans, ans
+
+
+def test_display_name_strips_ascii_tail_only_with_chinese():
+    """念名清洗：中文名带英文/十六进制尾巴要剥，纯英文名与前导英文名不动。"""
+    from core.nlu.query import say_name
+    assert say_name("办公室空调 Air Conditioner") == "办公室空调"
+    assert say_name("开窗器 123f-020A") == "开窗器"
+    assert say_name("HUIJIAN-BB28 麦克风开关") == "HUIJIAN-BB28 麦克风开关"
+    assert say_name("Air Conditioner") == "Air Conditioner"
+
+
+def test_say_name_keeps_short_index_suffix():
+    """v1.1.22：短尾（单个数字/字母）是**设备序号**不是型号——「客厅射灯2」剥成
+    「客厅射灯」后，多台带序号设备在播报里就分不出谁是谁；型号/英文/十六进制尾
+    照旧剥（判据：尾段 ≥2 字符且含字母）。"""
+    from core.nlu.query import say_name
+    assert say_name("客厅射灯2") == "客厅射灯2"
+    assert say_name("客厅射灯A") == "客厅射灯A"
+    assert say_name("客厅射灯 2") == "客厅射灯 2"
+    assert say_name("办公室空调 Air Conditioner") == "办公室空调"   # 型号尾照剥
+    assert say_name("开窗器 123f-020A") == "开窗器"
+
+
+class _HaClimate:
+    """只读替身：客厅空调（设定 26）+ 客厅温度传感器（室温 24.3）。"""
+    _areas = {}
+    ENTS = [
+        {"entity_id": "climate.kt", "state": "cool",
+         "attributes": {"friendly_name": "客厅空调", "temperature": 26}},
+        {"entity_id": "sensor.kt_t", "state": "24.3",
+         "attributes": {"friendly_name": "客厅温度传感器 温度",
+                        "device_class": "temperature", "unit_of_measurement": "°C"}},
+    ]
+
+    async def states(self):
+        return {e["entity_id"]: e for e in self.ENTS}
+
+    async def find_entities(self, area="", domains=(), name_contains=""):
+        out = []
+        for e in self.ENTS:
+            dom = e["entity_id"].split(".", 1)[0]
+            if domains and dom not in domains:
+                continue
+            nm = str((e.get("attributes") or {}).get("friendly_name") or "")
+            if area and area not in nm:
+                continue
+            out.append(e)
+        return out
+
+
+def test_ac_setpoint_question_answers_the_ac():
+    """v1.1.22：「客厅空调开多少度」问的是**空调设定值**——旧式落到裸「多少度」支
+    一律答房间传感器（实测 AC 设定 26 在案，却答「客厅的温度是 24.3 度」）。"""
+    qz = QueryZone(_HaClimate(), Settings(Path(os.environ["HUIJIAN_DATA"]) / "q18e.json"))
+    ans = asyncio.run(qz.answer("客厅空调开多少度"))
+    assert ans and "26" in ans and "24.3" not in ans, ans
+    # 反向钉：无设备词仍是房间温度（本职不变）
+    ans2 = asyncio.run(qz.answer("客厅多少度"))
+    assert ans2 and "24.3" in ans2, ans2

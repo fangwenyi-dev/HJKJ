@@ -141,14 +141,28 @@ def test_ci_e2e_hardgate_and_gitee_retired():
         "E2E 已连绿转正，挂绳不得复活（如需复活先证明真栈回归全绿）"
     assert "needs: [prepare, init, build, e2e]" in _job_seg("manifest"), \
         "manifest 必须 gate 在 e2e 之后（硬门禁拓扑）"
-    # 2026-09-16 用户裁定反转：网关仓停推 Gitee（镜像与 Release 冻结
-    # v1.7.24/41a1506），gitee-release job 整段下线。原正向钉桩
-    # （Create Gitee Release/target_commitish/isascii）转为负向防复活；
-    # 幂等脚本历史见 git log。
-    assert "gitee-release:" not in ci, "Gitee Release job 已按裁定下线，不得复活"
-    assert "Create Gitee Release" not in ci
-    assert "GITEE_TOKEN" not in ci, "Gitee secret 残留引用=半截复活"
-    assert "只推 GitHub" in ci, "ci.yaml 缺停推裁定墓碑"
+    # 2026-09-16「只推 GitHub」裁定 2026-09-17 就被推翻（停推代价实证见 ci.yaml 注释），
+    # 但 v1.7.24 下线的 gitee-release job 一直只留这条**负向防复活钉**——期间 v1.7.63/64/65
+    # 三条 Gitee Release 全靠手工 POST，漏一条就是徽章偏旧且无人知。2026-10-06 D4 把该
+    # job 自动化后，钉的方向随之翻转：不判"这个名字不许出现"，判"它必须存在且必须带着
+    # 当年踩出来的那几件"。负向三句（Create Gitee Release / GITEE_TOKEN 不得出现）随裁定
+    # 一并作废——留着就是把守卫钉在已死的行为上。
+    seg = _job_seg("gitee-release")
+    assert "needs: [prepare, release]" in seg, \
+        "Gitee Release 必须 gate 在 GitHub Release 之后（否则两源正文会分叉）"
+    assert "continue-on-error" not in seg, \
+        "Gitee 侧不得挂绳：半截绿等于悄悄回到手工时代，比不建更难发现"
+    for needle, why in [
+        ("/releases/tags/", "必须先按 tag 直查再决定 POST/PATCH（别拿列表序赌）"),
+        ('method="PATCH"', "同 tag 已存在时要 PATCH 同步正文（PUT 必 405 实锤）"),
+        ('"tag_name": tag', "PATCH 必须同载 tag_name（只发 body 直接 400）"),
+        ('"name": tag', "PATCH 必须同载 name（同上）"),
+        ("target_commitish", "缺省行为不可靠，必须显式指提交"),
+        ("isascii", "token 带 BOM/不可见字符要当场鉴别（.gitee_token 曾带 BOM 致 401 假象）"),
+        ("commits/${COMMIT}", "必须先确认 Gitee 侧真有本次 sha，否则 target_commitish 会指到旧提交"),
+    ]:
+        assert needle in seg, "Gitee Release job 缺判据 %r：%s" % (needle, why)
+    assert "只推 GitHub" in ci, "历史裁定要留痕（现由 D4 反转，见 ci.yaml 三段注释）"
 
 
 def test_e2e_script_key_steps():

@@ -33,8 +33,14 @@ gh run list --repo fangwenyi-dev/ha-gateway-plugin --limit 3
 gh run view <run-id> --repo fangwenyi-dev/ha-gateway-plugin --log-failed
 ```
 
-**仍未恢复的一件事**：`ci.yaml` 的 `gitee-release` job 仍是墓碑状态（已移除），
-所以 **Gitee 侧的 Release 对象不会自动创建**。两条后果要记住：
+**Gitee Release 已自动化（2026-10-06，语音侧并入商店仓那一刀的 D4）**：`ci.yaml` 的
+`gitee-release` job 从墓碑复活。此前它下线后 v1.7.63/64/65 三条 Gitee Release 全靠手工
+POST——漏一条就静默漂移且没人知道。现在它 `needs: [prepare, release]`，正文取 CHANGELOG
+对应版本段（缺段回落 prepare 产物），同 tag 已存在则 **PATCH 同步正文**（PUT 必 405，
+PATCH 必须同载 tag_name+name），并**先等 Gitee 镜像仓真的有本次 sha 才建**——等不到就
+响亮失败而不是把 Release 指到旧提交。⇒ 双推顺序从此是硬依赖：`git push origin main`
+之后**尽快** `git push gitee main`；该 job 若报"Gitee 镜像仓 10 分钟内没有本次提交"，
+补推 gitee 后重跑该 job 即可（GitHub 侧 Release 不受影响）。两条背景不变：
 - Supervisor 商店不受影响（它只读仓库内 `config.yaml`）；
 - 但慧尖 Web UI 的升级徽章走的是「GitHub + Gitee releases 双源并集取最大」
   （`www/js/huijian.js` `fetchLatestRelease`），GitHub 一路失败/被限流时只剩
@@ -69,6 +75,21 @@ bash -n run.sh                      # shell 语法
 # 匹配顶层，mqtt_handler/ 子包（v1.6.25 拆包引入）会整体漏出语法门。
 python -m compileall -q custom_components/window_controller_gateway
 ```
+
+**两套测试不得在同一 pytest 进程里混跑（2026-10-06 语音侧并入后新增的约束）**：
+`huijian_voice/tests` 里 10+ 处写的是 `from conftest import FakeHAClient`——裸模块名，
+而合并后仓里有两个 `tests/conftest.py`，同一进程内先被导入的那个会占住
+`sys.modules["conftest"]`，另一套就拿错实现（实发：混跑网关 `test_audit_round8` 时语音
+`test_relay_passes_through_echoed` 报 `ImportError: cannot import name 'FakeHAClient'
+from 'conftest' (…\huijian_mqtt_broker\tests\conftest.py)`，而单跑该文件 10/10 绿）。
+⇒ 本地要全绿就分两条命令跑（各自 CI 入口本来就分开：网关 lint 跑
+`pytest huijian_mqtt_broker/tests`，语音 lint 跑 `pytest huijian_voice/tests`）。
+真要消掉这颗雷，改法是给语音侧那 10+ 处换成按文件路径取 helper（或把 FakeHAClient 移进
+普通模块），不是给某一套加 `sys.path` 顺序技巧——顺序技巧只是把雷换个埋法。
+
+另：语音侧 opus 相关测试在 Windows 本机需要未跟踪的 `_winlibs/opus.dll`（gitignored，
+按设计不随 `git archive` 搬动）。合并树里跑时给 `HUIJIAN_OPUS_DLL_DIR` 指一份即可，
+不指的表现是 21 条以「opus 绑定缺失」红——**环境性，不是产品缺陷**（Linux/CI 用系统 libopus）。
 
 给 registry 兼容层/事件属性等"静默失效面"加改动时，须补断言实参的测试
 （参考 tests/test_utils.py 的 RecordingEntityRegistry 模式）——

@@ -1,0 +1,794 @@
+import logging
+import re
+from dataclasses import asdict, dataclass, field, replace
+from enum import Enum
+from typing import Any, Callable, Literal, get_args
+
+import voluptuous as vol
+from homeassistant.components import (climate, cover, fan, humidifier, light,
+                                      number)
+from homeassistant.const import (ATTR_ENTITY_ID, ATTR_TEMPERATURE,
+                                 SERVICE_SET_COVER_POSITION, SERVICE_TURN_ON,
+                                 Platform)
+from homeassistant.core import State, callback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import intent
+from homeassistant.util.color import RGBColor
+from homeassistant.util.json import JsonObjectType, JsonValueType
+
+from .intent_helper import (EntityInfo, HaTargetItem, match_intent_entities,
+                            normalize_targets_device_names, target_parameter_type,
+                            validate_slots_safely)
+
+_LOGGER = logging.getLogger(__name__)
+
+UnsupportAdjustmentError = intent.IntentHandleError(
+    "Adjustment is not supported. Try setting it directly to the specified value."
+)
+
+
+@dataclass
+class IntentEntityState:
+    name: str
+    success: bool = True
+    error: str | None = None
+    attrs: dict[str, str | int | float] = field(default_factory=dict)
+
+
+class ExtIntentResponse(intent.IntentResponse):
+    def __init__(self, language: str, intent: intent.Intent | None = None) -> None:
+        super().__init__(language, intent)
+        self.entity_states: dict[str, IntentEntityState] = {}
+        self.entity_order: list[str] = []
+
+    def create_default_state(self, name: str):
+        return IntentEntityState(name=name, attrs={})
+
+    def set_state(
+        self, entity_info: EntityInfo, attrs: dict | None = {}, error: str | None = None
+    ):
+        entity_id = entity_info.entity.id
+        name = entity_info.name
+        state = self.entity_states.setdefault(
+            entity_id,
+            self.create_default_state(name),
+        )
+        if attrs:
+            state.attrs.update(attrs)
+        if error:
+            state.success = False
+            state.error = f"Failed: {error}"
+
+        if entity_id not in self.entity_order:
+            self.entity_order.append(entity_id)
+
+    def states(self) -> tuple[list[JsonValueType], int]:
+        states = []
+        success_count = 0
+        for entity_id in self.entity_order:
+            state = self.entity_states[entity_id]
+            states.append(asdict(state))
+            if state.success:
+                success_count += 1
+        return states, success_count
+
+    @callback
+    def as_dict(self) -> dict[str, Any]:
+        """Return a dictionary representation of an intent response."""
+        response_dict = super().as_dict()
+        response_dict["states"], _ = self.states()
+        return response_dict
+
+
+class AdjustType(Enum):
+    INCREASE = 1
+    SET = 0
+    DECREASE = -1
+
+
+DeltaSpecialValue = Literal["min", "max", "low", "medium", "high", "auto"]
+DELTA_SPECIAL_VALUES: set[DeltaSpecialValue] = set(get_args(DeltaSpecialValue))
+
+DeltaSupport = Literal["level", "number"]
+
+
+@dataclass
+class Delta:
+    adjust: AdjustType
+    value: int | float = 0
+    abs_value: int | float = 0
+    str_value: str = ""  # 色值 FFEE00
+    unit: str = ""
+    special: DeltaSpecialValue | None = None
+
+    def readable_value(self) -> str:
+        if self.special:
+            return self.special
+        if self.str_value:
+            return self.str_value
+
+        mark = ""
+        if self.adjust == AdjustType.INCREASE:
+            mark = "+"
+        elif self.adjust == AdjustType.DECREASE:
+            mark = "-"
+
+        v = f"{mark}{self.value}"
+        if self.unit:
+            v = f"{v}{self.unit}"
+        return v
+
+    def calc_target(
+        self,
+        current_value: float | None,
+        level_step: float,
+        min_change: float,
+        min_value: float,
+        max_value: float,
+        supports: set[DeltaSupport],
+    ) -> int:
+        """Calculate target value (level, percentage or number).
+
+        Args:
+            current_value: The current value.
+            change_step: The supported change step.
+                - For percentage e.g, 50%, 33.3%, 25%, 20%
+        Returns:
+            The updated target after applying the delta.
+        """
+        level_step = int(level_step)
+        if self.special:
+            if self.special == "min":
+                target_value = min_value
+            elif self.special == "max":
+                target_value = max_value
+            elif self.special == "low":
+                target_value = min_value
+            elif self.special == "medium":
+                raise intent.IntentHandleError("unsupported")
+            elif self.special == "high":
+                target_value = max_value
+            else:
+                raise intent.IntentHandleError("unsupported")
+            return int(max(min_value, min(max_value, target_value)))
+
+        if self.unit in ["level", "档"]:
+            # Delta is level.
+            if "level" not in supports:
+                raise intent.IntentHandleError(f"level adjustment is not supported")
+
+            if self.adjust == AdjustType.SET:
+                target_value = self.value * level_step
+            else:
+                if current_value is None:
+                    raise UnsupportAdjustmentError
+
+                # Adjust the current value to the stepped value.
+                left_stepped_value = current_value // level_step * level_step
+                right_stepped_value = left_stepped_value + level_step
+                if (
+                    current_value - left_stepped_value
+                    <= right_stepped_value - current_value
+                ):
+                    stepped_current_value = left_stepped_value
+                else:
+                    stepped_current_value = right_stepped_value
+                target_value = stepped_current_value + self.value * level_step
+            return int(max(level_step, min(max_value, target_value)))
+
+        # Delta is number, includes percentage.
+        if "number" not in supports:
+            raise intent.IntentHandleError(f"number adjustment is not supported")
+
+        if self.adjust == AdjustType.SET:
+            user_target_value = self.value
+        else:
+            if current_value is None:
+                raise UnsupportAdjustmentError
+            user_target_value = current_value + self.value
+
+        if user_target_value == max_value:
+            target_value = max_value
+        else:
+            # Match to the right stepped value.
+            left_stepped_value = user_target_value // min_change * min_change
+            right_stepped_value = left_stepped_value + min_change
+            target_value = None
+            # e.g., 10.5 in [10, 11]
+            for valid_value in [left_stepped_value, right_stepped_value]:
+                # 第四轮审计 P2：**恰在档上直接采用**——旧循环对 INCREASE 不 break，
+                # 0.5 步进时「调高0.5度」会从 26.5 再被"向上对齐"到 27（放大成整度）。
+                if abs(user_target_value - valid_value) < 1e-9:
+                    target_value = valid_value
+                    break
+                if abs(user_target_value - valid_value) < 1:
+                    target_value = valid_value
+                    # Align to the smaller value when descrease or set.
+                    if (
+                        self.adjust == AdjustType.DECREASE
+                        or self.adjust == AdjustType.SET
+                    ):
+                        break
+            if target_value is None:
+                # 第四轮审计 P2：用户值落在两档之间时**吸附到最近档**——旧形抛
+                # 英文 "violates the change step: 25" 直达话术（step=25/33 的
+                # 百分比设备必中）。同距时：降档/设值取小，升档取大。
+                d_left = abs(user_target_value - left_stepped_value)
+                d_right = abs(right_stepped_value - user_target_value)
+                if (self.adjust == AdjustType.DECREASE
+                        or self.adjust == AdjustType.SET):
+                    target_value = (left_stepped_value if d_left <= d_right
+                                    else right_stepped_value)
+                else:
+                    target_value = (right_stepped_value if d_right <= d_left
+                                    else left_stepped_value)
+                # 对抗复核（2026-09-30）：吸附档**不得逆行**——「调高10%」在非网格
+                # 当前值上（51%，step=25）曾吸到 50% 反向走；「调低1%」在 99% 上曾吸
+                # 到 100%。几何保证：INCREASE 的右档恒高于当前值、DECREASE 的左档恒
+                # 低于（floor(x)+step > x），逆则改选对侧。
+                # ⚠ 2026-10-01 本仓实测留账（**未修，需产品定口径**）：上面那个
+                # `abs(user_target - valid) < 1` 的邻近档循环对 INCREASE 不 break，
+                # cur=50.5「调高0.3」step=25 仍得 50（逆向 0.5）。「把守卫提到两条路
+                # 之后」试过，代价是把 cur=50「调高0.5」从**零变化**改成**整档跳 75**
+                # ——步进 25/33 的风速/开合器上这是用户没要的大幅动作。两难：
+                #   A 落在最近合法档（现状：可能逆向半步）
+                #   B 强制同向最近档（跳一档：动作量远超用户所求）
+                #   C 够不到一档就不动并如实说"这一档够不到"（需新话术）
+                # 判据与回执口径等签字，本文件不擅自改行为。
+                if (self.adjust == AdjustType.INCREASE
+                        and target_value <= current_value):
+                    target_value = right_stepped_value
+                elif (self.adjust == AdjustType.DECREASE
+                        and target_value >= current_value):
+                    target_value = left_stepped_value
+                _LOGGER.info("step snap: %s -> %s (step=%s)",
+                             user_target_value, target_value, min_change)
+        _clamped = max(min_value, min(max_value, target_value))
+        # 第四轮审计 P2：0.5 度步进的目标值不得被 int() 截断（26.5→26）。
+        return int(_clamped) if float(_clamped).is_integer() else _clamped
+
+
+def parse_delta(raw: str):
+    """Parse raw value str to readable object."""
+    if raw in DELTA_SPECIAL_VALUES:
+        return Delta(
+            adjust=AdjustType.SET,
+            special=raw,
+        )
+    elif raw.startswith("#"):
+        # color hex value
+        raw = raw.upper()
+        # v1.1.29 复核 A10：消费端只处理 3/6 位（3 位展开、否则按 6 位切片）——旧闸
+        # 放行 4/5 位 ⇒ 4 位在 int(...) 抛 ValueError 逃出 handler（加载项拿不到结构化
+        # 失败），5 位静默算出色偏（#FFFFF → RGB(255,255,15)）还回 success。
+        hex_color_pattern = r"^#([0-9A-F]{3}|[0-9A-F]{6})$"
+        m = re.search(hex_color_pattern, raw)
+        if not m:
+            return
+
+        color_value = m.groups()[0]
+        return Delta(
+            adjust=AdjustType.SET,
+            str_value=color_value,
+            unit="#",
+        )
+    else:
+        m = re.search(r"^([+-]?)\s?(\d+\.\d+|\d+)\s?(.*)$", raw)
+        if not m:
+            return
+        mark, value_raw, unit = m.groups()
+
+        if value_raw.find(".") != -1:
+            abs_value = float(value_raw)
+        else:
+            abs_value = int(value_raw)
+        value = abs_value
+
+        if mark == "+":
+            adjust = AdjustType.INCREASE
+        elif mark == "-":
+            adjust = AdjustType.DECREASE
+            value = value * -1
+        else:
+            adjust = AdjustType.SET
+
+        return Delta(
+            adjust=adjust,
+            value=value,
+            abs_value=abs_value,
+            unit=unit.lower(),
+        )
+
+
+@dataclass
+class AdjustmentContext:
+    state: State
+    delta: Delta
+
+
+@dataclass
+class AdjustmentTarget:
+    service: str = ""
+    service_data: dict = field(default_factory=dict)
+    attributes: dict | None = None
+
+
+adjustment_functions: dict[
+    str, dict[str, Callable[[AdjustmentContext, AdjustmentTarget], None]]
+] = {}
+
+supported_domain_list = set()
+supported_attribute_list = set()
+
+
+def register_adjustment(domain: str, attrbute: str):
+    def decorator(func):
+        supported_domain_list.add(domain)
+        supported_attribute_list.add(attrbute)
+        attrbute_handlers = adjustment_functions.setdefault(domain, {})
+        attrbute_handlers[attrbute] = func
+
+        def wrapper(ctx: AdjustmentContext, target: AdjustmentTarget):
+            func(ctx, target)
+
+        return wrapper
+
+    return decorator
+
+
+@register_adjustment("light", "brightness")
+def adjust_light_brightness(ctx: AdjustmentContext, target: AdjustmentTarget):
+    percentage_step = 10
+    target.attributes = {
+        "max_level": int(100 // percentage_step),
+        "supported_adjust_step": f"{percentage_step}%",
+    }
+
+    current_percent = None
+    if ctx.delta.adjust != AdjustType.SET:
+        current_brightness = ctx.state.attributes.get(light.ATTR_BRIGHTNESS)
+        if current_brightness is None:
+            raise UnsupportAdjustmentError
+        current_percent = round(current_brightness / 254 * 100)
+
+    target_percent = ctx.delta.calc_target(
+        current_percent, percentage_step, 1, 1, 100, supports={"number", "level"}
+    )
+    target.service_data[light.ATTR_BRIGHTNESS_PCT] = target_percent
+
+    target.attributes["updated_brightness"] = f"{target_percent}%"
+    target.service = SERVICE_TURN_ON
+
+
+@register_adjustment("light", "color")
+def adjust_light_color(ctx: AdjustmentContext, target: AdjustmentTarget):
+    target.attributes = {}
+
+    hex_color = ctx.delta.str_value
+    if len(hex_color) == 3:
+        hex_color = "".join([c * 2 for c in hex_color])
+
+    # 十六进制转十进制
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    target_color = RGBColor(r, g, b)
+
+    target.service = SERVICE_TURN_ON
+    target.service_data[light.ATTR_RGB_COLOR] = target_color
+    target.attributes["updated_value"] = f"#{hex_color}"
+
+
+@register_adjustment("light", "temperature")
+def adjust_light_temperature(ctx: AdjustmentContext, target: AdjustmentTarget):
+
+    color_temperature_min = ctx.state.attributes.get(
+        light.ATTR_MIN_COLOR_TEMP_KELVIN, 2000
+    )
+    color_temperature_max = ctx.state.attributes.get(
+        light.ATTR_MAX_COLOR_TEMP_KELVIN, 6500
+    )
+    color_temperature_step = 500
+
+    if ctx.delta.unit == "%":
+        # Convert percentage to Kelvin
+        ctx.delta.value = int(
+            ctx.delta.value / 100 * (color_temperature_max - color_temperature_min)
+        )
+        if ctx.delta.adjust == AdjustType.SET:
+            ctx.delta.value += color_temperature_min
+        ctx.delta.unit = "K"
+
+    target.attributes = {
+        "min_value": f"{color_temperature_min}K",
+        "max_value": f"{color_temperature_max}K",
+        "supported_adjust_step": f"{color_temperature_step}K",
+    }
+
+    current_color_temperature = None
+    if ctx.delta.adjust != AdjustType.SET:
+        current_color_temperature: float | None = ctx.state.attributes.get(
+            light.ATTR_COLOR_TEMP_KELVIN
+        )
+        if current_color_temperature is None:
+            raise UnsupportAdjustmentError
+
+    target_temperature = ctx.delta.calc_target(
+        current_color_temperature,
+        color_temperature_step,
+        # v1.1.36 复核⑦：色温的吸附网格必须用它自己的步进——旧形传 1，于是
+        # "暖一点/调高色温"会落到 1K 这种设备根本不存在的档位上（播报 3417K，
+        # 设备实际只会就近吸到 500K 网格），与 v1.1.33 给空调 temperature_step
+        # 收的那个 0.5 度洞同型。
+        # 同批扫描结论：亮度(:346)/开度(:610)/湿度(:585) 三处传 1 **不是同一个洞**——
+        # HA 这三个域没有设备侧步进属性，1 就是它们的真实粒度，照旧不动。
+        color_temperature_step,
+        color_temperature_min,
+        color_temperature_max,
+        supports={"number", "level"},
+    )
+    target.service = SERVICE_TURN_ON
+    target.service_data[light.ATTR_COLOR_TEMP_KELVIN] = target_temperature
+    target.attributes["updated_value"] = f"{target_temperature}K"
+
+
+@register_adjustment("fan", "fan_speed")
+def adjust_fan_speed(ctx: AdjustmentContext, target: AdjustmentTarget):
+    percentage_step = ctx.state.attributes.get(fan.ATTR_PERCENTAGE_STEP, 25)
+    target.attributes = {
+        "max_level": 100 // int(percentage_step),
+        "supported_adjust_step": f"{int(percentage_step)}%",
+    }
+    current_percent = None
+    # Percentage or Level
+    if ctx.delta.unit != "%":
+        ctx.delta.unit = "level"
+    if ctx.delta.adjust != AdjustType.SET:
+        current_percent = ctx.state.attributes.get(fan.ATTR_PERCENTAGE)
+        if current_percent is None:
+            raise UnsupportAdjustmentError
+
+    target_percent = ctx.delta.calc_target(
+        current_percent,
+        percentage_step,
+        percentage_step,
+        percentage_step,
+        100,
+        supports={"number", "level"},
+    )
+    # Fix 33%*3 case.
+    if target_percent >= 99:
+        target_percent = 100
+    target.service = SERVICE_TURN_ON
+    target.service_data[fan.ATTR_PERCENTAGE] = target_percent
+    target.attributes["updated_level"] = int(target_percent // int(percentage_step))
+
+
+@register_adjustment("climate", "fan_speed")
+def adjust_climate_fan_speed(ctx: AdjustmentContext, target: AdjustmentTarget):
+    fan_modes: list[str] = ctx.state.attributes.get(climate.const.ATTR_FAN_MODES, [])
+    if len(fan_modes) == 0:
+        raise intent.IntentHandleError("unsupported")
+
+    target.attributes = {
+        "fan_modes": fan_modes,
+    }
+
+    if ctx.delta.special and ctx.delta.special in ["auto", "low", "medium", "high"]:
+        target_fan_mode = ctx.delta.special
+        if target_fan_mode in fan_modes:
+            target.service = climate.const.SERVICE_SET_FAN_MODE
+            target.service_data[climate.const.ATTR_FAN_MODE] = target_fan_mode
+            target.attributes["fan_mode"] = target_fan_mode
+            return
+        raise intent.IntentHandleError("unsupported the mode")
+
+    if fan_modes[0] == "auto":
+        fan_modes = fan_modes[1:]
+
+    if not fan_modes:
+        raise intent.IntentHandleError("该空调仅支持自动档位，无法调节风速")
+
+    percentage_step = 100 // len(fan_modes)
+    target.attributes = {
+        "max_level": len(fan_modes),
+        "supported_adjust_step": f"{int(percentage_step)}%",
+    }
+
+    # Percentage or Level
+    current_percent = None
+    if ctx.delta.unit != "%":
+        ctx.delta.unit = "level"
+    if ctx.delta.adjust != AdjustType.SET:
+        current_mode = ctx.state.attributes.get(climate.const.ATTR_FAN_MODE)
+        if current_mode is None or current_mode == "auto":
+            raise UnsupportAdjustmentError
+
+        mode_index = fan_modes.index(current_mode)
+        # 33% 66% 99%
+        current_percent = (mode_index + 1) * 100 // len(fan_modes)
+
+    target_percent = ctx.delta.calc_target(
+        current_percent,
+        percentage_step,
+        percentage_step,
+        percentage_step,
+        100,
+        supports={"number", "level"},
+    )
+    # Set fan mode.
+    if target_percent >= 99:
+        target_percent = 100
+
+    # 50*25/100
+    _LOGGER.info(
+        "adjust_climate_fan_speed: current_percent=%s target_percent=%s", current_percent, target_percent
+    )
+    target_mode_index = min(target_percent // percentage_step - 1, len(fan_modes) - 1)
+    target_fan_mode = fan_modes[target_mode_index]
+    target.service = climate.const.SERVICE_SET_FAN_MODE
+    target.service_data[climate.const.ATTR_FAN_MODE] = target_fan_mode
+    target.attributes["updated_level"] = target_mode_index
+    target.attributes["fan_mode"] = target_fan_mode
+
+
+@register_adjustment("climate", "temperature")
+def adjust_climate_temperature(ctx: AdjustmentContext, target: AdjustmentTarget):
+    if ctx.delta.unit == "%":
+        raise intent.IntentHandleError("unsupported percentage")
+
+    if ctx.delta.unit in ["档", "level"]:
+        ctx.delta.unit = "度"
+
+    min_temperature = ctx.state.attributes.get(climate.const.ATTR_MIN_TEMP, 10)
+    max_temperature = ctx.state.attributes.get(climate.const.ATTR_MAX_TEMP, 30)
+    temperature_step = ctx.state.attributes.get(climate.const.ATTR_TARGET_TEMP_STEP, 1)
+    # 第四轮审计 P2：旧形 max(step, 1) 把 0.5 度步进抬成 1（半度机型永不可达：
+    # 「调到26.5度」→26、「调高0.5度」→±1）；地板降到 0.5，并把真实步进
+    # 传给 calc_target 的 min_change（旧形硬编码 1）。
+    try:
+        temperature_step = float(temperature_step)
+    except (TypeError, ValueError):
+        temperature_step = 1.0
+    temperature_step = max(temperature_step, 0.5)
+    target.attributes = {
+        "supported_adjust_step": temperature_step,
+        "min_value": min_temperature,
+        "max_value": max_temperature,
+        "hvac_mode": ctx.state.state,
+    }
+
+    current_temperature: float | None = None
+    if ctx.delta.adjust != AdjustType.SET:
+        current_temperature: float | None = ctx.state.attributes.get("temperature")
+        if current_temperature is None:
+            raise UnsupportAdjustmentError
+
+    target_temperature = ctx.delta.calc_target(
+        current_temperature,
+        temperature_step,
+        temperature_step,          # 第四轮审计 P2：真实步进（旧形硬编码 1）
+        min_temperature,
+        max_temperature,
+        supports={"number"},
+    )
+    target.service = climate.const.SERVICE_SET_TEMPERATURE
+    target.service_data[ATTR_TEMPERATURE] = target_temperature
+    target.attributes["updated_value"] = target_temperature
+
+
+@register_adjustment("humidifier", "humidity")
+def adjust_humidifier_humidity(ctx: AdjustmentContext, target: AdjustmentTarget):
+    min_value = ctx.state.attributes.get(humidifier.const.ATTR_MIN_HUMIDITY, 0)
+    max_value = ctx.state.attributes.get(humidifier.const.ATTR_MAX_HUMIDITY, 100)
+    adjustment_step = 10
+    target.attributes = {
+        "supported_adjust_step": f"{adjustment_step}%",
+        "min_value": f"{min_value}%",
+        "max_value": f"{max_value}%",
+    }
+
+    current_value: float | None = None
+    if ctx.delta.adjust != AdjustType.SET:
+        current_value: float | None = ctx.state.attributes.get(
+            humidifier.const.ATTR_HUMIDITY
+        )
+        if current_value is None or (current_value < min_value):
+            raise UnsupportAdjustmentError
+
+    target_value = ctx.delta.calc_target(
+        current_value,
+        adjustment_step,
+        1,
+        min_value,
+        max_value,
+        supports={"number", "level"},
+    )
+    target.service = humidifier.const.SERVICE_SET_HUMIDITY
+    target.service_data[humidifier.const.ATTR_HUMIDITY] = target_value
+    target.attributes["updated_value"] = f"{target_value}%"
+
+
+@register_adjustment("cover", "position")
+def adjust_cover_position(ctx: AdjustmentContext, target: AdjustmentTarget):
+    percentage_step = 10
+    target.attributes = {
+        "supported_adjust_step": f"{percentage_step}%",
+    }
+    current_percent = None
+    if ctx.delta.adjust != AdjustType.SET:
+        current_percent = ctx.state.attributes.get(cover.ATTR_CURRENT_POSITION)
+        if current_percent is None:
+            raise UnsupportAdjustmentError
+
+    target_percent = ctx.delta.calc_target(
+        current_percent, percentage_step, 1, 0, 100, supports={"number"}
+    )
+    target.service = SERVICE_SET_COVER_POSITION
+    target.service_data[cover.ATTR_POSITION] = target_percent
+    target.attributes["updated_value"] = f"{target_percent}%"
+
+
+def _current_number_value(state: State) -> int | float | None:
+    """number 实体当前值：state 字符串为主，属性 "value" 兜底；解不出返 None。"""
+    for raw in (state.state, (state.attributes or {}).get("value")):
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return int(value) if value.is_integer() else value
+    return None
+
+
+@register_adjustment("number", "value")
+def adjust_number_value(ctx: AdjustmentContext, target: AdjustmentTarget):
+    target.attributes = {}
+    min_val = ctx.state.attributes.get("min")
+    max_val = ctx.state.attributes.get("max")
+    delta = ctx.delta
+    # v1.1.27：本处理器旧版**只读 delta.value** ⇒ 相对档被当绝对值下发
+    # （「数值调高10」→ set_value(10)），极值档 special 更是 value=0
+    # （「调到最大」→ set_value(0)，数值实体最低档）。两种都是静默误执行。
+    if delta.special:
+        # 极值档按实体自己声明的 min/max 映射（与 Delta.calc_target 同口径：
+        # low→min、high→max）；medium/auto 在数值实体无对应语义，如实失败。
+        if delta.special in ("max", "high"):
+            value = max_val
+        elif delta.special in ("min", "low"):
+            value = min_val
+        else:
+            raise intent.IntentHandleError(
+                f"数值实体不支持 {delta.special} 档位，请说具体数值")
+        if value is None:
+            raise intent.IntentHandleError(
+                "该数值实体未声明 min/max，无法确定极值档目标值，请说具体数值")
+    elif delta.adjust == AdjustType.SET:
+        value = delta.value
+    else:
+        current = _current_number_value(ctx.state)
+        if current is None:
+            # 相对档没有基准值就没有"加/减多少"——如实失败，绝不猜 0。
+            raise UnsupportAdjustmentError
+        value = current + delta.value
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+    if min_val is not None and value < min_val:
+        raise intent.IntentHandleError(f"数值 {value} 低于最小值 {min_val}")
+    if max_val is not None and value > max_val:
+        raise intent.IntentHandleError(f"数值 {value} 超出最大值 {max_val}")
+    target.service = number.const.SERVICE_SET_VALUE
+    target.service_data["value"] = value
+    target.attributes["updated_value"] = value
+
+
+@register_adjustment("media_player", "volume")
+def adjust_media_player_volume(ctx: AdjustmentContext, target: AdjustmentTarget):
+    raise intent.IntentHandleError("unsupported")
+
+
+@register_adjustment("media_player", "brightness")
+def adjust_media_player_brightness(ctx: AdjustmentContext, target: AdjustmentTarget):
+    raise intent.IntentHandleError("unsupported")
+
+
+class AdjustDeviceAttributeIntent(intent.IntentHandler):
+    intent_type = "AdjustDeviceAttribute"
+    description = (
+        "Set or adjust a device attribute value. "
+        "Supported attributes: brightness(light), color(light), temperature(light/climate), "
+        "position(cover), fan_speed(fan/climate), humidity(humidifier). "
+        "Delta format: '+10'/'上调10'=increase, '-5'/'下调5'=decrease, "
+        "'50%'/'50度'=set absolute, 'max'/'min'/'low'/'high'=special values. "
+        "Examples: '把卧室灯调亮20%' -> attribute=brightness, delta=+20, target=卧室灯. "
+        "'把空调温度调到26度' -> attribute=temperature, delta=26, target=空调."
+    )
+    platforms = {
+        Platform.LIGHT,
+        Platform.FAN,
+        Platform.COVER,
+        Platform.CLIMATE,
+        Platform.MEDIA_PLAYER,
+    }
+
+    @property
+    def slot_schema(self) -> dict | None:
+        """Return a slot schema."""
+        return {
+            vol.Required("attribute"): vol.Any(*supported_attribute_list),
+            vol.Required("delta"): intent.non_empty_string,
+            vol.Required("target"): target_parameter_type(),
+        }
+
+    async def async_handle(self, intent_obj: intent.Intent) -> JsonObjectType:  # type: ignore
+        """Handle the intent."""
+        hass = intent_obj.hass
+        slots, fail = validate_slots_safely(self, intent_obj, "AdjustDeviceAttribute")
+        if fail is not None:
+            return fail
+        _LOGGER.info("AdjustDeviceAttribute slots: %s", slots)
+
+        attribute: str = slots.get("attribute", {}).get("value")
+        delta_raw: str = slots.get("delta", {}).get("value")
+        targets: list[HaTargetItem] = slots.get("target", {}).get("value", [])
+        # 归一化中文数字（如"五号"->"5号"），提高实体匹配成功率
+        targets = normalize_targets_device_names(targets)
+
+        delta = parse_delta(delta_raw)
+        if not delta:
+            raise intent.IntentHandleError(f"invalid value: {delta_raw}")
+
+        error_msg, candidate_entities = await match_intent_entities(intent_obj, targets)
+        if error_msg:
+            return error_msg
+        if not candidate_entities:
+            # 永不抛（同 intent_turn：assert 炸 500 会让话术层只剩空括号）
+            return {"success": False, "error": "No available devices found"}
+
+        response = ExtIntentResponse(intent_obj.language, intent=intent_obj)
+        for item in candidate_entities:
+            domain = item.state.domain
+            state = item.state
+            _LOGGER.info("AdjustDeviceAttribute state: %s", item.state.as_dict_json)
+
+            error: str | None = None
+            target = AdjustmentTarget()
+            try:
+                prepare_adjustment = adjustment_functions.get(domain, {}).get(attribute)
+                if not prepare_adjustment:
+                    raise intent.IntentHandleError("unsupported")
+
+                # Find the paramters to adjust.
+                # M4（2026-09-23 深审）：adjust_light_temperature 等换算函数
+                # **就地**改写 ctx.delta（value %→K、unit 覆写），多实体
+                # （两台色温域不同的灯）时第二台跳过换算分支拿错值——
+                # 逐实体副本是数据卫生底线（同文件其它 target 本就逐实体新建）。
+                prepare_adjustment(
+                    AdjustmentContext(state=state, delta=replace(delta)), target)
+                target.service_data[ATTR_ENTITY_ID] = state.entity_id
+
+                # Perform adjustment.
+                _LOGGER.info("AdjustDeviceAttribute call target: %s", asdict(target))
+                await hass.services.async_call(
+                    domain,
+                    target.service,
+                    service_data=target.service_data,
+                    blocking=True,
+                    context=intent_obj.context,
+                )
+            except (intent.IntentHandleError, ServiceValidationError) as e:
+                error = str(e)
+
+            response.set_state(item, target.attributes, error)
+
+        states, success_count = response.states()
+        # v1.0.34：补顶层 success 对齐 turn 族返回形态——加载项 _normalize_result
+        # 旧版只认 "success" 键，此返回整体被折进 raw，话术只剩裸「好的」
+        # （2026-09-10 实发：'调到百分之十' 执行成功却只回"好的"）。
+        return {
+            "success": success_count > 0,
+            "success_count": success_count,
+            "states": states,
+        }

@@ -1,0 +1,558 @@
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
+import time
+
+from aiohttp import web
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.http import KEY_HASS, HomeAssistantView
+
+from ..const import CONF_STT_ENTITY_ID, CONF_TTS_ENTITY_ID, DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_https(hass: HomeAssistant):
+    this_data = hass.data.setdefault(DOMAIN, {})
+    if this_data.get("https_setup"):
+        return
+    this_data["https_setup"] = True
+    hass.http.register_view(HuijianSetupView)
+    hass.http.register_view(HuijianRemoveView)
+    hass.http.register_view(HuijianTtsSttView)
+    hass.http.register_view(HuijianSatellitesView)
+    hass.http.register_view(HuijianSatelliteOtaView)
+    hass.http.register_view(HuijianSatelliteContinuousView)
+
+
+class HuijianHttpView(HomeAssistantView):
+    requires_auth = False
+
+    async def check_sign(self, request: web.Request, speak_id=None):
+        hass = request.app[KEY_HASS]
+        params = request.query
+        if request.method in ("PUT", "POST"):
+            params = await request.json() or {}
+        if not speak_id:
+            speak_id = params.get("speak_id") or request.query.get("speak_id", "")
+        entry = None
+        for ent in hass.config_entries.async_loaded_entries(DOMAIN):
+            if speak_id == ent.data.get("speak_id"):
+                entry = ent
+                break
+        if not entry:
+            return None
+        salt = request.headers.get("Salt", "")
+        # 第四轮审计 P1（对抗复核 A1 修）：签名从**独立头** `X-Huijian-Sign` 取。
+        # 旧实现拿 `Authorization` 与裸摘要逐字比，而令牌闸（requires_auth=True）
+        # 要求同一个头必须是 `Bearer <HA令牌>` ⇒ 认证通过则签名必失败（"双闸"
+        # 自相矛盾、端点恒 400）。现契约：
+        #   · 令牌是**主闸**（HA middleware 强制，未带即 401）；
+        #   · `X-Huijian-Sign` 是**可选兼容闸**——带了就必须对（防错签/伪造），
+        #     不带则由令牌独立放行（签名密钥只是设备 MAC，本就不构成秘密，
+        #     安全强度由令牌承担；签名算法本身不动，跨端契约形状不变）。
+        sig = request.headers.get("X-Huijian-Sign", "")
+        if not sig:
+            return entry
+        ret = sig == calculate_sign(
+            request.path,
+            params,
+            entry.data.get("mac", "").lower(),
+            salt,
+        )
+        return entry if ret else False
+
+
+class HuijianSetupView(HuijianHttpView):
+    url = "/api/huijian-ai/setup/qrcode"
+    name = "api:huijian-ai:setup-qrcode"
+
+    async def post(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        this_data = hass.data.setdefault(DOMAIN, {})
+        if not (uuid := request.query.get("uuid")):
+            return self.json_message("uuid missing", 400)
+        if uuid not in this_data:
+            return self.json_message("uuid invalid", 400)
+
+        setup_data = await request.json() or {}
+
+        # Verify signature using UUID as shared secret
+        # If no signature is provided, fall back to UUID-only check
+        # for backward compatibility with existing clients
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header:
+            expected_sign = hmac.new(
+                uuid.encode("utf-8"),
+                json.dumps(setup_data, separators=(",", ":")).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if auth_header != expected_sign:
+                _LOGGER.warning("Setup request with invalid signature for uuid=%s", uuid)
+                return self.json_message("invalid signature", 401)
+
+        _LOGGER.info("Setup qrcode from miniprogram: %s",
+                     {k: v for k, v in setup_data.items() if k != "noise_psk"})
+
+        this_data[uuid] = setup_data
+        # OTA 设备台账（v1.0.65 审查批·契约 F-02 断链修复）：固件 CMD20 入驻 POST
+        # （ble_manager.cc:761）是现网**唯一**携带 fw_version 的设备上报，落点就在
+        # 本口——旧实现的台账写入挂在 speakname 口（设备 body 只有 speak_name/
+        # speak_id），fw_version 永远进不了账 → 面板版本恒「未上报」、updatable
+        # 恒 false。speak_id 维度台账=运行期内存态（每次重新入驻刷新）；建账时
+        # 版本由 config_flow 持久化进 entry.data（HA 重启后仍可显示）。
+        sid = str(setup_data.get("speak_id") or "")
+        fv = str(setup_data.get("fw_version") or "").strip()
+        if sid and fv:
+            this_data.setdefault("satellite_ledger_by_speakid", {})[sid] = {
+                "fw_version": fv, "ts": time.time()}
+        return self.json_message("ok")
+
+
+class HuijianRemoveView(HuijianHttpView):
+    # 第四轮审计 P1：解绑是破坏性写，而本口此前匿名 + 签名密钥只是设备 MAC
+    # （BLE 广播明文，非秘密）⇒ 局域网内知 speak_id+mac 者可解绑卫星。
+    # 与同文件 satellites/ota/continuous 同口径加 HA 令牌闸；签名校验保留
+    # （双闸：令牌 + 签名，签名算法不删以免动跨端契约）。
+    requires_auth = True
+    url = "/api/huijian-ai/remove"
+    name = "api:huijian-ai:remove"
+
+    async def delete(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        if not (speak_id := request.query.get("speak_id")):
+            return self.json_message("speak_id missing", 400)
+        entry = await self.check_sign(request, speak_id)
+        if not entry:
+            return self.json_message("params error", 400)
+
+        _LOGGER.info("Remove entry: %s", entry.entry_id)
+        await hass.config_entries.async_remove(entry.entry_id)
+        return self.json_message("ok")
+
+
+class HuijianSatellitesView(HuijianHttpView):
+    """卫星台账（OTA 方案 Phase 2 集成侧，2026-09-23；加载项面板数据源）。
+
+    每行=一个已加载的卫星 config entry：身份(mac/speak_id/host:port)、展示名
+    与区域（device registry 单一事实源）、在线态（RuntimeEntryData.available，
+    API 连接真源）、固件版本（两级回退：speak_id 台账（CMD20 入驻
+    POST，本运行期）→entry.data（建账时版本，可能陈旧，fw_source 标「入驻时」）
+    全缺=""=未上报）、以及设备端 OTA 接收口探测（entry_data.services 里带 ota
+    字样的 user service——现网 v2.1.35 恒空，固件 Phase 1 落地后自动点亮，面板
+    据此在「近场代发」与「远程下发」两态间切换，无需再改集成）。
+
+    安全：requires_auth=True——含内网拓扑；加载项 ha_client 已持 HA 长期令牌，
+    经 rest_get 调用（同 /api/huijian-ai/manage 系列数据面口径）。
+    """
+
+    requires_auth = True
+    url = "/api/huijian-ai/satellites"
+    name = "api:huijian-ai:satellites"
+
+    async def get(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        sid_ledger = domain_data.get("satellite_ledger_by_speakid", {})
+        device_registry = dr.async_get(hass)
+        areas = ar.async_get(hass)
+        out = []
+        for entry in hass.config_entries.async_loaded_entries(DOMAIN):
+            if not entry.data.get("host"):
+                continue  # assist 引擎类条目无 host＝不是卫星，不进台账
+            mac = str(entry.data.get("mac", "") or "").lower()
+            rd = getattr(entry, "runtime_data", None)
+            ota_services = []
+            for svc in (getattr(rd, "services", None) or {}).values():
+                name = getattr(svc, "name", "") or ""
+                if "ota" in name.lower() or "upgrade" in name.lower():
+                    ota_services.append(name)
+            area_name = ""
+            device_id = ""
+            if mac:
+                dev = device_registry.async_get_device(
+                    connections={(dr.CONNECTION_NETWORK_MAC, mac)})
+                if dev:
+                    device_id = dev.id
+                    if dev.area_id and (a := areas.async_get_area(dev.area_id)):
+                        area_name = a.name or ""
+            speak_id = str(entry.data.get("speak_id", "") or "")
+            # 固件版本两级回退（v1.0.65·契约 F-02）：speak_id 台账（CMD20 入驻
+            # POST，本运行期实时）→ entry.data（建账时持久化，跨重启可显但可能
+            # 陈旧，如实标源）。原 mac 台账（speakname 口）随死改名链一并移除。
+            rec = sid_ledger.get(speak_id, {})
+            fw_live = str(rec.get("fw_version", "") or "")
+            fw_source = "实时" if fw_live else ""
+            fw = fw_live or str(entry.data.get("fw_version", "") or "")
+            if fw and not fw_source:
+                fw_source = "入驻时"
+            out.append({
+                "entry_id": entry.entry_id,
+                "name": entry.title or entry.data.get("device_name", ""),
+                "mac": mac,
+                "speak_id": speak_id,
+                "host": entry.data.get("host", ""),
+                "port": entry.data.get("port", 6053),
+                "online": bool(getattr(rd, "available", False)),
+                "area": area_name,
+                "device_id": device_id,
+                "fw_version": fw,
+                "fw_source": fw_source,
+                "fw_reported_at": rec.get("ts"),
+                "ota_services": ota_services,
+                # v1.0.80：面板「连续对话」列数据源（True/False/None=不可判）
+                "continuous_dialogue": _continuous_state(hass, entry),
+                # v1.0.87：None 的四种成因如实分开（面板按钮话术数据源）
+                "continuous_dialogue_diag": _continuous_diag(hass, entry),
+            })
+        return self.json({"devices": out})
+
+
+class HuijianSatelliteOtaView(HuijianHttpView):
+    """v1.0.74 OTA 真下发中继：加载项 /api/firmware/dispatch 签好一次性链接后来
+    此调用——body {mac|entry_id, url}，本视图经已建连的 :6053 Noise 通道调设备
+    用户服务 ota_upgrade(url)。URL 来源校验**不在此重复实现**：设备侧
+    Ota::IsUpgradeUrlAllowed 白名单闸只收私网字面 IPv4+http（单一事实源）；
+    领取令牌一次性/TTL 在加载项固件仓。永不抛全路径折叠 200 JSON——加载项
+    rest_write 契约要求结构化 error 可读，不许裸 500。"""
+
+    url = "/api/huijian-ai/satellites/ota"
+    name = "api:huijian-ai:satellites-ota"
+    # 写命令通道（向设备下发固件 URL）：同卫星台账面口径必须 HA 令牌——
+    # 匿名 POST 能把任意 URL 喷向在线卫星，设备白名单闸只限网段不限意图。
+    requires_auth = True
+
+    async def post(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        try:
+            body = await request.json() or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        mac = str(body.get("mac", "") or "").strip().lower()
+        entry_id = str(body.get("entry_id", "") or "").strip()
+        url = str(body.get("url", "") or "").strip()
+        if not url.startswith("http://"):
+            return self.json({"success": False,
+                              "error": "url 缺失或非 http（设备白名单闸只收私网字面 IPv4）"})
+        if not mac and not entry_id:
+            return self.json({"success": False, "error": "mac/entry_id 必填其一"})
+        target = None
+        for ent in hass.config_entries.async_loaded_entries(DOMAIN):
+            if not ent.data.get("host"):
+                continue  # assist 引擎条目不是卫星（与 satellites 台账同判定）
+            if (mac and str(ent.data.get("mac", "") or "").lower() == mac) or \
+               (entry_id and ent.entry_id == entry_id):
+                target = ent
+                break
+        if target is None:
+            return self.json({"success": False,
+                              "error": f"卫星台账无此设备（mac={mac or entry_id}）——"
+                                       "配网入驻后且 HA 已连接才会出现在台账"})
+        rd = getattr(target, "runtime_data", None)
+        client = getattr(rd, "client", None) if rd is not None else None
+        if rd is None or client is None or not getattr(rd, "available", False):
+            return self.json({"success": False, "error": "设备离线或 API 通道未建立"})
+        svc = None
+        for s in (getattr(rd, "services", None) or {}).values():
+            name = getattr(s, "name", "") or ""
+            if "ota" in name.lower() or "upgrade" in name.lower():
+                svc = s
+                break
+        if svc is None:
+            return self.json({"success": False,
+                              "error": "设备固件无 ota_upgrade 接收口（<v2.1.36）——"
+                                       "请退回面板签发链接备存形态"})
+        try:
+            await client.execute_service(svc, {"url": url})
+        except Exception as e:
+            _LOGGER.warning("[OTA] 调设备 %s 失败: %s", svc.name, e)
+            return self.json({"success": False, "error": f"服务调用失败: {e}"[:160]})
+        _LOGGER.info("[OTA] ota_upgrade 已下发 %s (mac=%s)", target.title, mac or "-")
+        return self.json({"success": True, "service": svc.name})
+
+
+_CONT_SUFFIX = "-continuous_dialogue_switch"  # unique_id 契约：MAC-object_id（aioesphomeapi
+# build_unique_id 上游式）；object_id 由固件 v2.1.46 钉死 "continuous_dialogue_switch"
+
+
+# v1.0.87：连续对话态诊断码。v1.0.80 的 None 三态把"真无实体/实体被禁用/设备
+# 离线/实体未就绪"混成一句"需固件≥2.1.46"——现场据此换固件仍不亮，白折腾一轮
+# （v1.0.65 F-OTA-04 纪律：一种文案不背两种锅）。True/False/None 对外契约不变
+# （面板 data-on 与 v1080 钉仍吃它），细分原因另走 continuous_dialogue_diag。
+_CONT_ON, _CONT_OFF = "on", "off"
+_CONT_MISSING = "no_entity"      # 注册表无此实体：固件 < v2.1.46（或从未上报）
+_CONT_DISABLED = "disabled"      # 实体存在但在 HA 被禁用（用户在 HA 实体页关过）
+_CONT_OFFLINE = "offline"        # 实体在，HA 态 unavailable：设备/API 断链
+_CONT_PENDING = "pending"        # 实体在，还没有态：HA 刚起/平台未加载完
+_CONT_ERRORS = {
+    _CONT_MISSING: "该设备无「连续对话」实体（固件需 ≥v2.1.46）",
+    _CONT_DISABLED: "「连续对话」实体在 HA 中被禁用——请在 HA 里启用该实体后再试",
+    _CONT_OFFLINE: "设备当前离线（API 连接断开），开关指令无法送达——上线后再试",
+    _CONT_PENDING: "设备实体尚未就绪（HA 刚重启/平台加载中）——稍后重试",
+}
+
+
+def _continuous_entity(hass, entry):
+    """→ (entity_id | None, 诊断码)。禁用实体不作为可写实体，但单独报因。
+
+    注意 er 的注册表条目**含禁用实体**：不查 ent.disabled 就会把"被禁用"当成
+    "可以 turn_on"，服务调用必然以"服务调用失败: …"回话，病因被折叠成怪症状。
+    """
+    reg = er.async_get(hass)
+    disabled = None
+    for ent in er.async_entries_for_config_entry(reg, entry.entry_id):
+        if not (ent.entity_id.startswith("switch.")
+                and str(ent.unique_id or "").endswith(_CONT_SUFFIX)):
+            continue
+        if ent.disabled:
+            disabled = disabled or ent.entity_id
+            continue
+        return ent.entity_id, ""
+    return None, (_CONT_DISABLED if disabled else _CONT_MISSING)
+
+
+def _continuous_diag(hass, entry) -> str:
+    """台账诊断码：on|off|no_entity|disabled|offline|pending（面板话术数据源）。"""
+    eid, reason = _continuous_entity(hass, entry)
+    if eid is None:
+        return reason
+    st = hass.states.get(eid)
+    if st is None:
+        return _CONT_PENDING
+    if st.state == _CONT_ON:
+        return _CONT_ON
+    if st.state == _CONT_OFF:
+        return _CONT_OFF
+    return _CONT_OFFLINE if st.state == "unavailable" else _CONT_PENDING
+
+
+def _continuous_state(hass, entry):
+    """True/False=实体在且可达；None=不可判（无实体/禁用/离线/未就绪）。"""
+    d = _continuous_diag(hass, entry)
+    return True if d == _CONT_ON else (False if d == _CONT_OFF else None)
+
+
+class HuijianSatelliteContinuousView(HuijianHttpView):
+    """v1.0.80 连续对话开关（加载项面板用）：写设备同一个 esphome switch 实体
+    ——设备侧 setContinuousDialogue 是 NVS 唯一收口（BLE/HA/面板三边同源回显，
+    固件 v2.1.46 deferred publish）。永不抛折叠 200 JSON（OTA 中继视图同纪律）。"""
+
+    url = "/api/huijian-ai/satellites/continuous"
+    name = "api:huijian-ai:satellites-continuous"
+    requires_auth = True
+
+    async def post(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        try:
+            body = await request.json() or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        mac = str(body.get("mac", "") or "").strip().lower()
+        entry_id = str(body.get("entry_id", "") or "").strip()
+        enabled = bool(body.get("enabled", False))
+        if not mac and not entry_id:
+            return self.json({"success": False, "error": "mac/entry_id 必填其一"})
+        target = None
+        for ent in hass.config_entries.async_loaded_entries(DOMAIN):
+            if not ent.data.get("host"):
+                continue
+            if (mac and str(ent.data.get("mac", "") or "").lower() == mac) or \
+               (entry_id and ent.entry_id == entry_id):
+                target = ent
+                break
+        if target is None:
+            return self.json({"success": False,
+                              "error": f"卫星台账无此设备（mac={mac or entry_id}）"})
+        eid, reason = _continuous_entity(hass, target)
+        if eid is None:
+            return self.json({"success": False, "error": _CONT_ERRORS[reason]})
+        if _continuous_diag(hass, target) == _CONT_OFFLINE:
+            # 离线时服务调用只会以异常收口（"服务调用失败: Connection…"），
+            # 病因说是连接还是固件全靠猜——这里直接点名，且省掉下面的复核等待。
+            return self.json({"success": False,
+                              "error": _CONT_ERRORS[_CONT_OFFLINE]})
+        try:
+            await hass.services.async_call(
+                "switch", "turn_on" if enabled else "turn_off",
+                {"entity_id": eid}, blocking=True)
+        except Exception as e:
+            _LOGGER.warning("[连续对话] 调实体失败 %s: %s", eid, e)
+            return self.json({"success": False, "error": f"服务调用失败: {e}"[:160]})
+        # v1.0.87（现场"点了没反应，再点一次才变"根修）：esphome 的 switch_command
+        # 是即发即回（写进发送缓冲就返回，blocking=True 也只代表服务调用完成），
+        # 真态要等设备 NVS 写 + deferred publish 回灌（固件 v2.1.46 一拍）。旧形态
+        # 面板拿 success 立刻重读台账 → 读到旧态 → 按钮纹丝不动。这里有界复核
+        # ≤1.6s，把"设备已回显"与"仅令已下发"分成两句话，面板据此出话术。
+        echoed = False
+        for _ in range(8):
+            await asyncio.sleep(0.2)
+            st = hass.states.get(eid)
+            # 第四轮审计 P2：unavailable/unknown 不得算"已回显"——旧判据
+            # (False == enabled) 在关开关时把不可用实体判成回显（面板谎报）。
+            if (st is not None and st.state in ("on", "off")
+
+                    and (st.state == _CONT_ON) == enabled):
+                echoed = True
+                break
+        _LOGGER.info("[连续对话] %s → %s (mac=%s) 设备回显=%s", eid,
+                     "on" if enabled else "off", mac or entry_id, echoed)
+        return self.json({"success": True, "entity_id": eid, "enabled": enabled,
+                          "echoed": echoed})
+
+
+def parse_tts_stt_options(raw):
+    """options query 参数 → dict（审查修复 2026-09-21）。旧版把 query string
+    原样直传 async_create_result_stream，core 里 options.pop → AttributeError
+    ——该参数一传即 400，形同虚设。显式 JSON 解析并校验必须为对象；缺省 {}。"""
+    if not raw:
+        return {}
+    try:
+        opts = json.loads(raw)
+    except ValueError:
+        raise ValueError("options 必须为 JSON 对象字符串")
+    if not isinstance(opts, dict):
+        raise ValueError("options 必须为 JSON 对象")
+    return opts
+
+
+def pick_default_entities(loaded_entries):
+    """多条目取默认实体的**first-wins** 规则（审查修复 2026-09-21）。
+    旧循环"最后一条 entry 覆盖"——多设备条目下取到随机末位的配置
+    （张冠李戴）。各键取首个显式配置者；皆无则定案默认。"""
+    conf_tts = conf_stt = None
+    for entry in loaded_entries:
+        if not conf_tts:
+            conf_tts = entry.options.get(CONF_TTS_ENTITY_ID)
+        if not conf_stt:
+            conf_stt = entry.options.get(CONF_STT_ENTITY_ID)
+        if conf_tts and conf_stt:
+            break
+    return (conf_tts or "tts.huijian_speech",
+            conf_stt or "stt.huijian_asr")
+
+
+class HuijianTtsSttView(HuijianHttpView):
+    requires_auth = True
+    url = "/api/huijian-ai/tts-stt"
+    name = "api:huijian-ai:tts-stt"
+
+    async def get(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        message = request.query.get("message")
+        if not message or not message.strip():
+            return self.json_message("message 必填", 400)
+
+        default_tts, default_stt = pick_default_entities(
+            hass.config_entries.async_loaded_entries(DOMAIN))
+
+        tts_entity = request.query.get("tts_entity", default_tts)
+        stt_entity = request.query.get("stt_entity", default_stt)
+
+        try:
+            options = parse_tts_stt_options(request.query.get("options"))
+        except ValueError as err:
+            return self.json({"error": str(err)}, 400)
+        try:
+            stream = hass.data["tts_manager"].async_create_result_stream(
+                engine=tts_entity,
+                # 第四轮审计 P2：`?nocache`（空值）此前被判 falsy ⇒ 开关完全失效。
+                # v1.1.36 复核：那次"修复"仍是 no-op（见 `_file_cache_disabled` 头注），
+                # 现在按**键在不在**判，裸 `?nocache` 与 `?nocache=1` 都真的禁缓存。
+                use_file_cache=not _file_cache_disabled(request.query),
+                options=options,
+            )
+        except Exception as err:
+            return self.json({"error": str(err)}, 400)
+        stream.async_set_message(message)
+
+        stt_entity = hass.data["stt"].get_entity(stt_entity)
+        if not stt_entity:
+            return self.json_message("stt entity not found", 400)
+
+        from homeassistant.components import stt
+
+        from .audio import async_convert_audio
+
+        metadata = stt.SpeechMetadata(
+            language="zh",
+            format=stt.AudioFormats.WAV,
+            codec=stt.AudioCodecs.PCM,
+            bit_rate=stt.AudioBitRates.BITRATE_16,
+            sample_rate=stt.AudioSampleRates.SAMPLERATE_16000,
+            channel=stt.AudioChannels.CHANNEL_MONO,
+        )
+        converting = async_convert_audio(
+            hass,
+            stream.async_stream_result(),
+            stream.extension,
+            to_extension=metadata.format.value,
+            to_sample_rate=metadata.sample_rate.value,
+        )
+        # 第四轮审计 P2：整段识别必须有界——STT 通道停滞时旧形可把该 HTTP
+        # 请求挂到 tts 整轮总闸（720s），占死 aiohttp handler。
+        try:
+            async with asyncio.timeout(60):
+                result = await stt_entity.async_process_audio_stream(metadata, converting)
+        except TimeoutError:
+            return self.json_message("audio stream timeout", 504)
+        return self.json(
+            {
+                "text": result.text,
+                "result": result.result,
+            }
+        )
+
+
+def _file_cache_disabled(query) -> bool:
+    """`?nocache` **出现即**禁用 TTS 文件缓存（不带值也算，`?nocache=1` 同）。
+
+    第四轮审计 P2 那条"修复"取的是**值**再与 (None, "") 比——它与它声称要替换的
+    旧写法（同样看值真不真）**真值表逐位相同**（yarl 把裸 `?nocache` 解析成空串），
+    ⇒ 带值写法 `?nocache=1` 一直有效，**裸 `?nocache` 则从来没禁掉过缓存**，
+    而那条注释宣称"`?nocache` / `?nocache=1` 都生效"——半句为假（复核代理抓到、
+    我按 yarl 逐值复现过）。判据因此看**键在不在**，不看值真不真。
+    永不抛（query 不是映射时按"没禁用"处理）。
+    """
+    try:
+        return "nocache" in query
+    except TypeError:
+        return False
+
+
+def calculate_sign(uri, params, mac, salt):
+    """
+    签名算法:
+    1. n = sha256(uri)
+    2. 拼接参数字符串并计算 m = sha256(参数字符串)
+    3. response = sha256(m + n + mac + salt)
+
+    跨端约定（勿破坏）：
+    · uri 必须是**纯路径**（request.path / 固件侧固定路径字面量），**不得含
+      host/scheme/query**——固件 hashAuthorization（0513gujian ble_manager.cc）
+      以纯路径参与哈希，任何一侧把 host 或 query 卷进来都会签名失配 400。
+    · params 按 key ASCII 字典序拼 k=v&；固件 std::map 天然同序，Python 侧
+      sorted() 同序。POST 用 body JSON 作为 params 集合（request.json()），
+      固件 r_postDeviceName 用同名字段 map——两侧字段名/值必须逐字一致。
+    · mac 参与前统一小写（固件侧也转小写）；salt 由请求方生成经 Salt 头携带。
+    """
+    # 步骤1: 计算 n = sha256(uri)
+    n = hashlib.sha256(uri.encode("utf-8")).hexdigest()
+
+    # 步骤2: 拼接参数并计算 m = sha256(参数字符串)
+    # 将参数排序后拼接成 key=value 格式
+    sorted_params = sorted(params.items(), key=lambda x: x[0])
+    param_str = "&".join([f"{k}={v}" for k, v in sorted_params])
+    m = hashlib.sha256(param_str.encode("utf-8")).hexdigest()
+
+    # 步骤3: 计算最终摘要
+    response_str = f"{m}{n}{mac}{salt}"
+    return hashlib.sha256(response_str.encode("utf-8")).hexdigest()

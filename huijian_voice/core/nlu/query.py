@@ -1,0 +1,825 @@
+"""查询族（v4.1 定案 M1：本地读回，不走 LLM）。
+
+fast_path 的复杂查询守卫把 "客厅多少度" 放行（原代码即为温度查询预留），
+此处接管：解析区域+量纲 → ha_client 状态缓存 → 中文短句。
+未命中返回 None 继续向 LLM/兜底层流动。支持：温度/湿度/照度读数、开关状态、
+时间问答（GetDateTime 本地时钟 + HA 时区）。
+"""
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime
+from typing import Optional
+
+logger = logging.getLogger("huijian.query")
+
+_AREA_SUFFIX = ("室", "厅", "房", "间", "区", "馆", "楼", "卫", "厨")
+
+# v1.0.49（Q2）：本地可答量纲信号词——fast_path 的复杂守卫（多少|几 → 上层）
+# 之前先过这盏灯，否则「办公室温度多少」「平开窗电池电量多少」这类最普通的
+# 读数问句全部在入口被"交上层"截走，无 LLM 用户只剩兜底话术（现场主诉）。
+# 只放"读数据"专有维度词，不放泛疑问词——宁可少放行不可劫持控制/创作句。
+_LOCAL_DIM_RE = re.compile(
+    r"(温度|湿度|照度|亮度|电量|电池|有人|没人|有没有人|是否有人|人在不在|空不空|多少度|几度)")
+
+
+def looks_local_query(text: str) -> bool:
+    """命中本地量纲词 → True（守卫放行给查询族，未命中自然回原链）。"""
+    return bool(_LOCAL_DIM_RE.search(text or ""))
+
+
+# 本地时钟三支（_time_answer/_weekday_answer/_date_answer）——答案取自
+# datetime.now()（+ HA 时区），**不来自状态快照**，因此不吃陈旧加注。
+# 判据必须与 `_answer_inner` 里那三条分支**逐支对应**，包括各支自己的排除式：
+#   少一条 ⇒ 那一支的时钟答案被贴假注（线上形态：升级后第一句「现在几点」即中招，
+#   因为 `_states_ts` 初值是 0）；多一条 ⇒ 快照来源的答案被免了注。
+# v1.1.36 复核批二（对抗复核抓到、我复现）：旧写法把「定时|预约」的排除**提到全局**，
+#   而 `_answer_inner` 的星期几分支本来**没有**这道排除（它确实能答「预约的会议是
+#   星期几」）⇒ 该类时钟答案仍被贴"数字可能不是最新"。排除式必须跟着各自的分支走。
+# 单向钉不够：tests/test_v1136_review_batch.py 与 test_v1136_second_batch.py 配了
+#   正反两条（分支正则=豁免表；有排除的支不许免注、没排除的支必须免注）。
+_LOCAL_CLOCK_RE = re.compile(
+    r"(现在)?(几点了?|什么时间|几点钟|什么时候|时间)")
+_LOCAL_CLOCK_RE2 = re.compile(r"(星期几|礼拜几|周几)")
+_LOCAL_CLOCK_RE3 = re.compile(r"(几号|几月几号|日期是|号是)")
+
+
+def _answer_from_local_clock(text: str) -> bool:
+    """本句是否由时钟分支应答——三条分支各自的排除式一比一照抄。永不抛。"""
+    t = (text or "").strip().rstrip("。？！?!，,")
+    if not t:
+        return False
+    if _LOCAL_CLOCK_RE.search(t) and not re.search(r"定时|预约", t):
+        return True
+    if _LOCAL_CLOCK_RE2.search(t):                     # 星期几支：无排除式
+        return True
+    if _LOCAL_CLOCK_RE3.search(t) and not re.search(r"定时|预约|几天", t):
+        return True
+    return False
+
+# 查询族设备类别表（v1.1.2 统一：状态/属性/计数三支共用）。
+# 原表 12 词且三支各写一份正则（属性支漏 射灯/平开窗、计数支漏 窗/幕布…），
+# v1.1.0 那批具名设备词进了**设备**表却没进**查询**表，「射灯亮度多少」
+# 「哪些窗开着」类整族落空或答成全域。长词优先，最左命中即定域（「电动窗帘」
+# 不得被 电动窗/窗 截胡成窗族）。
+_DEVICE_WORDS = {
+    "灯": ("light",), "筒灯": ("light",), "射灯": ("light",), "灯带": ("light",),
+    "吸顶灯": ("light",), "台灯": ("light",), "吊灯": ("light",), "主灯": ("light",),
+    "阅读灯": ("light",), "镜前灯": ("light",), "感应灯": ("light",), "夜灯": ("light",),
+    "落地灯": ("light",), "床头灯": ("light",),
+    "空调": ("climate",), "中央空调": ("climate",), "挂机空调": ("climate",),
+    "柜机空调": ("climate",),
+    "风扇": ("fan",), "落地扇": ("fan",), "电风扇": ("fan",), "循环扇": ("fan",),
+    "排气扇": ("fan",), "换气扇": ("fan",),
+    "窗": ("cover",), "窗帘": ("cover",), "电动窗帘": ("cover",), "卷帘": ("cover",),
+    "百叶帘": ("cover",), "百叶窗": ("cover",), "纱窗": ("cover",), "开窗器": ("cover",),
+    "平开窗": ("cover",), "推拉窗": ("cover",), "内开窗": ("cover",), "悬窗": ("cover",),
+    "电动窗": ("cover",), "幕布": ("cover",), "投影幕布": ("cover",),
+    "加湿器": ("humidifier",), "净化器": ("fan",), "空气净化器": ("fan",),
+    "除湿机": ("humidifier",), "热水器": ("water_heater",), "新风机": ("fan",),
+    "插座": ("switch",), "开关": ("switch",), "门": ("lock", "cover"),
+    "锁": ("lock",), "门锁": ("lock",), "扫地机器人": ("vacuum",),
+}
+# 最长优先扫描表（等长按表内声明序，与 targets 侧同纪律）
+_CLASS_WORDS = tuple(sorted(_DEVICE_WORDS, key=len, reverse=True))
+
+# 播报量词（计数/状态句里"3 __"的空）。表外类别回退"个设备"。
+_ASCII_TAIL_RE = re.compile(r"[\s\-_·]*([A-Za-z0-9][A-Za-z0-9\-_.:() ]*)$")
+
+
+def say_name(raw) -> str:
+    """播报用设备名：剥掉**尾部**型号尾巴，只在名字确实含中文时才剥。
+
+    v1.1.18 线上实测的念名噪音：「办公室空调 Air Conditioner关着」「开窗器 123f-020A
+    开窗器关着」——注册表 friendly_name 自带英文型号/十六进制后缀，照念像机器。
+    前导英文名不受影响（「HUIJIAN-BB28 麦克风开关」原样保留）。
+
+    v1.1.22：短尾（单个数字/字母，如「客厅射灯2」「客厅射灯A」）是**设备序号**不是
+    型号——剥了多台带序号设备在播报里就分不出谁是谁。只剥"≥2 字符且含字母"的尾段
+    （英文型号/十六进制），纯数字短尾一律原样。"""
+    t = str(raw or "").strip()
+    if not t or not any("一" <= c <= "鿿" for c in t):
+        return t
+    m = _ASCII_TAIL_RE.search(t)
+    if not m:
+        return t
+    tail = m.group(1)
+    if len(tail) < 2 or not any(c.isascii() and c.isalpha() for c in tail):
+        return t
+    return t[:m.start()].strip() or t
+
+
+_CLASS_NOUN = {"灯": "盏灯", "筒灯": "盏灯", "射灯": "盏灯", "灯带": "条灯带",
+               "吸顶灯": "盏灯", "台灯": "盏灯", "吊灯": "盏灯", "主灯": "盏灯",
+               "阅读灯": "盏灯", "镜前灯": "盏灯", "感应灯": "盏灯", "夜灯": "盏灯",
+               "落地灯": "盏灯", "床头灯": "盏灯",
+               "空调": "台空调", "中央空调": "台空调", "挂机空调": "台空调",
+               "柜机空调": "台空调", "风扇": "台风扇", "落地扇": "台风扇",
+               "电风扇": "台风扇", "循环扇": "台风扇", "排气扇": "台风扇",
+               "换气扇": "台风扇", "新风机": "台新风机",
+               "窗": "扇窗", "平开窗": "扇窗", "推拉窗": "扇窗", "内开窗": "扇窗",
+               "悬窗": "扇窗", "电动窗": "扇窗", "纱窗": "扇纱窗", "百叶窗": "扇百叶",
+               "窗帘": "幅窗帘", "电动窗帘": "幅窗帘", "卷帘": "幅卷帘",
+               "百叶帘": "幅百叶帘", "开窗器": "扇窗", "幕布": "幅幕布",
+               "投影幕布": "幅幕布", "加湿器": "台加湿器", "除湿机": "台除湿机",
+               "净化器": "台净化器", "空气净化器": "台净化器", "热水器": "台热水器",
+               "插座": "个插座", "开关": "个开关", "门": "扇门", "锁": "把锁",
+               "门锁": "把锁", "扫地机器人": "台扫地机器人"}
+
+_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+# 属性取值链的域代表词回落：_ATTR_KEYS 按"人最常问的那一型"写死（灯/空调/
+# 风扇…），而类别表现在 30+ 词——「射灯亮度多少」查 (射灯,亮度) 落空并不
+# 意味着该域没有亮度属性，必须回落到同域代表词的取值链。
+_DOMAIN_CANON = {}
+for _w, _d in _DEVICE_WORDS.items():
+    _DOMAIN_CANON.setdefault(_d, _w)
+
+# 状态疑问判据（v1.1.2 安全闸，fast_path 同调此表——一处判据两档共守）。
+# 「状态词 + 语气尾」收尾＝问句；礼貌请求尾（好吗/可以吗/行吗）已在
+# normalize_polite/_ECHO_TONE 剥除，剥后仍留 吗/没 的就是真问句。
+# v1.1.17 收口（审计实测三处枚举漏，命令档会**真的动设备**）：
+#   ①尾巴后允许跟时间副词与标点——旧表以 $ 直接锚在语气词后，实测
+#     「办公室窗户关了吗现在」「射灯关了吗？」「灯关了没？」全部漏进命令档；
+#   ②补方言尾「不」（「窗户关着不」= 关着吗）。
+# 反向纪律不变：祈使/请求句照旧执行（「…打开好吗」的 吗 已被上游剥掉）。
+STATE_QUESTION_TAIL = re.compile(
+    r"(?:开着|开了|开着了|关着|关了|关上|关闭|关好|灭着|灭了|亮着|拉着|拉上|拉下|拉开"
+    r"|停着|停了|停止|运行|在运行|插着|锁着|上锁|反锁|开着门)"
+    r"(?:的)?(?:呢|了)?\s*"
+    r"(?:吗|么|没有|没|不|[?？])"
+    r"(?:现在|目前|这会儿|呢)?"
+    r"[\s。，,！!、?？]*$")
+# V 没 V（正反问，口语高频且不依赖标点）：「射灯关没关」「空调开没开」。
+# 只认同一动词的 没/没有 夹心形——不含 没 的复叠（"开开关关"）不在此列。
+# v1.1.17 复审：**必须锚到句尾**。此前是 unanchored search，实测把祈使句里的
+# 「关没关紧」片段当问句吞了——「把那个关没关紧的窗关上」「开没开过的灯都打开」
+# 整条从命令档掉光（该做的不做，与误执行同级的反向失能）。问句形制本来就居于句尾，
+# 锚尾零损失；容忍补语与尾随标点。
+STATE_QUESTION_V_NOT_V = re.compile(
+    r"(开|关|亮|灭|锁|停|插)(?:没|没有)\1(?:[紧好着完了上下]*)?[\s。，,！!、？?]*$")
+STATE_QUESTION_ALT = re.compile(
+    r"(?:是开着还是关着|是关着还是开着|开着还是关着|关了没有|是不是开着|是不是关着"
+    r"|是不是(?:还)?开|是不是(?:还)?关|是否开着|是否关着|有没有开|有没有关"
+    r"|(?:现在|目前)?什么状态|状态怎么样|状态如何|现在怎样|怎么样了吗"
+    r"|查询.{0,10}状态|查一下.{0,10}状态|查.{0,10}状态)")
+
+
+# v1.1.19 复审：触发词必须是**疑问形**——裸「状态」会把祈使句一起吞掉（实测
+# 「把空调调到除湿状态」「空调调到睡眠状态」两档同时弃权 = 命令被吞，同义句换
+# 「…模式」就正常）。查询族自己的状态分支另有一套疑问判据（is_state_question）。
+_QUERY_TRIGGER_RE = re.compile(
+    r"(什么状态|啥状态|状态怎么样|状态如何|查.{0,6}状态|现在状态|目前状态"
+    r"|情况怎么样|情况如何|哪些|列表"
+    # v1.1.38（2026-10-05 现网体表端到端实锤）：「哪些」在表里，**同一族的
+    # 疑问代词按量词分形却不在** —— 「哪个灯开着」「哪盏灯亮着」在 v1.1.36
+    # 真入口上落成 `HassTurnOn` **真把灯开了**（工作树回退臂实测 source=klar、
+    # 执行 1 次；v1.1.37 只是被"点名查无"闸误拦成错回话，洞没补上）。
+    # 「谁」同形（「谁开了灯」）。与既有「哪些」一条纪律：只加疑问代词，
+    # 不加裸量词/状态字，避免把祈使句一起吞掉（v1.1.19 复审的失能形态）。
+    r"|哪(?:个|盏|台|部|支|扇|组|路)|谁)")
+# 量纲疑问的**问句形**（v1.1.17 复审②）：命令句里不会出现"多少/多大/几度"这类
+# 疑问词（用户要设值就直接报数：调到26度/调到百分之三十），所以按疑问词判比按
+# 量纲词判安全——`looks_local_query` 那套量纲词（度/多少/电量）会把量纲**命令**
+# 一起拦掉（实测两条既有钉当场红），故不用它。词表短且闭合：
+# 多少 / 多大 / 多高 / 多低 / 多小 / 多亮 / 几度 / 几档 / 是多少 / 现在几点。
+_QUANTITY_Q_RE = re.compile(
+    r"(多少|多大|多高|多低|多小|多亮|几度|几档|几盏|几个|几台|几只|是多少|现在几点)")
+
+
+def is_query_like(text: str) -> bool:
+    """两档共用的"这句是查询、不是命令"判据（v1.1.17 复审，线上实锤驱动）。
+
+    病灶：疑问闸只挂在**字面表**那一侧（fast_path.py:711 的 is_state_question 与
+    :714 的 状态|情况|哪些|列表），`select_primary_plan` 的 **klar 支完全没有**——
+    办公 .91 / 加载项 1.1.17 线上实锤：「客厅射灯关了吗」被引擎落成 HassTurnOff
+    **真把灯关了**（还带改指注），「哪些灯开着」落成 HassTurnOn（灯要是关着就是
+    真开灯）。问一句动一次设备＝v1.1.2 那条红线的 klar 版，当年只补了一侧。
+
+    判据＝与字面表**同一组**（不是新枚举）：状态疑问尾 + 状态·情况·哪些·列表 +
+    量纲疑问词。**刻意不含 `looks_local_query`**：那是**量纲**触发词（度/多少/电量…），
+    「屋里空调调到26度」「亮度调到百分之三十」这类**量纲命令**会被它一起拦掉
+    （实测两条既有钉当场红）——那是"有量纲词"而不是"在问"。
+
+    永不抛；判据故障=不误拦命令（保守放行原链）。
+    """
+    try:
+        t = text or ""
+        return bool(is_state_question(t) or _QUERY_TRIGGER_RE.search(t)
+                    or _QUANTITY_Q_RE.search(t))
+    except Exception:  # noqa: BLE001 判据故障=不误拦命令
+        return False
+
+
+def is_status_query(text: str) -> bool:
+    """状态/情况/清单类查询的**疑问形**触发词（v1.1.22：单点定义）。
+
+    病灶：fast_path 复杂查询守卫此前是**裸** `(状态|情况|哪些|列表)`——1.1.20 只
+    把查询族一侧收窄成疑问形，字面表这条漏改 ⇒「把空调调到除湿状态」这类**命令**
+    仍被守卫吞掉（实测两档同时弃权=命令丢失，用户听到"我还不会"）。现守卫与本表
+    共用同一张疑问形表，与 `_QUERY_TRIGGER_RE` 逐字同源。永不抛。"""
+    try:
+        return bool(_QUERY_TRIGGER_RE.search(str(text or "")))
+    except Exception:  # noqa: BLE001 判据故障=不误拦命令（保守放行原文）
+        return False
+
+
+def is_state_question(text: str) -> bool:
+    """状态疑问句判据：命令档必须让路（实测「射灯关了吗」曾被 ^关了 接成
+    TurnDeviceOff，问一句关一次设备）；v1.1.17 补 V没V 与尾巴后置副词/标点。
+    永不抛。"""
+    try:
+        t = (text or "").strip().rstrip("。！!，,、")
+        return bool(STATE_QUESTION_TAIL.search(t)
+                    or STATE_QUESTION_ALT.search(t)
+                    or STATE_QUESTION_V_NOT_V.search(t))
+    except Exception:  # noqa: BLE001 判据故障=不误拦命令（保守放行原链）
+        return False
+
+
+def class_of(text: str):
+    """句中最长设备类别词 → (word, domains)；无类别词 (None, ())。"""
+    t = text or ""
+    for w in _CLASS_WORDS:
+        if w in t:
+            return w, _DEVICE_WORDS[w]
+    return None, ()
+
+
+
+class QueryZone:
+    def __init__(self, ha, settings):
+        self.ha = ha
+        self.settings = settings
+        self._tz = None
+
+    async def timezone(self):
+        if self._tz is None:
+            try:
+                cfg = await self.ha.get_config()
+                self._tz = cfg.get("time_zone") or None
+            except Exception:
+                self._tz = None
+        return self._tz
+
+    # ── 主入口：命中返回中文答案，否则 None ─────────────────────
+    async def answer(self, text: str) -> Optional[str]:
+        """查询应答唯一出口（第四轮审计 P2 ②/⑤：陈旧快照必须加注）。
+
+        v1.1.36 收窄：加注只给**状态快照来源**的答案。旧形无条件贴，而时钟三支
+        （几点/星期几/几号）取的是本地时钟，与快照毫无关系——`.91` 探针原文
+        「现在几点」→「现在是 0 点 11 分（注：HA 状态尚未取到，数字可能不是最新）」；
+        `_states_ts` 初值 0 ⇒ 升级后重启的第一句就中招。时钟支免注，其余照旧
+        （含室外环境传感器——那也是快照读数，宁保守）。永不抛。
+        """
+        out = await self._answer_inner(text)
+        if out and not _answer_from_local_clock(text):
+            try:
+                why = self.ha.states_stale() if hasattr(self.ha, "states_stale") else ""
+            except Exception:  # noqa: BLE001
+                why = ""
+            if why and why not in out:
+                out = out.rstrip("。") + f"（注：{why}，数字可能不是最新）"
+        return out
+
+    async def _answer_inner(self, text: str) -> Optional[str]:
+        if self.settings is not None and not self.settings.get("nlu.query_local", True):
+            return None
+        text = text.strip().rstrip("。？！?!，,")
+        # 时间（v1.1.2 扩：星期几/几号/什么时候——原表只认「几点/时间」，
+        # 「今天星期几」在 golden 表里长期钉着 miss=已知未做，本批补齐）
+        if re.search(r"(现在)?(几点了?|什么时间|几点钟|什么时候|时间)", text) \
+                and not re.search(r"定时|预约", text):
+            return await self._time_answer()
+        if re.search(r"(星期几|礼拜几|周几)", text):
+            return await self._weekday_answer()
+        if re.search(r"(几号|几月几号|日期是|号是)", text) and not re.search(r"定时|预约|几天", text):
+            return await self._date_answer()
+        area = self._find_area(text)
+        # 体验批 P2-14①：设备属性读数（"空调设定温度多少/灯现在多亮"）——
+        # 先于传感器规则：设备词+属性词是明确指向设备本身，不是房间传感器。
+        # v1.0.62 golden 实锤：「多亮」是"亮度"的口语变体，P2-14 注释承诺了
+        # 该句式但正则只认「亮度」二字——实现与承诺不符，此处补齐。
+        # v1.1.2：设备词改走统一类别表（原硬列 8 词，射灯/平开窗/卷帘/幕布
+        # 一律不认——v1.1.0 具名设备词只进了设备表没进查询表）；问法标记补
+        # 「多大|多高|多亮|几档」（「空调风量多大」原形整句落空）。
+        dev_word, _doms = class_of(text)
+        m = re.search(r"(设定温度|目标温度|当前温度|温度|亮度|多亮|色温|湿度|风量|风速|档位)",
+                      text)
+        if dev_word and m and re.search(
+                r"(多少|几|怎样|怎么样|如何|现在|是|多大|多高)", text):
+            attr_word = "亮度" if m.group(1) == "多亮" else m.group(1)
+            ans = await self._attr_answer(area, dev_word, attr_word)
+            if ans:
+                return ans
+        # 体验批 P2-14②：状态聚合计数（"有多少灯开着/几个设备没关"）
+        if re.search(r"(多少|几个|几盏|几台|几只|哪些)[^吗]{0,6}(开着|亮着|没关|运行|工作|开着没)", text) \
+                or re.search(r"(开着|亮着|没关)的[^？?]{0,4}(有哪些|几个|多少)", text) \
+                or re.search(r"(哪些|哪有|哪(?:个|盏|台|部|支|扇|组|路))[^？?]{0,4}(开着|亮着|没关)", text):
+            # v1.1.39（修⑩ 的另半边，审查 §1.1）：`_QUERY_TRIGGER_RE` 补了
+            # 「哪+量词」族之后，`is_query_like` 命中、两档都弃权（安全侧对），
+            # 但这条**应答侧**的计数触发式还是旧的 `(哪些|哪个|哪有)` ⇒
+            # 「哪盏灯亮着」「哪台空调开着」被让路给查询、查询又答不出，
+            # 最终回「这句话我还不会」——同义句「哪些灯开着」却答得出。
+            # 「谁」刻意不进计数式：计数答不出"是谁开的"，宁回不会。
+            ans = await self._count_answer(area, text)
+            if ans:
+                return ans
+        # 人感/有无人在场（v1.0.49 Q3：现场「办公室现在是否有人」——人感传感器
+        # 用 occupancy/presence/motion 判定，多颗任一在位即"有人"）
+        if re.search(r"(有人|没人|人在|空不空|有没有人|是否有人)", text):
+            ans = await self._presence_answer(area)
+            if ans:
+                return ans
+        # 设备电池电量（v1.0.49 Q4：「办公室平开窗电池电量多少」——device_class
+        # =battery 传感器，设备提示词按实体名匹配，读数直报）
+        if re.search(r"(电池|电量)", text) and re.search(
+                r"(多少|剩|还有|低|高|满|怎样|如何|状态|不足|正常|查询|查|看看)", text):
+            ans = await self._battery_answer(area, text)
+            if ans:
+                return ans
+        # 温度/湿度/照度
+        m = re.search(r"(温度|湿度|照度|亮度)", text)
+        if m and (re.search(r"(多少|几|怎样|怎么样|如何)", text)
+                  or re.search(r"(查询|查一查|查一下|查下|查查|看看|看下|报一下|告诉我)", text)):
+            kind = {"温度": "temperature", "湿度": "humidity", "照度": "illuminance", "亮度": "illuminance"}[m.group(1)]
+            return await self._sensor_answer(area, kind, m.group(1))
+        # 「多少度/几度」（fast_path 守卫专门放行给本层，必须接住）：**带设备词**时
+        # 先答设备本身的设定温度——旧式一律房间传感器（v1.1.22：问「客厅空调开多少度」
+        # 答成室温 24.3，而 AC 设定 26 就在快照里）；无设备词才是房间温度。
+        if re.search(r"(多少度|几度)", text):
+            dev_word, _doms = class_of(text)
+            if dev_word:
+                ans = await self._attr_answer(area, dev_word, "温度")
+                if ans:
+                    return ans
+            return await self._sensor_answer(area, "temperature", "温度")
+        # 设备开关状态（v1.1.2 重写：原表只有 8 个固定尾巴，实测 15 种口语问法
+        # 里 9 种落空——「现在是开着的吗/是开着还是关着/还亮着吗/关了没有/查询X
+        # 状态」全不在表内，落空后就被命令档字面表接走变成"问一句动一次设备"。
+        # 判据与命令档共用 is_state_question 同一张表（一处定义两档共守）。）
+        if is_state_question(text):
+            ans = await self._state_answer(area, dev_word)
+            if ans:
+                return ans
+        return None
+
+    # v1.0.42（Q1）：区域名前面的时间/礼貌/查询引导词。旧版正则 {2,4}?+后缀 从
+    # 句首起窗，「现在办公室的温度多少」提出「现在办公室」——查无此区域，整条
+    # 温度查询落兜底（真机日志 2026-09-11）。先剥前缀再抽区域。
+    _AREA_PREFIX_NOISE = re.compile(
+        r"^(?:现在|此刻|目前|眼下|今天|今晚|昨天|昨晚|刚才|刚刚|此时|请问|麻烦|"
+        r"帮我看看|帮我查(?:一下|下)?|查一下|查看一下|查下|查看|看一下|看下|查询|查一查|报一下|"
+        r"告诉我|我想知道|想问下|问一下)+[的]?")
+
+    def _find_area(self, text: str) -> Optional[str]:
+        """区域词提取：剥时间/引导前缀 → 优先注册区域名（ha._areas）→ 后缀启发。"""
+        t = self._AREA_PREFIX_NOISE.sub("", text) or text
+        names = sorted(set(self.ha._areas.values()), key=len, reverse=True) if self.ha._areas else []
+        for n in names:
+            if n and (n in t or n in text):
+                return n
+        # {1,4}?：「客厅/书房」这类两字区域（1字+后缀）也要能抽出（旧 {2,4}? 最少三字，
+        # 两字区域只在注册表命中时可用——registry 拿不到时静默丢区域）
+        m = re.search(r"([\u4e00-\u9fff]{1,4}?(?:" + "|".join(_AREA_SUFFIX) + r"))", t)
+        return m.group(1) if m else None
+
+    async def _time_answer(self) -> Optional[str]:
+        """GetDateTime → 本地时钟（HA 时区经 /api/config 缓存解析）。"""
+        try:
+            from zoneinfo import ZoneInfo
+            tz = await self.timezone()
+            now = datetime.now(ZoneInfo(tz)) if tz else datetime.now()
+        except Exception:
+            now = datetime.now()
+        return f"现在是 {now.hour} 点 {now.minute} 分。"
+
+    async def _weekday_answer(self) -> Optional[str]:
+        return f"今天是{_WEEKDAYS[self._now(await self.timezone()).weekday()]}。"
+
+    async def _date_answer(self) -> Optional[str]:
+        now = self._now(await self.timezone())
+        return f"今天是 {now.year} 年 {now.month} 月 {now.day} 号。"
+
+    @staticmethod
+    def _now(tz=None):
+        """HA 时区优先的本地时钟（时区拿不到就退本机钟——报数比不报强）。"""
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(tz)) if tz else datetime.now()
+        except Exception:  # noqa: BLE001 坏时区名不配让整条日期查询哑掉
+            return datetime.now()
+
+    _ATTR_KEYS = {   # 体验批 P2-14①：设备词 × 属性词 → attribute 取值链（多键尝试，HA 域差异）
+        ("空调", "设定温度"): ("temperature",), ("空调", "目标温度"): ("temperature",),
+        ("空调", "当前温度"): ("current_temperature",), ("空调", "温度"): ("temperature", "current_temperature"),
+        ("灯", "亮度"): ("brightness",),
+        ("灯", "色温"): ("color_temp_kelvin", "color_temp", "color_temperature"),
+        ("风扇", "风量"): ("percentage",), ("风扇", "风速"): ("percentage",), ("风扇", "档位"): ("percentage",),
+        # P3-b（2026-09-22 审查批）：原 ("净化器","湿度")→("aqi",) 会把 AQI 数值
+        # 冠以「湿度是 35」报给用户——量纲错标签即假成功。只认设备真实发布的
+        # humidity 属性；没有就返回 None 让位下方通用湿度传感器分支（宁缺勿错）。
+        ("加湿器", "湿度"): ("humidity",), ("加湿器", "档位"): ("fan_speed",),
+        ("净化器", "湿度"): ("humidity",), ("净化器", "档位"): ("fan_speed",),
+        ("除湿机", "湿度"): ("humidity",), ("热水器", "温度"): ("temperature", "current_operation"),
+        ("冰箱", "温度"): ("temperature",),
+    }
+
+    # v1.0.62 P1-6：手抄键表之上的**量纲闸**——实体带 unit_of_measurement 且与
+    # 属性词预期量纲冲突时整键不认（把 AQI/光照 lux 当"湿度"播报这类错标签的
+    # 根治：aqi 单位 "°AQI"/"AQI" ∉ % 白名单 → 拒报让位通用传感器分支，宁缺勿错）。
+    # 单位缺省=信任键表（大量集成不发布 unit，一票否决会砍掉可用读数）。
+    _UNIT_WHITELIST = {
+        "湿度": ("%", "rh", "%r.h.", "percent"),
+        "温度": ("°c", "°f", "celsius", "fahrenheit"),
+        "风量": ("%", "percent"), "风速": ("%", "percent"), "档位": ("%", "percent"),
+    }
+
+    @classmethod
+    def _unit_ok(cls, attr_word: str, attrs: dict) -> bool:
+        allow = next((v for k, v in cls._UNIT_WHITELIST.items() if k in attr_word), None)
+        if allow is None:
+            return True
+        u = str(attrs.get("unit_of_measurement") or "").strip().lower()
+        return (not u) or u in allow
+
+    @staticmethod
+    def _by_name(ents: list, word) -> list:
+        """按"用户说的是哪台"过滤实体（v1.1.18 复审，线上实锤驱动）。
+
+        病灶（办公 .91 线上，1.1.18 实测）：问「办公室射灯现在什么状态」，答的是
+        「办公室空调 Indicator Light关着」——旧实现只按 **区域+域** 取前 3 台，
+        **完全不看用户说的名字**（`_attr_answer` 同病）。名字全等优先（用户说的就是
+        实体名），其次互含（集成回的名字常更长/更短，如「平开窗 开窗器」）；都不中
+        返回空表，交调用方如实处理——宁可不答，绝不答成别的设备。
+        """
+        if not word:
+            return list(ents)
+        w = str(word).strip()
+        if not w:
+            return list(ents)
+
+        def fn(e):
+            return str(((e or {}).get("attributes") or {}).get("friendly_name") or "").strip()
+
+        exact = [e for e in ents if fn(e) == w]
+        if exact:
+            return exact
+        return [e for e in ents if w in fn(e) or (fn(e) and fn(e) in w)]
+
+    def _area_binding_known(self) -> bool:
+        """实体→房间映射**可用**吗（空表=注册表拿不到，或实体没绑设备也没绑房间）。
+
+        这道闸是给"按区域收窄后查无 ⇒ 敢说本区没有这台"用的：映射缺失时
+        `find_entities(area=…)` 会把本区那台一起滤掉，此时的"没有"是猜的。
+        `_sensor_answer`/`_presence_answer` 早有同形 fail-open（它们还多认 `_areas`，
+        因为那两支按名字旁路；本谓词服务于**否定断言**，只认映射本身）。
+        """
+        return bool(getattr(self.ha, "_entity_area", None))
+
+    async def _attr_answer(self, area, dev_word: str, attr_word: str) -> Optional[str]:
+        domains = _DEVICE_WORDS.get(dev_word, ())
+        if not domains:
+            return None        # 词表外设备词不猜域（find_entities 空 domains=全量，必错）
+        ents = await self.ha.find_entities(area=area or "", domains=domains)
+        ents = self._by_name(ents, dev_word)          # v1.1.18：先认"用户说的是哪台"
+        if not ents:
+            wider = self._by_name(await self.ha.find_entities(area="", domains=domains),
+                                 dev_word)
+            if not wider:
+                return f"没找到叫「{dev_word}」的设备。" if dev_word else None
+            ents = wider                              # 全屋按名找到：答案里会带实体名（自带房间）
+        keys = self._ATTR_KEYS.get((dev_word, attr_word)) or ()
+        if not keys:
+            canon = _DOMAIN_CANON.get(domains)
+            keys = self._ATTR_KEYS.get((canon, attr_word)) if canon else ()
+        if not keys:
+            return None
+        ent = next((e for e in ents
+                    if self._unit_ok(attr_word, e.get("attributes") or {})
+                    and any((e.get("attributes") or {}).get(k) is not None for k in keys)),
+                   None)
+        if ent is None:
+            # v1.1.2：设备在、属性读不到——绝大多数就是"它没开着"（HA 的
+            # brightness/color_temp 只在 on 时上报）。旧实现在这里返回 None，
+            # 用户问「射灯亮度多少」听到的是"这句话我还不会"，等于把一句
+            # 完全可以如实回答的话推给了兜底。
+            silent = [e for e in ents
+                      if str(e.get("state", "")) in ("off", "closed", "idle", "standby")]
+            if silent:
+                nm = (silent[0].get("attributes") or {}).get("friendly_name") or \
+                    silent[0]["entity_id"]
+                return f"{say_name(nm)}现在是关着的，没有{attr_word}读数。"
+            # unavailable = 实体离线，同样如实说明而不是不回话
+            dead = [e for e in ents if str(e.get("state", "")) == "unavailable"]
+            if dead:
+                nm = (dead[0].get("attributes") or {}).get("friendly_name") or \
+                    dead[0]["entity_id"]
+                return f"{say_name(nm)}现在不在线，读不到{attr_word}。"
+            return None
+        attrs = ent.get("attributes") or {}
+        val = next((attrs[k] for k in keys if attrs.get(k) is not None), None)
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return None
+        # v1.1.19 复审：名字里已含房间时**不再叠前缀**（线上实测念成「办公室的办公室射灯」；
+        # 跨房间回捞叠用户说的房间更糟——「客厅的卧室射灯」）。名字为空才用 区域+词。
+        nm = say_name(attrs.get("friendly_name") or "")
+        disp = nm or (f"{area}的{dev_word}" if area else dev_word)
+        if attr_word in ("亮度",):
+            pct = int(round(v * 100 / 255)) if 0 <= v <= 255 else int(round(v))
+            return f"{disp}亮度约 {pct}%。"
+        if attr_word == "色温":
+            # v1.0.62 P1-6：light 域 color_temp 惯例是 **mireds**（370 mired≈2700K），
+            # 旧代码裸报「色温 370K」=量纲错标签（与 aqi 事件同族）。≤1999 判为
+            # mireds 换算（mired 可视域 140-500 与 Kelvin 1700-6500 无交叠，判据稳）。
+            kelvin = int(round(1_000_000 / v / 50) * 50) if 0 < v < 2000 else int(v)
+            return f"{disp}色温约 {kelvin}K。"
+        if attr_word in ("风量", "风速", "档位"):
+            # v1.0.62 P1-6：无单位的小整数是「档位」语义（1..12），percentage
+            # 才报百分比——把空调 2 档播成「风量 2%」也是错标签。
+            u = str(attrs.get("unit_of_measurement") or "").strip().lower()
+            if not u and v <= 12 and float(v).is_integer():
+                return f"{disp}现在是 {int(v)} 档。"
+            pct = int(round(v)) if v <= 100 else int(round(v * 100 / 255))
+            return f"{disp}风量约 {pct}%。"
+        # 属性词自带「设定/目标」时不再叠字（线上实测念成「设定设定温度」）
+        _a = attr_word if ("设定" in attr_word or "目标" in attr_word) else (
+            f"设定{attr_word}" if attr_word == "温度" else attr_word)
+        return f"{disp}{_a}是 {v:g}。"
+
+    async def _count_answer(self, area, text: str) -> Optional[str]:
+        """体验批 P2-14②：开着/没关 设备计数与点名（≤3 具名，多则只报数）。"""
+        # v1.1.2 根修：设备类别改走统一表 class_of()。旧实现把类别词取自
+        # 「可选组 + [^吗]{0,4}」的 search，最左匹配下那一组经常是空——
+        # 「哪些窗开着」「还有几盏灯亮着」因此退化成**全域**计数，答案里混进
+        # 麦克风开关/插座（答错比不答坏：用户听着像正确答案）。
+        word, domains = class_of(text)
+        if not domains:
+            domains = ("light", "climate", "fan", "cover", "humidifier", "switch")
+        ents = await self.ha.find_entities(area=area or "", domains=domains)
+        ents = [e for e in ents if e["entity_id"].split(".")[0] in domains]
+        # v1.1.39（审查 §3[P1]，本机复现成立）：`class_of()` 拿到的具体设备词
+        # 此前**只用来定域**，取回整域后从不按名字过滤 ⇒
+        #   「卧室哪些射灯开着」→『开着2盏灯：卧室台灯、卧室灯带』
+        #   「卧室哪些吊灯开着」→ 同一句（家里根本没有吊灯也照报）
+        # 而同文件另外两个消费点（`_attr_answer`:476 / `_state_answer`:722）
+        # 在 v1.1.18 就都加了 `_by_name`——本函数是漏掉的第三个。
+        # 泛称句（「哪些设备开着」）不进这道过滤：靠的是 `class_of()` 对表外词
+        # 返回 `word=None`（第一半条件），`_DEVICE_WORDS.get(word)` 只是防
+        # `class_of` 日后返回表外词时的冗余闸——摘掉它本机观察不到行为差异
+        # （v1.1.40 变异臂 A4 实锤），别把它当"泛称不清空整域"的承重判据。
+        cross_room = False            # 本区按名查无、全屋回退命中
+        if word and _DEVICE_WORDS.get(word):
+            named = self._by_name(ents, word)
+            if not named:
+                wider = self._by_name(
+                    await self.ha.find_entities(area="", domains=domains), word)
+                if not wider:
+                    return f"没找到叫「{word}」的设备。"
+                named = wider                     # 全屋按名命中：答案自带房间名
+                cross_room = True
+            ents = named
+        on_words = {"on", "open", "opening", "heating", "cooling", "auto", "fan_only",
+                    "dry", "heat_cool", "eco", "playing", "paused", "heat", "preheat",
+                    # v1.1.27：vacuum 的"在工作"态与 :669 的中文话术表**同集合**
+                    # （清扫中/回充中 在 _state_answer 有中文；计数若不算 on，
+                    # 「有几台扫地机器人开着」会答"都关着呢"——答错比不答坏）。
+                    # 「已暂停(paused)」两侧一致：不念英文、也不算"关着"。
+                    "cleaning", "returning"}
+        on_ents = [e for e in ents if str(e.get("state", "")) in on_words]
+        prefix = f"{area}的" if area else ""
+        if cross_room:
+            # v1.1.40（第四轮复验 §2，本机复现成立）：全屋回退命中后 `ents` 已经
+            # 换了房间，前缀却还挂用户说的那间 ⇒ 念成「卧室的开着1盏灯：客厅射灯」
+            # （指代自相矛盾），"都不开"支更糟：「卧室的1盏灯都关着呢」既没点名、
+            # 又把客厅那台算进卧室。同文件 `_state_answer` 的跨房间支在 v1.1.18
+            # 就定了口径（先说"本区没有这台"、再报实体自带房间），计数是漏跟的
+            # 第二个消费点——三处消费点（attr/state/count）的跨房间纪律必须一致。
+            # 但"本区没有"这句**只在房间映射可用时才许说**（发版前对抗复核抓出：
+            # `_entity_area` 空时 `find_entities(area=…)` 把本区那台也滤掉，回退命中
+            # 的那盏就可能正挂在卧室——那是把不知道的说成知道）。降级只说"全屋"。
+            prefix = (f"{area}没有叫「{word}」的设备；全屋"
+                      if self._area_binding_known() else "全屋")
+        noun = _CLASS_NOUN.get(word, "个设备")
+        # v1.1.39（审查 §3[P2]）：`unavailable`/`unknown` 不是"关着"——旧文案用
+        # `len(ents)` 当分母说「3盏灯都关着呢」，等于断言离线/状态未知的那两台是关的，
+        # 而 `_state_answer`(:754-757) 对同两态诚实地讲「现在不在线」「状态未知」。
+        # 计数与状态两支必须同一口径（用户红线：不把不知道的说成知道）。
+        uncertain = [e for e in ents if str(e.get("state", "")) in ("unavailable", "unknown")]
+        if not on_ents:
+            if not ents:
+                return None               # 该区域/类别压根没设备：不猜，让位上层
+            if uncertain and len(uncertain) == len(ents):
+                return f"{prefix}{len(ents)}{noun}现在都说不上状态（不在线或状态未知）。"
+            off = len(ents) - len(uncertain)
+            if uncertain:
+                return (f"{prefix}{off}{noun}都关着呢，"
+                        f"另外{len(uncertain)}{noun}现在不在线或状态未知。")
+            # v1.1.18：补上数量——旧文案漏了数字，线上念成「办公室的盏灯都关着呢」
+            return f"{prefix}{len(ents)}{noun}都关着呢。"
+        names = [say_name((e.get("attributes") or {}).get("friendly_name")
+                          or e.get("entity_id", "")) for e in on_ents]
+        if len(on_ents) <= 3:
+            return f"{prefix}开着{len(on_ents)}{noun}：" + "、".join(names) + "。"
+        return f"{prefix}开着{len(on_ents)}{noun}，比如{'、'.join(names[:2])}。"
+
+    _PRESENCE_ON = {"on", "detected", "true", "home", "occupied"}
+    _PRESENCE_OFF = {"off", "not_detected", "false", "clear", "cleared",
+                     "not_home", "idle", "unoccupied"}
+    _PRESENCE_DCLASSES = ("occupancy", "presence", "motion")
+
+    async def _presence_answer(self, area: Optional[str]) -> Optional[str]:
+        """有人吗：区域 occupancy/presence/motion 传感器聚合。命中链：区域绑定
+        → 名称含区域词（注册表缺失降级，同 _sensor_answer Q2 纪律）→ 全屋唯一。
+        任一在位=有人；拿不到可判定的传感器返回 None 让位上层。"""
+        states = await self.ha.states()
+        have_area_data = bool(getattr(self.ha, "_areas", None)
+                              or getattr(self.ha, "_entity_area", None))
+        cands = []
+        for eid, ent in states.items():
+            domain = eid.split(".")[0]
+            if domain not in ("sensor", "binary_sensor"):
+                continue
+            attrs = ent.get("attributes") or {}
+            if attrs.get("device_class") not in self._PRESENCE_DCLASSES:
+                continue
+            name = attrs.get("friendly_name") or ""
+            ent_area = self.ha._entity_area.get(eid, "") if hasattr(self.ha, "_entity_area") else ""
+            if area and have_area_data and ent_area != area and area not in name:
+                continue
+            if area and not have_area_data and area not in name:
+                continue
+            cands.append(str(ent.get("state", "")).lower())
+        if not cands:
+            # v1.1.2：全屋压根没有可判在位/不在位的传感器时，如实说明——旧实现
+            # 一律返回 None，用户问「有没有人」听到的是"这句话我还不会"，
+            # 而"这家没装人感"是一个我们**确实知道**的事实。拿不准（有传感器
+            # 只是绑不到这个区域）仍返回 None 让位上层，绝不猜"没人"。
+            has_any = any(
+                ((e.get("attributes") or {}).get("device_class") in self._PRESENCE_DCLASSES)
+                for e in states.values() if isinstance(e, dict))
+            if not has_any:
+                return "家里还没接人感传感器，判断不了有没有人。"
+            return None
+        occ = any(st in self._PRESENCE_ON for st in cands)
+        unknown = all(st not in self._PRESENCE_ON and st not in self._PRESENCE_OFF
+                      for st in cands)
+        if unknown:
+            return None
+        prefix = f"{area}现在" if area else "家里现在"
+        return f"{prefix}{'有人' if occ else '没人'}。"
+
+    async def _battery_answer(self, area: Optional[str], text: str) -> Optional[str]:
+        """电池电量：device_class=battery 传感器。从问句剥骨架词得设备提示词
+        （「办公室平开窗电池电量多少」→「平开窗」），按实体名/区域匹配。"""
+        dev = text or ""
+        for w in ("电池电量", "剩余电量", "电池", "电量", "还剩多少", "还剩", "剩下",
+                  "还有多少", "还有", "是多少", "多少", "现在", "目前", "请问", "帮我",
+                  "我想知道", "查询", "查一查", "查一下", "查下", "查查", "看看", "告诉",
+                  "报一下", "状态", "有没有", "不足", "正常", "吗", "呢", "的", "了",
+                  "？", "?", "。", "现在", "如何", "怎样", "是"):
+            dev = dev.replace(w, "")
+        if area:
+            dev = dev.replace(area, "")
+        dev = dev.strip()[:8]
+        states = await self.ha.states()
+        cands = []
+        for eid, ent in states.items():
+            if not eid.startswith("sensor."):
+                continue
+            attrs = ent.get("attributes") or {}
+            if attrs.get("device_class") != "battery":
+                continue
+            name = attrs.get("friendly_name") or ""
+            ent_area = self.ha._entity_area.get(eid, "") if hasattr(self.ha, "_entity_area") else ""
+            try:
+                val = float(ent.get("state"))
+            except (TypeError, ValueError):
+                continue
+            if dev:
+                if dev in name:
+                    cands.append((name, val, 0))       # 名称含设备词：最强命中
+                elif not name and area and ent_area == area:
+                    cands.append((name, val, 2))
+            elif area and (ent_area == area or area in name):
+                cands.append((name, val, 0))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c[2])
+        name, val, _ = cands[0]
+        prefix = f"{area}的" if area else ""
+        label = name or (dev or "设备")
+        if len(cands) > 1 and cands[1][2] == cands[0][2]:
+            return f"{prefix}{label}电量还剩 {val:g}%。同区还有 {len(cands) - 1} 台设备有电池读数，想查哪台请说设备名。"
+        return f"{prefix}{label}电量还剩 {val:g}%。"
+
+    async def _sensor_answer(self, area: Optional[str], device_class: str, cn: str) -> Optional[str]:
+        states = await self.ha.states()   # 此调用顺带触发 registry 懒同步（refresh_states 内）
+        # v1.0.42（Q2）：区域注册表整体拿不到时（老HA端点404/权限缺失/token无
+        # config读），不再"按区域过滤→全被滤光→返回None"，降级为全量找同量纲
+        # 传感器唯一命中；多颗则宁缺勿滥不猜。
+        have_area_data = bool(getattr(self.ha, "_areas", None)
+                              or getattr(self.ha, "_entity_area", None))
+        candidates: list[tuple[str, float]] = []
+        # v1.1.27：**绑区命中优先于名称旁路**。旧实现只用一个列表 + append 之后
+        # 才 break——越区的那台（名字里带区域词、实体实际绑在别区）先到先得，
+        # 真正绑在本区的那台"永无机会"（实测：问办公室温度答出客厅绑区的那颗）。
+        bound: list[tuple[str, float]] = []
+        for eid, ent in states.items():
+            attrs = ent.get("attributes") or {}
+            if attrs.get("device_class") != device_class:
+                continue
+            name = (attrs.get("friendly_name") or "")
+            # v1.0.52：与 :223/:261 同规防护——真 HAClient 恒有该属性，但注入面
+            # 缺失时裸取会 AttributeError 被级联折叠成"查询族异常"整条静默降级。
+            ent_area = (self.ha._entity_area.get(eid, "")
+                        if hasattr(self.ha, "_entity_area") else "")
+            if area and have_area_data and ent_area != area and area not in name:
+                continue
+            try:
+                val = float(ent.get("state"))
+            except (TypeError, ValueError):
+                continue
+            if area and have_area_data and ent_area == area:
+                bound.append((name, val))
+                break
+            candidates.append((name, val))
+        candidates = bound + candidates
+        if not candidates:
+            return None
+        if len(candidates) > 1 and not have_area_data:
+            # v1.0.44 名称兜底：区域注册表拿不到时，实体名含所说区域词且唯一
+            # 命中 → 照答（现场「办公室温度传感器多少」，传感器名往往就叫
+            # 「办公室温度」——命名规范的现场不该被"未同步房间"拒掉）。
+            if area:
+                named = [c for c in candidates if area in (c[0] or "")]
+                if len(named) == 1:
+                    candidates = named
+                else:
+                    # 无区域信息且多颗同类传感器：答哪颗都是猜。诚实引导。
+                    return f"家里有多个{cn}传感器，但还没同步到房间信息，请给传感器所在区域绑定设备后重试。"
+            else:
+                return f"家里有多个{cn}传感器，但还没同步到房间信息，请给传感器所在区域绑定设备后重试。"
+        name, val = candidates[0]
+        unit = {"temperature": "度", "humidity": "%", "illuminance": "勒克斯"}[device_class]
+        val_s = f"{val:.1f}".rstrip("0").rstrip(".")   # 26.5→「26.5」，26.0→「26」
+        prefix = f"{area}的" if area else ""
+        return f"{prefix}{cn}是 {val_s} {unit.replace('勒克斯','lx')}。"
+
+    async def _state_answer(self, area: Optional[str], device_word: Optional[str]) -> Optional[str]:
+        domains = _DEVICE_WORDS.get(device_word or "", ())
+        ents = await self.ha.find_entities(area=area or "", domains=domains or ())
+        ents = [e for e in ents if e["entity_id"].split(".")[0] in (domains or ("light", "climate", "fan", "cover", "humidifier", "switch"))]
+        ents = self._by_name(ents, device_word)       # v1.1.18：旧实现完全不看名字（线上答成了别的灯）
+        if not ents:
+            wider = self._by_name(
+                [e for e in await self.ha.find_entities(area="", domains=domains or ())
+                 if e["entity_id"].split(".")[0] in (domains or ("light", "climate", "fan", "cover", "humidifier", "switch"))],
+                device_word)
+            if not wider:
+                if device_word:
+                    return f"没找到叫「{device_word}」的设备。"
+                # 无类别词（「厨房关了吗」）且本区没有可开关设备：别把 None 念进话术
+                return f"{area}里没有能开关的设备。" if area else None
+            if area:
+                # 说的区域里没有这台，但全屋按名有 → 如实说明"本区没有"+ 实体名自带房间
+                e0 = wider[0]
+                nm0 = (e0.get("attributes") or {}).get("friendly_name") or e0["entity_id"]
+                st0 = str(e0.get("state", ""))
+                cn0 = {"on": "开着", "off": "关着", "open": "开着", "closed": "关着"}.get(
+                    st0, "现在不在线" if st0 == "unavailable" else f"处于 {st0}")
+                if not self._area_binding_known():
+                    # 拿不到实体→房间的映射 ⇒ "本区没有这台"是猜的（那台可能就在本区，
+                    # 只是没绑房间）。退成只报实体自身（名字自带房间时用户能听出来）；
+                    # 无类别词时连"是哪台"都说不清 ⇒ 不答。与 `_count_answer` 同一道闸。
+                    return f"{nm0}{cn0}。" if device_word else None
+                if not device_word:
+                    # v1.1.40（对抗复核）：:771 那条注释早就写明"别把 None 念进话术"，
+                    # 但只挡住了 `not wider` 那半边——`wider` 命中时这里会产出
+                    # **「阳台没有叫「None」的设备；客厅灯开着。」**（answer('阳台关了吗')
+                    # 在"阳台是注册区域、但没有可开关设备"时实测原样念出来）。
+                    return f"{area}里没有能开关的设备。"
+                return f"{area}没有叫「{device_word}」的设备；{nm0}{cn0}。"
+            ents = wider
+        on_words = ("on", "open", "heating", "cooling", "auto", "fan_only", "dry", "heat_cool", "eco")
+        states_cn = {"on": "开着", "off": "关着", "open": "开着", "closed": "关着", "opening": "正在开", "closing": "正在关",
+                     "heat": "制热中", "cool": "制冷中", "dry": "除湿中", "fan_only": "送风中", "auto": "自动模式", "idle": "待机",
+                     # v1.1.27：vacuum 三态中文（同处注释"不念英文"承诺的实现面）。
+                     # 旧表缺 cleaning/returning/paused ⇒ 播报把 raw state 直念
+                     # （「扫地机器人处于 cleaning」），与 _count_answer 的 on_words
+                     # 同步收口（那边已有 paused，本批补 cleaning/returning）。
+                     "cleaning": "清扫中", "returning": "回充中", "paused": "已暂停"}
+        lines = []
+        for e in ents[:3]:
+            st = str(e.get("state", ""))
+            # unavailable/unknown 不把英文念进播报（与 _attr_answer 的映射同口径）
+            cn = states_cn.get(st) or (
+                "现在不在线" if st == "unavailable" else
+                "状态未知" if st == "unknown" else
+                "开着" if st in on_words else f"处于 {st}")
+            nm = say_name((e.get("attributes") or {}).get("friendly_name") or e["entity_id"])
+            lines.append(f"{nm}{cn}")
+        return "，".join(lines) + "。" if lines else None

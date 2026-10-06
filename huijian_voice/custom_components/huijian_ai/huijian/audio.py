@@ -1,0 +1,371 @@
+import asyncio
+import contextlib
+import io
+import logging
+import wave
+from collections.abc import AsyncGenerator, AsyncIterable
+
+import numpy as np
+import opuslib_next as opuslib
+from homeassistant.components import ffmpeg
+from homeassistant.core import HomeAssistant
+
+from ..const import DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def wrap_pcm_as_wav(pcm: bytes, rate: int, channels: int, sample_bytes: int = 2) -> bytes:
+    """裸 PCM → WAV 容器（纯 Python，无 ffmpeg 依赖；卫星推流目标同构）。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_bytes)
+        wav_file.setframerate(rate)
+        wav_file.writeframes(pcm)
+    return buf.getvalue()
+
+
+def wav_stream_header(rate: int, channels: int, sample_bytes: int = 2) -> bytes:
+    """流式 WAV 占位头（44B）：RIFF/data 长度域恒 0xFFFFFFFF。
+
+    v1.0.55：真流式要求首块 PCM 就绪即出头透传，整段长度此刻不可知；
+    `wave` 模块写不了占位长，此处手搓。语义=标准"未知长度流式 WAV"：
+    卫星侧 `_iter_wav_pcm_chunks` 对声明长度 0/0xFFFFFFFF 按"源结束收尾"
+    处理（v1.0.52 已备）；ffmpeg 的 wav demuxer 同样读到 EOF。`wave` 整读
+    型消费者拿 getnframes()=0xFFFFFFFF 需按短读处理——仅流式路会产这种头。
+    """
+    byte_rate = rate * channels * sample_bytes
+    block_align = channels * sample_bytes
+    return (
+        b"RIFF" + (0xFFFFFFFF).to_bytes(4, "little") + b"WAVE"
+        + b"fmt " + (16).to_bytes(4, "little") + (1).to_bytes(2, "little")
+        + int(channels).to_bytes(2, "little") + int(rate).to_bytes(4, "little")
+        + int(byte_rate).to_bytes(4, "little") + int(block_align).to_bytes(2, "little")
+        + int(sample_bytes * 8).to_bytes(2, "little")
+        + b"data" + (0xFFFFFFFF).to_bytes(4, "little")
+    )
+
+
+async def async_convert_audio(
+    hass: HomeAssistant,
+    audio_bytes_gen: AsyncIterable[bytes] | AsyncGenerator[bytes],
+    from_extension: str,
+    to_extension: str,
+    to_codec: str | None = None,
+    to_sample_rate: int | None = None,
+    to_sample_channels: int | None = None,
+    to_sample_bytes: int | None = None,
+    to_frame_duration: int | None = None,
+    input_params: list | None = None,
+    streaming: bool = False,
+) -> AsyncGenerator[bytes, None]:
+    """Convert audio to a preferred format using ffmpeg.
+
+    streaming=True 时 s16le→wav 直封支改为「占位头 + 逐块透传」增量出块
+    （v1.0.55 真流式修复：旧实现 b"".join 整段攒完才产一块，实体 peek 被
+    阻塞至全段合成结束，卫星首音=整段合成时间——v1.0.52 宣称的流式收益在
+    这条必经支被清零）。默认 False=批式整封（整段路/老调用字节级不变，
+    盘缓存消费者继续拿真实长度头）。
+    """
+    # ── s16le → wav 纯 Python 直封（v1.0.25）──────────────────────────
+    # 卫星推流只认 16k/mono/16bit WAV，而加载项 WS tts 通道吐的正是裸
+    # s16le 16k/mono——本可原样封容器。此前一律走 ffmpeg，而
+    # ffmpeg.get_ffmpeg_manager(hass) 要求 HA 已配置 ffmpeg 集成，
+    # 未配置即 RuntimeError → 播报静默且报错离病因很远（2026-09-09 排查）。
+    # 直封后关键路径零外部依赖、零子进程，字节级可断言。
+    if from_extension == "s16le" and to_extension == "wav":
+        rate, channels = 16000, 1
+        params = list(input_params or [])
+        for idx, param in enumerate(params):
+            if param == "-ar" and idx + 1 < len(params):
+                rate = int(params[idx + 1])
+            elif param == "-ac" and idx + 1 < len(params):
+                channels = int(params[idx + 1])
+        # v1.0.27：直封成立的前提是「输出要求 == 源 PCM 形态」。源是 16bit
+        # 裸 PCM 故 to_sample_bytes 只容 None/2；to_sample_rate/-channels 被
+        # 要求成别的值（如 tts.speak 要立体声或 22050）时必须回退 ffmpeg——
+        # 否则封出的 WAV 头字段与调用方要求不符：卫星按头校验直接拒收
+        # （「Can only stream 16Khz 16-bit mono WAV」→ 又一场静音），媒体
+        # 播放器则变速播放。宁慢勿错。
+        if (
+            to_sample_rate in (None, rate)
+            and to_sample_channels in (None, channels)
+            and to_sample_bytes in (None, 2)
+        ):
+            if streaming:
+                # ── v1.0.55：流式直封——先等到**第一块非空 PCM**再出头 ──
+                # 首块未到绝不出头：纯头 44B 是"非空 bytes"，会骗过实体
+                # peek 的空结果闸（v1.0.34 M2 同款毒化，见下方批式支注释）。
+                agen = audio_bytes_gen.__aiter__()
+                # 本支是"部分消费"形态：消费者随时可能中途 aclose 我们。源
+                # 收口必须显式落 finally——只靠 GC 终结器会把 transport 的
+                # 断连清算/残帧隔离推迟到不确定时刻（v1.0.45 纪律的延伸）。
+                try:
+                    first: bytes | None = None
+                    while True:
+                        try:
+                            cand = await agen.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        if cand:
+                            first = cand
+                            break
+                    if first is None:
+                        _LOGGER.error("[TTS] 直封收到空 PCM（加载项未回音频），不产出（出口走 fail-loud）")
+                        return
+                    total = len(first)
+                    yield wav_stream_header(rate, channels, 2)
+                    yield first
+                    async for chunk in agen:
+                        if chunk:
+                            total += len(chunk)
+                            yield chunk
+                    _LOGGER.info(
+                        "[TTS] s16le→wav 流式直封收束：%d 帧 %.2fs（%dHz/%dch/16bit，%d 字节，占位头）",
+                        total // (2 * channels),
+                        total / (2 * channels * rate),
+                        rate,
+                        channels,
+                        total,
+                    )
+                finally:
+                    with contextlib.suppress(BaseException):
+                        await agen.aclose()
+                return
+            pcm = b"".join([chunk async for chunk in audio_bytes_gen])
+            if not pcm:
+                # v1.0.34（审查 M2）：空合成必须在此截住——44 字节纯头是"非空
+                # bytes"，能骗过出口 `if not audio` 闸写进 HA TTS 缓存，同一句
+                # 永久静音+日志死寂（2026-09-09 病灶复发入口）。不产出 → 出口
+                # fail-loud 报 (None,None)，HA 跳缓存、错误当场可见。
+                _LOGGER.error("[TTS] 直封收到空 PCM（加载项未回音频），不产出（出口走 fail-loud）")
+                return
+            wav = wrap_pcm_as_wav(pcm, rate, channels, 2)
+            _LOGGER.info(
+                "[TTS] s16le→wav 直封：%d 帧 %.2fs（%dHz/%dch/16bit，%d 字节）",
+                len(pcm) // (2 * channels),
+                len(pcm) / (2 * channels * rate) if pcm else 0.0,
+                rate,
+                channels,
+                len(wav),
+            )
+            yield wav
+            return
+        _LOGGER.info(
+            "[TTS] 直封不适用：输出要求 %sHz/%sch/%sbyte ≠ 源 %dHz/%dch/16bit，转 ffmpeg",
+            to_sample_rate,
+            to_sample_channels,
+            to_sample_bytes,
+            rate,
+            channels,
+        )
+
+    ffmpeg_manager = ffmpeg.get_ffmpeg_manager(hass)
+    command = [
+        ffmpeg_manager.binary,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        from_extension,
+        *(input_params or []),
+        "-i",
+        "pipe:0",
+    ]
+    if to_sample_rate is not None:
+        command.extend(["-ar", str(to_sample_rate)])
+    if to_sample_channels is not None:
+        command.extend(["-ac", str(to_sample_channels)])
+    if to_extension == "mp3":
+        command.extend(["-q:a", "0"])
+    if to_codec is not None:
+        command.extend(["-c:a", str(to_codec)])
+    elif to_extension == "opus":
+        command.extend(["-c:a", "libopus"])
+    if to_sample_bytes == 2:
+        command.extend(["-sample_fmt", "s16"])
+    if to_frame_duration is not None:
+        command.extend(["-frame_duration", str(to_frame_duration)])
+    command.extend(["-f", to_extension, "pipe:1"])
+    _LOGGER.debug("Convert audio using ffmpeg: %s", " ".join(command))
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def write_input() -> None:
+        assert process.stdin
+        try:
+            async for chunk in audio_bytes_gen:
+                process.stdin.write(chunk)
+                await process.stdin.drain()
+        finally:
+            if process.stdin:
+                process.stdin.close()
+            # v1.0.70（深审④）：确定性关停源生成器。被打断/报错时 `async for`
+            # 只把自己解栈，**不会** aclose 上游——transport.stream() 帧连同
+            # _request_lock 一起悬置，锁释放从此赌 GC 时机（引用环时=一个 gc
+            # 代，现场=下一句首帧迟滞）。aclose 沿代链级联，正常耗尽路径上是
+            # no-op，全程抑制异常（本 finally 可能正跑在取消栈上）。
+            aclose = getattr(audio_bytes_gen, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(BaseException):
+                    await aclose()
+
+    writer_task = hass.async_create_background_task(
+        write_input(), f"{DOMAIN}_stt_ffmpeg"
+    )
+    assert process.stdout
+    completed = False
+    try:
+        if to_extension == "opus":
+            demuxer = AsyncOggOpusDemuxer(process.stdout)
+            async for chunk in demuxer:
+                yield chunk
+        else:
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        completed = True
+    finally:
+        # v1.0.65（TTS 深审 T2）：旧收口 `await writer_task; await process.wait()`
+        # 在消费端提前 aclose / 上游取消时两种坏法——writer_task 抛错直接跳过
+        # wait（ffmpeg 无人杀无人收：stdin 已关但 stdout 无人再读，残余输出灌满
+        # 64KB 管道后永久阻塞=孤儿进程+fd 泄漏到 HA 重启），或 writer 已跑完时
+        # process.wait() 本身在满管道上永挂（执行 aclose 的任务永久挂死）。
+        # 同仓 ffmpeg_proxy 已立「Terminate hangs, so kill is used」纪律，本函数
+        # 修一漏一。取消/提前退出路径静默清算；仅正常收束(completed)且 retcode
+        # 非 0 才归因报错——进程被 kill 的 -SIGKILL 不是转换失败。
+        if not writer_task.done():
+            writer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await writer_task
+        if process.returncode is None:
+            process.kill()
+        with contextlib.suppress(Exception):
+            await process.wait()
+        retcode = process.returncode
+        if completed and retcode not in (0, None):
+            assert process.stderr
+            stderr_data = await process.stderr.read()
+            _LOGGER.error(
+                "Convert audio failed (%s): %s", retcode,
+                stderr_data.decode(errors="replace")
+            )
+            raise RuntimeError(
+                f"Unexpected error while running ffmpeg with arguments: {command}. See log for details."
+            )
+
+
+def _parse_wav_data_offset(data: bytes) -> int:
+    """Parse RIFF/WAV header to find the offset of the data chunk.
+
+    Standard WAV has a 44-byte header, but extension chunks (fact, list, etc.)
+    can make it larger. This function traverses RIFF chunks to find 'data'.
+    """
+    if len(data) < 12:
+        return 44
+    if data[0:4] != b"RIFF":
+        return 0
+    # Skip RIFF header (12 bytes: RIFF + size + WAVE)
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_id = data[offset:offset + 4]
+        chunk_size = int.from_bytes(data[offset + 4:offset + 8], "little")
+        if chunk_id == b"data":
+            return offset + 8
+        offset += 8 + chunk_size
+        # Chunks are padded to even byte boundary
+        if chunk_size % 2:
+            offset += 1
+    return 44
+
+
+async def wav_to_opus(stream, sample_rate=16000, channels=1, frame_duration=60):
+    frame_samples = int(sample_rate * (frame_duration / 1000))
+    frame_bytes = frame_samples * channels * 2
+    encoder = opuslib.Encoder(sample_rate, channels, opuslib.APPLICATION_AUDIO)
+    buffer = bytearray()
+    wav_header_skip = None
+    async for chunk in stream:
+        if wav_header_skip is None and chunk.startswith(b"RIFF"):
+            wav_header_skip = _parse_wav_data_offset(chunk)
+            _LOGGER.debug("WAV data offset: %s", wav_header_skip)
+        elif wav_header_skip is None:
+            wav_header_skip = 0
+        if wav_header_skip > 0:
+            skip_len = min(len(chunk), wav_header_skip)
+            chunk = chunk[skip_len:]
+            wav_header_skip -= skip_len
+            if not chunk:
+                continue
+        buffer.extend(chunk)
+        while len(buffer) >= frame_bytes:
+            pcm_frame = buffer[:frame_bytes]
+            del buffer[:frame_bytes]
+            # yield bytes(pcm_frame)
+            np_frame = np.frombuffer(pcm_frame, dtype=np.int16)
+            yield encoder.encode(np_frame.tobytes(), frame_samples)
+    if buffer:
+        buffer = buffer.ljust(frame_bytes, b"\x00")
+        yield encoder.encode(bytes(buffer), frame_samples)
+
+
+class AsyncOggOpusDemuxer:
+    def __init__(self, reader: asyncio.StreamReader):
+        self._reader = reader
+        self._buffer = bytearray()
+        self._packet_count = 0
+
+    async def _read_exact(self, n: int) -> bytes | None:
+        while len(self._buffer) < n:
+            chunk = await self._reader.read(4096)
+            if not chunk:
+                return None
+            self._buffer.extend(chunk)
+
+        data = self._buffer[:n]
+        del self._buffer[:n]
+        return bytes(data)
+
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        while True:
+            page_header = await self._read_exact(4)
+            if not page_header:
+                break
+            if page_header != b"OggS":
+                raise ValueError("Invalid Ogg header received from ffmpeg")
+
+            common_header = await self._read_exact(23)
+            if not common_header:
+                break
+
+            n_segments = common_header[-1]
+
+            segment_table_bytes = await self._read_exact(n_segments)
+            if not segment_table_bytes:
+                break
+
+            segment_table = list(segment_table_bytes)
+            page_data_len = sum(segment_table)
+            page_data = await self._read_exact(page_data_len)
+            if not page_data:
+                break
+
+            packet_buffer = bytearray()
+            data_ptr = 0
+            for segment_len in segment_table:
+                packet_buffer.extend(page_data[data_ptr : data_ptr + segment_len])
+                data_ptr += segment_len
+
+                if segment_len < 255:
+                    self._packet_count += 1
+                    if self._packet_count > 2:
+                        yield bytes(packet_buffer)
+                    packet_buffer = bytearray()

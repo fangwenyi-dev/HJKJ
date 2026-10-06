@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# 本地 E2E-lite（无 docker 环境的自证通道，Windows-gitbash/WSL/Linux 通用）：
+# 真 core 服务 + 真模型（_hjmodels 预置或自动下载）+ 不可达 HA 降级 + 三通道断言
+# + reload 卸载/惰性重载复验。CI 侧对应用 docker 跑交付镜像本体的 run_e2e.sh。
+# 用法：bash tests/e2e/run_local.sh   （PYTHON=/path/to/python 可覆写解释器）
+set -Eeuo pipefail
+cd "$(dirname "$0")/../.."
+PY="${PYTHON:-python3}"
+LOG=/tmp/hj-e2e-server.log
+
+# dev 预置 _hjmodels 为手工解包产物：老布局无完成标记 → 补章迁移（生产镜像
+# 由 ModelStore 自行解包盖章，此段仅本地开发路径）
+MJ="$(dirname "$(pwd)")/_hjmodels"
+[ -d "$MJ" ] && for d in "$MJ"/*/; do [ -e "$d/.extracted_ok" ] || echo "dev-migration" > "$d/.extracted_ok"; done
+
+echo "==== 1. 起服务 ===="
+rm -rf _e2e_data
+"$PY" tests/e2e/e2e_server.py >"$LOG" 2>&1 &
+SRV=$!
+cleanup() { kill "$SRV" 2>/dev/null || true; wait "$SRV" 2>/dev/null || true; }
+trap cleanup EXIT
+
+echo "==== 2. 等 health + models_ready（自动下载形态可能数分钟）===="
+ready=""
+for i in $(seq 1 600); do
+    kill -0 "$SRV" 2>/dev/null || { echo "!! 服务进程已退出"; tail -40 "$LOG"; exit 1; }
+    if [ -z "$ready" ]; then
+        curl -sf http://127.0.0.1:8002/api/health >/dev/null 2>&1 && { echo "health ok"; }
+    fi
+    ready=$(curl -sf --max-time 5 http://127.0.0.1:8002/api/health 2>/dev/null \
+        | HJ_LOCK="$PWD/models.lock.json" "$PY" -c 'import json,os,sys
+try:
+    j=json.load(sys.stdin); m=j.get("models_ready") or {}
+    d=json.load(open(os.environ["HJ_LOCK"], encoding="utf-8"))
+    # v1.1.17：need 集从 models.lock 派生（default_provider:true），不再写死模型键
+    # 本脚本无 $ADDON（第 7 行只 cd），路径取 $PWD——v1.1.17 首版误用未定义量，
+    # set -u 下子壳当场 abort ⇒ ready 恒空 ⇒ 600×2s 后假报「models 未就绪」。
+    need=[k for k,v in d.items() if isinstance(v,dict) and v.get("default_provider")]
+    # v1.1.36 收口：`models_ready` 只说明**包在盘上解好了**，不等于引擎已装载。
+    # 真装态在同一份 health 里就是 `asr_loaded`/`tts_loaded`——门过去只看前者，
+    # 于是升级后第一次跑本通道必红：客户端在"冷启动双载闩"还没放行时就推第一句，
+    # 拿到 `{'text':'','reason':'模型正在加载（冷启动双载闩拦下本轮）'}`（2026-10-01
+    # 本机四轮同签名红，热栈手跑立刻三通道全绿 ⇒ 红在工装不在产品）。
+    # 闩本身是对的（备料期让位，不换嗓不断播），要补的是把关口径。
+    print("yes" if need and all(m.get(k) for k in need)
+          and j.get("asr_loaded") and j.get("tts_loaded") else "")
+except Exception: print("")' | tr -d '\r' || true)
+    [ "$ready" = "yes" ] && break
+    sleep 2
+done
+[ "$ready" = "yes" ] || { echo "!! models 未就绪"; tail -40 "$LOG"; exit 1; }
+
+echo "==== 3. 三通道断言（第一轮：常驻模型）===="
+"$PY" tests/e2e/e2e_client.py
+
+echo "==== 4. 空闲卸载 → 惰性重载（第二轮走快照/busy/executor 新链）===="
+curl -sf -X POST --max-time 30 http://127.0.0.1:8002/api/system/reload_models
+echo
+"$PY" tests/e2e/e2e_client.py
+
+echo "run_local：本地真栈 E2E 全绿 ✅"

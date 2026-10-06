@@ -1,0 +1,698 @@
+name: Build and Release (huijian_voice)
+
+# 与网关仓 ci.yaml 同源范式（v1.7.16 后的九 job 形态）。2026-10-06 语音侧并入本商店仓：
+# 本文件由 huijian-gateway-plugin-yy/.github/workflows/ci.yaml 逐字搬来，只动了六处——
+# 触发方式、concurrency 组名、tag 前缀 vo-（三处）、Gitee 目标仓说明、ACR 路径注释。
+# 判据/门禁/超时/脚本引用一字未改（跨境上传劣化、zstd 转码、tag 闸口那几段都是实发教训）。
+#
+# ⚠ 触发暂只留 workflow_dispatch：本仓尚未配 ACR_USER / ACR_PASS（语音镜像主源是阿里云
+#   ACR）。配好之前就开 push 触发的表现是——push-acr 因 continue-on-error 静默失败，
+#   当场红的是 release job 里那道「Wait for ACR readiness」，长得像跨境链路坏了。
+#   两个 secret 配齐后把下面这两行加回来即可恢复"改号即发版"：
+#     push:
+#       branches: [main]
+on:
+  workflow_dispatch:
+    inputs:
+      force_republish:
+        description: '明知故犯地重发已存在的 tag（覆盖已发布镜像与 Release）'
+        type: boolean
+        default: false
+
+# 同一时刻只允许一条发版链：v1.1.5 首发即因 push-acr 跨境写超时挂掉
+# （run 35626978134），若此时又有第二次 push 触发并发构建，两个 job 会交错
+# 写同一 ACR tag。cancel-in-progress 必须为 false——进行中的 ACR 上传被中断
+# 会留下半成品 manifest，比排队慢更糟。
+concurrency:
+  # 组名必须区别于网关 ci.yaml：并入同仓后若共用 group，两条发版链会互相排队阻塞
+  # （cancel-in-progress=false 下不取消只排队，而两边的 tag/镜像 tag 互不相干）。
+  group: huijian-voice-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCHITECTURES: '["amd64", "aarch64"]'
+  IMAGE_NAME: huijian-voice
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  # ========== 0. 代码质量检查（网关同款五门禁） ==========
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0     # v1.1.17 复审：默认 depth=1 时"历史扫"只扫到 HEAD blob，与索引扫同一批字节（实测 150 vs 1448）
+
+      - name: Check shell scripts syntax
+        run: |
+          apt-get update -qq && apt-get install -y -qq shellcheck > /dev/null 2>&1 || true
+          for f in huijian_voice/run.sh huijian_voice/boot.sh huijian_voice/nginx.sh huijian_voice/tests/e2e/*.sh; do
+            echo "检查 $f ..."
+            bash -n "$f" || exit 1
+            shellcheck "$f" || echo "⚠ shellcheck 警告（非阻塞）"
+          done
+
+      - name: Check YAML files syntax
+        run: |
+          pip install -q pyyaml
+          python3 -c '
+          import yaml, sys, glob
+          for f in glob.glob("**/*.yaml", recursive=True):
+              try:
+                  yaml.safe_load(open(f))
+                  print(f"OK {f}")
+              except Exception as e:
+                  print(f"FAIL {f}: {e}")
+                  sys.exit(1)
+          '
+
+      - name: Check JSON files syntax
+        run: |
+          for f in $(find . -name "*.json" -not -path "./.git/*"); do
+            python3 -c "import json; json.load(open('$f'))" || exit 1
+            echo "OK $f"
+          done
+
+      - name: Python syntax & unit tests
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libopus0 > /dev/null 2>&1 || true
+          pip install -q -r huijian_voice/requirements.txt pytest pyyaml
+          python3 -m compileall -q huijian_voice/core huijian_voice/tests
+          python3 -m pytest huijian_voice/tests -q
+
+      - name: Verify version consistency (四源)
+        run: |
+          VERSION=$(grep '^version:' huijian_voice/config.yaml | head -1 | awk -F'"' '{print $2}')
+          if [ -z "$VERSION" ]; then
+            echo "::error title=config.yaml 版本提取失败::'^version:' 行格式漂移？"
+            exit 1
+          fi
+          echo "config.yaml 版本: $VERSION"
+          HTML_VER=$(grep 'CURRENT_VERSION = "' huijian_voice/www/index.html | sed 's/.*CURRENT_VERSION = "\([^"]*\)".*/\1/')
+          echo "index.html 版本: $HTML_VER"
+          [ "$VERSION" = "$HTML_VER" ] || { echo "FAIL 版本不一致"; exit 1; }
+          python3 - "$VERSION" <<'PYEOF'
+          import json, sys
+          want = sys.argv[1]
+          vj = json.load(open('huijian_voice/www/version.json'))
+          mf = json.load(open('huijian_voice/custom_components/huijian_ai/manifest.json'))
+          for label, got in [("version.json.addon_version", vj.get("addon_version")),
+                             ("version.json.integration_version", vj.get("integration_version")),
+                             ("manifest.json.version", mf.get("version"))]:
+              status = "OK" if got == want else "FAIL"
+              print(f"{status} {label}: {got}")
+              if got != want:
+                  sys.exit(1)
+          PYEOF
+          echo "✅ 所有版本号一致: $VERSION"
+
+      - name: nginx config sanity (非阻塞提示)
+        run: |
+          # 完整语法校验在 e2e job 的真容器里跑（nginx -t 需要镜像内二进制）；
+          # 此处仅拦最劣级的花括号失衡
+          python3 - <<'PYEOF'
+          s = open('huijian_voice/nginx-huijian.conf').read()
+          assert s.count('{') == s.count('}'), "nginx conf 花括号失衡"
+          print("OK nginx-huijian.conf 括号平衡")
+          PYEOF
+
+
+
+  # ========== 1. 读取版本号 & 准备变更日志 ==========
+  prepare:
+    name: Prepare
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v5
+        # v1.7.12（审计 I-3）：changelog 兜底路径要 `git log --oneline -10`，
+        # 默认 fetch-depth=1 只能给出 1 条——给 20 条历史
+        with:
+          fetch-depth: 20
+
+      - name: Extract version from config.yaml
+        id: version
+        run: |
+          VERSION=$(grep '^version:' huijian_voice/config.yaml | head -1 | awk -F'"' '{print $2}')
+          # v1.7.12（第 6 轮审计 I-1）：空版本 fail-fast——prepare 是 build/
+          # manifest/release 三个下游的版本真源，空串会让镜像 tag 成
+          # `:latest`+`:`、Release 名成 "v"，污染仓库不可逆
+          if [ -z "$VERSION" ]; then
+            echo "::error title=config.yaml 版本提取失败::'^version:' 行缺失或格式漂移"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "提取到版本号: $VERSION"
+
+      - name: 发布闸口——同名 tag 已存在即停
+        # release job 是 "Create or Update Release"（ci.yaml 原有语义），且
+        # push-acr 会把镜像 tag 覆写进 ACR。config.yaml 版本号没涨就重推
+        # main，会把已发布版本原地换掉：老用户版本串未变，永远收不到更新，
+        # 也永远不知道自己被换了镜像。判据区分两种情形——
+        #   tag 指向本次同一 commit → 只是重跑失败的构建，放行；
+        #   tag 指向别的 commit     → 真覆盖，拦停（需 force_republish 明示）。
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="vo-$VERSION"   # D2：语音 tag 加 vo- 前缀——同仓后与网关 v1.7.x 共用一个
+                              # tag 命名空间，实测两仓旧 tag 重名 15 个（v1.0.0/v1.1.1…）
+          # 必须是 `|| true`：run 步默认 set -e，ls-remote 失败（临时网络/鉴权抖动）
+          # 会让 prepare job 直接红，闸口本身反而卡死发布链——闸口不得比它守的事更脆。
+          REFS=$(git ls-remote origin 2>/dev/null || true)
+          if [ -z "$REFS" ]; then
+            echo "::warning title=tag 闸口降级::git ls-remote origin 无输出，本轮跳过存在性判定"
+            exit 0
+          fi
+          DIRECT=$(awk -v r="refs/tags/$TAG" '$2==r{print $1}' <<<"$REFS")
+          # 附注标签的 refs/tags/vX 指向 tag 对象而非 commit，必须一起看 peeled
+          # 的 refs/tags/vX^{}——否则同一 commit 的重跑会被误判成"指向他处"拦停
+          PEELED=$(awk -v r="refs/tags/$TAG^{}" '$2==r{print $1}' <<<"$REFS")
+          TARGET="${PEELED:-$DIRECT}"
+          if [ -z "$TARGET" ]; then
+            echo "tag $TAG 未发布过，放行"
+            exit 0
+          fi
+          echo "已存在 tag $TAG -> ${TARGET:0:8}"
+          if [ "$TARGET" = "${{ github.sha }}" ]; then
+            echo "::notice title=重跑同一 commit::$TAG 指向本次 commit，按重跑放行"
+            exit 0
+          fi
+          if [ "${{ inputs.force_republish }}" = "true" ]; then
+            echo "::warning title=强制重发::正在覆盖已发布的 $TAG（原指向 ${TARGET:0:8}）"
+            exit 0
+          fi
+          echo "::error title=拒绝覆盖已发布版本::$TAG 已存在且指向 ${TARGET:0:8}（本次 ${{ github.sha }}）。升 huijian_voice/config.yaml 的版本号，或改用 workflow_dispatch 并勾选 force_republish。"
+          exit 1
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # 将 changelog 写入临时文件，避免 echo -e 破坏中文编码（Gitee 乱码根因）
+          CHANGELOG_FILE="/tmp/changelog.md"
+          
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="${{ steps.version.outputs.version }}" '
+              /^## \[/{ found=0 }
+              $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
+              /^## \[/{ if(found) exit }
+              found { print }
+            ' CHANGELOG.md | head -50 > "$CHANGELOG_FILE"
+          fi
+          
+          if [ ! -s "$CHANGELOG_FILE" ]; then
+            # 从 git log 自动生成 changelog（最近 10 条提交）
+            {
+              echo "## v${{ steps.version.outputs.version }}"
+              echo ""
+              git log --oneline -10 --format='- %h: %s'
+            } > "$CHANGELOG_FILE"
+          fi
+          
+          # 用文件内容设置输出（避免 echo -e 破坏 UTF-8 中文）
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "changelog<<$EOF" >> $GITHUB_OUTPUT
+          cat "$CHANGELOG_FILE" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+
+  # ========== 2. 构建 Docker 镜像 ==========
+  init:
+    name: Init
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Get build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.06.0
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          image-name: ${{ env.IMAGE_NAME }}
+
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [prepare, init]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        uses: home-assistant/builder/actions/build-image@2026.06.0
+        with:
+          arch: ${{ matrix.arch }}
+          context: "huijian_voice"
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          push: "true"
+          version: ${{ needs.prepare.outputs.version }}
+
+  # ========== 2.5 真镜像 E2E（发布硬门禁：构建交付镜像本体+真模型+协议断言） ==========
+  # 与网关 e2e 同定位：无 continue-on-error——本 job 失败即阻断 manifest/release。
+  # 覆盖：Dockerfile/s6/nginx/ModelStore 真下载/三通道协议/版本链/静态根 token
+  # 缺席断言/优雅停机。断言脚本与本地 run_local.sh 单一事实源（e2e_client.py）。
+  e2e:
+    name: E2E real image
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run image E2E
+        run: bash huijian_voice/tests/e2e/run_e2e.sh
+
+
+
+  manifest:
+    name: Manifest
+    # e2e 为 v1.6.23 起的硬门禁（详见 e2e job 注释）
+    needs: [prepare, init, build, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish multi-arch manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.06.0
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ env.IMAGE_NAME }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+
+      # v1.6.4 定案（实验实锤）：GitHub【没有】visibility 变更 API——
+      # REST PUT/PATCH × /user/ 与 /users/{owner}/ 全 404、GraphQL 公开
+      # schema 无该 mutation（updateV3RegistryPackage 已被移除）。
+      # 但 Actions 用 GITHUB_TOKEN 首推的包【继承仓库可见性】：public 仓库
+      # ⇒ 新包自动 public（amd64 删包重建实测 anon 200）。历史包因创建时
+      # 走了本地 PAT 推送被永久定死 private，修复手段=删包+重推：
+      #   gh api -X DELETE /user/packages/container/<pkg>
+      # 探测注意：token 必须带 service=ghcr.io 且 manifest GET 要带
+      # OCI/idx Accept 头，否则 audience 错 token 会得到误导性 404。
+      - name: Check package visibility
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -u
+          check_pull() {
+            FAILED=""
+            for p in "${IMAGE_NAME}" "amd64-${IMAGE_NAME}" "aarch64-${IMAGE_NAME}"; do
+              T=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${GITHUB_REPOSITORY_OWNER}/$p:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true)
+              C=$(curl -s -o /dev/null -w "%{http_code}" \
+                   -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+                   "https://ghcr.io/v2/${GITHUB_REPOSITORY_OWNER}/$p/manifests/${VERSION:-latest}" \
+                   -H "Authorization: Bearer ${T:-none}" || echo 000)
+              if [ "$C" = "200" ]; then
+                echo "✅ ${p} 匿名可拉（public）"
+              else
+                FAILED="${FAILED} ${p}(HTTP $C)"
+              fi
+            done
+          }
+          check_pull
+          if [ -n "${FAILED}" ]; then
+            # v1.6.9：复测一次再定罪——排除 ghcr 传播延迟/瞬时网络导致的误报
+            echo "⏳ 首轮失败，15 秒后复测：${FAILED}"
+            sleep 15
+            check_pull
+          fi
+          if [ -n "${FAILED}" ]; then
+            # v1.6.9（外部审计确认）：由 ::warning 升级为阻断——config.yaml 已启用
+            # image: 路由，包不可匿名拉取时用户安装必失败，绿 CI 是掩盖故障
+            echo "::error title=ghcr 包不可匿名拉取::${FAILED} —— image 路线安装会失败。修复：gh api -X DELETE /user/packages/container/<pkg> 删包后重推 CI 自动按仓库 public 重建（详见本文件上方注释）"
+            exit 1
+          fi
+
+
+
+  # ========== 2.6 ACR 国内主源分发（v1.0.1，首装卡下载实发的根治） ==========
+  # 定案：客户 image 主源=自有阿里云 ACR 个人版公开仓（上海，国内原生线路，
+  # 不再赌透传站边缘缓存运气）。本 job 把 ghcr 上已过 e2e 硬门禁的两架构
+  # 仓在 registry 侧合并为【单仓多架构 OCI index】推 ACR（imagetools 远端
+  # 合并，零本地转手；ghcr 公开源匿名读，无需 ghcr 登录）。
+  # 【硬门禁语义】release 的 needs 含本 job：ACR 推送失败=不发布——因为
+  # config.yaml image 已指 ACR，ACR 无此 tag 时发布即全体客户安装失败。
+  # 前置 secrets：ACR_USER / ACR_PASS（阿里云访问凭证固定密码，用户在
+  # ACR 控制台「访问凭证」设置；凭据只进 Secrets，严禁落仓）。
+  push-acr:
+    name: Push ACR CN mirror
+    needs: [prepare, manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # 转码=260MB 下载+重压+上传；2026-09-25 跨境上传劣化，40min 两连
+                          # 被 cancel（run 36019335781 两次）⇒ 放宽到 90min
+    # 2026-09-30（用户令「ACR 一律本地代推」配套）：降为 **best-effort 自动尝试**——
+    # 链路好时它自己推完；链路劣化时失败/卡死不挡发布。就绪把关上移到 release job 的
+    # 「Wait for ACR mirror readiness」验证步（谁推到位都认：本地代推或本 job）。
+    continue-on-error: true
+    env:
+      ACR: crpi-92gcrmsz8v7vvdy1.cn-shanghai.personal.cr.aliyuncs.com
+      # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner），
+      # 并入商店仓后**故意保留旧名**：改 ACR 仓名＝全体已装用户按 image 拉不到更新。
+      ACR_REPO: fangwenyi-dev/huijian-gateway-plugin-yy
+      VERSION: ${{ needs.prepare.outputs.version }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Transcode ghcr zstd layers to gzip and push ACR
+        env:
+          ACR_USER: ${{ secrets.ACR_USER }}
+          ACR_PASS: ${{ secrets.ACR_PASS }}
+        run: |
+          set -eu
+          # 两代实发教训：run1 按 tag 复制把 provenance attestation blob 搬去
+          # ACR→403；run2 @digest 绕过 attestation 仍 403——本地鉴别实验定案
+          # （真gzip流=202 / zstd魔数=403 / 纯字节=403）：ACR 个人版拒收一切
+          # 非 gzip 层流，而 hassio builder 推的层是 tar+zstd。唯一解=下载解压
+          # 重压缩 gzip 重写 manifest（scripts/acr_transcode.py，本地已对
+          # 1.0.1 全量端到端实证；config/diff_ids 不动，层内容零改变）。
+          python3 -m pip install --quiet --break-system-packages zstandard
+          child_digest() { # $1=repo $2=tag $3=oci_arch → 纯镜像子 manifest digest
+            local TOK J
+            TOK=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/$1:pull" \
+                  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+            J=$(curl -fsS -H "Authorization: Bearer $TOK" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/${OWNER}/$1/manifests/$2")
+            printf '%s' "$J" | python3 -c '
+          import json,sys
+          m=json.load(sys.stdin)
+          if "manifests" in m:
+              hit=[e for e in m["manifests"]
+                   if e.get("platform",{}).get("architecture")==sys.argv[1]
+                   and e.get("platform",{}).get("os")=="linux"]
+              assert hit, f"index 中无 {sys.argv[1]}/linux 纯镜像条目"
+              print(hit[0]["digest"])
+          else:
+              sys.exit(2)' "$3" || {
+              TOK=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:${OWNER}/$1:pull" \
+                    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+              curl -fsSI -H "Authorization: Bearer $TOK" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/${OWNER}/$1/manifests/$2" | tr -d '\r' \
+                | sed -n 's/^Docker-Content-Digest: *\(sha256:[0-9a-f]*\).*/\1/p'; }
+          }
+          AM=$(child_digest "amd64-huijian-voice" "$VERSION" amd64)
+          AR=$(child_digest "aarch64-huijian-voice" "$VERSION" arm64)
+          [ -n "$AM" ] && [ -n "$AR" ] || { echo "::error::源纯镜像 digest 解析失败"; exit 1; }
+          echo "源纯镜像 digest: amd64=$AM arm64=$AR"
+          DA=$(python3 scripts/acr_transcode.py transcode --src ghcr.io \
+                 --src-repo "$OWNER/amd64-huijian-voice" --src-ref "$AM" \
+                 --dst "$ACR" --dst-repo "$ACR_REPO" --dst-tag "$VERSION-amd64")
+          DR=$(python3 scripts/acr_transcode.py transcode --src ghcr.io \
+                 --src-repo "$OWNER/aarch64-huijian-voice" --src-ref "$AR" \
+                 --dst "$ACR" --dst-repo "$ACR_REPO" --dst-tag "$VERSION-arm64")
+          # digest 格式硬校验（run4 教训：stdout 混日志前缀→拼 URL 控制字符崩，
+          # 且异常被 set -e 吞步仍绿=假成功；格式不过立即红）
+          for D in "$DA" "$DR"; do
+            echo "$D" | grep -qE '^sha256:[0-9a-f]{64}$' || { echo "::error::transcode 输出非纯 digest: [$D]"; exit 1; }
+          done
+          for TGT in "$VERSION" latest; do
+            IX=$(python3 scripts/acr_transcode.py index --dst "$ACR" --dst-repo "$ACR_REPO" \
+                   --tag "$TGT" --member "amd64=$DA" --member "arm64=$DR")
+            echo "$IX" | grep -qE '^sha256:[0-9a-f]{64}$' || { echo "::error::index 输出异常: [$IX]"; exit 1; }
+            echo "index $TGT → $IX"
+          done
+      - name: Self-verify anonymous pull + dual-arch gzip index
+        run: |
+          set -eu
+          # 匿名认证链完全动态发现（不硬编码 realm，防 ACR 端点差异臆造）：
+          # /v2/ 401 → WWW-Authenticate 解 realm/service → 匿名 pull token → GET manifest
+          HDR=$(curl -sI "https://$ACR/v2/" | tr -d '\r')
+          REALM=$(echo "$HDR" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+          SVC=$(echo "$HDR" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+          [ -n "$REALM" ] || { echo "::error::ACR 未返回 auth realm，认证链异常"; exit 1; }
+          T=$(curl -fsS "${REALM}?service=${SVC}&scope=repository:${ACR_REPO}:pull" \
+              | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("token") or d.get("access_token",""))')
+          [ -n "$T" ] || { echo "::error::匿名 pull token 获取失败——公开读未生效，客户安装必失败"; exit 1; }
+          IDX=$(curl -fsS -H "Authorization: Bearer $T" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://$ACR/v2/$ACR_REPO/manifests/$VERSION")
+          echo "$IDX" | python3 -c '
+          import json,sys
+          m=json.load(sys.stdin)
+          archs={e["platform"]["architecture"] for e in m.get("manifests",[])}
+          assert {"amd64","arm64"} <= archs, f"index 缺架构: {archs}"
+          assert not {"unknown","attestation"} & archs, f"attestation 混入: {archs}"
+          print("多架构 index 完整:", sorted(archs))'
+          for CH in $(echo "$IDX" | python3 -c 'import json,sys;[print(e["digest"]) for e in json.load(sys.stdin)["manifests"]]'); do
+            curl -fsS -H "Authorization: Bearer $T" -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              "https://$ACR/v2/$ACR_REPO/manifests/$CH" | python3 -c '
+          import json,sys
+          m=json.load(sys.stdin)
+          bad=[l["mediaType"] for l in m["layers"] if l["mediaType"]!="application/vnd.oci.image.layer.v1.tar+gzip"]
+          assert not bad, f"子镜像含非 gzip 层（转码回退!）: {set(bad)}"
+          small=min(m["layers"], key=lambda l:l["size"])
+          print("层全 gzip ✓ 抽样层:", small["digest"][:19], small["size"], "B")'
+          done
+          # 端到端字节级：匿名真拉最小层并验 sha256（防“manifest 在位 blob 缺失”假成功）
+          python3 - "$ACR" "$ACR_REPO" "$T" <<'PYX'
+          import hashlib, json, sys, urllib.request
+          acr, repo, t = sys.argv[1:4]
+          def get(p, accept=None):
+              h = {"Authorization": "Bearer " + t}
+              if accept: h["Accept"] = accept
+              r = urllib.request.urlopen(urllib.request.Request(f"https://{acr}{p}", headers=h),
+                                         timeout=60)
+              return r.read()
+          idx = json.loads(get(f"/v2/{repo}/manifests/latest", "application/vnd.oci.image.index.v1+json"))
+          child = json.loads(get(f"/v2/{repo}/manifests/{idx['manifests'][0]['digest']}",
+                                 "application/vnd.oci.image.manifest.v1+json"))
+          l0 = min(child["layers"], key=lambda l: l["size"])
+          blob = get(f"/v2/{repo}/blobs/{l0['digest']}")
+          assert "sha256:" + hashlib.sha256(blob).hexdigest() == l0["digest"], "blob 字节损坏"
+          assert blob[:2] == b"\x1f\x8b", "非 gzip 流"
+          print("✅ ACR 匿名端到端实证：index→manifest→层 blob 字节+sha256+gzip 全对")
+          PYX
+
+
+  # ========== 3. 创建 GitHub Release ==========
+  release:
+    name: Release
+    # 2026-09-30 流程定案（配套用户令「ACR 一律本地代推」）：
+    #   发布**不再等 push-acr**——跨境链路劣化时该段可卡 40min+ 仍失败，
+    #   却会把 tag/Release/Gitee 一起拖住（v1.1.32 三连崩实况）。
+    #   ACR 镜像由本地代推保证（仓根 `_acr_local_push.py`：ghcr 数据面走国内
+    #   代理 + 本机直推，十几分钟），push-acr 保留为自动兜底尝试；
+    #   其失败只表示「镜像待本地补」，不代表发布失败。
+    #   ⚠ gzip 重压非跨环境字节确定性（同长不同字节实测）⇒ 本地代推后 CI
+    #   不保证秒传，别指望 rerun 让 CI 收口 ACR。
+    #   发布对账口径＝ tag + gh Release + Gitee Release + ACR 匿名 verify 四件套。
+    #   不变量（tag 出 ⇒ ACR 可拉）由下方「Wait for ACR mirror readiness」步机器把守。
+    needs: [prepare, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # v1.0.44 实锤教训：prepare 的 changelog 输出被 Actions 密钥扫描
+      # 「Skip output 'changelog' since it may contain secret」整段丢弃 →
+      # needs.prepare.outputs.changelog 静默为空 → Release 正文空壳（Gitee
+      # 侧因自读 CHANGELOG 无恙）。定案：正文在本 job 自提取走 body_path
+      # （文件通道不经 mask）；与 prepare 的同形 awk 是受控重复——漂移风险
+      # 远小于"整条输出链可被静默清空"的故障面。
+      - name: Extract release body (self-read)
+        run: |
+          set -eu
+          VER='${{ needs.prepare.outputs.version }}'
+          awk -v ver="$VER" '
+            /^## \[/{ found=0 }
+            $0 ~ "^## \\["ver"]" { found=1; print; next }
+            /^## \[/{ if(found) exit }
+            found { print }
+          ' CHANGELOG.md | head -80 > /tmp/release-body.md
+          if [ ! -s /tmp/release-body.md ]; then
+            { echo "## v$VER"; echo ""; git log --oneline -10 --format='- %h: %s'; } > /tmp/release-body.md
+          fi
+          echo "release body: $(wc -c < /tmp/release-body.md) bytes"
+
+      - name: Wait for ACR mirror readiness
+        # 发布不变量（机器可验证，替代 v1.0.1 时代「硬等 push-acr job」）：
+        # tag 一出 ⇒ ACR 必须可匿名拉（config.yaml image 指 ACR；ACR 无该 tag
+        # 的发布＝客户点更新装不上）。谁推到位都认：本地代推 _acr_local_push.py
+        # 或 CI push-acr 兜底。轮询上限 40min。
+        env:
+          ACR: crpi-92gcrmsz8v7vvdy1.cn-shanghai.personal.cr.aliyuncs.com
+          # 与 GitHub 仓名**无耦合**（这里是硬编码字符串，只有 OWNER 取 repository_owner），
+          # 并入商店仓后**故意保留旧名**：改 ACR 仓名＝全体已装用户按 image 拉不到更新。
+          ACR_REPO: fangwenyi-dev/huijian-gateway-plugin-yy
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          python3 - "$ACR" "$ACR_REPO" "$VERSION" <<'PYX'
+          import hashlib, json, re, sys, time, urllib.error, urllib.request
+          acr, repo, ver = sys.argv[1:4]
+
+          def http(url, accept=None, tok=None, timeout=30):
+              h = {}
+              if accept:
+                  h["Accept"] = accept
+              if tok:
+                  h["Authorization"] = "Bearer " + tok
+              return urllib.request.urlopen(
+                  urllib.request.Request(url, headers=h), timeout=timeout).read()
+
+          def realm_token():
+              # 匿名认证链动态发现（同 push-acr 自检口径；不硬编码 realm）
+              try:
+                  urllib.request.urlopen(
+                      urllib.request.Request(f"https://{acr}/v2/", method="HEAD"),
+                      timeout=20)
+                  auth = ""
+              except urllib.error.HTTPError as e:
+                  auth = e.headers.get("Www-Authenticate") or ""
+              rm = re.search(r'realm="([^"]+)"', auth)
+              sv = re.search(r'service="([^"]+)"', auth)
+              assert rm, "ACR 未返回 auth realm（认证链异常）"
+              d = json.loads(http(f"{rm.group(1)}?service={sv.group(1) if sv else ''}"
+                                  f"&scope=repository:{repo}:pull"))
+              t = d.get("token") or d.get("access_token") or ""
+              assert t, "匿名 pull token 获取失败（公开读未生效？）"
+              return t
+
+          ACCI = ("application/vnd.oci.image.index.v1+json,"
+                  "application/vnd.docker.distribution.manifest.list.v2+json")
+          ACCM = ("application/vnd.oci.image.manifest.v1+json,"
+                  "application/vnd.docker.distribution.manifest.v2+json")
+          last = ""
+          for i in range(80):   # 80 × 30s = 40min
+              try:
+                  tok = realm_token()
+                  idx = json.loads(http(
+                      f"https://{acr}/v2/{repo}/manifests/{ver}", ACCI, tok))
+                  archs = {(e.get("platform") or {}).get("architecture")
+                           for e in idx.get("manifests", [])}
+                  assert {"amd64", "arm64"} <= archs, f"index 缺架构: {archs}"
+                  for e in idx["manifests"]:
+                      cm = json.loads(http(
+                          f"https://{acr}/v2/{repo}/manifests/{e['digest']}", ACCM, tok))
+                      bad = [l["mediaType"] for l in cm["layers"]
+                             if l["mediaType"]
+                             != "application/vnd.oci.image.layer.v1.tar+gzip"]
+                      assert not bad, f"非 gzip 层（转码回退）: {set(bad)}"
+                      l0 = min(cm["layers"], key=lambda l: l["size"])
+                      blob = http(f"https://{acr}/v2/{repo}/blobs/{l0['digest']}",
+                                  None, tok, 60)
+                      assert "sha256:" + hashlib.sha256(blob).hexdigest() \
+                          == l0["digest"], "blob 字节损坏"
+                  print(f"✅ ACR 就绪：{ver} 双架构全 gzip、匿名端到端过（第 {i+1} 轮）")
+                  sys.exit(0)
+              except Exception as ex:
+                  last = f"{type(ex).__name__}: {ex}"
+                  print(f"… 第 {i+1}/80 轮未就绪（{last}），30s 后重试", flush=True)
+                  time.sleep(30)
+          print(f"::error::ACR 未在 40min 内就绪（{last}）——本地代推/CI 兜底均未落位？")
+          sys.exit(1)
+          PYX
+      - name: Create or Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vo-${{ needs.prepare.outputs.version }}
+          name: vo-${{ needs.prepare.outputs.version }}
+          body_path: /tmp/release-body.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # ========== 4. Gitee Release 自动补发（v1.6.21 起替代手工 POST） ==========
+  # 定案背景：Gitee 无 webhook 自动 release，历史做法是发版后手动补最新
+  # 一条（"只发最新版"规矩）。此 job 把该人工步骤自动化：body 取
+  # CHANGELOG 对应版本段、target_commitish 必带（API 缺省行为不可靠）、
+  # 幂等且**正文自愈**（同 tag 存在则 PATCH 同步 CHANGELOG 最新正文，v1.0.43 起；PUT 必 405，
+  # 旧版"存在即跳过"会让发版后的文档补记永久漂移）、401 时给出 BOM/凭据排障提示
+  # （.gitee_token 曾带 UTF-8 BOM 致 API 崩，Secret 值必须是纯 ASCII token）。
+  gitee-release:
+    name: Gitee Release
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create Gitee Release (idempotent)
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GITEE_REPO: ${{ github.repository }}  # gitee 侧假定同名仓（双远端规矩）。
+          # 并入本仓后它解析成 fangwenyi-dev/ha-gateway-plugin ⇒ 语音的 Gitee Release
+          # 从此发到网关镜像仓（一个商店仓＝一个 Gitee 镜像仓＝一张卡）；旧 -yy 镜像仓
+          # 过渡期只读保留，不再新增 Release。
+          COMMIT: ${{ github.sha }}
+          # v1.7.12（第 6 轮审计 I-4）：prepare 已生成过 CHANGELOG 段/兜底
+          # 正文——直传复用，不再两处独立解析（漂移源 + 缺段崩 job）
+          PREPARED: ${{ needs.prepare.outputs.changelog }}
+        run: |
+          set -eu
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "::error title=GITEE_TOKEN 未配置::仓库 Settings→Secrets→Actions 添加 GITEE_TOKEN（纯 ASCII，勿带 BOM）"
+            exit 1
+          fi
+          case "$GITEE_TOKEN" in
+            *[![:print:]]*|$'\xef'*) echo "::error title=GITEE_TOKEN 含异常字节::疑似复制进 BOM/换行，重新设置纯 token"; exit 1;;
+          esac
+          python3 - <<'PY'
+          import io, json, os, sys, urllib.request, urllib.error
+          ver, sha = os.environ["VERSION"], os.environ["COMMIT"]
+          tag = "vo-" + ver   # D2：与 GitHub 侧同前缀
+          tok = os.environ["GITEE_TOKEN"].strip()
+          if not tok.isascii():
+              print("::error title=GITEE_TOKEN 非 ASCII::含 BOM 或不可见字符"); sys.exit(1)
+          api = "https://gitee.com/api/v5/repos/" + os.environ["GITEE_REPO"]
+          def call(url, data=None, method=None):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(data).encode() if data else None,
+                  method=method or ("POST" if data else "GET"),
+                  headers={"Content-Type": "application/json"} if data else {})
+              return json.load(urllib.request.urlopen(req, timeout=30))
+          body = ""
+          if os.path.exists("CHANGELOG.md"):
+              log = io.open("CHANGELOG.md", encoding="utf-8").read()
+              if f"## [{ver}]" in log:
+                  i = log.index(f"## [{ver}]")
+                  rest = log[i + 1:]
+                  j = rest.index("## [", 3) if "## [" in rest[3:] else len(rest)
+                  body = log[i:i + 1 + j].strip()
+          if not body:
+              # v1.7.12（审计 I-4）：缺段不再 ValueError 崩 job——优先复用
+              # prepare 产物（含其 git-log 兜底），仍无则给最小说明
+              body = (os.environ.get("PREPARED") or "").strip()
+              if not body:
+                  body = f"## v{ver}\n\n完整变更记录见 GitHub Release {tag}。"
+          body = body + "\n\n---\n完整记录见 GitHub 仓库 CHANGELOG.md 与 Release %s。" % tag
+          # v1.0.42 发版后补记教训（星辰大海段 Gitee 缺、GitHub 有）：旧逻辑
+          # 「存在即跳过」让 release 创建之后的 CHANGELOG 修正永远漂移在镜像仓外。
+          # 新逻辑：tag 直查（别拿 per_page=100 赌列表序）——存在则 PATCH 同步正文，
+          # 不存在才创建。Gitee 无 webhook，本 job 是唯一同步通道。
+          try:
+              existing = call(f"{api}/releases/tags/{tag}?access_token={tok}")
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+              existing = None
+          if existing and existing.get("id"):
+              # 405 实锤（df92fa5 CI）：Gitee 更新发行版走 PATCH，PUT 必 405
+              # v1.0.48 CI 实锤：Gitee PATCH 现要求 tag_name/name 同载（只发
+              # body 直接 400 messages:[tag_name is missing, name is missing]）
+              r = call(f"{api}/releases/{existing['id']}?access_token={tok}",
+                       {"body": body, "tag_name": tag,
+                        "name": tag}, method="PATCH")
+              print(f"Gitee Release 已同步正文: id={r.get('id', existing['id'])} tag={tag}")
+              sys.exit(0)
+          r = call(f"{api}/releases?access_token={tok}", {
+              "tag_name": tag, "name": tag, "body": body,
+              "target_commitish": sha, "prerelease": False})
+          print(f"Gitee Release 已创建: id={r['id']} tag={r['tag_name']}")
+          PY

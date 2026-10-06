@@ -1,0 +1,1722 @@
+"""Config flow to configure esphome component."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections import OrderedDict
+from collections.abc import Mapping
+from typing import Any, cast
+from urllib.parse import urlencode
+
+import aiohttp
+import voluptuous as vol
+from aioesphomeapi import (APIClient, APIConnectionError, DeviceInfo,
+                           InvalidAuthAPIError, InvalidEncryptionKeyAPIError,
+                           RequiresEncryptionAPIError, ResolveAPIError,
+                           wifi_mac_to_bluetooth_mac)
+from homeassistant.components import zeroconf
+from homeassistant.config_entries import (SOURCE_ESPHOME, SOURCE_IGNORE,
+                                          SOURCE_IMPORT, SOURCE_REAUTH,
+                                          SOURCE_RECONFIGURE, ConfigEntry,
+                                          ConfigEntryBaseFlow, ConfigFlow,
+                                          ConfigFlowResult, FlowType,
+                                          OptionsFlowWithReload)
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow, FlowResultType
+from homeassistant.helpers import discovery_flow, selector
+from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.importlib import async_import_module
+from homeassistant.helpers.network import get_url
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+from homeassistant.helpers.service_info.esphome import ESPHomeServiceInfo
+from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+from homeassistant.helpers.service_info.mqtt import MqttServiceInfo
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
+from homeassistant.util import ulid
+from homeassistant.util.json import json_loads_object
+
+from .const import (CONF_ALLOW_SERVICE_CALLS, CONF_CONFIG_TYPE,
+                    CONF_DEBOUNCE_MINUTES, CONF_DEVICE_NAME,
+                    CONF_LLM_ENDPOINT, CONF_MCP_ENDPOINT, CONF_NOISE_PSK,
+                    CONF_STT_ENDPOINT, CONF_STT_ENTITY_ID,
+                    CONF_SUBSCRIBE_LOGS, CONF_TTS_ENDPOINT,
+                    CONF_TTS_ENTITY_ID, DEFAULT_ALLOW_SERVICE_CALLS,
+                    DEFAULT_DEBOUNCE_MINUTES,
+                    DEFAULT_NEW_CONFIG_ALLOW_ALLOW_SERVICE_CALLS,
+                    DEFAULT_PORT, DOMAIN, VOICE_CHANNELS, VOICE_WS_PORT)
+from .dashboard import (async_get_or_create_dashboard_manager,
+                        async_set_dashboard_info)
+from .encryption_key_storage import async_get_encryption_key_storage
+from .entry_data import ESPHomeConfigEntry
+from .huijian import Dict, generate_qr_code, get_haid
+from .huijian.http import async_setup_https
+from .manager import async_replace_device
+
+ERROR_REQUIRES_ENCRYPTION_KEY = "requires_encryption_key"
+ERROR_INVALID_ENCRYPTION_KEY = "invalid_psk"
+ERROR_INVALID_PASSWORD_AUTH = "invalid_auth"
+_LOGGER = logging.getLogger(__name__)
+
+ZERO_NOISE_PSK = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+DEFAULT_NAME = "huijian"
+
+
+def _ensure_lan_port(hass, url: str) -> str:
+    """局域网裸 IP 的 http 地址补上 HA 真实监听端口。
+
+    2026-09 实机定案：HA 的 internal_url 常被配成不带端口的 http://192.168.1.91，
+    该值经二维码 ha_internal 直达设备，固件 HttpClient 默认打 :80 → TCP 拒绝 →
+    CMD20 恒回 -1（小程序侧只能乐观兜底猜 8123，双端各猜一次不如源头给对）。
+    仅处理「http + IPv4 私有地址 + 无显式端口」形态；域名/https（反代场景端口
+    语义归用户配置）与公网地址一律原样放行。端口取 hass.http.server_port 实况，
+    属性缺失（http 未就绪等罕见时序）回落官方默认 8123。
+    """
+    try:
+        import ipaddress
+        from urllib.parse import urlparse, urlunparse
+
+        p = urlparse(url)
+        if p.scheme != "http" or p.port or not p.hostname:
+            return url
+        try:
+            ip = ipaddress.ip_address(p.hostname)
+        except ValueError:
+            return url  # 域名形态交给反代语义，不猜端口
+        if ip.version != 4:
+            return url  # IPv6 字面量：hostname 无括号形态，重拼 netloc 必产畸形 URL（承诺域=IPv4）
+        if not ip.is_private:
+            return url
+        port = getattr(getattr(hass, "http", None), "server_port", None) or 8123
+        # 裸根路径归一（"http://ip/" → "http://ip:port"），防下游拼接出 "//api" 双斜杠
+        path = p.path if p.path not in ("", "/") else ""
+        return urlunparse(p._replace(netloc=f"{p.hostname}:{port}", path=path))
+    except Exception:  # noqa: BLE001 —— 装饰性归一，绝不阻断配二维码流程
+        return url
+
+
+def _clean_mcp_endpoint(value: Any) -> str | None:
+    """设备上报的 MCP 端点必须带 scheme，否则按空处理（对齐 D1 门禁语义）。
+
+    存量固件瑕疵（0513gujian ble_manager.cc，v2.1.5 立项）：纯 LAN 部署下
+    小程序的 mcpEndpoint/token_str 两字段皆空，固件仍无条件拼
+    `mcpEndpoint + "?token=" + token_str` → POST body 携带垃圾值 "?token="。
+    集成侧 D1 门禁（mcp_transport.py）判的是「空字符串」，垃圾值穿透后会拿
+    无 scheme 的 URL 挂 MCP transport，entry setup 走弯路。此处在入驻入口
+    归一为 None——v2.1.4 及更早存量设备零刷机即被本修复覆盖。
+    """
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    if v.lower().startswith(("ws://", "wss://", "http://", "https://")):
+        return v
+    _LOGGER.warning("入驻数据 mcp_endpoint 非 URL 形态，按空处理: %r", value)
+
+
+def _redact_url_for_log(url) -> str:
+    """端点进日志前的脱敏（与 huijian/ws_transport._redact_endpoint 同口径）：
+    只留 '?' 前 host+path，query 以标记留痕——translations 指引会把
+    ?token=<加载项令牌> 粘进 endpoint，原文落 INFO 即凭据外流。"""
+    s = str(url or "")
+    return s.split("?", 1)[0] + (" ?<masked>" if "?" in s else "")
+
+
+_SETUP_LOG_ENDPOINT_KEYS = ("llm_endpoint", "stt_endpoint", "tts_endpoint", "mcp_endpoint")
+_SETUP_LOG_SECRET_KEYS = ("noise_psk", "password")
+
+
+def _redact_setup_for_log(data) -> dict:
+    """v1.1.27-r2（金标复测）：setup_data 进 INFO 日志前的脱敏快照——
+    四端点按 URL 口径（host 可辨、query 掩掉），密钥只留类型+长度。"""
+    out: dict = {}
+    for k, v in dict(data or {}).items():
+        if k in _SETUP_LOG_ENDPOINT_KEYS:
+            out[k] = _redact_url_for_log(v)
+        elif k in _SETUP_LOG_SECRET_KEYS and v:
+            out[k] = f"<{type(v).__name__} len={len(str(v))}>"
+        else:
+            out[k] = v
+    return out
+    return None
+
+
+def _voice_endpoint_url(host: str, channel: str) -> str:
+    """构造语音引擎单通道端点 URL（assist 自动装配用）。
+
+    host 应为不带 scheme/路径的局域网主机（IPv4 或主机名）；通道 ∈ VOICE_CHANNELS
+    （llm/stt/tts），路径与加载项 core/ws_server.py 的 /xiaozhi/v1/{channel} 对齐。
+    """
+    return f"ws://{host}:{VOICE_WS_PORT}/xiaozhi/v1/{channel}"
+
+
+def _default_voice_host(hass, url: str) -> str:
+    """从 HA 访问 URL 提取语音引擎默认 host（加载项与集成同宿主 host_network）。
+
+    与 _ensure_lan_port 同一语义：internal 裸 IP/域名均可；返回 hostname（无端口）。
+    解析失败返回空串，由调用方决定是否自动装配（不可达则跳过自动建条）。
+    """
+    try:
+        from urllib.parse import urlparse
+
+        p = urlparse(_ensure_lan_port(hass, url))
+        return p.hostname or ""
+    except Exception:  # noqa: BLE001 —— 装饰性提取，绝不阻断
+        return ""
+
+
+def _assist_endpoints_from_url(hass, url: str) -> dict[str, str]:
+    """assist 自动装配：由 HA internal URL 生成三条默认语音端点。
+
+    仅当 host 可解析才返回完整 dict（llm/stt/tts）；解析不出返回 {}（调用方跳过）。
+    """
+    host = _default_voice_host(hass, url)
+    if not host:
+        return {}
+    return {f"{channel}_endpoint": _voice_endpoint_url(host, channel)
+            for channel in VOICE_CHANNELS}
+
+
+class BaseFlow(ConfigEntryBaseFlow):
+    def init(self):
+        self._extra = Dict()
+        self._extra.setdefault("config_data", {})
+        # F（2026-09-08 审查）：v1.0.2 起只设 True 从不初始化/消费，
+        # getattr 满世界兜底。显式初始化并在 qrcode_done 超时分支消费。
+        self._setup_wait_timed_out = False
+
+    @property
+    def this_data(self):
+        return self.hass.data.setdefault(DOMAIN, {})
+
+    @property
+    def setup_data(self):
+        return self.this_data.setdefault(self.setup_uuid, None)
+
+    @property
+    def setup_uuid(self):
+        return self._extra.setup_uuid
+
+    @setup_uuid.setter
+    def setup_uuid(self, uuid):
+        if uuid:
+            self._extra.setup_uuid = uuid
+            self.this_data[uuid] = None
+            _LOGGER.info("Waiting for setup data: %s", uuid)
+
+    def clean_setup(self):
+        self.this_data.pop(self.setup_uuid, None)
+        self._extra.pop("setup_uuid", None)
+
+
+class ConfigFlowHandler(ConfigFlow, BaseFlow, domain=DOMAIN):
+    """Handle a esphome config flow."""
+
+    VERSION = 1
+
+    _reauth_entry: ConfigEntry
+    _reconfig_entry: ConfigEntry
+    _wait_task: asyncio.Task | None = None
+
+    def __init__(self) -> None:
+        """Initialize flow."""
+        self._host: str | None = None
+        self._connected_address: str | None = None
+        self.__name: str | None = None
+        self._port: int | None = None
+        self._password: str | None = None
+        self._noise_required: bool | None = None
+        self._noise_psk: str | None = None
+        self._device_info: DeviceInfo | None = None
+        # The ESPHome name as per its config
+        self._device_name: str | None = None
+        self._device_mac: str | None = None
+        # 2026-10-01：本流程是否由**自动发现**（zeroconf/mqtt/dhcp）发起的标记。
+        # 用途见 _async_try_fetch_device_info 的取不到密钥分支。刻意不用
+        # self.source in (SOURCE_ZEROCONF, ...) 判据：HA 各版本 config_entries
+        # 是否导出这批 SOURCE_* 常量不一（本仓只用过 ESPHONE/IGNORE/IMPORT/
+        # REAUTH/RECONFIGURE），而集成顶层急切 import 不存在的符号 = 整个集成
+        # 加载失败（三端契约铁律①同型事故）。在三个发现入口里就地置位，零新符号。
+        self._from_discovery: bool = False
+        self._entry_with_name_conflict: ConfigEntry | None = None
+        self.init()
+
+    def _cancel_wait_task(self):
+        if self._wait_task and not self._wait_task.done():
+            self._wait_task.cancel()
+            self._wait_task = None
+
+    def async_abort(self, *, reason: str = "user", description_placeholders=None):
+        # v1.0.18：对齐 core 签名（同步、keyword-only、必带 reason）。
+        # 旧覆写是无参协程版——任何带 reason 的 abort（如更新分支的
+        # async_update_reload_and_abort、no_setup_data）都会 TypeError 并
+        # 吞掉真实错误（台架仿真实发取证 2026-09-08）。
+        self._cancel_wait_task()
+        self.clean_setup()
+        return super().async_abort(
+            reason=reason, description_placeholders=description_placeholders
+        )
+
+    async def _async_step_user_base(
+        self, user_input: dict[str, Any] | None = None, error: str | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            self._host = user_input[CONF_HOST]
+            self._port = user_input[CONF_PORT]
+            return await self._async_try_fetch_device_info()
+
+        fields: dict[Any, type] = OrderedDict()
+        fields[vol.Required(CONF_HOST, default=self._host or vol.UNDEFINED)] = str
+        fields[vol.Optional(CONF_PORT, default=self._port or DEFAULT_PORT)] = int
+
+        errors = {}
+        if error is not None:
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema(fields),
+            errors=errors,
+        )
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by the user.
+
+        第四轮审计 P2：带 host/port 的提交必须回**手工表单步**——旧版无条件转
+        qrcode，而 qrcode 步整体不读 user_input ⇒ 拉取失败后「改 IP 重试」的输入
+        被静默丢弃、跳进扫码空等 5 分钟（恢复路径成死胡同）。
+        """
+        if user_input is not None and CONF_HOST in user_input:
+            return await self._async_step_user_base(user_input)
+        return await self.async_step_qrcode(user_input=user_input)
+
+    async def async_step_qrcode(self, user_input=None):
+        await async_setup_https(self.hass)
+        if not self._wait_task:
+            self._wait_task = self.hass.async_create_task(self._wait_for_setup_data())
+        if self._wait_task.done():
+            return self.async_show_progress_done(next_step_id="qrcode_done")
+        if not self.setup_uuid:
+            self.setup_uuid = ulid.ulid_hex()
+        # 判定书 v1.0.2（用户实机 setup-data 超时根治）：二维码正文是 external
+        # （配置了远程访问即公网/反代地址），而设备 CMD20 后 POST 目标直接取该
+        # 正文——固件 HTTP 客户端到公网 TLS/中转常不可达，setup_data 永不到达。
+        # 追加局域网直连字段 ha_internal，小程序给设备的地址以它为准。
+        # 关键顺序：internal/external 必须先于 params 字面量求值（v1.0.2 首发
+        # 曾因 "ha_internal": internal 引用未绑定的 internal 崩 UnboundLocalError→500）。
+        internal = _ensure_lan_port(self.hass, get_url(self.hass, prefer_external=False))
+        external = get_url(self.hass, prefer_external=True) or internal
+        params = {
+            "haid": await get_haid(self.hass),
+            "uuid": self.setup_uuid,
+            "home_name": self.hass.config.location_name,
+            "ha_internal": internal,
+        }
+        reconfig_entry = self._get_reconfig_entry()
+        if reconfig_entry and reconfig_entry.data.get("mac"):
+            params.update(
+                {
+                    "mac": reconfig_entry.data.get("mac"),
+                    "speak_id": reconfig_entry.data.get("speak_id"),
+                }
+            )
+        # v1.1.40（第四轮复验 §5.4 的 P3）：旧形 `internal.split("//")[1]` 是**裸下标**，
+        # `internal` 里没有 "//" 时（HA 的 internal_url 存的就是用户填进去的串，
+        # 形如裸 "192.168.1.91:8123" 时无 scheme）直接 IndexError 崩掉整个扫码步；
+        # IPv6 的「http://[fe80::1]:8123」则切出「[fe80」这种畸形串（两种都在
+        # `_goldtest/repro_audit_v1139_recheck.py` 里跑出来了）。同文件已有的
+        # `_default_voice_host` 走 urlparse 且**永不抛**（解析不出回空串），拿它 +
+        # 原文兜底：tip 只是给人看的，绝不允许把配网向导弄崩。
+        haip = _default_voice_host(self.hass, internal) or internal
+        image = generate_qr_code(
+            f"{external}/api/huijian-ai/setup/qrcode?{urlencode(params)}"
+        )
+        self._extra.tip = "\n".join(
+            [
+                f"您的 HomeAssistant 局域网IP地址是 **{haip}**",
+                f"\n{image}",
+            ]
+        )
+        return self.async_show_progress(
+            step_id="qrcode",
+            progress_action="qrcode",
+            description_placeholders={
+                "tip": self._extra.pop("tip", ""),
+            },
+            progress_task=self._wait_task,
+        )
+
+    async def async_step_qrcode_done(self, user_input=None):
+        errors = {}
+        schema = {}
+        haid = await get_haid(self.hass)
+        # v1.1.27（批7）：进度完成（user_input is None）与表单提交（{}）是两个
+        # 态。旧写法把 None 归一成 {} 后判 `user_input is not None` 恒真 ⇒ 超时
+        # 引导表单整段不可达（_setup_wait_timed_out 成僵尸标志），用户 5 分钟
+        # 超时只会被静默 abort。
+        submitted = user_input is not None
+        if user_input is None:
+            user_input = {}
+
+        _LOGGER.info("setup_data: %s", _redact_setup_for_log(self.setup_data))
+        if not self.setup_data:
+            if submitted:
+                if user_input.get("rewait"):
+                    # F：uuid 未失效时设备 POST 可能迟到——保持同一
+                    # setup_uuid 重启等待任务续等一轮（旧表单再提交只会
+                    # 重复同一条错误，是死胡同）。
+                    self._setup_wait_timed_out = False
+                    self._wait_task = None
+                    return await self.async_step_qrcode()
+                return self.async_abort(reason="no_setup_data")
+            tip = (
+                "等待超时：未收到设备配对数据（约 5 分钟）。"
+                "请确认设备处于配网模式、小程序已完成“连接 Home Assistant”"
+                "配对（CMD20），然后重新扫码。"
+            )
+            if self._setup_wait_timed_out:
+                tip += (
+                    "\n\n若设备其实已配对成功（只是数据迟到），勾选"
+                    "「再等一轮」保持同一二维码继续等待；取消勾选则退出本流程。"
+                )
+                return self.async_show_form(
+                    step_id="qrcode_done",
+                    errors={"base": "unknown_config_type"},
+                    data_schema=vol.Schema({
+                        vol.Required("rewait", default=True):
+                            selector.BooleanSelector()
+                    }),
+                    description_placeholders={"tip": tip},
+                )
+            return self.async_show_form(
+                step_id="qrcode_done",
+                errors={"base": "unknown_config_type"},
+                data_schema=vol.Schema({}),
+                description_placeholders={"tip": tip},
+            )
+        config_type = self.setup_data.get("config_type", "device")
+        mcp_endpoint = _clean_mcp_endpoint(
+            self.setup_data.get("mcp_endpoint") if self.setup_data else None)
+        _LOGGER.info("mcp_endpoint: %s", _redact_url_for_log(mcp_endpoint))
+
+        if config_type == "device":
+            self._name = self.setup_data.get("speak_name") or self._name
+            self._host = self.setup_data[CONF_HOST]
+            port = self.setup_data.get(CONF_PORT, 6053)
+            try:
+                self._port = int(port)
+            except (TypeError, ValueError):
+                self._port = 6053
+                _LOGGER.exception("Invalid port value '%s', using default 6053", port)
+            self._noise_psk = self.setup_data.get(CONF_NOISE_PSK)
+            error = await self._fetch_device_info_through_reboot()
+            if error:
+                errors["base"] = error
+                schema = {
+                    vol.Required(
+                        "submit_confirm", default=True
+                    ): selector.BooleanSelector(),
+                }
+            elif not user_input.get("submit_confirm"):
+                self._extra.tip = "\n".join(
+                    [
+                        "设备信息如下:",
+                        f"**名称**: {self._name}",
+                        f"**IP**: {self._host}" f"**MAC**: {self._device_mac}",
+                    ]
+                )
+                schema = {
+                    vol.Required(
+                        "submit_confirm", default=True
+                    ): selector.BooleanSelector(),
+                }
+            else:
+                self._extra.config_data = {
+                    "config_type": config_type,
+                    "uuid": self.setup_uuid,
+                    "mac": self._device_mac,
+                    "speak_id": self.setup_data.get("speak_id"),
+                    "mcp_endpoint": mcp_endpoint,
+                    # OTA 台账（v1.0.65·契约 F-02）：CMD20 入驻 POST 带的
+                    # fw_version 建账时持久化——satellite_ledger_by_speakid 是
+                    # 运行期内存态，HA 重启后卫星台账靠此兜底显示「入驻时」版本。
+                    "fw_version": str(
+                        (self.setup_data or {}).get("fw_version") or "").strip(),
+                }
+                self.clean_setup()
+                return await self._async_authenticate_or_add()
+
+        if config_type == "assist":
+            config_data = self._assist_config_data_from_setup()
+            return await self._async_create_or_update_assist(config_data)
+
+        if schema:
+            return self.async_show_form(
+                step_id="qrcode_done",
+                errors=errors,
+                data_schema=vol.Schema(schema),
+                description_placeholders={
+                    "tip": self._extra.pop("tip", ""),
+                },
+            )
+        return self.async_show_form(
+            step_id="qrcode_done",
+            errors={"base": "unknown_config_type"},
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "tip": "配置类型未知，请重新尝试",
+            },
+        )
+
+    def _assist_config_data_from_setup(self) -> dict[str, Any]:
+        """assist 型条目数据（setup_data 语义，供 qrcode_done 分支使用）。"""
+        mcp_endpoint = _clean_mcp_endpoint(self.setup_data.get("mcp_endpoint"))
+        return {
+            CONF_CONFIG_TYPE: "assist",
+            "uuid": self.setup_uuid,
+            "speak_id": self.setup_data.get("speak_id"),
+            CONF_DEVICE_NAME: self.setup_data.get("speak_name", ""),
+            CONF_MCP_ENDPOINT: mcp_endpoint,
+            CONF_LLM_ENDPOINT: self.setup_data.get(CONF_LLM_ENDPOINT),
+            CONF_STT_ENDPOINT: self.setup_data.get(CONF_STT_ENDPOINT),
+            CONF_TTS_ENDPOINT: self.setup_data.get(CONF_TTS_ENDPOINT),
+        }
+
+    async def _async_create_or_update_assist(
+        self, config_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """创建或更新 assist 语音服务条目（全局唯一：unique_id=haid）。
+
+        assist 条目 = 语音引擎三实体（conversation/stt/tts）的装载载体，
+        端点指向 huijian_voice 加载项 :8000 三条 WS 通道。同一 HA 只允许
+        一条 assist 条目（haid 唯一）：已存在则整体更新 data（含端点），
+        不存在则创建。多来源共用：qrcode_done(小程序/设备 POST assist)、
+        SOURCE_IMPORT(device 自动注册)、SOURCE_RECONFIGURE(用户改端点)。
+        """
+        haid = await get_haid(self.hass)
+        # create_entry 路径不会走 async_abort→clean_setup，uuid 便签若不清会
+        # 永久滞留 hass.data[DOMAIN]（每 boot 一条）；update 路径 abort 钩子再
+        # pop 一次也幂等安全（B4 泄漏清理）。config_data 已含 uuid 值，先清无碍。
+        self.clean_setup()
+        if entry := self.hass.config_entries.async_entry_for_domain_unique_id(
+            DOMAIN, haid
+        ):
+            _LOGGER.debug("Update existing assist entry: %s", config_data)
+            return self.async_update_reload_and_abort(entry, data=config_data)
+
+        await self.async_set_unique_id(haid)
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title="huijian AI",
+            data=config_data,
+        )
+
+    async def async_step_import(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """SOURCE_IMPORT：语音引擎服务随慧尖语音设备自动注册的免 UI 入口。
+
+        触发方：__init__.py device 型 entry 装配成功后检测到 HA 尚无 assist
+        条目时 async_init(source=SOURCE_IMPORT, data=<端点>)。data 里
+        config_type 必须为 assist，端点由调用方按 HA internal host + :8000
+        推导（加载项 host_network 与集成同宿主）；本步不做网络探测，
+        端点不可达时集成侧 transport 自会断连/提示，用户可在条目「重新配置」
+        中改成实际地址。重复 import 幂等（haid 唯一 → 更新）。
+        """
+        data = dict(user_input or {})
+        config_type = data.get(CONF_CONFIG_TYPE, "device")
+        if config_type != "assist":
+            # 未知 config_type 走默认二维码流程（老行为兜底）
+            return await self.async_step_user(user_input=data)
+        # 与 setup_data 分支共用同一数据组装（字段名一致）
+        self.setup_uuid = str(data.get("uuid") or ulid.ulid_hex())
+        self.this_data[self.setup_uuid] = {
+            CONF_CONFIG_TYPE: "assist",
+            "speak_id": data.get("speak_id"),
+            # speak_name 为主键（与 qrcode setup_data 同名）；兼容调用方直接给
+            # device_name 键的写法，二选一都能落进条目的 device_name（B4）。
+            "speak_name": data.get("speak_name") or data.get(CONF_DEVICE_NAME, ""),
+            CONF_MCP_ENDPOINT: data.get(CONF_MCP_ENDPOINT),
+            CONF_LLM_ENDPOINT: data.get(CONF_LLM_ENDPOINT),
+            CONF_STT_ENDPOINT: data.get(CONF_STT_ENDPOINT),
+            CONF_TTS_ENDPOINT: data.get(CONF_TTS_ENDPOINT),
+        }
+        config_data = self._assist_config_data_from_setup()
+        return await self._async_create_or_update_assist(config_data)
+
+    # 判定书 v1.0.2 补丁：设备配对数据（CMD20→设备 POST）的人肉链路远超 60s——
+    # 扫码→贴令牌→BLE 连接→发送→设备同步 POST，实测窗口常 >2min，原 60s
+    # 必超时（用户日志 Timeout waiting for setup data 即此）。放宽至 5min。
+    _WAIT_SETUP_ROUNDS = 1000
+    _WAIT_SETUP_INTERVAL = 0.3
+
+    async def _wait_for_setup_data(self):
+        for _ in range(self._WAIT_SETUP_ROUNDS):
+            if self.setup_data:
+                return
+            await asyncio.sleep(self._WAIT_SETUP_INTERVAL)
+        self._setup_wait_timed_out = True
+        _LOGGER.error(
+            "Timeout waiting for setup data for %s (waited %.0fs)；"
+            "请确认设备已被小程序配对（BLE CMD20 完成后设备会 POST 本流程）",
+            self.setup_uuid,
+            self._WAIT_SETUP_ROUNDS * self._WAIT_SETUP_INTERVAL,
+        )
+
+    def _get_reconfig_entry(self):
+        if getattr(self, "_reauth_entry", None):
+            return self._reauth_entry
+        if getattr(self, "_reconfig_entry", None):
+            return self._reconfig_entry
+        return None
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by a reauth event."""
+        self._reauth_entry = self._get_reauth_entry()
+        # assist 语音引擎条目 reauth 分流（三端复核 B1）：端点 401/失效由
+        # ws_transport 清空端点并触发 EntryAuthFailedError→reauth；修复手段
+        # 是编辑 llm/stt/tts/mcp 端点。assist 没有设备侧 POST 来源，走
+        # qrcode 流即 5 分钟必超时死等（v1.0.7 只分流了 reconfigure，漏了
+        # reauth 这条真实触发链）。_reconfig_entry 赋值复用 assist 表单。
+        if self._reauth_entry.data.get(CONF_CONFIG_TYPE) == "assist":
+            self._reconfig_entry = self._reauth_entry
+            return await self.async_step_assist_reconfigure()
+        self._host = entry_data.get(CONF_HOST)
+        self._port = entry_data.get(CONF_PORT)
+        self._password = entry_data.get(CONF_PASSWORD)
+        self._device_name = entry_data.get(CONF_DEVICE_NAME)
+        self._name = self._reauth_entry.title
+        return await self.async_step_qrcode()
+
+    async def async_step_reauth_encryption_removed_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reauthorization flow when encryption was removed."""
+        if user_input is not None:
+            self._noise_psk = None
+            return await self._async_validated_connection()
+
+        return self.async_show_form(
+            step_id="reauth_encryption_removed_confirm",
+            description_placeholders={"name": self._async_get_human_readable_name()},
+        )
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reauthorization flow."""
+        errors = {}
+
+        if (
+            await self._retrieve_encryption_key_from_storage()
+            or await self._retrieve_encryption_key_from_dashboard()
+        ):
+            error = await self.fetch_device_info()
+            if error is None:
+                return await self._async_authenticate_or_add()
+
+        if user_input is not None:
+            self._noise_psk = user_input[CONF_NOISE_PSK]
+            error = await self.fetch_device_info()
+            if error is None:
+                return await self._async_authenticate_or_add()
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_NOISE_PSK): str}),
+            errors=errors,
+            description_placeholders={"name": self._async_get_human_readable_name()},
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initialized by a reconfig request."""
+        self._reconfig_entry = self._get_reconfigure_entry()
+        data = self._reconfig_entry.data
+        # assist 语音服务条目没有 host/6053——「重新配置」编辑的是语音引擎端点
+        if data.get(CONF_CONFIG_TYPE) == "assist":
+            return await self.async_step_assist_reconfigure(user_input=user_input)
+        self._host = data.get(CONF_HOST)
+        self._port = data.get(CONF_PORT, DEFAULT_PORT)
+        self._noise_psk = data.get(CONF_NOISE_PSK)
+        self._device_name = data.get(CONF_DEVICE_NAME)
+        return await self.async_step_qrcode()
+
+    async def async_step_assist_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """assist 条目重新配置：编辑 llm/stt/tts/mcp 四条端点（用户后期可改）。"""
+        data = dict(self._reconfig_entry.data)
+        if user_input is not None:
+            config_data = {
+                **data,
+                CONF_CONFIG_TYPE: "assist",
+                CONF_LLM_ENDPOINT: (user_input.get(CONF_LLM_ENDPOINT) or "").strip()
+                or None,
+                CONF_STT_ENDPOINT: (user_input.get(CONF_STT_ENDPOINT) or "").strip()
+                or None,
+                CONF_TTS_ENDPOINT: (user_input.get(CONF_TTS_ENDPOINT) or "").strip()
+                or None,
+                CONF_MCP_ENDPOINT: _clean_mcp_endpoint(
+                    user_input.get(CONF_MCP_ENDPOINT)
+                ),
+            }
+            return self.async_update_reload_and_abort(
+                self._reconfig_entry, data=config_data
+            )
+        defaults = {
+            CONF_LLM_ENDPOINT: data.get(CONF_LLM_ENDPOINT) or "",
+            CONF_STT_ENDPOINT: data.get(CONF_STT_ENDPOINT) or "",
+            CONF_TTS_ENDPOINT: data.get(CONF_TTS_ENDPOINT) or "",
+            CONF_MCP_ENDPOINT: data.get(CONF_MCP_ENDPOINT) or "",
+        }
+        return self.async_show_form(
+            step_id="assist_reconfigure",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_LLM_ENDPOINT, default=defaults[CONF_LLM_ENDPOINT]): str,
+                    vol.Optional(CONF_STT_ENDPOINT, default=defaults[CONF_STT_ENDPOINT]): str,
+                    vol.Optional(CONF_TTS_ENDPOINT, default=defaults[CONF_TTS_ENDPOINT]): str,
+                    vol.Optional(CONF_MCP_ENDPOINT, default=defaults[CONF_MCP_ENDPOINT]): str,
+                }
+            ),
+            description_placeholders={
+                "name": self._reconfig_entry.title,
+            },
+        )
+
+    @property
+    def _name(self) -> str:
+        return self.__name or DEFAULT_NAME
+
+    @_name.setter
+    def _name(self, value: str) -> None:
+        self.__name = value
+        self.context["title_placeholders"] = {
+            "name": self._async_get_human_readable_name()
+        }
+
+    async def _async_try_fetch_device_info(self) -> ConfigFlowResult:
+        """Try to fetch device info and return any errors."""
+        response: str | None
+        if self._noise_required:
+            # If we already know we need encryption, don't try to fetch device info
+            # without encryption.
+            response = ERROR_REQUIRES_ENCRYPTION_KEY
+        else:
+            # After 2024.08, stop trying to fetch device info without encryption
+            # so we can avoid probe requests to check for password. At this point
+            # most devices should announce encryption support and password is
+            # deprecated and can be discovered by trying to connect only after they
+            # interact with the flow since it is expected to be a rare case.
+            response = await self.fetch_device_info()
+
+        if response == ERROR_REQUIRES_ENCRYPTION_KEY:
+            if not self._device_name and not self._noise_psk:
+                # If device name is not set we can send a zero noise psk
+                # to get the device name which will allow us to populate
+                # the device name and hopefully get the encryption key
+                # from the dashboard.
+                self._noise_psk = ZERO_NOISE_PSK
+                response = await self.fetch_device_info()
+                self._noise_psk = None
+
+            # Try to retrieve an existing key from dashboard or storage.
+            if (
+                self._device_name
+                and await self._retrieve_encryption_key_from_dashboard()
+            ) or (
+                self._device_mac and await self._retrieve_encryption_key_from_storage()
+            ):
+                response = await self.fetch_device_info()
+
+            # If the fetched key is invalid, unset it again.
+            if response == ERROR_INVALID_ENCRYPTION_KEY:
+                self._noise_psk = None
+                response = ERROR_REQUIRES_ENCRYPTION_KEY
+
+        if response == ERROR_REQUIRES_ENCRYPTION_KEY:
+            # 2026-10-01 用户实机主诉（设备与服务里自动发现的语音设备卡片要求
+            # 「输入加密密钥」）：**发现类流程的密钥输入框是死胡同**——本产品的
+            # NoisePSK 由小程序每次配对现生成（ha-connect.js:439 generateHexPsk），
+            # 且刻意不向用户展示（v2.1.27 连串口明文都改成只留长度），用户手上根本
+            # 没有可抄的字符串，手输必然 invalid_psk，卡片配不上还留个错误现场。
+            # 唯一持有密钥的一方是设备自己：它在 CMD20 配对后把 noise_psk POST 回
+            # /api/huijian-ai/setup/qrcode（huijian/http.py:93 入库 →
+            # config_flow:365 消费）。故拿不到密钥时**改道回扫码通道**，与本仓
+            # async_step_reconfigure 需要凭据时走 async_step_qrcode（:601）同一先例。
+            # 手输表单对 reauth/reconfigure/用户自建（ESPHome yaml 里写过
+            # encryption.key，操作者确实知情）保留原路，不削既有恢复能力。
+            if self._from_discovery:
+                _LOGGER.info(
+                    "发现类流程(source=%s)未取到加密密钥→改道扫码配对通道，不再要求手输"
+                    "密钥（设备 POST 自带 noise_psk）: host=%s name=%s",
+                    self.source, self._host, self._device_name,
+                )
+                return await self.async_step_qrcode()
+            return await self.async_step_encryption_key()
+        if response is not None:
+            return await self._async_step_user_base(error=response)
+        return await self._async_authenticate_or_add()
+
+    async def _async_authenticate_or_add(self) -> ConfigFlowResult:
+        # Only show authentication step if device uses password
+        assert self._device_info is not None
+        if self._device_info.uses_password:
+            return await self.async_step_authenticate()
+
+        self._password = ""
+        return await self._async_validated_connection()
+
+    async def async_step_discovery_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle user-confirmation of discovered node."""
+        if user_input is not None:
+            return await self._async_try_fetch_device_info()
+        return self.async_show_form(
+            step_id="discovery_confirm",
+            description_placeholders={"name": self._async_get_human_readable_name()},
+        )
+
+    async def async_step_zeroconf(
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle zeroconf discovery."""
+        mac_address: str | None = discovery_info.properties.get("mac")
+
+        # Mac address was added in Sept 20, 2021.
+        # https://github.com/esphome/esphome/pull/2303
+        if mac_address is None:
+            return self.async_abort(reason="mdns_missing_mac")
+
+        # mac address is lowercase and without :, normalize it
+        mac_address = format_mac(mac_address)
+
+        # Hostname is format: livingroom.local.
+        device_name = discovery_info.hostname.removesuffix(".local.")
+
+        self._device_name = device_name
+        self._name = discovery_info.properties.get("friendly_name", device_name)
+        self._host = discovery_info.host
+        self._port = discovery_info.port
+        self._device_mac = mac_address
+        self._from_discovery = True        # 「设备与服务」里那张自动发现卡片
+        self._noise_required = bool(discovery_info.properties.get("api_encryption"))
+
+        # Check if already configured
+        await self.async_set_unique_id(mac_address)
+
+        # Convert WiFi MAC to Bluetooth MAC and notify Improv BLE if waiting
+        # ESPHome devices use WiFi MAC + 1 for Bluetooth MAC
+        # Late import to avoid circular dependency
+        # NOTE: Do not change to hass.config.components check - improv_ble is
+        # config_flow only and may not be in the components registry
+        if improv_ble := await async_import_module(
+            self.hass, "homeassistant.components.improv_ble"
+        ):
+            ble_mac = wifi_mac_to_bluetooth_mac(mac_address)
+            improv_ble.async_register_next_flow(self.hass, ble_mac, self.flow_id)
+            _LOGGER.debug(
+                "Notified Improv BLE of flow %s for BLE MAC %s (derived from WiFi MAC %s)",
+                self.flow_id,
+                ble_mac,
+                mac_address,
+            )
+
+        await self._async_validate_mac_abort_configured(
+            mac_address, self._host, self._port
+        )
+        return await self.async_step_discovery_confirm()
+
+    async def _async_validate_mac_abort_configured(
+        self, formatted_mac: str, host: str, port: int | None
+    ) -> None:
+        """Validate if the MAC address is already configured."""
+        assert self.unique_id is not None
+        if not (
+            entry := self.hass.config_entries.async_entry_for_domain_unique_id(
+                self.handler, formatted_mac
+            )
+        ):
+            return
+        if entry.source == SOURCE_IGNORE:
+            # Don't call _fetch_device_info() for ignored entries
+            raise AbortFlow("already_configured")
+        configured_host: str | None = entry.data.get(CONF_HOST)
+        configured_port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
+        # When port is None (from DHCP discovery), only compare hosts
+        if configured_host == host and (port is None or configured_port == port):
+            # Don't probe to verify the mac is correct since
+            # the host matches (and port matches if provided).
+            raise AbortFlow("already_configured")
+        configured_psk: str | None = entry.data.get(CONF_NOISE_PSK)
+        await self._fetch_device_info(host, port or configured_port, configured_psk)
+        updates: dict[str, Any] = {}
+        if self._device_mac == formatted_mac:
+            updates[CONF_HOST] = host
+            if port is not None:
+                updates[CONF_PORT] = port
+        self._abort_unique_id_configured_with_details(updates=updates)
+
+    @callback
+    def _abort_unique_id_configured_with_details(self, updates: dict[str, Any]) -> None:
+        """Abort if unique_id is already configured with details."""
+        assert self.unique_id is not None
+        if not (
+            conflict_entry := self.hass.config_entries.async_entry_for_domain_unique_id(
+                self.handler, self.unique_id
+            )
+        ):
+            return
+        assert conflict_entry.unique_id is not None
+        if self.source == SOURCE_RECONFIGURE:
+            error = "reconfigure_already_configured"
+        elif updates:
+            error = "already_configured_updates"
+        else:
+            error = "already_configured_detailed"
+        self._abort_if_unique_id_configured(
+            updates=updates,
+            error=error,
+            description_placeholders={
+                "title": conflict_entry.title,
+                "name": conflict_entry.data.get(CONF_DEVICE_NAME, "unknown"),
+                "mac": format_mac(conflict_entry.unique_id),
+            },
+        )
+
+    async def async_step_mqtt(
+        self, discovery_info: MqttServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle MQTT discovery."""
+        if not discovery_info.payload:
+            return self.async_abort(reason="mqtt_missing_payload")
+
+        device_info = json_loads_object(discovery_info.payload)
+        if "mac" not in device_info:
+            return self.async_abort(reason="mqtt_missing_mac")
+
+        # there will be no port if the API is not enabled
+        if "port" not in device_info:
+            return self.async_abort(reason="mqtt_missing_api")
+
+        if "ip" not in device_info:
+            return self.async_abort(reason="mqtt_missing_ip")
+
+        # mac address is lowercase and without :, normalize it
+        unformatted_mac = cast(str, device_info["mac"])
+        mac_address = format_mac(unformatted_mac)
+
+        device_name = cast(str, device_info["name"])
+
+        self._device_name = device_name
+        self._name = cast(str, device_info.get("friendly_name", device_name))
+        self._host = cast(str, device_info["ip"])
+        self._port = cast(int, device_info["port"])
+
+        self._from_discovery = True
+        self._noise_required = "api_encryption" in device_info
+
+        # Check if already configured
+        await self.async_set_unique_id(mac_address)
+        self._abort_unique_id_configured_with_details(
+            updates={CONF_HOST: self._host, CONF_PORT: self._port}
+        )
+
+        return await self.async_step_discovery_confirm()
+
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle DHCP discovery."""
+        mac_address = format_mac(discovery_info.macaddress)
+        await self.async_set_unique_id(format_mac(mac_address))
+        await self._async_validate_mac_abort_configured(
+            mac_address, discovery_info.ip, None
+        )
+        # This should never happen since we only listen to DHCP requests
+        # for configured devices.
+        return self.async_abort(reason="already_configured")
+
+    async def async_step_hassio(
+        self, discovery_info: HassioServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle Supervisor service discovery."""
+        await async_set_dashboard_info(
+            self.hass,
+            discovery_info.slug,
+            discovery_info.config["host"],
+            discovery_info.config["port"],
+        )
+        return self.async_abort(reason="service_received")
+
+    async def async_step_name_conflict(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle name conflict resolution."""
+        assert self._entry_with_name_conflict is not None
+        assert self._entry_with_name_conflict.unique_id is not None
+        assert self.unique_id is not None
+        assert self._device_name is not None
+        return self.async_show_menu(
+            step_id="name_conflict",
+            menu_options=["name_conflict_migrate", "name_conflict_overwrite"],
+            description_placeholders={
+                "existing_mac": format_mac(self._entry_with_name_conflict.unique_id),
+                "existing_title": self._entry_with_name_conflict.title,
+                "mac": format_mac(self.unique_id),
+                "name": self._device_name,
+            },
+        )
+
+    async def async_step_name_conflict_migrate(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle migration of existing entry."""
+        assert self._entry_with_name_conflict is not None
+        assert self._entry_with_name_conflict.unique_id is not None
+        assert self.unique_id is not None
+        assert self._device_name is not None
+        assert self._host is not None
+        old_mac = format_mac(self._entry_with_name_conflict.unique_id)
+        new_mac = format_mac(self.unique_id)
+        entry_id = self._entry_with_name_conflict.entry_id
+        self.hass.config_entries.async_update_entry(
+            self._entry_with_name_conflict,
+            data={
+                **self._entry_with_name_conflict.data,
+                CONF_HOST: self._host,
+                CONF_PORT: self._port or DEFAULT_PORT,
+                CONF_PASSWORD: self._password or "",
+                CONF_NOISE_PSK: self._noise_psk or "",
+            },
+        )
+        await async_replace_device(self.hass, entry_id, old_mac, new_mac)
+        self.hass.config_entries.async_schedule_reload(entry_id)
+        return self.async_abort(
+            reason="name_conflict_migrated",
+            description_placeholders={
+                "existing_mac": old_mac,
+                "mac": new_mac,
+                "name": self._device_name,
+            },
+        )
+
+    async def async_step_name_conflict_overwrite(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle creating a new entry by removing the old one and creating new."""
+        assert self._entry_with_name_conflict is not None
+        if self.source in (SOURCE_REAUTH, SOURCE_RECONFIGURE):
+            return self.async_update_reload_and_abort(
+                self._entry_with_name_conflict,
+                title=self._name,
+                unique_id=self.unique_id,
+                data=self._async_make_config_data(),
+                options={
+                    CONF_ALLOW_SERVICE_CALLS: DEFAULT_NEW_CONFIG_ALLOW_ALLOW_SERVICE_CALLS,
+                },
+            )
+        await self.hass.config_entries.async_remove(
+            self._entry_with_name_conflict.entry_id
+        )
+        return await self._async_create_entry()
+
+    async def _async_create_entry(self) -> ConfigFlowResult:
+        """Create the config entry."""
+        assert self._name is not None
+        assert self._device_info is not None
+
+        # Check if Z-Wave capabilities are present and start discovery flow
+        next_flow_id: str | None = None
+        # If the zwave_home_id is not set, we don't know if it's a fresh
+        # adapter, or the cable is just unplugged. So only start
+        # the zwave_js config flow automatically if there is a
+        # zwave_home_id present. If it's a fresh adapter, the manager
+        # will handle starting the flow once it gets the home id changed
+        # request from the ESPHome device.
+        if (
+            self._device_info.zwave_proxy_feature_flags
+            and self._device_info.zwave_home_id
+        ):
+            assert self._connected_address is not None
+            assert self._port is not None
+
+            # Start Z-Wave discovery flow and get the flow ID
+            zwave_result = await self.hass.config_entries.flow.async_init(
+                "zwave_js",
+                context={
+                    "source": SOURCE_ESPHOME,
+                    "discovery_key": discovery_flow.DiscoveryKey(
+                        domain=DOMAIN,
+                        key=self._device_info.mac_address,
+                        version=1,
+                    ),
+                },
+                data=ESPHomeServiceInfo(
+                    name=self._device_info.name,
+                    zwave_home_id=self._device_info.zwave_home_id,
+                    ip_address=self._connected_address,
+                    port=self._port,
+                    noise_psk=self._noise_psk,
+                ),
+            )
+            if zwave_result["type"] in (
+                FlowResultType.ABORT,
+                FlowResultType.CREATE_ENTRY,
+            ):
+                _LOGGER.debug(
+                    "Unable to continue created Z-Wave JS config flow: %s", zwave_result
+                )
+            else:
+                next_flow_id = zwave_result["flow_id"]
+
+        return self.async_create_entry(
+            title=self._name,
+            data=self._async_make_config_data(),
+            options={
+                CONF_ALLOW_SERVICE_CALLS: DEFAULT_NEW_CONFIG_ALLOW_ALLOW_SERVICE_CALLS,
+            },
+            next_flow=(FlowType.CONFIG_FLOW, next_flow_id) if next_flow_id else None,
+        )
+
+    @callback
+    def _async_make_config_data(self) -> dict[str, Any]:
+        """Return config data for the entry."""
+        return {
+            CONF_HOST: self._host,
+            CONF_PORT: self._port,
+            # The API uses protobuf, so empty string denotes absence
+            CONF_PASSWORD: self._password or "",
+            CONF_NOISE_PSK: self._noise_psk or "",
+            CONF_DEVICE_NAME: self._device_name,
+            **(self._extra.config_data or {}),
+        }
+
+    @callback
+    def _async_abort_wrong_device(
+        self, entry: ConfigEntry, expected_mac: str, actual_mac: str
+    ) -> ConfigFlowResult:
+        """Abort flow because a different device was found at the IP address."""
+        assert self._host is not None
+        assert self._device_name is not None
+        if self.source == SOURCE_RECONFIGURE:
+            reason = "reconfigure_unique_id_changed"
+        else:
+            reason = "reauth_unique_id_changed"
+        return self.async_abort(
+            reason=reason,
+            description_placeholders={
+                "name": entry.data.get(CONF_DEVICE_NAME, entry.title),
+                "host": self._host,
+                "expected_mac": expected_mac,
+                "unexpected_mac": actual_mac,
+                "unexpected_device_name": self._device_name,
+            },
+        )
+
+    async def _async_validated_connection(self) -> ConfigFlowResult:
+        """Handle validated connection."""
+        if self.source == SOURCE_RECONFIGURE:
+            return await self._async_reconfig_validated_connection()
+        if self.source == SOURCE_REAUTH:
+            return await self._async_reauth_validated_connection()
+        for entry in self._async_current_entries(include_ignore=False):
+            if entry.data.get(CONF_DEVICE_NAME) == self._device_name:
+                self._entry_with_name_conflict = entry
+                return await self.async_step_name_conflict()
+        return await self._async_create_entry()
+
+    async def _async_reauth_validated_connection(self) -> ConfigFlowResult:
+        """Handle reauth validated connection."""
+        assert self._reauth_entry.unique_id is not None
+        if self.unique_id == self._reauth_entry.unique_id:
+            return self.async_update_reload_and_abort(
+                self._reauth_entry,
+                data=self._reauth_entry.data | self._async_make_config_data(),
+            )
+        assert self._host is not None
+        self._abort_unique_id_configured_with_details(
+            updates={
+                CONF_HOST: self._host,
+                CONF_PORT: self._port,
+                CONF_NOISE_PSK: self._noise_psk,
+            }
+        )
+        # Reauth was triggered a while ago, and since than
+        # a new device resides at the same IP address.
+        assert self._device_name is not None
+        return self._async_abort_wrong_device(
+            self._reauth_entry,
+            format_mac(self._reauth_entry.unique_id),
+            format_mac(self.unique_id),
+        )
+
+    async def _async_reconfig_validated_connection(self) -> ConfigFlowResult:
+        """Handle reconfigure validated connection."""
+        assert self._reconfig_entry.unique_id is not None
+        assert self._host is not None
+        assert self._device_name is not None
+        if not (
+            unique_id_matches := (self.unique_id == self._reconfig_entry.unique_id)
+        ):
+            self._abort_unique_id_configured_with_details(
+                updates={
+                    CONF_HOST: self._host,
+                    CONF_PORT: self._port,
+                    CONF_NOISE_PSK: self._noise_psk,
+                }
+            )
+        for entry in self._async_current_entries(include_ignore=False):
+            if (
+                entry.entry_id != self._reconfig_entry.entry_id
+                and entry.data.get(CONF_DEVICE_NAME) == self._device_name
+            ):
+                return self.async_abort(
+                    reason="reconfigure_name_conflict",
+                    description_placeholders={
+                        "name": self._reconfig_entry.data[CONF_DEVICE_NAME],
+                        "host": self._host,
+                        "expected_mac": format_mac(self._reconfig_entry.unique_id),
+                        "existing_title": entry.title,
+                    },
+                )
+        if unique_id_matches:
+            return self.async_update_reload_and_abort(
+                self._reconfig_entry,
+                data=self._reconfig_entry.data | self._async_make_config_data(),
+            )
+        if self._reconfig_entry.data.get(CONF_DEVICE_NAME) == self._device_name:
+            self._entry_with_name_conflict = self._reconfig_entry
+            return await self.async_step_name_conflict()
+        return self._async_abort_wrong_device(
+            self._reconfig_entry,
+            format_mac(self._reconfig_entry.unique_id),
+            format_mac(self.unique_id),
+        )
+
+    async def async_step_encryption_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle getting psk for transport encryption."""
+        errors = {}
+        if user_input is not None:
+            self._noise_psk = user_input[CONF_NOISE_PSK]
+            error = await self.fetch_device_info()
+            if error is None:
+                return await self._async_authenticate_or_add()
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="encryption_key",
+            data_schema=vol.Schema({vol.Required(CONF_NOISE_PSK): str}),
+            errors=errors,
+            description_placeholders={"name": self._async_get_human_readable_name()},
+        )
+
+    @callback
+    def _async_get_human_readable_name(self) -> str:
+        """Return a human readable name for the entry."""
+        entry: ConfigEntry | None = None
+        if self.source == SOURCE_REAUTH:
+            entry = self._reauth_entry
+        elif self.source == SOURCE_RECONFIGURE:
+            entry = self._reconfig_entry
+        friendly_name = self._name
+        device_name = self._device_name
+        if (
+            device_name
+            and friendly_name in (DEFAULT_NAME, device_name)
+            and entry
+            and entry.title != friendly_name
+        ):
+            friendly_name = entry.title
+        if not device_name or friendly_name == device_name:
+            return friendly_name
+        return f"{friendly_name} ({device_name})"
+
+    async def async_step_authenticate(
+        self, user_input: dict[str, Any] | None = None, error: str | None = None
+    ) -> ConfigFlowResult:
+        """Handle getting password for authentication."""
+        if user_input is not None:
+            self._password = user_input[CONF_PASSWORD]
+            error = await self.try_login()
+            if error:
+                return await self.async_step_authenticate(error=error)
+            return await self._async_validated_connection()
+
+        errors = {}
+        if error is not None:
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="authenticate",
+            data_schema=vol.Schema({vol.Required("password"): str}),
+            description_placeholders={"name": self._async_get_human_readable_name()},
+            errors=errors,
+        )
+
+    async def _fetch_device_info(
+        self, host: str, port: int | None, noise_psk: str | None
+    ) -> str | None:
+        """Fetch device info from API and return any errors."""
+        zeroconf_instance = await zeroconf.async_get_instance(self.hass)
+        cli = APIClient(
+            host,
+            port or DEFAULT_PORT,
+            self._password or "",
+            zeroconf_instance=zeroconf_instance,
+            noise_psk=noise_psk,
+        )
+        try:
+            await cli.connect()
+            self._device_info = await cli.device_info()
+            self._connected_address = cli.connected_address
+        except InvalidAuthAPIError:
+            return ERROR_INVALID_PASSWORD_AUTH
+        except RequiresEncryptionAPIError:
+            return ERROR_REQUIRES_ENCRYPTION_KEY
+        except InvalidEncryptionKeyAPIError as ex:
+            if ex.received_name:
+                device_name_changed = self._device_name != ex.received_name
+                self._device_name = ex.received_name
+                if ex.received_mac:
+                    self._device_mac = format_mac(ex.received_mac)
+                if not self._name or device_name_changed:
+                    self._name = ex.received_name
+            return ERROR_INVALID_ENCRYPTION_KEY
+        except ResolveAPIError:
+            return "resolve_error"
+        except APIConnectionError:
+            return "connection_error"
+        finally:
+            await cli.disconnect(force=True)
+        self._device_mac = format_mac(self._device_info.mac_address)
+        self._device_name = self._device_info.name
+        self._name = self._device_info.friendly_name or self._device_info.name
+        return None
+
+    # 固件 BLEManager::RestartAfter10s: CMD20 → 10s restart → ha_url 门控
+    # 开机读取，首次配对 :6053 在 POST 返回时尚未 listen。窗口不是 10s：
+    # 12:24 实机日志校准 = 10s 延迟重启 + boot≈3s + WiFi 重连≈5~10s +
+    # ESPHome API 起来 ≈ POST 后 18~25s 就绪。v1.0.11 的 12s 窗（6s×2）
+    # 差约 13s 恒撞墙（267740b 发版后实机复现），拉到 6s×5=30s 覆盖。
+    # 30s 仍 refused 视为非配对时序问题（IP 变了/设备没起来），照常报错。
+    _REBOOT_RETRY_DELAY = 6.0
+    _REBOOT_RETRY_ATTEMPTS = 5
+
+    async def _fetch_device_info_through_reboot(self) -> str | None:
+        """fetch_device_info，带设备 CMD20 后 10s 重启窗口的自动重试。
+
+        2026-09-08 11:02:32 实机（配对 200 OK 后）：集成 qrcode_done 立即
+        连 :6053 → Errno 111（refused）——固件把 ha_url/noise 门控放在开机
+        读取（ble_manager.cc:745），CMD20 后延迟 10s 重启才真正 listen 6053。
+        仅 connection_error 重试；鉴权/加密键错误是确定性的，重试只会拖慢
+        配对面板，维持一次即报。最坏耗时 30s，处于等待 setup 的分钟级
+        面板节奏内可接受。
+        """
+        error = await self.fetch_device_info()
+        for _ in range(self._REBOOT_RETRY_ATTEMPTS):
+            if error != "connection_error":
+                break
+            _LOGGER.info(
+                "配对后 6053 未就绪（设备正在应用 ha_url 门控重启），%ss 后重试",
+                self._REBOOT_RETRY_DELAY)
+            await asyncio.sleep(self._REBOOT_RETRY_DELAY)
+            error = await self.fetch_device_info()
+        return error
+
+    async def fetch_device_info(self) -> str | None:
+        """Fetch device info from API and return any errors."""
+        assert self._host is not None
+        assert self._port is not None
+        if error := await self._fetch_device_info(
+            self._host, self._port, self._noise_psk
+        ):
+            return error
+        assert self._device_info is not None
+        mac_address = format_mac(self._device_info.mac_address)
+        await self.async_set_unique_id(mac_address, raise_on_progress=False)
+        if self.source not in (SOURCE_REAUTH, SOURCE_RECONFIGURE):
+            self._abort_unique_id_configured_with_details(
+                updates={
+                    CONF_HOST: self._host,
+                    CONF_PORT: self._port,
+                    CONF_NOISE_PSK: self._noise_psk,
+                }
+            )
+
+        return None
+
+    async def try_login(self) -> str | None:
+        """Try logging in to device and return any errors."""
+        zeroconf_instance = await zeroconf.async_get_instance(self.hass)
+        assert self._host is not None
+        assert self._port is not None
+        cli = APIClient(
+            self._host,
+            self._port,
+            self._password,
+            zeroconf_instance=zeroconf_instance,
+            noise_psk=self._noise_psk,
+        )
+
+        try:
+            await cli.connect(login=True)
+        except InvalidAuthAPIError:
+            return "invalid_auth"
+        except APIConnectionError:
+            return "connection_error"
+        finally:
+            await cli.disconnect(force=True)
+
+        return None
+
+    async def _retrieve_encryption_key_from_dashboard(self) -> bool:
+        """Try to retrieve the encryption key from the dashboard.
+
+        Return boolean if a key was retrieved.
+        """
+        if (
+            self._device_name is None
+            or (manager := await async_get_or_create_dashboard_manager(self.hass))
+            is None
+            or (dashboard := manager.async_get()) is None
+        ):
+            return False
+
+        await dashboard.async_request_refresh()
+        if not dashboard.last_update_success:
+            return False
+
+        device = dashboard.data.get(self._device_name)
+
+        if device is None:
+            return False
+
+        try:
+            noise_psk = await dashboard.api.get_encryption_key(device["configuration"])
+        except aiohttp.ClientError as err:
+            _LOGGER.error("Error talking to the dashboard: %s", err)
+            return False
+        except json.JSONDecodeError:
+            _LOGGER.exception("Error parsing response from dashboard")
+            return False
+
+        self._noise_psk = noise_psk
+        return True
+
+    async def _retrieve_encryption_key_from_storage(self) -> bool:
+        """Try to retrieve the encryption key from storage.
+
+        Return boolean if a key was retrieved.
+        """
+        # Try to get MAC address from current flow state or reauth entry
+        mac_address = self._device_mac
+        if mac_address is None and self._reauth_entry is not None:
+            # In reauth flow, get MAC from the existing entry's unique_id
+            mac_address = self._reauth_entry.unique_id
+
+        assert mac_address is not None
+
+        storage = await async_get_encryption_key_storage(self.hass)
+        if stored_key := await storage.async_get_key(mac_address):
+            self._noise_psk = stored_key
+            return True
+
+        return False
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: ESPHomeConfigEntry,
+    ) -> OptionsFlowHandler:
+        """Get the options flow for this handler."""
+        return OptionsFlowHandler()
+
+
+class OptionsFlowHandler(OptionsFlowWithReload):
+    """Handle a option flow for esphome."""
+
+    DOMAIN_NAMES = {
+        "light": "灯",
+        "switch": "开关",
+        "climate": "空调",
+        "cover": "窗帘",
+        "fan": "风扇",
+        "media_player": "媒体",
+        "button": "窗户",
+        "lock": "锁",
+        "valve": "阀门",
+    }
+    INTENT_NAMES = {
+        "TurnDeviceOn": "打开",
+        "TurnDeviceOff": "关闭",
+        "ControlWindow": "窗户",
+        "AdjustDeviceAttribute": "调节",
+        "SetDeviceMode": "设模式",
+    }
+
+    @staticmethod
+    def _format_action_summary(action: dict) -> str:
+        """Format a single action into a readable summary string."""
+        intent = action.get("intent") or action.get("name", "")
+        params = action.get("params") or action.get("parameters", {})
+
+        if intent in ("ControlWindow", "WindowControl"):
+            action_type = params.get("action", "")
+            action_label = {
+                "open": "开窗",
+                "close": "关窗",
+                "pause": "暂停窗户",
+                "a": "窗户A",
+            }.get(action_type, f"窗户({action_type})")
+            targets = params.get("target", [])
+            areas = []
+            for t in targets if isinstance(targets, list) else [targets]:
+                if isinstance(t, dict) and t.get("area"):
+                    areas.append(t["area"])
+            prefix = f"{areas[0]}" if areas else ""
+            return f"{prefix}{action_label}"
+
+        if intent in ("TurnDeviceOn", "TurnDeviceOff"):
+            action_label = "打开" if intent == "TurnDeviceOn" else "关闭"
+            targets = params.get("target", [])
+            parts = []
+            for t in targets if isinstance(targets, list) else [targets]:
+                if not isinstance(t, dict):
+                    continue
+                area = t.get("area", "")
+                devices = t.get("devices", [])
+                for d in devices if isinstance(devices, list) else [devices]:
+                    if not isinstance(d, dict):
+                        continue
+                    domains = d.get("domains", [])
+                    for domain in domains if isinstance(domains, list) else [domains]:
+                        name = OptionsFlowHandler.DOMAIN_NAMES.get(domain, domain)
+                        prefix = f"{area}" if area else ""
+                        parts.append(f"{prefix}{name}")
+            if parts:
+                return action_label + "+".join(parts)
+            return action_label + "设备"
+
+        if intent in ("HassCreateVoiceScene",):
+            return "创建场景"
+
+        if intent in ("HassDeleteVoiceScene",):
+            return "删除场景"
+
+        if intent == "HassBroadcast":
+            return "广播"
+
+        return intent
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage voice scenes and automations inline - support batch delete."""
+        from .intent_automation import get_automation_store
+        from .intent_voice_scene import get_voice_scene_store
+
+        voice_store = get_voice_scene_store(self.hass)
+        auto_store = get_automation_store(self.hass)
+        scenes = await voice_store.get_all_scenes()
+        automations = await auto_store.get_all_automations()
+
+        if user_input is not None:
+            to_delete = user_input.get("to_delete", [])
+            if isinstance(to_delete, str):
+                to_delete = [to_delete]
+            to_delete_auto = user_input.get("to_delete_auto", [])
+            if isinstance(to_delete_auto, str):
+                to_delete_auto = [to_delete_auto]
+            # 第四轮审计 P2：两类删除**一次收口**——旧形删了场景就 `if deleted:
+            # return`，同一次提交里勾的自动化整段被丢；且 failed/failed_auto 算了
+            # 不展示（静默半删）。现在两族结果合并进同一条 result_msg，失败逐条点名。
+            deleted: list = []
+            failed: list = []
+            deleted_auto: list = []
+            failed_auto: list = []
+            for scene_id in to_delete:
+                success, msg = await voice_store.delete_scene(scene_id=scene_id)
+                if success:
+                    deleted.append(scene_id)
+                else:
+                    failed.append(f"{scene_id}: {msg}")
+            for auto_id in to_delete_auto:
+                success, msg = await auto_store.delete_automation(auto_id)
+                if success:
+                    deleted_auto.append(auto_id)
+                else:
+                    failed_auto.append(f"{auto_id}: {msg}")
+            if to_delete or to_delete_auto:
+                parts = []
+                if deleted:
+                    parts.append(f"已删除 {len(deleted)} 个场景")
+                if failed:
+                    parts.append("场景删除失败：" + "；".join(failed[:3]))
+                if deleted_auto:
+                    parts.append(f"已删除 {len(deleted_auto)} 个自动化")
+                if failed_auto:
+                    parts.append("自动化删除失败：" + "；".join(failed_auto[:3]))
+                return self.async_show_form(
+                    step_id="voice_scene_delete_result",
+                    description_placeholders={"result_msg": "；".join(parts)},
+                    last_step=False,
+                )
+
+            to_options = user_input.get("to_options", False)
+            if to_options:
+                return await self.async_step_options()
+
+            return await self.async_step_init()
+
+        scene_lines = []
+        for i, scene in enumerate(scenes, 1):
+            trigger = scene.get("trigger_phrase", "未命名")
+            actions = scene.get("actions", [])
+            created = scene.get("created_at", "")
+            created_short = created[:19] if created else ""
+            action_summaries = [self._format_action_summary(a) for a in actions]
+            action_text = "、".join(action_summaries)
+            scene_lines.append(f"{i}. 「{trigger}」 - {action_text} ({created_short})")
+        scene_desc = "\n".join(scene_lines) if scene_lines else "暂无语音场景"
+
+        auto_lines = []
+        for i, auto in enumerate(automations, 1):
+            trigger = auto.get("trigger", {})
+            entity_id = trigger.get("entity_id", "未知传感器")
+            above = trigger.get("above")
+            below = trigger.get("below")
+            condition = ""
+            if above is not None:
+                condition += f"> {above}"
+            if below is not None:
+                condition += f" < {below}" if condition else f"< {below}"
+            actions = auto.get("actions", [])
+            action_summaries = []
+            for a in actions:
+                intent_name = a.get("name") or a.get("intent", "Unknown")
+                action_summaries.append(intent_name)
+            auto_lines.append(
+                f"{i}. {entity_id} ({condition}) -> {', '.join(action_summaries)}"
+            )
+        auto_desc = "\n".join(auto_lines) if auto_lines else "暂无传感器自动化"
+
+        scene_options = {}
+        for scene in scenes:
+            sid = scene.get("scene_id", "")
+            trigger = scene.get("trigger_phrase", "未知")
+            scene_options[sid] = f"删除语音场景「{trigger}」"
+
+        auto_options = {}
+        for auto in automations:
+            aid = auto.get("automation_id", "")
+            trigger = auto.get("trigger", {}).get("entity_id", "未知")
+            auto_options[aid] = f"删除自动化「{trigger}」"
+
+        data_schema = vol.Schema({})
+        if scene_options:
+            data_schema = data_schema.extend(
+                {
+                    vol.Optional("to_delete", default=[]): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                {"value": k, "label": v}
+                                for k, v in scene_options.items()
+                            ],
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                            multiple=True,
+                        ),
+                    ),
+                }
+            )
+        if auto_options:
+            data_schema = data_schema.extend(
+                {
+                    vol.Optional("to_delete_auto", default=[]): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                {"value": k, "label": v}
+                                for k, v in auto_options.items()
+                            ],
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                            multiple=True,
+                        ),
+                    ),
+                }
+            )
+
+        internal_url = get_url(self.hass, prefer_external=False)
+        manage_url_text = f"管理界面：{internal_url}/api/huijian-ai/manage-page"
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=data_schema,
+            description_placeholders={
+                "scene_list": scene_desc,
+                "auto_list": auto_desc,
+                "manage_url": manage_url_text,
+            },
+            last_step=False,
+        )
+
+    async def async_step_voice_scene_delete_result(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show delete result and allow further management."""
+        return await self.async_step_init()
+
+    async def async_step_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show options form."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_ALLOW_SERVICE_CALLS,
+                    default=self.config_entry.options.get(
+                        CONF_ALLOW_SERVICE_CALLS, DEFAULT_ALLOW_SERVICE_CALLS
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_SUBSCRIBE_LOGS,
+                    default=self.config_entry.options.get(CONF_SUBSCRIBE_LOGS, False),
+                ): bool,
+                vol.Optional(
+                    CONF_DEBOUNCE_MINUTES,
+                    default=self.config_entry.options.get(
+                        CONF_DEBOUNCE_MINUTES, DEFAULT_DEBOUNCE_MINUTES
+                    ),
+                ): vol.All(vol.Coerce(int), vol.Range(min=0, max=60)),
+                vol.Optional(
+                    CONF_TTS_ENTITY_ID,
+                    default=self.config_entry.options.get(
+                        CONF_TTS_ENTITY_ID, "tts.huijian_speech"
+                    ),
+                ): str,
+                vol.Optional(
+                    CONF_STT_ENTITY_ID,
+                    default=self.config_entry.options.get(
+                        CONF_STT_ENTITY_ID, "stt.huijian_asr"
+                    ),
+                ): str,
+            }
+        )
+        defaults = dict(self.config_entry.options)
+        data_schema = self.add_suggested_values_to_schema(data_schema, defaults)
+        return self.async_show_form(step_id="options", data_schema=data_schema)

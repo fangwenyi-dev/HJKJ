@@ -1,0 +1,3117 @@
+"""理解级联编排（v1.0.9 三层定位）：
+  scene 契约 > 慧尖独占意图(窗/模式/调节/场景自动化管理) > klar 标准控制 >
+  字面表剩余(t0/T1) > 查询族 > LLM(用户配置才启用) > 固定兜底；
+  执行期两路互为降级（慧尖意图挂→klar 直调兜底；klar 挂→字面表回退）。
+外加执行结果旁路：huijian_voice_utterance 事件（回合留痕，HA 自动化可消费）。
+本级联是 LLM 通道 detect 的业务内核；STT/TTS 通道不经过它。
+
+体验批（2026-09）新增：
+  P0-1 fp/klar 两路并行判定（关键路径不再串行吃 klar HTTP 往返）；
+  P0-3 事件旁路 task 化（不占回复延迟）；
+  P1 去重三修：in-flight 共享结果（不再空回）、窗口锚定首见（完成不顺延）、
+      有界清扫（不再无界增长）；
+  P2-10 跨轮上下文：会话级环形历史（喂 LLM）+ 目标继承（代词/回指副词触发，
+      Adjust* 无目标句兜底继承）——代码注释里的 M2 就此落地；
+  P2-11 空间化：satellite_areas 把卫星 IP 映射到区域，无目标句默认落本区域；
+  P2-12 复合句切分：fp/klar 分句全命中才链发（all-or-nothing 同 klar 纪律）；
+  P2-13 风险操作确认环：**解锁族**先问后办（dialog.confirm_risky）——含 t0 的
+      HassUnlock、慧尖形 TurnDeviceOff×名含锁、klar grounded HassTurnOff/Toggle×
+      lock.* 实体与多步 plan 的解锁步（2026-09-22 审查批 C2 补全三形态+extra_steps）；
+      LLM 工具通道对锁目标直接拒办并指回本地确认流程。删场景/删自动化不走本环：
+      创建通道要求精准命中触发词/ID（多义与未命中一律拒办并列表引导），命中即
+      执行、落点由播报复述点名（test_pipeline_creation 钉死现行为，本注释此前超售）；
+  P2-15 LLM 流式钩子：on_sentence 逐句回调，Reply.streamed 防重复播报；
+  P2-17 触发 targets 动态词表节流同步（friendly_name 派生）。
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import logging
+import re
+import time
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, Coroutine, Optional
+
+from . import const
+from .tts import _SPEED_MAX, _SPEED_MIN      # 语速钳位单点（确认环 TTL 与合成账同源）
+from .nlu.query import is_query_like
+from .nlu.fast_path import (END_DIALOGUE_INTENT, FLAG_ANAPHORA_STRIPPED,
+                            FLAG_CHAIN_ANAPHORA, FLAG_PRONOUN_TARGET,
+                            TRACE_TAG_CHAIN, TRACE_TAG_CONTEXT,
+                            FastPath, Plan,
+                            attribute_domain_target, is_end_dialogue, is_pronoun,
+                            is_bare_negation_imperative, is_negation_imperative,
+                            is_whole_house, split_compound)
+from .nlu import targets as T
+from .nlu import corrector
+from . import capability
+from .nlu.canonical import canonical
+from .nlu import music
+from .nlu import creation
+from .nlu.klar_client import KlarClient
+
+logger = logging.getLogger("huijian.pipeline")
+
+# ── 级联仲裁（v1.0.9 三层定位，用户拍板）──────────────────────────
+# ① scene = 用户触发词契约，恒最高优先；
+# ② 慧尖意图只负责 klar 做不了的类型：窗户（开合器=按钮按压语义）、模式
+#    （能力探测+剔除 off）、相对/属性调节、语音场景与自动化管理、实时上下文；
+#    目标名含窗类词（窗帘/纱窗除外——它们是标准 cover）同样归慧尖意图；
+# ③ 标准控制（开/关/调亮/温度…）klar 恒优先：引擎 grounded entity_id 直调
+#    服务，不依赖 huijian_ai 集成——集成没加载的路也有（指令①）；
+# ④ 两路互为降级（select_fallback_plan），仍失败且用户配了 LLM 才复议（指令③）。
+HUIJIAN_ONLY_INTENTS = frozenset({
+    "ControlWindow", "SetDeviceMode", "AdjustDeviceAttribute",
+    "HassTriggerVoiceScene", "HassCreateVoiceScene", "HassDeleteVoiceScene",
+    "HassListVoiceScenes", "HassCreateAutomation", "HassDeleteAutomation",
+    "HassListAutomations", "HassUpdateAutomation", "HuijianGetLiveContext",
+    # v1.0.93 会话控制意图：字面表等值命中，恒胜 klar（draft 回放曾把闲聊句
+    # grounded 成调光——"退下"绝不许再被任何引擎抓去动设备）。
+    END_DIALOGUE_INTENT,
+})
+
+# 空间化兜底域（无目标位时补 target 用；绝不发 area-only——集成端
+# target["devices"] 会 KeyError，2026-09-12 实锤）
+_SPATIAL_DOMAIN = {
+    "ControlWindow": ["cover"],
+    "AdjustDeviceAttribute": ["light"],
+    "SetDeviceMode": ["climate"],
+}
+
+# 泛类设备词：这类目标（"开灯/关窗帘"）才做卫星区域限定；指名道姓的设备句
+# 零影响（v1.0.20 原设计语义，2026-09-12 补实现）
+_GENERIC_DEVICE_WORDS = frozenset({
+    "灯", "灯光", "灯带", "筒灯", "射灯", "吊灯", "窗帘", "空调", "风扇",
+    "插座", "开关", "电视", "音箱", "净化器", "加湿器", "扫地机", "热水器",
+})
+
+_INTEGRATION_HINTS = ("集成",)
+
+# 本地 NLU 总开关（nlu.enabled=false）关掉时的兜底话术：两端都关必须说人话，
+# 不能拿"这句话我还不会"糊弄（那会把配置问题伪装成理解失败）。
+_NLU_OFF_TEXT = ("本地理解已关闭，而且还没配置大模型——请在设置里打开"
+                 "「启用本地理解」，或填好大模型端点再试")
+
+# 触发条件形状（"每天晚上8点"/"当客厅温度超过30度"）：改自动化时用户只给条件、
+# 不重复动作 → 动作沿用原样，只换触发条件。
+_TRIGGER_ONLY_RE = re.compile(r"^(?:每天|当|如果|要是|假如)")
+
+
+# 区域继承的重排动词表（"打开空调"+客厅 → "打开客厅空调"，fast_path 认的
+# 动词+区域+设备语序；单字动词排最后，避免把"开合度"类名词拦腰切断）
+_AREA_VERB_RE = re.compile(
+    r"^(打开|开启|开一下|关闭|关掉|关上|关了|拉上|拉下|调到|调成|调高|调低|"
+    r"调整|调节|设为|设成|设定|设置|锁上|解锁|停止|暂停|开|关|调|拉|锁)")
+
+
+def _area_as_name(plan: Optional[Plan], area: str) -> bool:
+    """区域被当成了设备名（target 无 area、name=区域、domains 空）——执行侧按
+    名字子串命中（"客厅"∈"客厅射灯/客厅空调/客厅窗帘"）会把整个区域的设备都开了，
+    属于"过宽目标"，绝不允许进场景/自动化，也不许直接执行。"""
+    tgt = (plan.args or {}).get("target") if plan is not None else None
+    if not isinstance(tgt, list) or not tgt:
+        return True
+    for t in tgt:
+        if not isinstance(t, dict):
+            return True
+        if str(t.get("area") or "").strip():
+            continue                              # 有区域限定 → 窄目标，放行
+        for d in (t.get("devices") or []):
+            if not isinstance(d, dict):
+                return True
+            if str(d.get("name") or "").strip() == area and not (d.get("domains") or []):
+                return True
+    return False
+
+
+def _reorder_area(clause: str, area: str) -> Optional[str]:
+    """「打开空调」→「打开客厅空调」；「把空调打开」→「客厅空调打开」。
+    两条都是 fast_path 认得的语序，产出 区域+设备+domains 的规范目标；
+    无法安全重排（无动词可切）返回 None，交由调用方如实拒收。"""
+    s = (clause or "").strip()
+    m = _AREA_VERB_RE.match(s)
+    if m:
+        rest = s[m.end():].strip()
+        return f"{m.group(1)}{area}{rest}" if rest else None
+    s2 = re.sub(r"^[把将]\s*", "", s)
+    if s2 and s2 != s:
+        return f"{area}{s2}"                      # 设备在前：区域+设备+动作
+    return None
+
+
+def _mentions_window_device(args: Any) -> bool:
+    """慧尖场景里「窗」多为开合器按钮，cover 服务表达不了内倒/暂停。
+    先剔除窗帘/纱窗（标准 cover，klar 干得好）。永不抛。"""
+    try:
+        t = json.dumps(args or {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return False
+    t = t.replace("窗帘", "").replace("纱窗", "")
+    return any(w in t for w in ("窗", "开合器", "内倒", "推拉门"))
+
+
+# v1.0.55 主裁决窗闸（2026-09-12 现场 16:10/16:41 双案实锤）：
+# 「办公室瓶盖窗速度设为百分之三十五」被 klar 回放兜底（引擎 draft.rs：未知
+# 目标+任意数字 → 硬套上一个可见灯 + HassLightSet+brightness）点亮了摄影灯。
+# v1.0.12 的窗闸只护**降级方向**且查 args——klar grounded args 里只有 pinyin
+# entity_id（无任何中文），查不到窗。此闸补主裁决方向：**原话文本** × **目标
+# 域** 交叉核验。误伤面刻意收得很窄：
+#   · 窗帘/纱窗先行剔除（它们是 klar 该干的标准 cover）；
+#   · 目标本来就是 cover/fan 放行（窗/风扇的速度语义合法）；
+#   · 句内同时提了灯（「窗户旁边的灯」）放行——用户真在说灯；
+#   · 只 veto 明确的"开关/亮度类意图 × light/switch 实体"，其余（空调温度等）
+#     不动。弃用后走级联下层（TextCNN/查询/LLM），宁可不执行也绝不错开灯。
+_KLAR_WINDOW_GUARD_INTENTS = frozenset({
+    "HassLightSet", "HassSetPosition",
+    "HassTurnOn", "HassTurnOff", "HassToggle",
+})
+
+
+def _klar_window_lamp_conflict(kl: Optional[Plan]) -> bool:
+    """True = 该 klar 计划与句内窗/速度语义冲突，主裁决必须弃用。永不抛。"""
+    try:
+        if kl is None or kl.intent not in _KLAR_WINDOW_GUARD_INTENTS:
+            return False
+        eid = str((kl.args or {}).get("entity_id") or "")
+        if "." not in eid:
+            return False                      # 未 grounded 步 → intent 通道自理，不在此闸职责
+        dom = eid.split(".", 1)[0]
+        if dom in ("cover", "fan"):
+            return False                      # 窗/风扇的速度·位置语义合法
+        t = (kl.utterance or "").replace("窗帘", "").replace("纱窗", "")
+        if not any(w in t for w in ("窗", "开合器", "内倒", "推拉门", "速度", "力度")):
+            return False
+        if dom == "light" and any(w in t for w in ("灯", "照明", "亮")):
+            return False                      # 句里同时点了灯：用户真在说灯
+        return dom in ("light", "switch")
+    except Exception:  # noqa: BLE001 —— 守卫自身故障不得拦正常句
+        return False
+
+
+# ── v1.0.92 控制步「目标证据」总闸（2026-09-17 17:35 双复现实锤）──────────
+# 「给我讲一个三百字左右的睡前故事」被 klar 回放兜底（draft.rs：未知目标+任意
+# 数字→硬套上一个可见灯+HassLightSet）grounded 成**办公室射灯亮度 1% 并真执行**
+# （现场 br=3 两次；与 v1.0.55「办公室瓶盖窗速度设为百分之三十五」同族病灶）。
+# v1.0.55 窗闸词表只拦「窗/速度」语义，纯闲聊句畅通无阻。本闸把判据升为通式：
+# grounded 控制步的**原话**里必须有目标证据——目标域设备词、已知区域名、回指
+# 代词三者之一；**数字不算证据**（draft.rs 回放的诱饵恰恰就是数字）。无证据整条
+# 弃用落级联下层（慧尖意图/查询族/LLM/兜底），宁可对闲聊说「我还不会」，绝不动
+# 用户没点名的设备。误拦代价=一句「我还不会」；误执行代价=真实世界设备动作。
+_KLAR_WRITE_INTENTS = frozenset({
+    "HassTurnOn", "HassTurnOff", "HassToggle", "HassLightSet",
+    "HassSetPosition", "HassClimateSetTemperature",
+    # 第四轮审计 P2：这两族是已接管的 grounded 写值步（KLAR_CONTROL_INTENTS 里
+    # 本就有），却漏在证据闸外——"数字不算证据"的现场洞（v1.0.55/v1.0.92）
+    # 在风速/湿度写值上原样存在。全族同闸（口径边界见下方 v1.1.36 注：
+    # 域都判不了的 args 形状一律 fail-open，那是有意的，不是漏族）。
+    "HassFanSetSpeed", "HassClimateSetHumidity",
+    # v1.1.36 复核⑤：上面那句"全族同闸"此前**不实**——本集只有 8 个意图，白名单
+    # （nlu/klar_client.py `KLAR_CONTROL_INTENTS`）更多，锁族/扫地机族/风扇预设整条
+    # 绕过去。**这里刻意不写"白名单有几个"**：写死的数字会随白名单增长变假（复核
+    # 代理抓到我把 14 数成 12）；两集是否相等由 tests/test_v1136_gate_families.py
+    # 的差集钉在运行时判。实测（.91 工装同形句）：
+    #   HassLock「把会飞的门锁上」「给故事机上个锁」→ 放行执行
+    #   HassVacuumStart「启动会飞的扫地机」        → 放行执行
+    #   HassFanSetPresetMode「会飞的风扇设成睡眠」  → 放行执行
+    # 词表不缺（_DOMAIN_EVIDENCE 里 lock/vacuum/fan 都在），缺的是意图路由。
+    # 锁是高风险面（intent_turn.py:326 `# off = unlock`）。
+    # 不变量由 tests/test_v1136_gate_families.py 机器钉住：白名单控制族必须
+    # 全部进本集——今后加白名单忘加闸，那条钉自己转红。
+    "HassLock", "HassUnlock", "HassFanSetPresetMode",
+    "HassVacuumStart", "HassVacuumPause", "HassVacuumReturnToBase",
+})
+
+# 域→设备词表：任一子串命中即视为用户点了该类设备。刻意收着放（漏拦由降级链
+# 兜底，误拦才不可恢复）。
+_DOMAIN_EVIDENCE = {
+    "light": ("灯", "光", "亮", "暗", "照", "色温", "氛围", "台灯", "射灯",
+              "筒灯", "吊灯", "壁灯", "夜灯", "灯带", "荧光", "暖", "刺眼"),
+    "switch": ("开关", "插座", "电源", "断电", "通电"),
+    "cover": ("帘", "窗", "纱", "遮阳", "开合", "晾衣", "门", "幕"),
+    "fan": ("风扇", "扇", "换气", "排风"),
+    "climate": ("空调", "温度", "度", "冷", "暖", "制热", "制冷", "除湿", "风速"),
+    "lock": ("锁", "门"),
+    "media_player": ("音量", "音", "媒体", "暂停", "继续", "静音", "播放",
+                     "歌", "乐"),
+    "vacuum": ("扫地", "吸尘"),
+    "humidifier": ("加湿", "除湿"),
+    "scene": ("场景", "模式"),
+}
+
+# 回指：上下文继承轮（"把它关了"/"那个也打开"）合法，不在此闸职责内。
+_ANAPHORA_WORDS = ("它", "这", "那", "该", "刚才", "之前", "上面")
+
+# 「类别词前面的修饰段」提取用：首部/尾部都剥动词·处置介词·客套·指示与结构助词·
+# 目标量词（反复剥到稳定）。刻意**不**在此判语义——判"名字存不存在"交给词表与
+# targets 的近音救援，避免第二套手抄词表（与 capability/UNTOGGLEABLE 同纪律）。
+_NAME_HEAD_STRIP = re.compile(
+    r"^(?:把|将|请|麻烦|帮我|给我|我们|现在|马上|立即|再|还|就|来|去|快|然后|顺便|"
+    r"打开|开启|开一下|启动|关闭|关掉|关上|关了|停止|调成|调到|调节|调整|调|设成|设为|"
+    r"设置|设为|切换|改成|变成|所有的|全部|所有|都|全|的|地|得|了|这|那|该)+")
+_TAIL_TOKENS = (
+    r"打开|开启|开一下|启动|关闭|关掉|关上|关了|停止|调成|调到|调节|调整|调|设成|设为|"
+    r"设置|设为|切换|改成|变成|成|为|到|至|亮|暗|一下|一些|一|点|些|所有|全部|都|全|"
+    r"部|每|任何|个|只|盏|根|台|头|的|地|得|了|吗|呢|吧|啊|啦|哦|呀|嗯|度")
+_NAME_TAIL_STRIP = re.compile(r"(?:" + _TAIL_TOKENS + r")+$")
+
+# 「这段不像名字，别拿它去判有没有这台设备」的两种形状（v1.1.36 复核批二）。
+# 形状一：动词语素开头 + 趋向补语/短小 —— 锁上门 / 关好门 / 反锁上门 / 暂停扫地机 /
+#   给门上锁。锁与扫地机这两个域的**类别词本身就兼做动词**，补齐 6 族之后日常句
+#   全被当成"点名的设备"拦下（实测复现，见 tests/test_v1136_second_batch.py）。
+# 形状二：整段就是"数词(+量词)" —— 一个 / 一盏 / 两只。孤字下限把量词留住之后，
+#   「关掉一个灯」这类也不再被剥空，于是从"无判据放行"变成"点名查无"。
+# 刻意只在这几种形状上**放弃裁决**（宁放行不误拦）：误拦的代价是用户天天说的句子
+# 失灵，漏拦只是回到本闸上线前的行为。
+#   形状一：整段都是动词语素/趋向补语/量词虚词 ⇒「锁上」「关好」「暂停」「一个」「一盏」
+#   形状二：两字且含本域类别词 ⇒「门上」（「大门」这类真名同理——放行本来就是正解）
+# 「会飞的」「书桌的」「阳台的」「故事机上」都不在表内，照旧拦。
+_NAMELESS_HEAD_VERBS = frozenset("锁关开反解上下停暂启取恢设调按推拉给封")
+# 状态定语的起字（「没关紧的窗」「未拉严的窗帘」）——用户拿状态指认那台东西，
+# 不是点一个查无此物的名字；见 `_phrase_is_not_a_name` 内注。
+_STATE_DESC_HEAD = frozenset("没未")
+# 连动前段的收尾轻动词（「睡觉前**把**灯关掉」「等一下**开**灯」）——它们是下一个动作的
+# 引子，不是名字成分。**刻意不含 上/下/到/过/起**：那些是「阳台**上**的灯」「书桌**上**
+# 的灯」这种位置短语的尾巴，属于本闸要拦的形态（v1.1.36 的两条反向钉盯着它）。
+# 也刻意不并进 `_NAMELESS_HEAD_VERBS`：那张表是"动词兼类别词"族，同时喂 seg[0] 的
+# 头部判据，混进来会扩大豁免面。
+_SERIAL_TAIL_LIGHT_VERBS = frozenset("把将给让开关")
+_NAMELESS_TAIL_COMPS = ("上", "下", "好", "完", "住", "到", "过", "起")
+_VERBISH_CHARS = _NAMELESS_HEAD_VERBS | frozenset(
+    "上下来去就好完住到过起个只盏台部根一二两三四五六七八九十几每半把给让们我你他它"
+    "这那为在中和与了地得请帮谢要）")
+_NUM_QUANT_RE = re.compile(r"^[一二两三四五六七八九十几半每][个只盏台部根组]?$")
+
+
+def _phrase_is_not_a_name(seg: str, nouns=()) -> bool:
+    """修饰段更像**动词短语/数量短语/状态定语**而不是设备名 ⇒ 本闸不据此裁决。永不抛。
+
+    与 `_area_like` 同纪律：只借既有词表判形状，不另抄一张"设备名词表"。
+    """
+    try:
+        seg = (seg or "").strip()
+        if len(seg) < 2:
+            return False                  # 交回原有的"无可判修饰段"分支
+        if _NUM_QUANT_RE.match(seg):
+            return True
+        if all(ch in _VERBISH_CHARS for ch in seg):
+            return True
+        if len(seg) <= 2 and any(n and n in seg for n in nouns):
+            return True
+        if (seg[0] in _STATE_DESC_HEAD
+                and any(ch in _NAMELESS_HEAD_VERBS for ch in seg[1:])):
+            # 状态定语（没关紧 / 没拉严 / 未锁好）：用户是在**用状态指认那台东西**，
+            # 不是点一个查无此物的名字。v1.1.27 的 CHANGELOG 写"修掉了它对正常句的
+            # 误杀"，其实只修了字面表一侧——v1.1.35 这道新闸把「把没关紧的灯关上」
+            # 判成"没有这台『没关紧的灯』"（本机实得 unknown='没关紧的灯'），
+            # 修①把窗恢复成锚点后同形在窗域复现。
+            return True
+        if len(seg) >= 3 and seg[-1] in _SERIAL_TAIL_LIGHT_VERBS:
+            # v1.1.38 现网体表实锤（既存，自 v1.1.35 起）：**时段状语+轻动词**收尾的
+            # 连动前段被当成了设备名——「睡觉前把灯关掉」拼出『睡觉前把灯』、
+            # 「出门前把灯关了」拼出『出门前把灯』、日常「等一下开灯」拼出『等一下开灯』，
+            # 前两句全部回「没有找到对应的设备」，第三句该做的没做。
+            # 名字性/位置性修饰语（「会飞」「阳台的」「书桌上的」「不亮的」「星空」）
+            # 不在 `_SERIAL_TAIL_LIGHT_VERBS` 上收尾，裁决权照旧。
+            # 只管 ≥3 字：2 字形态（「催拉」）得留给近音救援判，别在这里弃权。
+            return True
+        return (seg[0] in _NAMELESS_HEAD_VERBS
+                and seg.endswith(_NAMELESS_TAIL_COMPS))
+    except Exception:  # noqa: BLE01 —— 守卫自身故障不得拦正常句
+        return False
+
+
+# 锚点只取**名词性**类别词：`_DOMAIN_EVIDENCE` 里混着属性字（亮/暗/光/暖/冷/度/
+# 色温…——它们是"这句在要求这个属性"的证据，不是设备名词）。拿属性字当锚点会把
+# 「把办公室的射灯亮度调到百分之三十」的修饰段剥成「的射灯」⇒ 误判"点了没这台"
+# （v1.0.92 既有钉 test_legit_control_sentences_pass 当场抓出）。属性字从
+# `_ATTR_EVIDENCE` 各值集派生排除（**惰性取**：本表定义在本函数之后，模块加载期
+# 直读会 NameError），不另起手抄表。
+_ATTRISH_CACHE: frozenset | None = None
+
+
+def _attrish_words() -> frozenset:
+    global _ATTRISH_CACHE
+    if _ATTRISH_CACHE is None:
+        _ATTRISH_CACHE = frozenset(
+            w for vals in _ATTR_EVIDENCE.values() for w in vals) - _class_nouns()
+    return _ATTRISH_CACHE
+
+
+def _class_nouns() -> frozenset:
+    """**类别词身份优先于属性身份**的字集：属性字表不得吃掉某个域自己的类别词。
+
+    「窗/帘」进 `_ATTR_EVIDENCE["HassSetPosition"]` 的理由是「开窗位置」那类句里它们
+    是**属性证据**；但对 cover 域它们首先是设备类别词。把"属性"当绝对判据，等于把
+    cover 整类排除在点名查无闸之外——真机（办公 .91，v1.1.35 现役）实测
+    「关掉会飞的窗」两道判据双双放行，家里唯一那扇窗被顶包、还播「会飞的窗关了」。
+    类别词取自 `targets._GENERIC_FAMILIES`（泛称字族的既有单源，含 窗/灯/门），
+    该表按"开窗器"形状收词、不含「帘」，故帘在此显式补齐（它在属性证据里只出现过
+    一次，正是被吃掉的那一个）。
+    """
+    return frozenset(T._GENERIC_FAMILIES) | {"帘"}
+
+
+def _category_nouns(dom: str):
+    skip = _attrish_words()
+    return tuple(w for w in (_DOMAIN_EVIDENCE.get(dom) or ()) if w not in skip)
+
+
+def _unknown_spoken_device_name(text: str, words, device_names,
+                                known_areas=(), real_areas=None) -> str:
+    """原话里"类别词前面的修饰段"构成的设备名，在**给定在装清单**里查无此名时回该名；
+    查得着、或提不出可判修饰段时回空串（=不据此拦）。
+
+    三种"查得着"都算放行（回空串）：①名字在设备词表里（静态 KNOWN_DEVICES ∪ 给定
+    清单）；②与某个在装名**同长度且拼音音节差 ≤1**——ASR 听岔（社灯→射灯、催拉窗→
+    推拉窗）走的正是 `targets._generic_rescue` 那条既有纪律；③修饰段与某个在装名互相
+    包含——用户说半截名字（「走廊灯」对上「走廊感应灯」，或反过来只说「感应灯」）。
+    纯泛称「关灯」、区域名+类别词「办公室的灯」、听写残句都提不出可判修饰段 ⇒ 回空串。
+
+    ⚠ `device_names` **必须由调用方显式给**（Pipeline 从 ha 状态缓存取）：不读
+    `T.ALL_SET/ALL_DEVICES` 那份**进程级全局词表**——单测夹具（如 `_pipe`）刻意不
+    同步词表，读全局会让本闸随测试收集顺序时开时关（本仓记过的"全局态泄漏"同型坑）。
+    没清单就没裁决权：`device_names` 空 ⇒ 一律回空串。
+
+    锚点按**同一结束位置取最长类别词**去重：`_DOMAIN_EVIDENCE["light"]` 里「灯」与
+    「台灯」并存，按元组序先撞单字会把「关掉台灯」的修饰段算成「关掉台」⇒ 假阳性。
+
+    为什么要有这一道（2026-09-30 办公 .91 实锤，v1.0.92 证据闸罩不住）：
+    「关掉会飞的灯」原话里**有**"灯"字 ⇒ 旧判据认定证据充分并放行，引擎把修饰语
+    丢掉顶了同类别里唯一那台，日志 `[执行] HassTurnOff light.ban_gong_shi_she_deng
+    → 成功 | 会飞的灯关了`——真实世界关掉了用户没点名的灯。链式形态更难看：
+    「打开办公室射灯然后关掉会飞的灯」两腿绑同一台，先开后关净零变化，却播
+    「好的，都办妥了」。类别词只证明"这句在说这一类"，**不证明用户点的那台存在**。
+    """
+    try:
+        names = [str(d) for d in (device_names or ()) if d]
+        if not names:
+            return ""
+        anchors = {}                              # end → 该结束位置上最长的类别词
+        for g in words:
+            if not g:
+                continue
+            at = text.find(g)
+            while at >= 0:
+                end = at + len(g)
+                if end not in anchors or len(g) > len(anchors[end]):
+                    anchors[end] = g
+                at = text.find(g, end)
+        unknown = ""
+        unknown_said = ""
+        for end, g in anchors.items():
+            pre = text[:end - len(g)]
+            # 区域名从修饰段里剥掉时**只剥真注册区域**（v1.1.36 复核⑥）：旧形剥的是
+            # `known_areas`，而 `_known_areas()` = 静态 BASE_AREAS ∪ 注册表 ⇒ 家里根本
+            # 没有阳台时，"阳台"被当区域名剥走，修饰段只剩动词 ⇒ 无判据 ⇒ 放行 ⇒
+            # 顶了办公室那台射灯。表没拿到（空）才退回静态表，宁可不拦也不误拦。
+            for a in (real_areas or (known_areas or ())):
+                if a:
+                    pre = pre.replace(a, "")
+            # 判据用"剥干净的修饰段"，回显用"用户自己说的那截"（只剥首部动词，
+            # 留着「的」）——播报里念「会飞的灯」而不是我拼出来的「会飞灯」。
+            said = pre.strip()
+            # v1.1.36 复核⑥：**头部剥到底（不设长度下限），尾部只认 ≥2 的结果**。
+            # 旧形把"剥头+剥尾"合成一步且不看余长 ⇒「关掉阳台的」一次算到终态「阳」
+            # （"的"之后接着吃量词"台"）⇒ 长度不够 ⇒ 无判据 ⇒ 放行 ⇒ 顶了别的房间
+            # 那台并回播「阳台的灯关了」（办公 .91 探针实得；同批另一侧「书桌的灯」
+            # 反而被拦，两向都偏）。两类必须分开：
+            #   「打开社灯」的「社」= 动词剥完的残名（射↔社 是 ASR 听岔）——短的也要
+            #     交给近音救援，故头部不设下限；
+            #   「阳台」被量词表(台/头/个/只/盏)吃成「阳」= 复合词被拆坏——停在「阳台」，
+            #     让它去**真区域表**判"家里有没有这间房"。
+            cur = pre.strip()
+            while True:
+                head = _NAME_HEAD_STRIP.sub("", cur).strip()
+                if head == cur:
+                    break
+                cur = head
+            while True:
+                tail = _NAME_TAIL_STRIP.sub("", cur).strip()
+                if tail == cur or (len(tail) < 2 <= len(cur)):
+                    break
+                cur = tail
+            pre = cur
+            # v1.1.36 复核批二：本批补齐证据闸 6 族之后，**锁/扫地机域的类别词本身
+            # 兼做动词**，于是日常动词短语被当成"点名的设备"拦下（对抗复核抓到、
+            # 我逐句复现）：「锁上门」「给门上锁」「关好门」「反锁上门」「暂停扫地机」
+            # 全变成「没有找到对应的设备『锁上门』」。同批另一形：孤字下限停在 2 字
+            # 之后，数量词不再被剥空 ⇒「关掉一个灯/一盏灯/两个灯/一只灯」一起中。
+            # 这两类形状上**放弃裁决**（宁放行）：误拦的代价是用户天天说的句子失灵，
+            # 而漏拦只是回到本闸上线前的行为。描述性修饰段（「会飞的」「书桌的」）
+            # 不受本条影响，照旧拦。
+            if _phrase_is_not_a_name(pre, words) or _phrase_is_not_a_name(said, words):
+                continue
+            if not (2 <= len(pre) <= 4):
+                continue                            # 无可判修饰段 ⇒ 不据此拦
+            if any(a in pre for a in _ANAPHORA_WORDS):
+                continue            # 回指（那盏/这个）不在本闸职责内
+            if not all("\u4e00" <= c <= "\u9fff" for c in pre):
+                continue                            # 混英文/数字：既有救援不管
+            # v1.1.37 现网实锤：**否定前缀不是设备修饰语**。办公 .91「打开办公室的射灯，
+            # 别开台灯」的第二腿被这里拼成"点名了一台叫『别开台灯』的设备"⇒ 家里查无 ⇒
+            # 整链判死、该动的灯没动（2026-10-05 live_check_1137 N5）。与上面回指豁免
+            # 同一条纪律：「别开/不要关」表达的是**拒绝这个动作**，不是"要哪一台"。
+            # 状态定语不受影响（「没关紧的」在 `_NEGATION_CMD` 的 `…的` 负向预查里）。
+            if is_negation_imperative(pre) or is_negation_imperative(said):
+                continue                            # 拒绝腿：无裁决权，宁放行
+            # v1.1.36 复核⑥：位置词豁免必须问"**这间房家里真有吗**"。
+            # 旧形两道都吃 `known_areas`/`_area_like`，而 `_known_areas()` 把静态
+            # BASE_AREAS（主卧/次卧/阳台/玄关/车库/露台/走廊）并了进来 ⇒ 办公 .91
+            # （只注册 办公室/展厅）实测「关掉阳台的灯」「关掉走廊的灯」「关掉书房的灯」
+            # 被豁免后顶了唯一那台办公室射灯、回播「阳台的灯关了」＝**猜房间**
+            # （同批另一侧「关掉书桌的灯」反而被拦，两向都偏）。用户红线：绝不猜房间。
+            # 三档：①拿到真区域表 ⇒ **只认表里的房间**；②表为空（注册表还没到）
+            # ⇒ 退回旧判据；③调用方没给表（既有单测形状，None）⇒ 原样，零漂移。
+            if real_areas:
+                if any(a and (a in pre or pre in a) for a in real_areas):
+                    continue                        # 家里真有这间 ⇒ 交给区域机器
+            else:
+                if any(a and (a in pre or pre in a) for a in (known_areas or ())):
+                    continue                        # 位置词不是设备修饰语（客厅灯）
+                if getattr(T, "_area_like", lambda _s: False)(pre):
+                    continue
+            spoken = pre + g
+            if spoken in T._STATIC_SET or spoken in names:
+                return ""                             # ①名字真实存在
+            if any(len(d) >= 2 and (pre in d or d in spoken) for d in names):
+                # ②互相包含（半截名字）：「走廊灯」对上在装的「走廊感应灯」，
+                # 或反过来只说后半截「感应灯」。
+                # v1.1.36 曾在此加"名字不得跨修饰语边界"的收紧（`d in g` + 位置前缀
+                # 判据），变异验证显示它**不承重**：加了上面的孤字下限之后，
+                # 「关掉阳台的灯」的修饰段停在「阳台的」，「台灯」本就不是它的尾串，
+                # 那条洞到达不了。判据留原形，删掉多余的一层（我给自己的改动做的
+                # 减法，依据是 tests/test_v1136_area_modifier.py 的两条救援钉）。
+                return ""
+            if _near_homophone_in_home(spoken, names):
+                return ""                             # ③同长度近音（ASR 听岔）
+            said = _NAME_HEAD_STRIP.sub("", said.strip())
+            unknown = unknown or spoken
+            unknown_said = unknown_said or (said + g if said else spoken)
+        return unknown_said or unknown              # 一个可判修饰段都没有=空串
+    except Exception:  # noqa: BLE01 —— 守卫自身故障不得拦正常句
+        return ""
+
+
+def _near_homophone_in_home(spoken: str, names) -> bool:
+    """spoken 是否与某个在装名同长度且拼音音节差 ≤1（同 `_generic_rescue` 的判据）。
+    无 pypinyin（CI Lint 环境）时回 False＝不据此拦——绝不因缺依赖误杀真设备。"""
+    try:
+        from pypinyin import lazy_pinyin
+    except ImportError:
+        return False
+    try:
+        s = lazy_pinyin(spoken)
+        if len(s) != len(spoken):
+            return False                  # 原话不是一字一音节 ⇒ 无从比对
+        for d in names:
+            if len(d) != len(spoken) or d == spoken:
+                continue
+            pd = lazy_pinyin(d)
+            # 必须"一字一音节"两边都成立。2026-10-05 办公 .91 真清单实证：在装名
+            # 里有拉丁短名（`Sun` 3 字符但 lazy_pinyin 只回 ['Sun'] 一个音节），
+            # 旧形只比字符长度 ⇒ zip 后差异数恒 ≤1，任何 3 字"查无名字"都被判成
+            # "这是 ASR 听岔" ⇒ 整道点名查无闸在真机上被短路
+            # （「关掉会飞的灯」真下发 HassTurnOff light.ban_gong_shi_she_deng）。
+            # 汉字名不受影响：「催拉窗」↔「推拉窗」、「社灯」↔「射灯」照旧救援。
+            if len(pd) != len(d):
+                continue
+            if sum(1 for a, b in zip(s, pd) if a != b) <= 1:
+                return True
+        return False
+    except Exception:  # noqa: BLE01
+        return False
+
+
+def _plan_target_domain(plan) -> str:
+    """从**任意形状**的 args 里取域：klar 平铺（entity_id/domain）与慧尖
+    `target=[{devices:[{domains:[…]}]}]` 两种都认；取不到回空串（=不裁决）。"""
+    try:
+        args = plan.args or {}
+        eid = str(args.get("entity_id") or "")
+        if "." in eid:
+            return eid.split(".", 1)[0]
+        d = args.get("domain")
+        if isinstance(d, list) and d:
+            return str(d[0] or "")
+        if isinstance(d, str) and d:
+            return d
+        tgt = args.get("target")
+        if isinstance(tgt, list):
+            for slot in tgt:
+                if not isinstance(slot, dict):
+                    continue
+                for dev in (slot.get("devices") or []):
+                    if isinstance(dev, dict) and (dev.get("domains") or []):
+                        return str(dev["domains"][0] or "")
+    except Exception:  # noqa: BLE01
+        return ""
+    return ""
+
+
+_PLAN_NAMED_ABSENT_INTENTS = frozenset({
+    "TurnDeviceOn", "TurnDeviceOff", "AdjustDeviceAttribute", "SetDeviceMode",
+    "ControlWindow",
+}) | _KLAR_WRITE_INTENTS
+
+
+def _plan_named_absent_target(plan, device_names, known_areas=(),
+                              real_areas=None) -> str:
+    """**不论计划来自哪条通道**，"用户点名而家里查无"的设备名；否则空串。
+
+    v1.1.39（第三轮复查 §1.2，本机复现成立）：这道闸原来只喂 klar 计划
+    （`_klar_named_absent_target(kl, …)`），于是 **klar 关闭/未接地的降级态**里
+    慧尖 T0 自己就把修饰语丢掉顶了同类别唯一那台——办公 .91 夹具实测：
+
+        [降级态] '关掉会飞的灯' source=t0 下发=['TurnDeviceOff'] 回执='好的，办好了'
+        FastPath.match('关掉会飞的灯') → TurnDeviceOff target=[{devices:[{name:'灯'}]}]
+
+    裁决面要问的是"**这句话在点哪台**"，与计划来自哪条通道无关，故判据上提到
+    `Plan` 层。豁免四条与 klar 侧逐字同纪律：回指句 / 裸否定腿 / 疑问句 /
+    域判不出（fail-open，宁放行不误拦）。永不抛。
+    """
+    try:
+        if plan is None or plan.intent not in _PLAN_NAMED_ABSENT_INTENTS:
+            return ""
+        dom = _plan_target_domain(plan)
+        if not dom or _DOMAIN_EVIDENCE.get(dom) is None:
+            return ""
+        t = plan.utterance or getattr(plan, "first_utterance", "") or ""
+        if not t or any(a in t for a in _ANAPHORA_WORDS):
+            return ""
+        if is_bare_negation_imperative(t) or is_query_like(t):
+            return ""
+        return _unknown_spoken_device_name(t, _category_nouns(dom), device_names,
+                                           known_areas=known_areas,
+                                           real_areas=real_areas)
+    except Exception:  # noqa: BLE01
+        return ""
+
+
+def _klar_named_absent_target(kl: Optional[Plan], device_names,
+                              known_areas=(), real_areas=None) -> str:
+    """klar grounded **写值**步里、用户点名而家里查无的那个设备名；否则空串。
+
+    一处判据两处用：①作 v1.0.92 目标证据闸的"无证据"形态（非空 ⇒ 弃用本计划，
+    含降级支——只闸主裁决是 v1.0.90 记过的半道闸）；②给裁决点当**如实话术**的
+    取值源：弃用一条"没这台"的计划，不该播成「这句话我还不会」。
+    永不抛；非写值意图/无原话/回指句/域判不了/无在装清单一律回空串（fail-open）。
+    """
+    try:
+        if kl is None or kl.intent not in _KLAR_WRITE_INTENTS:
+            return ""
+        args = kl.args or {}
+        eid = str(args.get("entity_id") or "")
+        if "." in eid:
+            dom = eid.split(".", 1)[0]
+        else:
+            d = args.get("domain")
+            dom = d[0] if isinstance(d, list) and d else str(d or "")
+        words = _DOMAIN_EVIDENCE.get(dom)
+        if words is None:
+            return ""
+        t = kl.utterance or ""
+        if not t or any(a in t for a in _ANAPHORA_WORDS):
+            return ""
+        # v1.1.37 现网实锤：闸是给"点了家里没有的那台"用的，不是给"用户明确说不要"
+        # 用的。否定腿经 `is_bare_negation_imperative` 已被裁决弃用（:650/:679），
+        # 但这条查无闸不吃同一判据 ⇒「打开办公室的射灯，别开台灯」的第二腿被当成
+        # 点名查无，整链判死、该动的灯没动（同 :642 疑问闸"判据只落一侧"的老病根）。
+        if is_bare_negation_imperative(t):
+            return ""
+        # v1.1.38：问句不是"点名要哪一台"。裁决面早已让路（`is_query_like`，:645/:636），
+        # 但闸在这里不看同一条判据 ⇒「哪个灯开着」被回成"没有找到对应的设备『哪个灯』"
+        # ——把一次提问答成"家里没这台"。与否定腿同一条纪律：非指认形态一律无裁决权。
+        if is_query_like(t):
+            return ""
+        return _unknown_spoken_device_name(t, _category_nouns(dom),
+                                           device_names,
+                                           known_areas=known_areas,
+                                           real_areas=real_areas)
+    except Exception:  # noqa: BLE01
+        return ""
+
+
+
+_VALUE_WRITE_INTENTS = ("HassLightSet", "HassSetPosition", "HassClimateSetTemperature")
+# 属性字面证据（v1.1.15 办公实锤 D1）：写"值"的 klar 计划，原话里必须有属性字样。
+_ATTR_EVIDENCE = {
+    "HassLightSet": ("亮度", "亮", "暗", "色温", "百分", "半", "度", "%", "％",
+                     "最", "光", "暖", "冷"),
+    "HassSetPosition": ("位置", "开度", "百分", "半", "度", "%", "％", "帘", "窗",
+                        "开", "关", "摇"),
+    "HassClimateSetTemperature": ("度", "温度", "摄", "冷", "暖", "热", "℃"),
+}
+_VALUE_ARG = {"HassLightSet": ("brightness", "color_temp"),
+              "HassSetPosition": ("position",),
+              "HassClimateSetTemperature": ("temperature",)}
+
+
+def _klar_value_without_attr_evidence(kl: Optional[Plan]) -> bool:
+    """True = klar 这条在**写值**（亮度/开度/温度），但原话里一个属性字样都没有。
+
+    2026-09-27 办公实锤：5.28s 长句被识别成
+    「家财百万打开办公室射灯和关闭办公室灯器皿茶叶等等日用都是等」（前后都是幻听），
+    目标证据闸放行了（用户确实说了"射灯/灯"），可 klar 仍从幻听里挑出「百万」当数值，
+    产出 `HassLightSet brightness:100` 并**真把亮度改了**——与 v1.0.92 记的
+    「给我讲一个三百字左右的睡前故事」→亮度 1% 是同一族病灶（draft.rs：未知目标 +
+    任意数字 → 硬套上一台可见灯）。目标有证据不等于"这句在要求这个属性"，故再加一道：
+    值型意图必须在全句里回捞出属性字（亮/暗/度/百分/光…），捞不到就整条弃用，
+    落回降级链（宁可对闲聊说「我还不会」，绝不动用户没要求的档位）。
+    永不抛；无值参数、无原话、不认识的意图一律放行（fail-open）。
+    """
+    try:
+        if kl is None or kl.intent not in _VALUE_WRITE_INTENTS:
+            return False
+        args = kl.args or {}
+        if not any(args.get(k) not in (None, "") for k in _VALUE_ARG[kl.intent]):
+            return False                          # 只开关不带值：不归本闸管
+        t = kl.utterance or ""
+        if not t:
+            return False                          # 合成/回放轮无原话：放行
+        return not any(w in t for w in _ATTR_EVIDENCE[kl.intent])
+    except Exception:  # noqa: BLE001 —— 守卫自身故障不得拦正常句
+        return False
+
+
+def _klar_write_without_target_evidence(kl: Optional[Plan],
+                                        known_areas=(), device_names=(),
+                                        real_areas=None) -> bool:
+    """True = klar grounded 控制步在**原话里找不到任何目标证据**，主裁决弃用。
+    永不抛；utterance 缺失/域判定不了/词表拿不到一律放行（fail-open）。"""
+    try:
+        if kl is None or kl.intent not in _KLAR_WRITE_INTENTS:
+            return False
+        args = kl.args or {}
+        eid = str(args.get("entity_id") or "")
+        if "." in eid:
+            dom = eid.split(".", 1)[0]
+        else:
+            d = args.get("domain")
+            dom = d[0] if isinstance(d, list) and d else str(d or "")
+        words = _DOMAIN_EVIDENCE.get(dom)
+        if words is None:
+            return False                          # 不认识的域（含未 grounded）不管
+        t = kl.utterance or ""
+        if not t:
+            return False                          # 合成/回放轮无原话：放行
+        if any(w in t for w in words):
+            # v1.1.35：类别词命中只证明"这句在说这一类设备"，**不证明用户点名的
+            # 那台存在**——「关掉会飞的灯」就是靠一个"灯"字过了本闸，引擎丢掉修饰语
+            # 顶了同类别唯一那台并真执行（.91 实锤）。名字在家里查无 ⇒ 本闸仍判无证据。
+            # 提取锚点用名词性子集（属性字不当锚点，见 _category_nouns 头注）。
+            return bool(_unknown_spoken_device_name(t, _category_nouns(dom),
+                                                    device_names, known_areas,
+                                                    real_areas))
+        if any(a in t for a in known_areas or ()):
+            return False                          # 用户真点了区域名
+        if any(a in t for a in _ANAPHORA_WORDS):
+            return False
+        return True
+    except Exception:  # noqa: BLE01 —— 守卫自身故障不得拦正常句
+        return False
+
+
+def select_primary_plan(fp: Optional[Plan], kl: Optional[Plan],
+                        known_areas=(), device_names=(),
+                        real_areas=None) -> Optional[Plan]:
+    """纯裁决函数（可单测）：scene 契约 > 慧尖独占 > klar 标准 > 字面表剩余。
+
+    v1.0.92：known_areas 传入时启用「控制步目标证据」闸——见
+    _klar_write_without_target_evidence。
+    v1.1.35：device_names（在装设备名清单）传入时启用「点名设备查无」闸——见
+    _unknown_spoken_device_name；不传=该子闸不参与（既有钉零漂移）。"""
+    if fp is not None and fp.source == "scene":
+        # scene 契约**恒最高优先**（模块头裁决①／fast_path:1060-1066）：等值触发词
+        # 是用户自己绑的"说 X 就 Y"。查询闸此前压在它前面（先把 fp 置 None）⇒
+        # 疑问形触发词的场景永不触发（用户明明被告知"以后说 X 就 Y"）。
+        return fp
+    # v1.1.19 复审（线上实测）：查询句两档都不得执行。闸此前只在 klar 支里，
+    # 而引擎关/缺失/熔断（常规降级态）时 fp 会成为唯一计划 ⇒
+    # 「客厅空调开多少度」被字面表接成 TurnDeviceOn 真执行。
+    if fp is not None and is_query_like(getattr(fp, "utterance", "") or ""):
+        fp = None
+    if fp is not None:
+        if fp.intent in HUIJIAN_ONLY_INTENTS or _mentions_window_device(fp.args):
+            return fp
+    if kl is not None:
+        # v1.1.17 复审（线上实锤）：**查询句不得由 klar 执行**。疑问闸此前只在字面表
+        # 一侧，引擎支没有 ⇒「客厅射灯关了吗」被落成 HassTurnOff 真关了灯、
+        # 「哪些灯开着」落成 HassTurnOn。判据与字面表共用 is_query_like（单点定义）。
+        if is_query_like(kl.utterance or ""):
+            return None
+        # 修②（2026-10-01）：**否定祈使两档都不得执行**——与上面疑问闸同一条纪律。
+        # v1.1.27 的"全局拒执行"只落在字面表 `FastPath.match` 里（拒接管=不出计划），
+        # klar 支不经该判据 ⇒ 现役树上「别开台灯」真把灯打开并播「好的，办好了」。
+        if is_bare_negation_imperative(kl.utterance or ""):
+            return None
+        # v1.0.55：见 _klar_window_lamp_conflict——句在说窗、klar 却指向
+        # 灯/开关时**整条弃用**（返回 None 落级联下层，宁可不执行）。
+        if _klar_window_lamp_conflict(kl):
+            return None
+        # v1.0.92：说故事说出开灯——控制步必须先在原话里拿出目标证据。
+        if _klar_write_without_target_evidence(kl, known_areas, device_names,
+                                               real_areas) or \
+                _klar_value_without_attr_evidence(kl):
+            return None
+        return kl
+    return fp
+
+
+def select_fallback_plan(primary: Optional[Plan], fp: Optional[Plan],
+                         kl: Optional[Plan], speech: str,
+                         known_areas=(), device_names=(),
+                         real_areas=None) -> Optional[Plan]:
+    """纯函数：主计划执行失败后的降级选择；None = 不降级（如实报+LLM 复议）。"""
+    if primary is None:
+        return None
+    if primary.source != "klar":
+        # 慧尖意图失败：常见根因就是「集成还没加载」——klar 直调不依赖集成，
+        # 只要 klar 同句有命中（裁决时让位给契约/独占类），值得一试。
+        if kl is None or kl is primary:
+            return None
+        # v1.0.92：降级支同样过目标证据闸——v1.0.90 假成功案根因就是
+        # 「主路被拦、降级通道不再复检」；只闸主裁决=半道闸。
+        if is_bare_negation_imperative(kl.utterance or ""):
+            return None                                   # 修②：降级支同闸
+        if _klar_write_without_target_evidence(kl, known_areas, device_names,
+                                               real_areas) or \
+                _klar_value_without_attr_evidence(kl):
+            return None
+        # v1.0.12 窗户误动作闸（2026-09-08 实机：ControlWindow 未注册时
+        # 「打开 办公室平开窗」降级 klar 命中办公室灯，真把灯点亮——比
+        # 礼貌失败糟糕得多）。窗户是慧尖独占语义（开合器=按钮按压），
+        # klar 兜底只允许同样打在窗类目标上；否则不降级，用主话术如实
+        # 报「集成未运行」（v1.0.9 指令①诊断话术已点破根因）。
+        if (primary.intent == "ControlWindow"
+                or _mentions_window_device(primary.args)) \
+                and not _mentions_window_device(kl.args):
+            return None
+        return kl
+    # klar 失败（实体漂移/服务拒绝）：非场景类的字面表命中可作替代路径。
+    return fp if (fp is not None and fp is not primary and fp.source != "scene") else None
+
+
+@dataclass
+class Reply:
+    text: str
+    source: str = ""                 # t0|t0_strip|t0_prefix|t0_end|scene|t1|query|llm|fallback|dedup|confirm*|chain
+    ok: bool = True
+    trace: list[str] = field(default_factory=list)
+    streamed: bool = False           # P2-15：on_sentence 已逐句送达，调用方勿重播
+    # v1.0.93：退下旗。True=LlmSession 在 end 帧带 end_dialogue:1，
+    # 集成透传进 INTENT_END kv，固件置单轮 stop_after_tts_（正向专用旗——
+    # 只用来"停"，绝不复用 continue_conversation 孤旗，三端契约同批钉）。
+    end_dialogue: bool = False
+
+
+# ── 体验批常量 ──────────────────────────────────────────────────
+DEDUP_MAX_ENTRIES = 512              # P1-7 去重表有界
+CONTEXT_TTL_S = 90.0                 # P2-10 目标继承/历史窗口
+CONTEXT_MAX_TURNS = 8                # 每 origin 环形缓冲（4 回合 ×2 条）
+CONFIRM_TTL_S = 30.0                 # P2-13 待确认存活（基线，无提示文本时回落此值）
+# v1.1.7（办公室实测：30s 固定 TTL 被长歧义提示播报吃光，剩 7.2s 应答窗 → 用户
+# 重唤醒+回答超时，「取消」被当改口走 fallback）：确认环 TTL 改**自适应**——基线
+# + 提示播报时长估算（封顶 +30s）。长提示自动获得更长应答窗，短提示维持基线。
+# 只放宽超时上限，不改是/否/改口三态语义。
+# v1.1.17 收口：播报时长估算改**实测口径**——旧式 0.2s/字（=5 字/s）是拍的，比仓内
+# 两个已测口径都乐观：
+#   · tts.py 的合成账 4.5 字/s（"账同固件 v2.1.44"，speed 自适应）＝**合成**时长；
+#   · v1.1.7 自己记的现场：~70 字歧义提示播报 ≈23s，且是在**默认 speed=1.25** 档
+#     测的 ⇒ 基准档(1.0) ≈2.4 字/s，默认档 ≈3.04 字/s（播报还含停顿与设备缓冲）。
+# TTL 是安全余量，取慢的一侧；并随 tts.speed 缩放（旧式完全不吃语速档）。
+_CONFIRM_ANN_CPS = 2.4               # 播报语速基准（字/秒，speed=1.0 档）
+_TTS_SPEED_DEFAULT = 1.25            # settings.py 出货默认（用户拍板 2026-09-19）
+_CONFIRM_ANN_MAX_EXTRA = 30.0        # 播报补偿封顶（防超长提示把 TTL 拉到离谱）
+_VOCAB_SYNC_S = 30.0                 # P2-17 动态词表节流
+
+# P2-13 风险意图：解锁（含 D7 反转形态 TurnDeviceOff×锁）与删除族。
+# v1.1.27：同族锁动作一并入闸——上锁同样是不可逆的门禁动作（此前只认 HassUnlock，
+# 「锁上大门」无确认环直拔门锁）。HassTurnOn×lock 仍不在闸内（D7 语义下那是"上锁"
+# 的安全向形态，见 _plan_has_risky_step）。
+_RISKY_INTENTS = frozenset({"HassUnlock", "HassLock",
+                            "HassDeleteVoiceScene", "HassDeleteAutomation"})
+_CONFIRM_YES = frozenset({"确认", "确定", "是的", "是", "对", "对呀", "嗯", "好", "好的",
+                          "好吧", "执行", "继续吧", "yes", "ok", "y"})
+_CONFIRM_NO = frozenset({"取消", "不", "不要", "不用", "别", "算了", "不确认", "no", "n"})
+
+def _strip_punct(text: str) -> str:
+    return re.sub(r"[\s。，,！!？?~～.]+$", "", (text or "").strip()).strip()
+
+
+def _target_names(args: dict) -> list[str]:
+    """从两种 args 形态提设备名（慧尖 target 列表 / klar 平铺 name）。永不抛。"""
+    out: list[str] = []
+    try:
+        for ent in args.get("target") or []:
+            for dev in (ent or {}).get("devices") or []:
+                if (dev or {}).get("name"):
+                    out.append(str(dev["name"]))
+        if not out and args.get("name"):
+            out.append(str(args["name"]))
+    except Exception:
+        pass
+    return out
+
+
+def _target_areas(args: dict) -> list[str]:
+    out = []
+    try:
+        for ent in args.get("target") or []:
+            if (ent or {}).get("area"):
+                out.append(str(ent["area"]))
+        if not out and args.get("area"):
+            out.append(str(args["area"]))
+    except Exception:
+        pass
+    return out
+
+
+def _target_domains(tgt) -> list[str]:
+    """target 槽里已声明的域并集（v1.1.28：给主域判据当输入，不另抄一张域族表）。
+
+    归一走 capability._domain_slots：LLM/上游把单域塞成字符串时，旧写法会把
+    "light" 炸成 ('l','i','g','h','t')。无域声明 ⇒ []（= 不过滤，不是"拒绝"）。
+    """
+    out: list[str] = []
+    try:
+        for slot in (tgt or []):
+            if not isinstance(slot, dict):
+                continue
+            for dev in (slot.get("devices") or []):
+                for dom in capability._domain_slots((dev or {}).get("domains")):
+                    if dom and dom not in out:
+                        out.append(dom)
+    except Exception:  # noqa: BLE001 提取失败=当未声明
+        return []
+    return out
+
+
+def _has_explicit_target(args: dict) -> bool:
+    """target 已含区域或设备名 = 明示目标，不做继承/区域注入。"""
+    return bool(_target_names(args) or _target_areas(args) or args.get("entity_id"))
+
+
+def _is_wholehouse_args(args: dict) -> bool:
+    """target 仅由「空 name + domains 过滤」构成 = 显式全屋。
+
+    v1.0.40 修复（A2）：这类目标必须**免于上下文继承**——旧实现下 `_has_explicit_target`
+    对它是 False（没有 name/area/entity_id），于是「再打开所有灯」会被上一轮的目标
+    （如「客厅的灯」）静默替换：用户说全屋、实际只动一个房间，而 trace 里还写着
+    "全屋显式"。真机实测：覆盖前 `[{'devices':[{'name':'','domains':['light']}]}]`
+    → 覆盖后 `[{'area':'客厅','devices':[{'name':'灯'}]}]`。
+    """
+    tgt = args.get("target")
+    if not isinstance(tgt, list) or not tgt:
+        return False
+    saw_domain = False
+    for ent in tgt:
+        if not isinstance(ent, dict) or ent.get("area") or ent.get("entity_id"):
+            return False
+        devs = ent.get("devices")
+        if not isinstance(devs, list) or not devs:
+            return False
+        for d in devs:
+            if not isinstance(d, dict) or d.get("name"):
+                return False
+            if not d.get("domains"):
+                return False
+            saw_domain = True
+    return saw_domain
+
+
+def _at_say(at: str) -> str:
+    """'07:00' → '早上7点'、'22:30' → '晚上10点半'（耳朵友好，不回显 ISO 格式）。"""
+    try:
+        h, m = int(at[:2]), at[3:5]
+    except (ValueError, IndexError):
+        return at
+    seg = ("凌晨" if h < 6 else "早上" if h < 11 else "中午" if h < 13
+           else "下午" if h < 18 else "晚上")
+    hh = h if 1 <= h <= 12 else (h - 12 if h >= 13 else 12)
+    if m == "30":
+        return f"{seg}{hh}点半"
+    return f"{seg}{hh}点" if m == "00" else f"{seg}{hh}点{int(m)}分"
+
+
+class Pipeline:
+    def __init__(self, settings, ha, scenes, textcnn, executor, agent=None, klar=None):
+        self.settings = settings
+        self.ha = ha
+        self.fast_path = FastPath(scenes, textcnn, settings)
+        self.scenes = scenes
+        self.executor = executor
+        self.agent = agent
+        # 一级确定性 NLU（fail-open：引擎缺失/熔断恒 None，级联照旧）
+        self.klar = klar if klar is not None else KlarClient(settings)
+        from .nlu.query import QueryZone
+        self.query = QueryZone(ha, settings)
+        # P1-5/6/7 去重：text → {first, fut, reply}，有序有界（窗口锚首见）
+        self._last: "OrderedDict[tuple, dict]" = OrderedDict()   # 键=(origin,text)
+        # P2-10 会话上下文（按 origin=卫星 IP / "panel" 分桶）
+        self._turns: dict[str, deque] = {}
+        # P1 音乐批：端点→最近点歌记账（P2a 前卫星实体不报 media_title 时，
+        # 「现在放的是什么歌」的兜底事实源；有界+TTL，重启即清）
+        self._music_last: "OrderedDict[str, dict]" = OrderedDict()
+        # 上次清单播报对象（"删第2条"回指）：**按 origin 分桶 + TTL**（v1.1.29 复核 A2
+        # ——旧式全局单值：另一台卫星可零确认删掉自己没听过的场景/自动化，且永不过期）。
+        self._last_list: dict[str, tuple[str, float]] = {}
+        self._last_target: dict[str, dict] = {}
+        self._origin_ts: dict[str, float] = {}      # LRU 清扫用
+        # P2-13 待确认环
+        self._confirm: dict[str, dict] = {}
+        # P0-3/P2-15 后台 task 强引用袋（session F7b 纪律）
+        self._pending: set[asyncio.Task] = set()
+        self._vocab_ts = 0.0
+        # v1.1.20（去重分桶的消费侧）：命中判定同样按 (origin, text)——见下方 _dedup_gate
+    # v1.0.62 P0-1/P0-2：漏斗指标 + 兜底语料回流（观测件，永不干预主链；
+        # 测试用 __new__ 构造的 Pipeline 无此属性，钩子端 getattr 容错）。
+        # 回流文件落**持久卷 DATA_DIR**（非安装目录）：加载项升级镜像重建
+        # 语料不丢；测试基建成 HUIJIAN_DATA→tmp，盘写天然出仓。
+        from .nlu.telemetry import Telemetry
+        self.telemetry = Telemetry(settings, const.DATA_DIR)
+
+    # ── 后台 task 助手 ──────────────────────────────────────────
+    def _spawn(self, coro: Coroutine) -> None:
+        t = asyncio.create_task(coro)
+        self._pending.add(t)
+        t.add_done_callback(self._pending.discard)
+
+    # ── 入口 ───────────────────────────────────────────────────
+    async def handle(self, text: str, origin: str = "",
+                     on_sentence: Optional[Callable[[str], Any]] = None) -> Reply:
+        t0 = time.time()
+        text = (text or "").strip()
+        if not text:
+            return Reply("", "fallback", ok=False)
+        self._sync_vocab()
+        dup = await self._dedup_gate(text, origin)
+        if dup is not None:
+            return dup
+        try:
+            reply = await self._cascade(text, origin, on_sentence)
+        except asyncio.CancelledError:
+            self._dedup_abandon(text, origin)    # 在飞方被杀：结算防共享方永挂
+            raise
+        except Exception:            # 级联永不冒泡：future 必须先结算再重抛语义（去重共享方）
+            logger.exception("[级联] 意外异常（按兜底收束）")
+            reply = Reply(self.settings.get("dialog.fallback_text", const.FALLBACK_TEXT),
+                          "fallback", ok=False)
+        self._dedup_settle(text, reply, origin)
+        # v1.0.62 P0-1/P0-2：漏斗计数 + 兜底回流（观测件；_dedup_gate 早退的
+        # 共享方不经过此处，天然不重复计数；reply.source 已是最终收口档位）。
+        tele = getattr(self, "telemetry", None)
+        if tele is not None:
+            tele.observe(text, reply.source, reply.ok, time.time() - t0)
+        # P0-3：事件旁路出回复路径（回合留痕对时序无强要求）
+        self._spawn(self.ha.fire_event(const.EVENT_NAME, {
+            "utterance": text, "reply": reply.text, "source": reply.source,
+            "ok": reply.ok, "origin": origin,
+            "ms": int((time.time() - t0) * 1000)}))
+        # v1.1.22：日志打**纠错后**文本——现场把 ASR 听错的原话（「平台窗」）误读成
+        # 缺陷；判据与 fast_path 内部同表同参（corrector.apply），故障回落原文；
+        # 原始听写文本降级 DEBUG 留痕（诊断 ASR 仍拿得到）。
+        try:
+            shown = corrector.apply(text, self.settings.get("nlu.corrections_extra") or {})
+        except Exception:  # noqa: BLE001 纠错故障=日志回落原文
+            shown = text
+        if shown != text:
+            logger.debug("[级联] 原始听写 %r（纠错后见下行）", text)
+        logger.info("[级联] %r → [%s] %r (%.0fms)", shown, reply.source, reply.text,
+                    (time.time() - t0) * 1000)
+        return reply
+
+    # ── P1-5/6/7 去重三修 ──────────────────────────────────────
+    def _dedup_sweep(self, now: float, win: float) -> None:
+        # 已完成且出窗 → 删；在飞条目保留（其结果由 settle/abandon 结算）
+        stale = [k for k, v in self._last.items()
+                 if v.get("reply") is not None and now - v["first"] >= win]
+        for k in stale:
+            self._last.pop(k, None)
+        if len(self._last) > DEDUP_MAX_ENTRIES:
+            # 病态兜底：强行裁最早的已完成项（在飞项绝不裁，防共享方饿死）
+            victims = [k for k, v in self._last.items() if v.get("reply") is not None]
+            for k in victims[:max(1, len(victims) - DEDUP_MAX_ENTRIES // 2)]:
+                self._last.pop(k, None)
+
+    def _dkey(self, text: str, origin: str = ""):
+        """去重键：**(origin, text)**（v1.1.20）——旧实现只按文本分桶，两颗卫星在
+        2s 窗内说同一句时，后说话的那颗被前一颗粒的结果顶掉（自己房间零动作、
+        听到别人房间的回答）。"""
+        # 第四轮审计 P2：键用 canonical() 归一——「调亮一点/请调亮一点/调亮一点吧」
+        # 是同一句的三种转写，旧键按原文分桶 ⇒ 三条各执行一遍（相对量叠加）。
+        return (origin or "", canonical(text))
+
+    async def _dedup_gate(self, text: str, origin: str = "") -> Optional[Reply]:
+        """契约 §1.4-② 短时去重的成熟形态：
+        ① 窗口内已完成 → 复述上次结果；② 窗口内在飞 → 共享同一 future 的真实结果
+        （不再返回空串把 TTS 打成静默/兜底）；③ 窗口锚定首见时间，执行完成不顺延。"""
+        win = float(self.settings.get("dialog.dedup_window_s", 2.0))
+        if win <= 0:
+            return None
+        now = time.time()
+        self._dedup_sweep(now, win)
+        key = self._dkey(text, origin)
+        e = self._last.get(key)
+        if e is not None and now - e["first"] < win:
+            if e.get("reply") is not None:
+                # v1.1.21：**问句型回复不走去重复述**——重复一句待确认指令时，复述
+                # 不会再挂确认环（只有真跑一遍才会），用户接着说「确认」就被当改口，
+                # 高风险动作（解锁等）静默丢失。放行走正常流程 = 重新挂环。
+                if str(getattr(e["reply"], "source", "") or "").startswith("confirm"):
+                    logger.info("[级联] 去重命中但上轮是问句型回复 → 放行重跑（重挂确认环）: %s", text)
+                    return None
+                logger.info("[级联] 去重命中(%0.1fs 内重复): %s", now - e["first"], text)
+                r0 = e["reply"]
+                return Reply(r0.text, "dedup", r0.ok, end_dialogue=r0.end_dialogue)
+            # 在飞：等它的结果（封顶等待，超时报"正在处理"，绝不重复执行）
+            try:
+                r = await asyncio.wait_for(asyncio.shield(e["fut"]), timeout=min(10.0, win * 5))
+                logger.info("[级联] 去重共享在飞结果: %s", text)
+                return Reply(r.text, "dedup", r.ok, end_dialogue=r.end_dialogue)
+            except asyncio.TimeoutError:
+                logger.info("[级联] 去重在飞等待超时: %s", text)
+                return Reply("这条指令我正在处理，请稍候", "dedup")
+            except Exception:
+                return Reply("刚才那条指令处理时出了点问题，可以再试一次", "dedup", ok=False)
+        fut = asyncio.get_running_loop().create_future()
+        # v1.1.20：键带 origin——旧实现只按文本去重 ⇒ 两颗卫星 2s 内说同一句时，
+        # 后说话的那颗被前一颗粒的回复顶掉（自己房间零动作、听到别人的房间）
+        # v1.1.22：1.1.20/21 只改了键函数，handle 三处调用没把 origin 传下来
+        # （键恒 `("", text)`，分桶等于没接线）；现三处补传，本注释才成立。
+        self._last[key] = {"first": now, "fut": fut, "reply": None}
+        self._last.move_to_end(key)
+        return None
+
+    def _dedup_settle(self, text: str, reply: Reply, origin: str = "") -> None:
+        e = self._last.get(self._dkey(text, origin))
+        if e is not None:
+            e["reply"] = reply
+            if not e["fut"].done():
+                e["fut"].set_result(reply)
+
+    def _dedup_abandon(self, text: str, origin: str = "") -> None:
+        """在飞执行被取消（超时/断连）：以兜底 Reply 结算，共享方拿真实文本，
+        否则队头永远 in-flight，清扫与后续同句全部饿死。"""
+        e = self._last.pop(self._dkey(text, origin), None)
+        if e is not None and not e["fut"].done():
+            e["fut"].set_result(
+                Reply(self.settings.get("dialog.fallback_text", const.FALLBACK_TEXT),
+                      "fallback", ok=False))
+
+    # ── P2-17 动态词表节流 ─────────────────────────────────────
+    def _sync_vocab(self) -> None:
+        now = time.time()
+        if now - self._vocab_ts < _VOCAB_SYNC_S:
+            return
+        self._vocab_ts = now
+        try:
+            # 直读 ha 状态缓存（私有属性同进程只读；无 await，关键路径零成本）。
+            T.sync_vocab(getattr(self.ha, "_states", {}) or {},
+                         getattr(self.ha, "_entity_alias", {}) or {})
+            # 2026-09-30 区域表同步（数据集对账）：真实区域名喂 targets._area_like
+            # ——主卧/阳台/玄关 等不带区域尾字的区名自此可析出（ha_client 已按
+            # WS config/area_registry/list 维护 _areas，与查询族同源）。
+            T.sync_areas((getattr(self.ha, "_areas", {}) or {}).values())
+        except Exception:
+            logger.debug("[词表] 动态同步异常", exc_info=True)
+
+    # ── 两路并行判定（P0-1）────────────────────────────────────
+    async def _match_fp(self, text: str) -> Optional[Plan]:
+        try:
+            return await self.fast_path.match(text)
+        except Exception:
+            logger.exception("[级联] fast_path 异常（视为未命中）")
+            return None
+
+    async def _match_klar(self, text: str) -> Optional[Plan]:
+        try:
+            return await self.klar.match(text)
+        except Exception:
+            logger.exception("[级联] klar 异常（fail-open，视为未命中）")
+            return None
+
+    async def _match_pair(self, text: str) -> tuple[Optional[Plan], Optional[Plan]]:
+        """fp 与 klar 互不依赖：gather 并行，关键路径不再串行吃 klar 的 HTTP 往返。"""
+        return await asyncio.gather(self._match_fp(text), self._match_klar(text))  # type: ignore[return-value]
+
+    # ── 级联主流程 ─────────────────────────────────────────────
+    async def _cascade(self, text: str, origin: str = "",
+                       on_sentence: Optional[Callable[[str], Any]] = None) -> Reply:
+        # v1.0.62 P1-7 全链统一起点：ASR 纠错+礼貌语剥离一次做净，确认环/创建
+        # 承接/复合拆分/fp∥klar/查询族/LLM 兜底吃同一文本（旧状：corrector 只在
+        # fp 内生效，「开床器电量多少」fp 认得、query 不认得——同句因档位而异
+        # 即漂移源）。幂等纪律见 canonical 模块头；fp 内部原调用保留作纵深。
+        text = canonical(text, self.settings)
+        # P2-13 确认环优先：有 pending 时本句是对问句的回答（是/否/改口）
+        answered = await self._confirm_answer(text, origin)
+        if answered is not None:
+            return answered
+
+        # nlu.enabled=false：本地理解全线让位（快速通道/场景契约/查询族/场景与
+        # 自动化本地承接一律不参与），只剩 LLM 兜底——开关必须说到做到，否则
+        # 用户"关了 NLU 却还被本地拦截"就是配置与行为打架（本次修订核心之一）。
+        # v1.0.93 例外一条：退下收词表=**会话控制**不是本地理解，不受 nlu 开关
+        # 管辖——关了 NLU 也必须有办法用语音停掉麦克风（否则开关语义反而把人
+        # 永久锁在聆听态）。判据仍走同一等值谓词，与 fast_path 单点词表。
+        if not self.settings.get("nlu.enabled", True):
+            if is_end_dialogue(text):
+                return Reply(const.END_DIALOGUE_SAY, "t0_end", True,
+                             ["退下字面表(NLU已关)"], end_dialogue=True)
+            if self.agent and self.agent.enabled:
+                llm = await self._llm(text, origin, on_sentence)
+                if llm:
+                    return llm
+            return Reply(_NLU_OFF_TEXT, "fallback", ok=False, trace=["NLU已关闭"])
+
+        # v1.0.30 语音创建承接（零 LLM）：「当我说X就Y」/「当[事件]就Y」。
+        # 必须前置于复合切分——创建句内的"并/然后"属于 Y 子句内容，不能被链发。
+        created = await self._voice_creation(text, origin)
+        if created is not None:
+            return created
+
+        # P2-12 复合句：分句全命中才链发，否则原样回退单发路径
+        chain = await self._try_compound(text, origin)
+        if chain is not None:
+            return chain
+
+        # ⓪①②③④ klar 引擎与 T0/T1/场景并行判定，三层裁决（见模块头）
+        fp_plan, kl_plan = await self._match_pair(text)
+        plan = select_primary_plan(fp_plan, kl_plan, self._known_areas(),
+                                 self._device_names(), self._real_areas())
+        if plan is None:
+            absent = _klar_named_absent_target(kl_plan, self._device_names(),
+                                            self._known_areas(),
+                                            self._real_areas())
+            if absent:
+                # v1.1.35（2026-09-30 办公 .91 实锤）：用户点了**具体名字**而家里
+                # 查无这台。引擎的形态是把修饰语丢掉、顶同类别里唯一那台并回显原话
+                # （「关掉会飞的灯」真关射灯、回「会飞的灯关了」）。裁决弃用之后，
+                # 必须如实说"没找到"——播成「这句话我还不会」等于把"家里没这台"这件
+                # 用户最需要知道的事藏起来。
+                logger.info("[级联] 点名设备查无「%s」→ 不执行、绝不猜同类别另一台",
+                            absent)
+                return Reply(f"没有找到对应的设备「{absent}」，"
+                             f"换个叫法或带上房间名再试试",
+                             "no_such_device", ok=False,
+                             trace=[f"点名设备查无:{absent}"])
+        # v1.0.93 「退下」句：纯会话控制，零设备执行——在上下文注入**之前**
+        # 收口（_apply_context 会给空 args 继承上一轮目标，退出句绝不吃到）。
+        # 旗随 Reply 走：LlmSession 挂进 end 帧 → 集成 INTENT_END → 固件闸。
+        if plan is not None and plan.intent == END_DIALOGUE_INTENT:
+            return Reply(const.END_DIALOGUE_SAY, "t0_end", True,
+                         list(plan.trace), end_dialogue=True)
+        plan = self._apply_context(plan, text, origin)
+        if plan:
+            ob = self._overbroad_area_target(plan)
+            if ob:
+                logger.info("[级联] 过宽目标拦截（%s 全部设备）：%s", ob, plan.args)
+                return Reply(self._overbroad_say(ob), "clarify", ok=False,
+                             trace=[f"过宽目标拦截:{ob}"])
+            bad_area = await self._plan_area_problem(plan)
+            if bad_area:
+                # v1.1.24：畸形/不存在区域当场拦下（连写句解析产物），不白跑 HA
+                logger.info("[级联] 区域解析不到 → 不执行（%s）：%s", bad_area, plan.args)
+                return Reply(self._area_say(bad_area), "clarify", ok=False,
+                             trace=[f"区域不存在:{bad_area}"])
+            # v1.1.39（§1.2 残留）：降级态（无 klar 计划）里慧尖 T0 同样会把修饰语
+            # 丢掉顶同类别那台 ⇒ 同一道查无闸必须也吃 fp/慧尖计划。放在区域闸**之后**，
+            # 让"没这间房"的话术仍优先（那是更准的根因）。
+            absent_self = _plan_named_absent_target(plan, self._device_names(),
+                                                    self._known_areas(),
+                                                    self._real_areas())
+            if absent_self:
+                logger.info("[级联] 点名设备查无「%s」（%s 计划，非只 klar）→ 不执行",
+                            absent_self, plan.source)
+                return Reply(f"没有找到对应的设备「{absent_self}」，"
+                             f"换个叫法或带上房间名再试试",
+                             "no_such_device", ok=False,
+                             trace=[f"点名设备查无:{absent_self}({plan.source})"])
+            ask = self._confirm_ask(plan, origin)
+            if ask is not None:
+                return ask
+            ask = self._ambiguity_ask(plan, origin)   # v1.1.4 多台同名先问
+            if ask is not None:
+                return ask
+            ok, speech = await self.executor.run(plan)
+            exec_risk = self._exec_risk()          # 本次执行是否可能已生效（防复议重放）
+            trace = list(plan.trace)
+            if not ok:
+                fb = select_fallback_plan(plan, fp_plan, kl_plan, speech,
+                                          self._known_areas(),
+                                          self._device_names(),
+                                          self._real_areas())
+                # v1.0.87（现场 13:06:37 案）：降级同样是**动作**——主发次若是
+                # "结果不确定"（超时/连接/5xx：HA 可能已执行，只是回执丢了），
+                # 再放一发等于把同一件事做两遍（灯幂等没事，门锁/卷帘/相对量
+                # 最伤），且把播报再压后一发时长（现场 klar 执行超时 → 降级
+                # TurnDeviceOn 又跑 4.5s → 全轮 15.4s 才出声 → 用户以为没反应
+                # 重唤醒 → 又拆一轮）。同一判据（exec_risk）下方 LLM 复议闸
+                # 早已生效，这里补齐——"多一层兜底"不得变成"多一次动作"。
+                if fb is not None and exec_risk:
+                    logger.info("[级联] %s 执行结果不确定（可能已生效）→ 不降级重放，"
+                                "如实播报: %r", plan.source, speech[:24])
+                    trace.append("降级跳过:结果不确定")
+                    fb = None
+                if fb is not None:
+                    fb = self._apply_context(fb, text, origin)
+                    bad_area = await self._plan_area_problem(fb)
+                    if bad_area:
+                        # v1.1.24：降级计划同样过区域预检（同口径，绝不带畸形区域下发）
+                        logger.info("[级联] 降级计划区域解析不到 → 不执行（%s）", bad_area)
+                        return Reply(self._area_say(bad_area), "clarify", ok=False,
+                                     trace=[f"降级区域不存在:{bad_area}"])
+                    # v1.1.21：降级同样要过**过宽目标闸与歧义闸**（逐行审计实锤：
+                    # 主路三道里只补了 confirm，`name=客厅` 这类"区域当设备名"的降级
+                    # 计划会直接执行=一次动作打穿整个区域，含开关/门锁）
+                    ob = self._overbroad_area_target(fb)
+                    if ob:
+                        logger.info("[级联] 降级计划过宽目标拦截（%s 全部设备）: %s", ob, fb.args)
+                        return Reply(self._overbroad_say(ob), "clarify", ok=False,
+                                     trace=trace + [f"降级过宽目标拦截:{ob}"])
+                    ask = self._confirm_ask(fb, origin)   # 降级计划同样过风险闸
+                    if ask is not None:
+                        return ask
+                    ask = self._ambiguity_ask(fb, origin)  # 多台同名同样先问（v1.1.4 同款）
+                    if ask is not None:
+                        return ask
+                    logger.info("[级联] %s 执行失败 → 降级 %s:%s（%r）",
+                                plan.source, fb.source, fb.intent, speech[:24])
+                    ok2, speech2 = await self.executor.run(fb)
+                    exec_risk = exec_risk or self._exec_risk()
+                    trace.append(f"降级→{fb.source}:{fb.intent}" + ("✓" if ok2 else "✗"))
+                    if ok2:
+                        self._note_target(origin, fb)
+                        return Reply(speech2, fb.source, True, trace)
+                    # 两路全挂：降级话术点破「集成」根因者更可用（用户指令①的诊断价值）
+                    if (any(h in speech2 for h in _INTEGRATION_HINTS)
+                            and not any(h in speech for h in _INTEGRATION_HINTS)):
+                        speech = speech2
+            if ok:
+                self._note_target(origin, plan)
+                self._remember_turn(origin, text, speech)
+                return Reply(speech, plan.source, True, trace)
+            # 快速通道（klar+慧尖意图）双双用尽：LLM 配置了就复议，没配如实播失败。
+            # 安全闸（本次修订）：已部分生效（多步链）或结果不确定（超时/连接/5xx）
+            # → 绝不复议——LLM 拿原句重做会把相对量动作（+10 亮度）叠加第二遍，
+            # "多一层兜底"不能变成"多一次动作"。
+            if self.agent and self.agent.enabled and not exec_risk:
+                logger.info("[级联] 快速通道执行失败 → LLM 复议: %s", speech)
+                llm = await self._llm(text, origin, on_sentence)
+                if llm:
+                    return llm
+            elif exec_risk and self.agent and self.agent.enabled:
+                trace.append("复议跳过:可能已执行")
+                logger.info("[级联] 跳过 LLM 复议（本地执行可能已部分生效/结果不确定）")
+            self._remember_turn(origin, text, speech)
+            return Reply(speech, plan.source, False, trace)
+        # ⑤a 音乐带（P1 上移至查询族之前）：点歌/播控/正在播放查询直连 HA
+        # 标准 media_player 服务。上移原因：「音箱现在放的是什么歌」这类带
+        # 设备词前缀的问句会被查询族抢走；now_playing 在带内判序最先，
+        # 普通状态查询（"客厅温度""灯什么状态"）不受影响。
+        mcmd = music.parse_music(text, await self._music_areas())
+        if mcmd is not None:
+            return await self._music(mcmd, text, origin)
+        # ⑤b 查询族
+        try:
+            ans = await self.query.answer(text)
+        except Exception:
+            logger.exception("[级联] 查询族异常")
+            ans = None
+        if ans:
+            self._remember_turn(origin, text, ans)   # 查询轮也进 LLM 历史，防跨轮失忆
+            return Reply(ans, "query", True, [f"query:{text}"])
+        # ⑥ LLM
+        if self.agent and self.agent.enabled:
+            llm = await self._llm(text, origin, on_sentence)
+            if llm:
+                return llm
+        # ⑦ 固定兜底
+        return Reply(self.settings.get("dialog.fallback_text", const.FALLBACK_TEXT), "fallback")
+
+    _MUSIC_SVC = {"pause": "media_pause", "resume": "media_play",
+                  "stop": "media_stop", "next": "media_next_track",
+                  "prev": "media_previous_track"}
+    _MUSIC_SAY = {"pause": "好的，先暂停了", "resume": "继续播放",
+                  "stop": "已停止播放", "next": "来，下一首",
+                  "prev": "退回上一首"}
+    _MUSIC_LEDGER_TTL_S = 6 * 3600.0          # 点歌记账存活：超过即不作数
+    _MUSIC_LEDGER_MAX = 16                    # 有界（端点远超此值逐出最旧）
+    # MA 智能检索只吃明文检索词；URL/media-source 虚拟路径打给非托管实体
+    # 必挂（慧尖卫星固件是裸 GET）——源头拦一句，好过"端点没有响应"。
+    _VIRTUAL_ID = re.compile(r"^(?:https?://|media-source://|/|file://)", re.I)
+
+    async def _music_areas(self) -> set:
+        """区域定向词表：HA 区域注册表 ∪ satellite_areas 值 ∪ area_entities
+        键。注册表不可达只少一路来源，永不抛（词表缺=不定向，保守放行）。"""
+        out: set = set()
+        try:
+            amap = self.settings.get("music.area_entities", {}) or {}
+            if isinstance(amap, dict):
+                out |= {str(k) for k in amap if k}
+            sat = self.settings.get("spatial.satellite_areas", {}) or {}
+            if isinstance(sat, dict):
+                out |= {str(v) for v in sat.values() if v}
+            names = await self.ha.area_names()
+            if names:
+                out |= {str(n) for n in names if n}
+        except Exception:
+            pass
+        return out
+
+    def _resolve_music_entity(self, cmd: dict) -> tuple[str, str]:
+        """区域定向选端点 → (entity, 如实回退说明)。映射缺失**且**有默认端点
+        才回退并说明；两者皆无交调用方走配置指引（绝不静默放错房间）。"""
+        default = str(self.settings.get("music.player_entity", "") or "").strip()
+        area = str(cmd.get("area") or "").strip()
+        if not area:
+            return default, ""
+        amap = self.settings.get("music.area_entities", {}) or {}
+        if isinstance(amap, dict):
+            ent = str(amap.get(area) or "").strip()
+            if ent:
+                return ent, ""
+            if default:
+                return default, f"{area}没有单独的播放端点，先用默认音箱"
+        return default, ""
+
+    def _ledger_record(self, entity: str, query: str) -> None:
+        """点歌成功记账（P2a 前卫星不报曲目，查询兜底靠它）。永不抛。"""
+        try:
+            led = getattr(self, "_music_last", None)
+            if led is None:
+                led = self._music_last = OrderedDict()
+            led[entity] = {"q": query, "ts": time.time()}
+            led.move_to_end(entity)
+            while len(led) > self._MUSIC_LEDGER_MAX:
+                led.popitem(last=False)
+        except Exception:
+            pass
+
+    def _ledger_peek(self, entity: str) -> str:
+        try:
+            rec = (getattr(self, "_music_last", {}) or {}).get(entity) or {}
+            if rec and time.time() - float(rec.get("ts") or 0) \
+                    <= self._MUSIC_LEDGER_TTL_S:
+                return str(rec.get("q") or "")
+        except Exception:
+            pass
+        return ""
+
+    async def _now_playing_say(self, cmd: dict) -> Reply:
+        """正在播放查询：读端点态 media_title/artist（永不抛）；端点不报曲目
+        （P2a 前卫星）→ 回退本加载项的点歌记账（缺口②收口）。"""
+        entity, note = self._resolve_music_entity(cmd)
+        if not entity:
+            return Reply("先到 设置-音乐 里配置播放端点，我才知道问谁。",
+                         "music", ok=False, trace=["music:未配置端点"])
+        # v1.1.21：读不到端点/连不上 HA 时**不再折叠成"没有在放歌"**（假否定，
+        # 还会被计成一次成功）——按与 _music_fail_say 同口径分诊如实说。
+        _ent_none = False
+        try:
+            ent = await self.ha.get_state(entity)
+            if ent is None:
+                _ent_none = True
+                ent = {}
+        except Exception:
+            _ent_none = True
+            ent = {}
+        if _ent_none:
+            reach = getattr(self.ha, "reachable", True)
+            _why = "连不上 Home Assistant" if not reach else "没读到播放端点（端点可能改名/被删）"
+            return Reply(f"现在读不到播放器的状态——{_why}。", "music", ok=False,
+                         trace=["music:state-unreadable"])
+        st = str(ent.get("state") or "")
+        attrs = ent.get("attributes") or {}
+        title = str(attrs.get("media_title") or "").strip()
+        artist = str(attrs.get("media_artist") or "").strip()
+        if st in ("playing", "paused") and title:
+            say = f"正在播放{title}"
+            if artist:
+                say += f"，{artist}唱的"
+            if st == "paused":
+                say += "（目前是暂停状态）"
+        elif st in ("playing", "paused"):
+            q = self._ledger_peek(entity)
+            if q:
+                say = f"正在播放《{q}》（按你之前的点歌记录，端点没有上报曲目详情）"
+            else:
+                say = "正在放着，不过端点没有上报曲目信息。"
+        else:
+            say = "现在没有在放歌。"              # idle/off/unknown 折叠同款
+        if note:
+            say = f"{say}（{note}）"
+        return Reply(say, "music", True, [f"music:now_playing:{st or 'none'}"])
+
+
+    async def _music_fail_say(self, entity: str, res: dict) -> str:
+        """失败话术分诊（现场 2026-09-14：配置后仍"没有响应"=端点拼错/离线，
+        却只有一句话，用户无从下手）。仅在服务调用失败后加一次 get_state 读数
+        （states 有 TTL 缓存，成本≈0）；判据拿不准一律回落通用话术。
+        保「抱歉」前缀纪律；测试桩 get_state 返回 {} 视同"读数不可得"走通用。"""
+        msg = str((res or {}).get("message") or "")
+        if "未就绪" in msg:
+            return "抱歉，HA 通道还没就绪，指令没有送出去"
+        try:
+            ent = await self.ha.get_state(entity)
+        except Exception:
+            ent = {}
+        if ent is None:
+            # get_state 返回 None 有两种真因：端点确实不存在，或桥根本读不到
+            # （states 空）。把后者也播报成"请到设置-音乐重新选择"，是当着用户
+            # 的面把人支进死胡同——真因在通道，重选端点没用（v1.0.97 同族）。
+            if getattr(self.ha, "reachable", True) is False:
+                return "抱歉，连不上 HA，暂时读不到播放端点，请检查 HA 通道后再试"
+            return (f"抱歉，HA 里找不到播放端点 {entity}，"
+                    "请到 设置-音乐 重新选择")
+        st = str((ent or {}).get("state") or "")
+        if st == "unavailable":
+            nm = str(((ent or {}).get("attributes") or {})
+                     .get("friendly_name") or entity)
+            return f"抱歉，{nm} 当前不在线"
+        return "抱歉，播放端点没有响应"
+
+    async def _music(self, cmd: dict, text: str, origin: str) -> Reply:
+        """音乐带执行（P1）：端点解析（区域定向→映射→默认+如实回退）、
+        now_playing 查询（读端点态，缺曲目回退点歌记账）、play_media 虚拟
+        路径拦闸、首音预期话术。永不抛（ha_client 已折叠）；失败话术保
+        「抱歉」前缀纪律。"""
+        act = cmd["action"]
+        if act == "now_playing":
+            return await self._now_playing_say(cmd)
+        entity, note = self._resolve_music_entity(cmd)
+        if not entity:
+            return Reply("想点歌的话，先到 设置-音乐 里配置播放端点"
+                         "（Music Assistant 托管的音箱实体）。",
+                         "music", ok=False, trace=["music:未配置端点"])
+        if act == "play":
+            q = str(cmd["query"])
+            if not q:
+                return Reply("想听点什么？说歌名或歌手就行。",
+                             "music", trace=["music:泛点歌"])
+            if self._VIRTUAL_ID.match(q):
+                return Reply("点歌只报歌名或歌手就行，网址和媒体路径我不接。",
+                             "music", ok=False, trace=["music:虚拟路径拦下"])
+            res = await self.ha.call_service("media_player", "play_media", {
+                "entity_id": entity, "media_content_type": "music",
+                "media_content_id": q})
+            ok = bool(res.get("success"))
+            if ok:
+                self._ledger_record(entity, q)
+            speech = f"好的，正在播放《{q}》" if ok \
+                else await self._music_fail_say(entity, res)
+            if ok and self.settings.get("music.expect_wait_note", True):
+                # P2a 前卫星=整曲下载形态，首音有可感等待；话术按"点了会等
+                # 一会儿"设计（方案 §6-R2 口径），第三方秒开档可关
+                speech += "，曲库联网取音频，可能要等一小会儿"
+        else:
+            res = await self.ha.call_service(
+                "media_player", self._MUSIC_SVC[act], {"entity_id": entity})
+            ok = bool(res.get("success"))
+            speech = self._MUSIC_SAY[act] if ok \
+                else await self._music_fail_say(entity, res)
+        if note:
+            speech = f"{speech}（{note}）"
+        self._remember_turn(origin, text, speech)
+        tag = f"music:{act}" + (f":{cmd['area']}" if cmd.get("area") else "")
+        return Reply(speech, "music", ok, [tag])
+
+    async def _llm(self, text: str, origin: str = "",
+                   on_sentence: Optional[Callable[[str], Any]] = None) -> Optional[Reply]:
+        parts: list[str] = []
+        streamed = False
+        try:
+            agen = self.agent.answer(text, self._history_snapshot(origin))
+            async for sent in agen:
+                parts.append(sent)
+                if on_sentence is not None:
+                    await on_sentence(sent)
+                    streamed = True
+        except Exception as e:
+            logger.warning("[级联] LLM 失败: %s", e)
+            if streamed:
+                # 半途而废：已流式送达片段，只补一句收束（返 None 会整段重播兜底）
+                try:
+                    await on_sentence("抱歉，这个回答中断了。")
+                except Exception:
+                    pass
+                return Reply("", "llm", ok=False, streamed=True)
+            return None
+        if not parts:
+            return None
+        reply = Reply("".join(parts), "llm", streamed=streamed)
+        self._remember_turn(origin, text, reply.text)
+        return reply
+
+    # ── 语音创建（v1.0.30 零 LLM，060401 收编优化）────────────────
+    # 旧架构这两句式的解析归 LLM function calling（custom_llm_api 时代）；
+    # 本地级联承接后，动作子句 Y 复用 fast_path 判定——「能执行的句子才能
+    # 进场景」，任一子句听不懂整单拒绝（不建半成品），全中才产
+    # HassCreateVoiceScene / HassCreateAutomation 走既有 handle_intent 入库。
+    async def _voice_creation(self, text: str, origin: str) -> Optional[Reply]:
+        if not self.settings.get("nlu.creation_enabled", True):
+            return None
+        c = creation.parse(text)
+        if c is None:
+            return None
+        if c["kind"] == "delete_scene":
+            return await self._scene_delete(c, text, origin)
+        if c["kind"] in ("list_scenes", "list_automations"):
+            return await self._object_list(c, text, origin)
+        if c["kind"] == "delete_automation":
+            return await self._automation_delete(c, text, origin)
+        if c["kind"] == "modify_scene":
+            return await self._scene_modify(c, text, origin)
+        if c["kind"] == "modify_automation":
+            return await self._automation_modify(c, text, origin)
+        if c["kind"] == "delete_index":
+            return await self._index_delete(c, text, origin)
+        built = await self._build_actions(c, text)
+        if isinstance(built, Reply):
+            return built
+        actions, y_say = built
+        if c["kind"] == "scene":
+            x = c["trigger_phrase"]
+            if x in (self.scenes.triggers or []):
+                # 集成侧 create_scene 有权威 dup 闸，这里只是缓存命中的友好前置
+                return Reply(f"「{x}」这个场景已经有了，要换动作就说"
+                             f"「把场景{x}改成……」",
+                             "creation", ok=False, trace=[f"场景重名:{x}"])
+            plan = Plan(intent="HassCreateVoiceScene",
+                        args={"trigger_phrase": x, "actions": actions},
+                        source="creation", utterance=text,
+                        trace=[f"创建场景:{x}→{len(actions)}动作"])
+            ok, _ = await self.executor.run(plan)
+            if not ok:
+                return Reply("抱歉，场景没创建成功，稍后再试", "creation",
+                             ok=False, trace=plan.trace)
+            await self.scenes.refresh(force=True)   # 触发词即刻可用，不等 60s 缓存
+            say = f"好的，语音场景已创建，以后说「{x}」，就{y_say}"
+            say += self._risky_actions_note(actions)   # v1.1.22：含解锁动作必须点名
+        else:
+            plan = Plan(intent="HassCreateAutomation",
+                        args={"trigger": c["trigger"], "actions": actions},
+                        source="creation", utterance=text,
+                        trace=[f"创建自动化:{c['trigger']}→{len(actions)}动作"])
+            ok, _ = await self.executor.run(plan)
+            if not ok:
+                return Reply("抱歉，自动化没创建成功，稍后再试", "creation",
+                             ok=False, trace=plan.trace)
+            idx = await self._automation_count()      # 播报编号=删除锚点（fail-open）
+            say = f"好的，语音自动化已创建：{self._cond_say(c)}，就{y_say}"
+            say += self._risky_actions_note(actions)   # v1.1.22：含解锁动作必须点名
+            if idx:
+                say += f"。要改它就说「删除自动化{idx}」再说一句新的"
+        self._remember_turn(origin, text, say)
+        return Reply(say, "creation", True, plan.trace)
+
+    @staticmethod
+    def _desc_area(desc: str) -> str:
+        """触发描述 → 区域名：尾字扫描优先；退 HA 区名表切分（阳台/主卧/
+        玄关等不带「室厅房」尾字的高频区名）。两法都不中回空串。"""
+        desc = str(desc or "")
+        if not desc:
+            return ""
+        area, _rest = T.extract_prefix(desc)
+        if not area:
+            area, _rest = T.split_area_head(desc)
+        return area or ""
+
+    def _scope_action_area(self, plan: Plan, clause: str, c: dict) -> Plan:
+        """动作句没写区域时，继承触发条件里的区域（2026-09-15 用户令）：
+        「当客厅温度超过28度就开灯」＝**客厅的灯**；只有用户明说「打开所有灯/
+        全部灯/全屋的灯」才保留全屋语义。设备名自带区域（"书房空调"）或句子本身
+        已写区域的零改动；推断出的"区域"不是真区域（如"客厅灯温度"）也不注入。"""
+        if plan is None or getattr(plan, "whole_house", False) or is_whole_house(clause):
+            return plan
+        area = self._desc_area(str(c.get("desc") or "")) or str(
+            c.get("area_hint") or "")
+        if not area:
+            return plan
+        known = self._known_areas()
+        if known and area not in known:
+            return plan
+        targets = (plan.args or {}).get("target")
+        if not isinstance(targets, list) or not targets:
+            return plan
+        for t in targets:
+            if not isinstance(t, dict) or str(t.get("area") or "").strip():
+                continue
+            devs = [d for d in (t.get("devices") or []) if isinstance(d, dict)]
+            if not devs:
+                continue
+            names = [str(d.get("name") or "") for d in devs]
+            if any(n and any(a in n for a in known) for n in names):
+                continue                     # 设备名自带区域（"书房空调"）→ 不覆盖
+            t["area"] = area
+            plan.trace = (plan.trace or []) + [f"动作区域继承:{area}"]
+        return plan
+
+    async def _scene_delete(self, c: dict, text: str, origin: str) -> Reply:
+        """语音删场景（v1.0.33 本地句，零 LLM）：只认带名字的精准删除；
+        触发词表在缓存里查无 → 如实报不瞎删。裸删（不带名字）本地列清单+
+        编号引导，不推到 LLM（无 LLM 时也必须能用）。"""
+        x = c["trigger_phrase"]
+        if not x:
+            listed = await self._object_list({"kind": "list_scenes"}, text, origin)
+            if self._peek_last_list(origin) is None:  # 空清单：已给创建引导
+                return listed
+            listed.text = (f"要删哪个场景？{listed.text}。"
+                           f"说「删除场景名字」或「删第N条」都行")
+            return listed
+        if x not in (self.scenes.triggers or []):
+            return Reply(f"没有找到叫「{x}」的语音场景；全部场景可在管理页"
+                         f"「场景/自动化」查看。", "creation", ok=False,
+                         trace=[f"删除未命中:{x}"])
+        plan = Plan(intent="HassDeleteVoiceScene", args={"trigger_phrase": x},
+                    source="creation", utterance=text, trace=[f"删除场景:{x}"])
+        ok, _ = await self.executor.run(plan)
+        if not ok:
+            return Reply(f"抱歉，场景「{x}」没删除成功，稍后再试。", "creation",
+                         ok=False, trace=plan.trace)
+        await self.scenes.refresh(force=True)
+        say = f"好的，语音场景「{x}」已删除"
+        self._remember_turn(origin, text, say)
+        return Reply(say, "creation", True, plan.trace)
+
+    async def _build_actions(self, c: dict, text: str):
+        """Y 子句 → 可执行动作表（能执行的句子才能进场景）。
+        返回 (actions, y_say)，任一子句听不懂 → 直接返回拒收 Reply。"""
+        actions: list[dict] = []
+        echo_parts: list[str] = []
+        for clause in creation.split_actions(c["y"]):
+            plan = await self._match_fp(clause)
+            ob = self._overbroad_area_target(plan)
+            if ob:
+                # "当我说回家就客厅开灯"这类子句：区域被当设备名 → 会把整片区域
+                # 的设备（含门锁/开关）都写进场景，绝不入库
+                logger.info("[创建] 子句过宽目标拒收 %r（%s 全部设备）", clause, ob)
+                return Reply(self._overbroad_say(ob), "creation", ok=False,
+                             trace=[f"创建拒收:过宽目标:{ob}"])
+            if plan is None or plan.intent not in creation.ACTIONABLE_INTENTS:
+                plan = await self._retry_with_area(clause, c)
+            if plan is None or plan.intent not in creation.ACTIONABLE_INTENTS:
+                logger.info("[创建] 子句拒收 %r → 整单作废（原句 %r）", clause, text)
+                return Reply(self._creation_reject(c, clause), "creation",
+                             ok=False, trace=[f"创建拒收:{clause!r}"])
+            plan = self._scope_action_area(plan, clause, c)
+            bad_area = await self._creation_area_problem(plan)
+            if bad_area:
+                # v1.1.22：区域解析不到的动作绝不入库（否则场景触发时必半失败）
+                logger.info("[创建] 子句区域解析不到 → 整单拒收 %r（area=%r）",
+                            clause, bad_area)
+                return Reply(self._area_say(bad_area), "creation", ok=False,
+                             trace=[f"创建拒收:区域不存在:{bad_area}"])
+            actions.append({"intent": plan.intent, "params": copy.deepcopy(plan.args)})
+            echo_parts.append(clause)
+        return actions, "，".join(echo_parts)
+
+    async def _automation_rows(self):
+        """拉语音自动化列表（store 序=创建序，编号锚点）。走 run_raw 拿原始
+        dict（executor.run 会把结果折叠成话术串，列表数据不能走它）。失败 None。"""
+        plan = Plan(intent="HassListAutomations", args={}, source="creation",
+                    utterance="", trace=["列出自动化"])
+        ok, res = await self.executor.run_raw(plan)
+        if not ok or not isinstance(res, dict):
+            return None
+        rows = res.get("automations")
+        return rows if isinstance(rows, list) else None
+
+    async def _automation_count(self) -> int:
+        try:
+            rows = await self._automation_rows()
+            return len(rows) if rows is not None else 0
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _auto_index(rows: list, row: dict) -> int:
+        """行在列表里的 1-based 编号——按**对象身份**取，不用 list.index：两条内容
+        完全相同的自动化（同 trigger/同动作）用 == 比较会指到先出现那条，播报编号
+        就张冠李戴（删除仍按 automation_id 走，不会删错，但话术会骗人）。"""
+        for i, r in enumerate(rows, 1):
+            if r is row:
+                return i
+        try:
+            return rows.index(row) + 1
+        except ValueError:
+            return 0
+
+    def _auto_say(self, i: int, a: dict) -> str:
+        """单条自动化 → 「1，当…就…」（编号=删除锚点）。"""
+        from .admin_api import _hv_trigger_cn, _hv_action_cn
+        trig = _hv_trigger_cn(a.get("trigger") or {})
+        acts = "；".join(filter(None, (_hv_action_cn(x)
+                                   for x in (a.get("actions") or [])[:2])))
+        head = f"{i}，" if i else ""
+        return f"{head}{trig}的时候{acts or '执行动作'}"
+
+    async def _object_list(self, c: dict, text: str, origin: str) -> Reply:
+        """语音列场景/列自动化（v1.0.34 本地，零 LLM）。"""
+        if c["kind"] == "list_scenes":
+            rows = self.scenes.all() if hasattr(self.scenes, "all") else []
+            if not rows:
+                await self.scenes.refresh(force=True)
+                rows = self.scenes.all() if hasattr(self.scenes, "all") else []
+            if not rows:
+                self._set_last_list(origin, None)
+                say = "你还没有创建过语音场景，说「当我说晚安，就关闭客厅灯」就能创建一个"
+            else:
+                from .admin_api import _hv_action_cn
+                parts = []
+                # 编号必须用**行位置**（enumerate 从 1 起），与 _index_delete 的
+                # rows[n-1] 同一套序号；否则「删第N条」会指向另一条场景。
+                # 1.0.34/1.0.36 公告与 _scene_delete 引导都写着"带编号"，播报此前漏了。
+                for i, s in enumerate(rows[:5], 1):
+                    if not isinstance(s, dict):
+                        continue
+                    acts = "、".join(filter(None, (_hv_action_cn(a)
+                                              for a in (s.get("actions") or [])[:2])))
+                    tp = str(s.get("trigger_phrase") or s.get("name") or "")
+                    body = f"{tp}就{acts}" if acts else tp
+                    parts.append(f"{i}，{body}")
+                more = f"；其余{len(rows)-5}个在管理页看" if len(rows) > 5 else ""
+                say = f"目前有{len(rows)}个语音场景：{'；'.join(parts)}{more}"
+                self._set_last_list(origin, "scene")
+            self._remember_turn(origin, text, say)
+            return Reply(say, "creation", True, [f"列场景:{len(rows)}"])
+        rows = await self._automation_rows()
+        if rows is None:
+            return Reply("暂时读不到自动化列表，稍后再试", "creation", ok=False,
+                         trace=["列自动化失败"])
+        if not rows:
+            self._set_last_list(origin, None)
+            say = ("你还没有语音自动化，说「当客厅温度超过28度就打开空调」"
+                   "或「每天早上7点帮我打开客厅窗帘」就能创建")
+        else:
+            items = "；".join(self._auto_say(i, a)
+                              for i, a in enumerate(rows[:5], 1)
+                              if isinstance(a, dict))
+            more = f"，其余{len(rows)-5}条在管理页看" if len(rows) > 5 else ""
+            say = f"目前有{len(rows)}条语音自动化：{items}{more}"
+            self._set_last_list(origin, "automation")
+        self._remember_turn(origin, text, say)
+        return Reply(say, "creation", True, [f"列自动化:{len(rows)}"])
+
+    def _set_last_list(self, origin: str, kind: Optional[str]) -> None:
+        """清单回指锚点写入（kind=None 即清本 origin）。"""
+        if kind:
+            self._origin_ts[origin] = time.time()   # 第四轮审计 P2：并入 GC 依据
+            self._last_list[origin] = (kind, time.time())
+        else:
+            self._last_list.pop(origin, None)
+
+    def _peek_last_list(self, origin: str) -> Optional[str]:
+        hit = self._last_list.get(origin)
+        return hit[0] if hit else None
+
+    def _take_last_list(self, origin: str) -> Optional[str]:
+        """取本 origin 的清单锚点（一次性；超 TTL 即失效）。"""
+        hit = self._last_list.pop(origin, None)
+        if not hit:
+            return None
+        kind, ts = hit
+        ttl = float(self.settings.get("dialog.context_ttl_s", CONTEXT_TTL_S))
+        return kind if (time.time() - ts) <= ttl else None
+
+    async def _index_delete(self, c: dict, text: str, origin: str) -> Reply:
+        """「删第N条」= 上一次清单播报的第 N 项（清单说完紧跟着删的自然交互）。
+        无上下文如实反问；执行后清上下文（清单已失效，防旧编号误删）。"""
+        n = c["n"]
+        kind = self._take_last_list(origin)
+        if kind is None:
+            return Reply(f"要删的第{n}条是什么？先说「有哪些自动化」或「有哪些场景」"
+                         f"听一遍编号清单，再说「删第{n}条」",
+                         "creation", ok=False, trace=["删第N条:无清单上下文"])
+        if kind == "automation":
+            self._set_last_list(origin, None)
+            return await self._automation_delete({"target": str(n)}, text, origin)
+        rows = self.scenes.all() if hasattr(self.scenes, "all") else []
+        if not rows or n > len(rows):
+            await self.scenes.refresh(force=True)
+            rows = self.scenes.all() if hasattr(self.scenes, "all") else []
+        if n > len(rows):
+            return Reply(f"场景一共{len(rows)}个，没有第{n}条",
+                         "creation", ok=False, trace=[f"删第{n}条:越界"])
+        x = str(rows[n - 1].get("trigger_phrase") or "")
+        self._set_last_list(origin, None)
+        return await self._scene_delete({"trigger_phrase": x}, text, origin)
+
+    def _auto_hits(self, rows: list, tgt) -> list:
+        """序号/关键词 → 命中的自动化行（删与改共用同一套匹配纪律）。"""
+        hit: list = []
+        if isinstance(tgt, int):
+            if 1 <= tgt <= len(rows):
+                hit = [rows[tgt - 1]]
+            return hit
+        from .admin_api import _hv_action_cn
+        kw = str(tgt)
+        for a in rows:
+            if not isinstance(a, dict):
+                continue
+            trig = a.get("trigger") or {}
+            hay = str(trig.get("entity_id") or "") + str(trig.get("at") or "") + \
+                "；".join(filter(None, (_hv_action_cn(x)
+                                      for x in (a.get("actions") or []))))
+            if kw in hay:
+                hit.append(a)
+        return hit
+
+    async def _automation_delete(self, c: dict, text: str, origin: str) -> Reply:
+        """语音删自动化（v1.0.34）：序号/关键词精准命中才删；裸删列编号引导。"""
+        rows = await self._automation_rows()
+        if rows is None:
+            return Reply("暂时读不到自动化列表，稍后再试", "creation", ok=False,
+                         trace=["删自动化:列表失败"])
+        if not rows:
+            return Reply("你还没有语音自动化，不用删除", "creation", True,
+                         trace=["删自动化:空"])
+        tgt = creation.auto_target(c.get("target", ""))
+        if tgt is None:                            # 裸删：列编号，让用户点名
+            items = "；".join(self._auto_say(i, a) for i, a in enumerate(rows[:5], 1)
+                              if isinstance(a, dict))
+            self._set_last_list(origin, "automation")  # 清单编号即锚点，「删第N条」直接可用
+            return Reply(f"要删哪一条？你说「删除自动化序号」：{items}",
+                         "creation", True, trace=["删自动化:引导"])
+        hit = self._auto_hits(rows, tgt)
+        if not hit:
+            return Reply(f"没有找到和「{tgt}」对应的语音自动化，"
+                         f"说「有哪些自动化」可以看清单",
+                         "creation", ok=False, trace=[f"删自动化未命中:{tgt}"])
+        if len(hit) > 1:
+            items = "；".join(self._auto_say(self._auto_index(rows, h), h)
+                              for h in hit[:5])
+            return Reply(f"「{tgt}」匹配到{len(hit)}条，说得再具体些：{items}",
+                         "creation", True, trace=[f"删自动化多义:{tgt}"])
+        aid = str(hit[0].get("automation_id") or "")
+        plan = Plan(intent="HassDeleteAutomation", args={"automation_id": aid},
+                    source="creation", utterance=text, trace=[f"删自动化:{aid}"])
+        ok, _ = await self.executor.run(plan)
+        if not ok:
+            return Reply("抱歉，自动化没删除成功，稍后再试", "creation", ok=False,
+                         trace=plan.trace)
+        say = f"好的，{self._auto_say(self._auto_index(rows, hit[0]), hit[0])}这条自动化已删除"
+        self._remember_turn(origin, text, say)
+        return Reply(say, "creation", True, plan.trace)
+
+    @staticmethod
+    def _auto_rows_area(row: dict) -> str:
+        """旧动作里的区域线索（改动作不换房间时的继承后备源）。
+        多条动作指向**多个不同区域** = 线索有歧义 → 回空串（不猜房间，
+        维持「两处都无线索 → 如实拒收」的同口径）。"""
+        areas = set()
+        for a in (row.get("actions") or []):
+            if not isinstance(a, dict):
+                continue
+            params = a.get("params") or a.get("parameters") or {}
+            targets = params.get("target") or []
+            if isinstance(targets, dict):
+                targets = [targets]
+            for t in targets:
+                if isinstance(t, dict) and str(t.get("area") or "").strip():
+                    areas.add(str(t["area"]).strip())
+        return areas.pop() if len(areas) == 1 else ""
+
+    async def _automation_modify(self, c: dict, text: str, origin: str) -> Reply:
+        """语音改自动化（本地闭环补全，零 LLM）：新句是完整条件句 → 连触发条件
+        一起换；只给动作 → 保留原触发条件只换动作；只给条件（"每天…点"）→ 只换
+        条件动作不变。动作子句听不懂 → 整单拒绝，旧数据零改动（同创建纪律）。
+        执行走集成 HassUpdateAutomation（trigger/actions 可给其一），不删旧建新。"""
+        rows = await self._automation_rows()
+        if rows is None:
+            return Reply("暂时读不到自动化列表，稍后再试", "creation", ok=False,
+                         trace=["改自动化:列表失败"])
+        if not rows:
+            return Reply("你还没有语音自动化，不用修改。说「当客厅温度超过28度"
+                         "就打开空调」就能创建一个", "creation", True,
+                         trace=["改自动化:空"])
+        tgt = creation.auto_target(c.get("target", ""))
+        if tgt is None:
+            return Reply("要改哪一条？说「有哪些自动化」听一遍编号，再说"
+                         "「把自动化1改成每天早上8点打开客厅灯」",
+                         "creation", ok=False, trace=["改自动化:无目标"])
+        hit = self._auto_hits(rows, tgt)
+        if not hit:
+            return Reply(f"没有找到和「{tgt}」对应的语音自动化，"
+                         f"说「有哪些自动化」可以看清单",
+                         "creation", ok=False, trace=[f"改自动化未命中:{tgt}"])
+        if len(hit) > 1:
+            items = "；".join(self._auto_say(self._auto_index(rows, h), h)
+                              for h in hit[:5])
+            return Reply(f"「{tgt}」匹配到{len(hit)}条，说得再具体些：{items}",
+                         "creation", True, trace=[f"改自动化多义:{tgt}"])
+        row = hit[0]
+        idx = self._auto_index(rows, row)
+        new_text = str(c.get("y") or "").strip()
+        inner = creation.parse(new_text)
+        trigger = desc = None
+        y_text = new_text
+        if isinstance(inner, dict) and inner.get("kind") == "automation":
+            trigger = inner["trigger"]
+            desc = str(inner.get("desc") or "")
+            y_text = inner["y"]
+        elif _TRIGGER_ONLY_RE.match(new_text):
+            # 只给触发条件：借一次"条件+占位动作"解析取 trigger，动作表不动
+            probe = creation.parse(new_text + "就打开客厅灯")
+            if isinstance(probe, dict) and probe.get("kind") == "automation":
+                trigger = probe["trigger"]
+                desc = str(probe.get("desc") or "")
+                y_text = ""
+        actions: Optional[list] = None
+        y_say = ""
+        if y_text:
+            area_hint = ""
+            if trigger is None:
+                # 仅改动作：旧触发条件里的区域名（"客厅温度"→客厅）作为无目标
+                # 动作句的区域继承来源，让「把自动化1的动作改成打开空调」可执行。
+                # 时间触发器（at）没有实体可继承 ⇒ 退一档用旧动作里已存的区域；
+                # 两处都无线索 → 维持如实拒收（绝不猜房间）。
+                desc = str((row.get("trigger") or {}).get("entity_id") or "")
+                area_hint = self._auto_rows_area(row)
+            built = await self._build_actions(
+                {"kind": "automation", "y": y_text, "desc": desc or "",
+                 "area_hint": area_hint}, text)
+            if isinstance(built, Reply):
+                return built                        # 动作听不懂：旧数据原样不动
+            actions, y_say = built
+        if trigger is None and actions is None:
+            return Reply(self._creation_reject(
+                {"kind": "automation"},
+                f"{new_text}（要带上触发条件或动作）"), "creation", ok=False,
+                trace=["改自动化:无可改内容"])
+        args: dict = {"automation_id": str(row.get("automation_id") or "")}
+        if trigger:
+            args["trigger"] = trigger
+        if actions is not None:
+            args["actions"] = actions
+        plan = Plan(intent="HassUpdateAutomation", args=args, source="creation",
+                    utterance=text,
+                    trace=[f"改自动化:{idx}" + ("（含触发条件）" if trigger else "（仅动作）")])
+        ok, _ = await self.executor.run(plan)
+        if not ok:
+            return Reply("抱歉，自动化没改成功，稍后再试", "creation", ok=False,
+                         trace=plan.trace)
+        if not y_say:                               # 只换触发条件
+            say = (f"好的，自动化{idx}的触发条件已改成："
+                   f"{self._cond_say({'trigger': trigger, 'desc': desc or ''})}"
+                   f"（动作不变）")
+        elif trigger:
+            say = (f"好的，自动化{idx}已改成："
+                   f"{self._cond_say({'trigger': trigger, 'desc': desc or ''})}"
+                   f"，就{y_say}")
+        else:
+            say = f"好的，自动化{idx}的动作已改成：就{y_say}（触发条件不变）"
+        if actions:
+            say += self._risky_actions_note(actions)   # v1.1.22：含解锁动作必须点名
+        self._remember_turn(origin, text, say)
+        return Reply(say, "creation", True, plan.trace)
+
+    async def _scene_modify(self, c: dict, text: str, origin: str) -> Reply:
+        """语音改场景（v1.0.34）：预检新动作全可执行 → 删旧 → 建新。
+        删成建败的窄窗如实报并提示重建（预检已把失败面压到集成掉线级别）。"""
+        x = c["trigger_phrase"]
+        if x not in (self.scenes.triggers or []):
+            return Reply(f"没有找到叫「{x}」的语音场景；说「有哪些场景」可以看清单",
+                         "creation", ok=False, trace=[f"改场景未命中:{x}"])
+        built = await self._build_actions(c, text)
+        if isinstance(built, Reply):
+            return built                            # 新动作听不懂：旧场景原样不动
+        actions, y_say = built
+        dp = Plan(intent="HassDeleteVoiceScene", args={"trigger_phrase": x},
+                  source="creation", utterance=text, trace=[f"改场景删旧:{x}"])
+        ok, _ = await self.executor.run(dp)
+        if not ok:
+            return Reply(f"抱歉，场景「{x}」没改成交（旧的还在，没动它）",
+                         "creation", ok=False, trace=dp.trace)
+        cp = Plan(intent="HassCreateVoiceScene",
+                  args={"trigger_phrase": x, "actions": actions},
+                  source="creation", utterance=text, trace=[f"改场景建新:{x}"])
+        ok2, _ = await self.executor.run(cp)
+        await self.scenes.refresh(force=True)
+        if not ok2:
+            say = (f"场景「{x}」的旧动作已删除，但新动作没保存成功——"
+                   f"请再说一句「当我说{x}，就{y_say}」")
+            return Reply(say, "creation", ok=False, trace=cp.trace)
+        say = f"好的，场景「{x}」已改成：就{y_say}"
+        say += self._risky_actions_note(actions)       # v1.1.22：含解锁动作必须点名
+        self._remember_turn(origin, text, say)
+        return Reply(say, "creation", True, cp.trace)
+
+    async def _retry_with_area(self, clause: str, c: dict):
+        """Y 子句无目标而事件描述带区域（"当客厅温度超28度就打开空调"）→
+        区域继承重试一次；仍听不懂照旧拒绝。
+
+        ⚠ 区域继承必须产出**窄目标**：`f"{area}{clause}"` 在 fast_path 会走
+        t0 前缀分支，把区域当成设备名（"客厅打开空调"→ name=客厅/domains 空），
+        执行侧按名字子串命中整个客厅的设备——2026-09-15 实证：这种目标会把客厅
+        所有设备一起打开。故命中"区域当名字"的形态一律作废，改用动词+区域+设备
+        语序重排（"打开客厅空调"）；重排不成 → 不继承、如实拒收。"""
+        area = self._desc_area(str(c.get("desc") or "")) or str(
+            c.get("area_hint") or "")
+        if not area:
+            return None
+        merged = await self._match_fp(f"{area}{clause}")
+        if merged is not None and (merged.intent not in creation.ACTIONABLE_INTENTS
+                                   or _area_as_name(merged, area)):
+            merged = None
+        if merged is None:
+            alt = _reorder_area(clause, area)
+            if alt:
+                merged = await self._match_fp(alt)
+                if merged is not None and (
+                        merged.intent not in creation.ACTIONABLE_INTENTS
+                        or _area_as_name(merged, area)):
+                    merged = None
+        if merged is None:
+            return None
+        merged.trace = (merged.trace or []) + [f"区域继承:{area}"]
+        return merged
+
+    def _cond_say(self, c: dict) -> str:
+        """trigger 结构 → 自含播报短语（每分支带"的时候"，不回显 JSON）。"""
+        trig = c["trigger"]
+        if trig.get("at"):
+            return f"每天{_at_say(trig['at'])}的时候"
+        d = str(c.get("desc") or trig.get("entity_id") or "")
+        if trig.get("to") is not None:
+            return f"{d}检测到人的时候" if trig["to"] == "on" else f"{d}没人的时候"
+        if "above" in trig:
+            u = "度" if "温度" in d else ""
+            return f"{d}超过{trig['above']:g}{u}的时候"
+        if "below" in trig:
+            u = "度" if "温度" in d else ""
+            return f"{d}低于{trig['below']:g}{u}的时候"
+        return f"{d}变化的时候"
+
+    def _creation_reject(self, c: dict, clause: str) -> str:
+        demo = ("可以这样说：当我说晚安，就关闭卧室灯"
+                if c["kind"] == "scene" else
+                "可以这样说：当客厅温度超过28度，就打开空调")
+        return f"抱歉，「{clause}」这句我没听懂具体要做什么，先不创建了。{demo}"
+
+    # ── P2-12 复合句 ───────────────────────────────────────────
+    async def _chain_decide(self, text: str, origin: str
+                            ) -> tuple[Optional[Reply], Optional[Plan], list, bool]:
+        """复合句逐腿裁决（**零执行**）→ (拦截话术, 合链计划, 逐腿计划, 含退下旗)。
+
+        v1.1.29 复核 A12：从 _try_compound **原样抽出**——调试面板（dry_run）必须展示
+        真实会被执行的裁决结果，而旧 dry_run 不含复合链 ⇒ 面板说「未命中」，设备其实
+        已按链执行过。本函数不跑任何设备指令、不记账（真流量入口仍是 _try_compound，
+        执行与记账都在它那半段）。
+        """
+        if not self.settings.get("dialog.chain_enabled", True):
+            return (None, None, [], False)
+        # 场景契约恒最高优先（模块头裁决①）：整句就是某个触发词时**绝不切分**——
+        # 契约句必须走单发通路交给 fast_path 的 scene 判定，否则「当我说X」会被
+        # 连排切分当设备指令做掉（与 fast_path 侧同一纪律）。
+        # getattr：部分单测手工装配的 Pipeline 没有 scenes 字段（真机恒有）。
+        _sc = getattr(self, "scenes", None)
+        if _sc is not None and _sc.check(text) == text:
+            return (None, None, [], False)
+        clauses = split_compound(text)
+        if not clauses:
+            # 无连接词的动词连排（2026-09-10 真机：连排双动作只执行了后一个）
+            clauses = creation.serial_clauses(text)
+        if not clauses:
+            # 并列宾语「打开展厅内倒窗和推拉窗」（2026-09-21 用户令第③点）：
+            # 共享动词多设备句必须链发；T0 单发只吃一个并谎报「办好了」=半执行。
+            # 任一分句听不懂→整句拒猜（fast_path 同形守卫兜住回退单发那一步）。
+            clauses = T.coord_clauses(text)
+        if not clauses:
+            return (None, None, [], False)
+        pairs = await asyncio.gather(*[self._match_pair(c) for c in clauses])
+        plans: list[Plan] = []
+        chain_spec: Optional[dict] = None       # 链内回指：同句先行分句的具名目标
+        for (fpp, klp), clause in zip(pairs, clauses):
+            if is_bare_negation_imperative(clause):
+                # v1.1.37 现网实锤（办公 .91）：「打开办公室的射灯，别开台灯」里
+                # 「别开台灯」是**拒绝腿**——它天然不该有计划，也就不能按"分句不中
+                # → 整句回退单发"或"点名查无 → 整链判死"处理。用户红线：半句否定
+                # 不许打死整句 ⇒ 这腿零动作跳过，其余腿照常链发并逐腿回执。
+                logger.info("[级联] 链内分句是否定腿「%s」→ 该腿不执行，其余腿照常",
+                            clause)
+                continue
+            p = select_primary_plan(fpp, klp, self._known_areas(),
+                                self._device_names(), self._real_areas())
+            if p is None:
+                absent = _klar_named_absent_target(klp, self._device_names(),
+                                                self._known_areas(),
+                                                self._real_areas())
+                if absent:
+                    # v1.1.35：链里某一分句点了家里没有的设备 ⇒ 整链不执行并**点名
+                    # 说没找到**（同"链内区域解析不到→整链不执行"的既有口径）。
+                    # 走旧的「回退单发」会把这条腿**静默丢掉**：事故形态正是
+                    # 「打开办公室射灯然后关掉会飞的灯」只剩一腿、播「都办妥了」。
+                    logger.info("[级联] 链内分句点名设备查无「%s」→ 整链不执行",
+                                absent)
+                    return (Reply(f"没有找到对应的设备「{absent}」，"
+                                  f"换个叫法或带上房间名再试试",
+                                  "no_such_device", ok=False,
+                                  trace=[f"链内点名设备查无:{absent}"]),
+                            None, [], False)
+                return (None, None, [], False)   # 任一分句不中 → 整句回退单发
+            # 上下文注入按分句文本（先前误用整句文本，"它"会误标到首句）；
+            # 链内先行目标优先，跨轮目标/卫星区域兜底。
+            p = self._apply_context(p, clause, origin, seed=chain_spec)
+            ob = self._overbroad_area_target(p)
+            if ob:
+                # 链中分句过宽：整句不执行，直接引导（同单发口径）
+                return (Reply(self._overbroad_say(ob), "clarify", ok=False,
+                              trace=[f"链内过宽目标拦截:{ob}"]), None, [], False)
+            bad_area = await self._plan_area_problem(p)
+            if bad_area:
+                # v1.1.24：链中分句区域解析不到 → 整链不执行（同单发口径）
+                logger.info("[级联] 链内分句区域解析不到 → 不执行（%s）：%s",
+                            bad_area, p.args)
+                return (Reply(self._area_say(bad_area), "clarify", ok=False,
+                              trace=[f"链内区域不存在:{bad_area}"]), None, [], False)
+            # v1.1.39（§1.2）：链内同样只看 klar 计划会漏——T0 腿把「会飞的」丢掉
+            # 顶同类别那台时，整链照样谎报「都办妥了」。
+            absent_leg = _plan_named_absent_target(p, self._device_names(),
+                                                   self._known_areas(),
+                                                   self._real_areas())
+            if absent_leg:
+                logger.info("[级联] 链内分句点名设备查无「%s」（%s）→ 整链不执行",
+                            absent_leg, p.source)
+                return (Reply(f"没有找到对应的设备「{absent_leg}」，"
+                              f"换个叫法或带上房间名再试试",
+                              "no_such_device", ok=False,
+                              trace=[f"链内点名设备查无:{absent_leg}({p.source})"]),
+                        None, [], False)
+            if self._risky(p):
+                return (None, None, [], False)   # 链中藏风险操作 → 不链发
+            ask = self._ambiguity_ask(p, origin)
+            if ask is not None:
+                # v1.1.29 复核 A3：链这条腿此前没有歧义闸——单发会 clarify 的同名目标，
+                # 加个「然后」就原样下发（集成按名子串匹配 ⇒ 孪生一起动）。clarify
+                # （零下发、信息全）直接如实回；confirm 退回单发通路——挂单腿确认环会让
+                # 「确认」只执行这一腿（其余腿静默丢），退前清掉挂起防误执行。
+                if ask.source == "clarify":
+                    return (ask, None, [], False)
+                # 第四轮审计 P2：挂起键一律归一（写入侧全是 `origin or "panel"`）——
+                # 旧形 pop 未归一 origin，origin 为空时挂起清不掉，TTL 内一句
+                # 「嗯」就执行一条**从未问出口**的计划。
+                self._confirm.pop(origin or "panel", None)
+                return (None, None, [], False)
+            # risky 判定放到注入后：代词分句继承出「锁」类目标同样要拦
+            s = self._spec_of(p)
+            if s is not None:
+                chain_spec = s                       # 本句最新明示目标滚入下一分句
+            plans.append(p)
+        if not plans:
+            # 整句只剩拒绝腿（「别开灯，也不要关窗」）⇒ 没有可执行的分句，
+            # 回退单发通路（那边有裸否定闸，宁可不执行）。
+            return (None, None, [], False)
+        # v1.0.93 链中退下分句（"关灯然后退下"）：HuijianEndConversation 是
+        # 纯会话控制，绝不进 executor（HA 无此注册意图）；执行其余分句后把
+        # 退出旗挂到链应答上。若整链只剩退下，回退单发通路（等值表在那收口）。
+        end_in_chain = any(p.intent == END_DIALOGUE_INTENT for p in plans)
+        if end_in_chain:
+            plans = [p for p in plans if p.intent != END_DIALOGUE_INTENT]
+            if not plans:
+                return (None, None, [], False)
+        first = plans[0]
+        chain_notes = [t for p in plans[1:] if FLAG_CHAIN_ANAPHORA in p.flags
+                       for t in p.trace if t.startswith(f"{TRACE_TAG_CHAIN}:")]
+        # v1.1.38（外部审计复现成立·P1）：合链原来只摊平 `plans[1:]` 的本体，
+        # **每条腿自带的 extra_steps 一律丢弃**。而 klar 的 `to_plan` 会把并列宾语
+        # 「打开客厅的灯和卧室的灯」折成 首步+extra_steps 的多步计划 ⇒ 首腿那半截
+        # 设备静默蒸发，executor 少跑一步却照播「都办妥了」（用户红线：半执行比
+        # 不执行更坏）。这里按腿序把「腿本体 + 该腿自带步」一起摊平。
+        steps: list[dict] = []
+        for _idx, p in enumerate(plans):
+            if _idx:                     # 首腿本体已在 merged.intent/args 里
+                steps.append({"name": p.intent, "args": p.args, "source": p.source,
+                              "utterance": p.utterance or ""})
+            for st in (p.extra_steps or []):
+                if isinstance(st, dict) and st.get("name"):
+                    steps.append({"name": st["name"], "args": st.get("args"),
+                                  "source": p.source,
+                                  "utterance": st.get("utterance") or p.utterance or ""})
+        merged = Plan(intent=first.intent, args=first.args, source=first.source,
+                      utterance=text,
+                      trace=list(first.trace) + chain_notes + [f"复合x{len(plans)}"],
+                      # 每腿带自己的 source：分句逐路裁决（窗户类恒让字面表、标准开关
+                      # 类优先 klar），一条链本就可能是混形的。执行层若只看首腿来源，
+                      # 次腿的 grounded entity_id 就失去直调（v1.1.15 D6，见
+                      # executor.run 的 steps 构造与 _klar_direct 取值处）。
+                      # 每腿还带自己的**分句原话**（v1.1.21/第四轮 P1）：执行层
+                      # `_turn_gate` 拿整句判窗词会把灯腿误拒；`steps` 里逐步取自
+                      # 该步所属腿的 utterance，首腿原话另由 `first_utterance` 交付。
+                      extra_steps=steps,
+                      # 第四轮审计 P1：v1.1.21 只给**次腿**带了分句原话，首腿仍在
+                      # 执行层读整句 plan.utterance ⇒ 「打开客厅的灯然后关上推拉窗」
+                      # 的灯腿被窗腿的词误拒，整链零执行（v1.1.21 注释自述病灶的
+                      # 首腿漏修）。首腿分句原话单独交付，执行层 idx==0 优先取它。
+                      first_utterance=first.utterance or "")
+        return (None, merged, plans, end_in_chain)
+
+    async def _try_compound(self, text: str, origin: str) -> Optional[Reply]:
+        """复合句：分句全命中才链发（P2-12）。裁决在 _chain_decide，执行在本函数。"""
+        reply, merged, plans, end_in_chain = await self._chain_decide(text, origin)
+        if reply is not None or merged is None:
+            return reply
+        ok, speech = await self.executor.run(merged)
+        if ok:
+            for p in plans:
+                self._note_target(origin, p)         # 末个具名目标定格为跨轮上下文
+        self._remember_turn(origin, text, speech)
+        reply = Reply(speech, merged.source if not ok else "chain", ok, merged.trace)
+        if end_in_chain:
+            reply.end_dialogue = True
+            # 分句真执行了才补退下话术；链失败（ok=False）如实报失败原因，
+            # 退出旗照发——失败一句不该把人锁在聆听态。
+            if speech:
+                reply.text = speech.rstrip("。") + "。" + const.END_DIALOGUE_SAY
+            else:
+                reply.text = const.END_DIALOGUE_SAY
+        return reply
+
+    # ── P2-10/11 上下文与空间注入 ──────────────────────────────
+    def _apply_context(self, plan: Optional[Plan], text: str,
+                       origin: str, seed: Optional[dict] = None) -> Optional[Plan]:
+        """明示目标零改动；无目标句按 代词/回指>上轮目标 > 卫星区域 > 全屋 兜底。
+        seed：链内回指注入的同句先行目标（视为最新鲜，绕过跨轮 TTL）。"""
+        if plan is None or not self.settings.get("dialog.context_enabled", True):
+            return plan
+        if plan.source == "scene":
+            return plan
+        args = plan.args
+        if args is None:                       # 坑：`plan.args or {}` 对空 dict 会
+            args = plan.args = {}              # 另造孤儿 dict，注入写进去等于没写
+        if _is_wholehouse_args(args):
+            # v1.0.40（A2）：显式全屋绝不被上一轮目标替换（说"所有灯"就必须是全屋）
+            return plan
+        if _has_explicit_target(args):
+            # 明示目标（非代词/回指解析）也补卫星区域——v1.0.20 空间化此前被
+            # 这道早退挡住，"开灯"永不落本区域（2026-09-12 探针实锤）。
+            if not self._is_anaphoric(plan, text):
+                self._apply_spatial(plan, args, origin)
+            return plan
+        if seed is not None:
+            spec, fresh = seed, True           # 链内先行分句，天然新鲜
+        else:
+            spec = self._last_target.get(origin or "panel")
+            now = time.time()
+            ttl = float(self.settings.get("dialog.context_ttl_s", CONTEXT_TTL_S))
+            fresh = bool(spec) and (now - spec["ts"] <= ttl)
+        # 回指标记：fast_path 已裁定的"代词目标/回指"以**旗标**为准（trace 文案
+        # 只作诊断，改措辞不得改语义）；裸代词句与句首副词句式（"再打开"/"把它
+        # 关了"）兜底文本级判定。
+        marked = (bool({FLAG_PRONOUN_TARGET, FLAG_ANAPHORA_STRIPPED} & plan.flags)
+                  or is_pronoun(text) or "它" in text or "们" in text
+                  or any(t in text for t in ("再", "还是", "继续", "也")))
+        injected = False
+        tag = TRACE_TAG_CHAIN if seed is not None else TRACE_TAG_CONTEXT
+        if fresh and (marked or plan.intent in ("AdjustDeviceAttribute", "SetDeviceMode")):
+            # 目标继承：慧尖 target 形态（含基础 Turn*；空 args 也算——代词句
+            # _build_plan 产 args={}）直接复装；klar 平铺走 area/entity_id 支路
+            if spec["kind"] == "target" and (plan.source != "klar" or "target" in args):
+                args["target"] = copy.deepcopy(spec["target"])
+                plan.trace.append(f"{tag}:继承目标 {args['target']}")
+                injected = True
+            elif spec["kind"] == "area" and "area" in args and not args.get("area"):
+                args["area"] = spec["target"]
+                plan.trace.append(f"{tag}:继承区域 {args['area']}")
+                injected = True
+            if not injected and spec["kind"] == "entity_id" and plan.source == "klar":
+                args["entity_id"] = spec["target"]
+                plan.trace.append(f"{tag}:沿用实体 {spec['target']}")
+                injected = True
+            if injected and seed is not None:
+                # 链内回指旗标就地落，供 _is_anaphoric/复合链聚合消费
+                plan.mark(FLAG_CHAIN_ANAPHORA)
+        if not injected:
+            if (plan.intent in ("AdjustDeviceAttribute", "SetDeviceMode")
+                    and not args.get("target")):
+                # v1.1.1 对账：裸属性/裸模式句（「风速调到最大」「设置为制冷」）
+                # 无设备无区域时补同域过滤目标——集成 slot_schema Required
+                # ('target') 缺槽即 Invalid，整句白丢。必须在 fp 之外补：那形态
+                # 正是 _is_wholehouse_args 的"显式全屋"，写进 _build_plan 会
+                # 提前豁免上下文继承（射灯→全屋灯事故）。
+                fam_target = attribute_domain_target(plan.intent, args)
+                if fam_target:
+                    args["target"] = fam_target
+                    plan.trace.append(f"属性域兜底:{fam_target}")
+            self._apply_spatial(plan, args, origin)
+        return plan
+
+    @staticmethod
+    def _is_anaphoric(plan: Plan, text: str) -> bool:
+        """该计划的目标是否来自代词/回指解析（此类目标不得再叠卫星区域）。"""
+        return (bool({FLAG_PRONOUN_TARGET, FLAG_ANAPHORA_STRIPPED,
+                      FLAG_CHAIN_ANAPHORA} & plan.flags)
+                or is_pronoun(text) or "它" in text or "们" in text)
+
+    def _apply_spatial(self, plan: Plan, args: dict, origin: str) -> None:
+        """卫星区域空间化：只补缺（明示区域优先），永不发 area-only 目标。
+
+        2026-09-12 三端深挖两坑同修：①此前 HUIJIAN_ONLY 分支发 {"area": x}
+        无 devices 键 → 集成端 target["devices"] 必 KeyError；②Turn* 因早退
+        恒不命中 → "开灯"不落本区域。
+        """
+        area = (self.settings.get("spatial.satellite_areas") or {}).get(origin)
+        if not area:
+            return
+        if getattr(plan, "whole_house", False):
+            return                       # 显式全屋（"打开所有灯"）绝不被缩回本房间
+        targets = args.get("target")
+        if isinstance(targets, list) and targets:
+            # 只给"泛类词"目标补区域（灯/窗帘/空调…），指名道姓的设备句零影响
+            # ——原设计语义如此，且避免把「打开射灯」这类明示句误缩到本房间。
+            changed = False
+            for t in targets:
+                if not isinstance(t, dict) or t.get("area"):
+                    continue
+                names = [str(d.get("name") or "") for d in (t.get("devices") or [])
+                         if isinstance(d, dict)]
+                if names and all(n in _GENERIC_DEVICE_WORDS for n in names if n):
+                    t["area"] = area
+                    changed = True
+            if changed:
+                plan.trace.append(f"空间化:卫星→{area}")
+            return
+        if plan.intent in HUIJIAN_ONLY_INTENTS or "target" in args:
+            args["target"] = [{"area": area,
+                               "devices": [{"domains": _SPATIAL_DOMAIN.get(plan.intent, [])}]}]
+            plan.trace.append(f"空间化:卫星→{area}")
+        elif "area" in args and not args.get("area"):
+            args["area"] = area
+            plan.trace.append(f"空间化:卫星→{area}")
+
+    def _spec_of(self, plan: Plan) -> Optional[dict]:
+        """从计划抽「明示目标」三形态 spec（不带 ts）；无明示目标返回 None。
+        链内回指与跨轮继承共用（同一抽取纪律，行为可对齐单测钉）。"""
+        args = plan.args or {}
+        try:
+            if (plan.source == "klar" and isinstance(args.get("entity_id"), str)
+                    and "." in args["entity_id"]):
+                return {"kind": "entity_id", "target": args["entity_id"]}
+            if _target_names(args) or _target_areas(args):
+                tgt = copy.deepcopy(args.get("target")) or None
+                if tgt is None and args.get("area"):
+                    return {"kind": "area", "target": str(args["area"])}
+                if tgt:
+                    return {"kind": "target", "target": tgt}
+        except Exception:
+            return None
+        return None
+
+    def _note_target(self, origin: str, plan: Plan) -> None:
+        """执行成功的明示目标入上下文。只存不改写（空目标句不覆写，保留最近具名目标）。"""
+        if not origin:
+            origin = "panel"
+        spec = self._spec_of(plan)
+        if spec:
+            spec["ts"] = time.time()
+            self._last_target[origin] = spec
+            self._gc_origins()
+
+    def _exec_risk(self) -> bool:
+        """最近一次 Executor.run 是否"可能已经生效"——部分步骤已落地（多步链
+        中途失败）或失败原因不确定（超时/连接/5xx：HA 可能已执行只是回执丢了）。
+        这类回合禁止交给 LLM 复议重做。执行桩无该状态时按 False（保守放行）。"""
+        st = getattr(self.executor, "last_run", None)
+        if not isinstance(st, dict):
+            return False
+        try:
+            if int(st.get("applied") or 0) > 0:
+                return True
+            return bool(st.get("indeterminate"))
+        except (TypeError, ValueError):
+            return False
+
+    def _remember_turn(self, origin: str, user: str, assistant: str) -> None:
+        if not origin:
+            origin = "panel"
+        dq = self._turns.get(origin)
+        if dq is None:
+            dq = self._turns[origin] = deque(maxlen=CONTEXT_MAX_TURNS)
+        now = time.time()
+        dq.append((now, user, assistant))
+        self._origin_ts[origin] = now
+        self._gc_origins()
+
+    def _gc_origins(self) -> None:
+        """origin 桶有界（64 台卫星封顶），超量按最久未用裁。
+
+        v1.1.29 复核 A2：`_last_list` 也并入本表；getattr 容忍——手工装配的管线
+        替身（`Pipeline.__new__`）只补它关心的属性，不该因本表多一项就炸。
+        """
+        for name in ("_turns", "_last_target", "_confirm", "_last_list"):
+            table = getattr(self, name, None)
+            if not isinstance(table, dict):
+                continue
+            if len(table) <= 64:
+                continue
+            victims = sorted(self._origin_ts.items(), key=lambda kv: kv[1])
+            for k, _ in victims[:max(1, len(table) - 64)]:
+                table.pop(k, None)
+
+    def _history_snapshot(self, origin: str) -> list[dict]:
+        """P2-10：LLM 跨轮记忆（会话级环形缓冲，TTL 内的 user/assistant 对）。"""
+        dq = self._turns.get(origin or "panel")
+        if not dq:
+            return []
+        now = time.time()
+        rounds = int(self.settings.get("llm.history_rounds", 10) or 10)
+        msgs: list[dict] = []
+        for ts, u, a in list(dq)[-rounds:]:
+            # v1.0.62 P2-10：历史窗独立成键（原 `context_ttl_s * 4` 魔法数——
+            # 调继承窗会意外拉扯历史窗，两窗语义本就不同）。缺省 360s 与旧
+            # 90*4 行为逐位一致，纯治理零行为漂移。
+            if now - ts > float(self.settings.get(
+                    "dialog.history_ttl_s", CONTEXT_TTL_S * 4)):   # 历史比目标继承耐存一点
+                continue
+            msgs.append({"role": "user", "content": u})
+            if a:
+                msgs.append({"role": "assistant", "content": a})
+        return msgs
+
+    def _known_areas(self) -> set:
+        """已知区域名集合（HA 区域注册表缓存 + 卫星区域映射 + 静态基准通用区名）。
+        取不到注册表=只剩静态基准，闸门随之收窄但不全哑（宁可不拦，也不误拦）。"""
+        areas: set = set(T.BASE_AREAS)
+        try:
+            areas.update(str(v) for v in (getattr(self.ha, "_areas", {}) or {}).values())
+        except Exception:
+            pass
+        try:
+            areas.update(str(v) for v in
+                         (self.settings.get("spatial.satellite_areas", {}) or {}).values())
+        except Exception:
+            pass
+        return {a.strip() for a in areas if a and str(a).strip()}
+
+    async def _creation_area_problem(self, plan: Plan) -> Optional[str]:
+        """创建入库前的**区域可解析性**预检（v1.1.22 办公实锤）。
+
+        病灶：连写句「打开办公室的射灯办公室的空调」被解析成 area='办公室的射灯办公室'
+        的畸形动作——创建时无人校验，场景照样入库、播报"已创建"，**触发时必然半失败**
+        （现场「我有点热」1/2 个动作没执行成功）。
+        判据：动作目标的 area 必须在 **HA 区域注册表**（`ha._areas`）里存在；注册表
+        未同步（_areas 空）⇒ 一律放行（fail-open，同 capability 纪律：宁漏放不误拒）。
+        只判区域名——设备名不在册不判（离线/隐藏实体在册，误拒风险高）。永不抛。
+        v1.1.24：判据与即时执行侧共用 `capability.bad_target_area/registry_areas`。
+
+        v1.1.28：即时执行侧改了**逐槽**判据（`_plan_area_problem`），创建侧**不跟着
+        放宽**——入库是"以后没人盯着地自动执行"，这里不能像即时执行那样把不合格槽
+        剪掉（那等于把用户点的动作偷偷丢一个），也不能因为有别的槽合格就放行。
+        故仍按"任一槽区域不在册 ⇒ 拦下"的旧口径（这里不传 states ⇒ 只看注册表）。"""
+        try:
+            targets = (plan.args or {}).get("target")
+            if not isinstance(targets, list) or not targets:
+                return None
+            ha = getattr(self, "ha", None)      # 手工装配的管线可无 ha（fail-open）
+            if ha is None:
+                return None
+            reg = await capability.registry_areas(ha)
+            bads = capability.bad_area_slots(targets, reg)
+            return str((bads[0] or {}).get("area") or "").strip() if bads else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _plan_area_problem(self, plan: Optional[Plan]) -> Optional[str]:
+        """**即时执行**前的区域可解析性预检（v1.1.24 引入，v1.1.28 改逐槽）。
+
+        旧口径（v1.1.24）：主步 + extra_steps 的目标里**任一** area 不在 HA 区域
+        注册表 ⇒ 整句拦下，为的是拦住连写句解析出的畸形区域（"办公室的射灯办公室"
+        这种），不再白跑一趟集成。
+        v1.1.28：判据改为**逐槽**——双语桥把一个英文句拆成两个槽
+        （`turn on the office light` ⇒ [{area:'office'}, {area:'办公室'}]），第二个
+        槽已正确解析到实体，不该被第一个槽的英文区域名连坐。处理次序：
+          ① 所有带区域的槽都不合格（区域不在册 **且** 本槽解析不出实体）⇒ 返回该
+             区域名，走原来的"整句拦下"话术；
+          ② 有合格的槽 ⇒ **就地剪掉**不合格的那些槽（未知区域绝不下发 —— 本闸"防
+             跨区误抓"的原意靠这一步保住），其余槽照常执行；某一份 target 会因此
+             被剪空 ⇒ 该份放弃整句拦下（空 target 会被下游当"全屋语义"放行，
+             比拦下危险得多）。
+        states 快照取不到 ⇒ 无逐槽证据 ⇒ 退回①的旧口径。
+        注册表未同步（reg 空）⇒ None（fail-open）。永不抛。"""
+        if plan is None:
+            return None
+        try:
+            slots: list = []                  # [(持有该 target 列表的 args dict, key)]
+            targets: list = []
+            main_args = plan.args or {}
+            if isinstance(main_args.get("target"), list) and main_args.get("target"):
+                slots.append((main_args, "target"))
+                targets += list(main_args["target"])
+            for st in (getattr(plan, "extra_steps", None) or []):
+                if not isinstance(st, dict):
+                    continue
+                sub = st.get("args") or {}
+                if isinstance(sub.get("target"), list) and sub.get("target"):
+                    slots.append((sub, "target"))
+                    targets += list(sub["target"])
+            if not targets or not slots:
+                return None
+            ha = getattr(self, "ha", None)      # 手工装配的管线可无 ha（fail-open）
+            if ha is None:
+                return None
+            reg = await capability.registry_areas(ha)
+            try:
+                states = await ha.states()
+            except Exception:                   # noqa: BLE001 快照读不到=无逐槽证据
+                states = {}
+            entity_area = getattr(ha, "_entity_area", {}) or {}
+            bads = capability.bad_area_slots(targets, reg, states, entity_area)
+            bad = capability.bad_target_area(targets, reg, states, entity_area)
+            first_bad = str((bads[0] or {}).get("area") or "").strip() if bads else ""
+            # 按**对象身份**比对（两个内容相同的槽是不同的槽，不许连坐）
+            bad_ids = {id(b) for b in bads}
+            if bad is None:
+                if not bads:
+                    return None                 # 全部合格
+                # ②：还有槽能解析到设备 ⇒ 剪掉不合格槽，别连坐整句
+                all_steps_ok = True
+                for holder, key in slots:
+                    cur = list(holder.get(key) or [])
+                    kept = [t for t in cur if id(t) not in bad_ids]
+                    if len(kept) == len(cur):
+                        continue                # 本份目标无不合格槽
+                    if kept:
+                        holder[key] = kept      # 就地剪除：未知区域绝不跟着下发
+                    else:
+                        all_steps_ok = False    # 整份目标都不可解析 ⇒ 不放行该步
+                if not all_steps_ok:
+                    return first_bad           # 剪空即等于"这一步没有可解析目标"
+                logger.info("[级联] 目标槽区域不可解析（已就地剪除 %d/%d 槽，"
+                            "其余照常执行）：%s", len(bads), len(targets),
+                            [str((b or {}).get("area") or "") for b in bads])
+                return None
+            return bad                          # ①：全不可解析 ⇒ 整句拦下（原话术）
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _area_say(bad: str) -> str:
+        return (f"抱歉，「{bad}」这个房间我没找到——这句可能没听全，"
+                f"请把房间和设备说清楚再说一次（比如「打开办公室的射灯」）。")
+
+    def _overbroad_area_target(self, plan: Optional[Plan]) -> Optional[str]:
+        """target 只有"区域名当设备名"+空 domains（"客厅开灯"→name=客厅/domains=[]）
+        → 执行侧按名字子串命中**该区域所有设备**（灯、窗帘、开关、门锁一起动，
+        2026-09-15 实测复现）。命中返回区域名，安全返回 None。
+
+        这类目标一律不执行、不入库，改用一句引导让用户说清设备——按项目既定
+        纪律「比礼貌失败糟糕得多」处理。"""
+        if plan is None:
+            return None
+        areas = self._known_areas()
+        if not areas:
+            return None
+        tgt = (plan.args or {}).get("target")
+        if not isinstance(tgt, list) or not tgt:
+            return None
+        for t in tgt:
+            if not isinstance(t, dict) or str(t.get("area") or "").strip():
+                continue
+            devs = t.get("devices")
+            if not isinstance(devs, list):
+                continue
+            # 逐台检查（不假设"只有一台"）：klar 多目标/复合目标里混进一个
+            # "区域当设备名"同样会把整片区域带开，必须一并拦下
+            for d in devs:
+                if not isinstance(d, dict) or d.get("domains"):
+                    continue
+                nm = str(d.get("name") or "").strip()
+                if nm and nm in areas:
+                    return nm
+        return None
+
+    def _device_names(self) -> tuple:
+        """在装设备友好名清单——只给「点名设备查无」子闸当裁决依据。
+
+        刻意**不**走 `targets` 的进程级全局词表：单测夹具（`_pipe`）故意抑制
+        sync_vocab，全局态会随收集顺序时好时坏（本仓记过的"全局态泄漏"同型坑）；
+        这条闸的判据必须只关于**这台 HA 当前真有的设备**。拿不到 ⇒ 空表 ⇒ 子闸
+        自动不判（没清单就没裁决权，宁放行不误拦）。
+        """
+        try:
+            states = getattr(self.ha, "_states", None) or {}
+            out = []
+            for ent in states.values():
+                fn = str(((ent or {}).get("attributes") or {})
+                         .get("friendly_name") or "").strip()
+                if fn:
+                    out.append(fn)
+            return tuple(out)
+        except Exception:  # noqa: BLE01
+            return ()
+
+    def _real_areas(self) -> tuple:
+        """这台 HA **真注册过**的区域名（不含静态 BASE_AREAS）。
+
+        给「点名设备查无」子闸当位置豁免的唯一依据——v1.1.36 复核⑥：旧形用
+        `_known_areas()`（静态基准 ∪ 注册表）与 `_area_like` 的静态词形判"这是不是
+        位置词"，于是家里根本没有阳台时「关掉阳台的灯」被当位置词豁免、顶了别的
+        房间那台。位置词豁免从此只认表；**表拿不到（空）⇒ 返回空 tuple，闸自动
+        退回旧判据**（宁可不拦也不误拦，与 `_device_names` 同纪律）。永不抛。
+        """
+        try:
+            out = []
+            for v in (getattr(self.ha, "_areas", None) or {}).values():
+                name = str(v or "").strip()
+                if name:
+                    out.append(name)
+            for v in (self.settings.get("spatial.satellite_areas", {}) or {}).values():
+                name = str(v or "").strip()
+                if name and name not in out:
+                    out.append(name)
+            return tuple(out)
+        except Exception:  # noqa: BLE01
+            return ()
+
+    @staticmethod
+    def _overbroad_say(area: str) -> str:
+        return (f"「{area}」里设备不止一台，我不确定你要哪一台，这次先不动。"
+                f"说具体点就行，比如「打开{area}的灯」或「打开{area}空调」")
+
+    # ── P2-13 风险操作确认环 ───────────────────────────────────
+    def _risky(self, plan: Plan) -> bool:
+        if not self.settings.get("dialog.confirm_risky", True):
+            return False
+        return self._plan_has_risky_step(plan)
+
+    @staticmethod
+    def _plan_has_risky_step(plan: Plan) -> bool:
+        """整案风险扫描（主步骤 + extra_steps 全查）。
+
+        2026-09-22 审查批 C2 两修：
+        1) 目标判据升级为 T.args_target_lock——klar grounded 形（args 只有
+           entity_id=lock.* 的拼音实体 id、无中文）与全屋域形（domains 含 lock、
+           名为空）此前旁路确认环，「解锁大门」被引擎接地后直接拔锁；
+        2) 多分句 plan 的 extra_steps 此前完全不设防——「关灯并且解锁大门」
+           主步 HassTurnOff light.x 不风险，第二步解锁裸奔。
+        HassTurnOn×lock=上锁（D7 安全向），不在闸内；显式 HassLock（「锁上大门」）
+        v1.1.27 起同族入闸——上锁也是不可逆的门禁动作。"""
+        pairs = [(plan.intent, plan.args or {})]
+        pairs += [(st.get("name"), st.get("args") or {})
+                  for st in (getattr(plan, "extra_steps", None) or [])
+                  if isinstance(st, dict)]
+        for intent, args in pairs:
+            if intent in _RISKY_INTENTS:
+                return True
+            if intent in ("TurnDeviceOff", "HassTurnOff", "HassToggle") \
+                    and T.args_target_lock(args):
+                return True                       # D7 反转语义：关锁=解锁
+        return False
+
+    @staticmethod
+    def _risky_actions_note(actions: list) -> str:
+        """入库动作里含**锁族**时的点名尾注（v1.1.22 用户拍板：创建/修改**不拦**，
+        但必须在播报里点名）。D7 反转语义（「关闭门锁」=解锁）静默入库 = 埋一条以后
+        无人值守的解锁；v1.1.27 起 HassLock（上锁）同族在表，动词按方向取。判据与
+        确认环 `_plan_has_risky_step` 同一张表。返回 ""＝无可点名项。永不抛（拼注
+        失败=不加注，不改成败）。"""
+        try:
+            for a in actions or []:
+                if not isinstance(a, dict):
+                    continue
+                intent = str(a.get("intent") or "")
+                params = a.get("params") or {}
+                if intent in _RISKY_INTENTS or (
+                        intent in ("TurnDeviceOff", "HassTurnOff", "HassToggle")
+                        and T.args_target_lock(params)):
+                    what = "、".join(_target_names(params) or _target_areas(params)
+                                     or ["某台设备"])
+                    verb = "上锁" if intent == "HassLock" else "解锁"
+                    return f"（注：含{verb}{what}的动作，触发时会直接执行）"
+            return ""
+        except Exception:  # noqa: BLE001 注可缺，动作入库不受影响
+            logger.exception("[创建] 锁族点名拼装异常（不加注）")
+            return ""
+
+    def _confirm_ttl(self, text: str) -> float:
+        """确认环自适应存活窗：基线 TTL + 提示播报时长估算（见 CONFIRM_TTL_S 注）。
+
+        基线取 settings（用户可调），无提示文本时即基线本身。播报补偿＝字数 ÷
+        （实测语速 × tts.speed，钳位与 tts 同源），封顶 _CONFIRM_ANN_MAX_EXTRA，
+        防超长提示把窗口拉到离谱。"""
+        base = float(self.settings.get("dialog.confirm_ttl_s", CONFIRM_TTL_S))
+        try:
+            speed = float(self.settings.get("tts.speed", _TTS_SPEED_DEFAULT) or 0.0)
+        except (TypeError, ValueError):
+            speed = _TTS_SPEED_DEFAULT
+        cps = _CONFIRM_ANN_CPS * max(_SPEED_MIN, min(speed, _SPEED_MAX))
+        return base + min(len(text or "") / cps, _CONFIRM_ANN_MAX_EXTRA)
+
+    def _confirm_ask(self, plan: Plan, origin: str) -> Optional[Reply]:
+        if not self._risky(plan):
+            return None
+        origin = origin or "panel"
+        args = plan.args or {}
+        if plan.intent == "HassDeleteVoiceScene":
+            phrase = str(args.get("trigger_phrase") or "").strip()
+            act = f"删除场景「{phrase}」" if phrase else "删除该语音场景"
+        elif plan.intent == "HassDeleteAutomation":
+            act = "删除该自动化"
+        else:
+            # C2 配套：多步 plan 的问句按**风险步**取目标——主步是灯、第二步
+            # 才解锁时，拿主步 args 问「解锁该设备」会问错对象。
+            rargs = args
+            rverb = None
+            for st in (getattr(plan, "extra_steps", None) or []):
+                if not isinstance(st, dict):
+                    continue
+                sn, sa = st.get("name"), st.get("args") or {}
+                if sn in _RISKY_INTENTS or (
+                        sn in ("TurnDeviceOff", "HassTurnOff", "HassToggle")
+                        and T.args_target_lock(sa)):
+                    rargs = sa
+                    # v1.1.27：风险步的**方向**按意图取（HassLock=上锁；
+                    # 其余风险步＝解锁族，含 D7 反转形态 TurnDeviceOff×锁）。
+                    rverb = "上锁" if sn == "HassLock" else "解锁"
+                    break
+            what = "、".join(_target_names(rargs) or _target_areas(rargs)
+                             or ["该设备"])
+            # v1.1.27：HassLock 进闸后旧写法会把"上锁"问成"解锁"（语义反转，
+            # 用户按「确认」时以为在解锁）——按意图名取动词，主步同理。
+            verb = rverb or ("上锁" if plan.intent == "HassLock" else "解锁")
+            act = f"{verb}{what}"
+        text = f"接下来要{act}，说「确认」执行，或说「取消」放弃"
+        self._confirm[origin] = {"plan": plan, "ts": time.time(),
+                                 "ttl": self._confirm_ttl(text)}
+        self._origin_ts[origin] = time.time()
+        return Reply(text, "confirm",
+                     ok=True, trace=list(getattr(plan, "trace", [])) + ["确认环:挂起"])
+
+    # ── v1.1.4 第 3 步：歧义目标确认（复用 P2-13 的 是/否/改口三态）────────
+    # v1.1.27：补三族进闸。本方法 docstring 自述的实锤案「平开窗」正落在
+    # ControlWindow 上（名=平开窗 命中隔壁「测试平开窗」），锁族（开门禁）同属
+    # "动错设备"最贵的一类——它们此前整族旁路，点了名多台就当批量语义直接执行。
+    _AMB_INTENTS = ("TurnDeviceOn", "TurnDeviceOff", "PauseDevice",
+                    "AdjustDeviceAttribute", "SetDeviceMode",
+                    "ControlWindow", "HassLock", "HassUnlock")
+
+    # ── v1.1.28：歧义目标的"主域"证据（复用既有域族判据，不另抄一张表）──
+    @staticmethod
+    def _plan_main_domains(intent: str, args: dict) -> tuple:
+        """本条计划的"主域"证据；证据不足一概返回 ()（无证据即不收窄）。
+
+        动机（2026-09-29 金标复测 / 192.168.1.91 实锤）：动态词表给的是**域并集**，
+        t0 字面表把「关闭平开窗」落成 domains=['button','cover','number']——一台开窗器
+        的零件兄弟（①开启/②暂停/③关闭/速度/力度）全进候选集；此时若无全等名，
+        旧 `_best_candidate` 直接取 `cands[0]` ⇒ 收敛到「平开窗 ① 开启」（方向相反）。
+
+        判据一律引既有单点（严禁这里再手写一张域族表）：
+          · ControlWindow → cover：窗动作的承载域（executor._LEG_WINDOW_DESIRED 与
+            capability.supports_attribute position→cover 同口径）；
+          · AdjustDeviceAttribute / SetDeviceMode → fast_path.attribute_domain_target
+            （无目标属性句补目标用的就是这一张表，两边必须同源）；
+          · HassLock / HassUnlock → lock（nlu.targets.args_target_lock 同族）；
+          · 开关族 → nlu.targets.primary_turn_domains（v1.1.24-B 主域优先级表，
+            #9「打开办公室空调」那条已验收的语义）。
+        """
+        try:
+            intent = str(intent or "")
+            args = args if isinstance(args, dict) else {}
+            if intent == "ControlWindow":
+                return ("cover",)
+            if intent in ("HassLock", "HassUnlock"):
+                return ("lock",)
+            if intent in ("AdjustDeviceAttribute", "SetDeviceMode"):
+                for sl in (attribute_domain_target(intent, args) or []):
+                    for d in ((sl or {}).get("devices") or []):
+                        doms = capability._domain_slots((d or {}).get("domains"))
+                        if doms:
+                            return doms
+                return ()
+            if intent in ("TurnDeviceOn", "TurnDeviceOff", "PauseDevice",
+                          "HassTurnOn", "HassTurnOff", "HassToggle"):
+                return tuple(T.primary_turn_domains(_target_domains(args.get("target"))))
+            return ()
+        except Exception:  # noqa: BLE001 判不出主域=不带证据（上层不得因此放飞）
+            return ()
+
+    @staticmethod
+    def _cand_name(c: dict) -> str:
+        """候选实体的展示名（friendly_name 优先，回落 entity_id）。永不抛。"""
+        try:
+            return str(((c or {}).get("attributes") or {}).get("friendly_name")
+                       or (c or {}).get("entity_id") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @classmethod
+    def _best_candidate(cls, cands, tgt, intent=None, entity_area=None,
+                        main_domains: tuple = ()) -> Optional[str]:
+        """按证据优先级收敛到一台实体名；**收不住就返回 None**（绝不盲取 cands[0]）。
+
+        优先序（v1.1.28）：① 全等名 > ② 同区域 > ③ 域匹配（计划主域）> None。
+        旧口径在无全等名时直接 `cands[0]`，实锤两类误动作：
+          · 「关闭平开窗」→「平开窗 ① 开启」（**方向相反**的按钮）；
+          · 「把办公室空调温度调到26度」→「办公室空调 左右摆风」（switch，非空调本体）。
+        用户回「确认」就是一次误动作——退回首台并不比这两例更"可预期"，那只是把
+        注册表遍历顺序当判据用。
+        """
+        try:
+            pool = [c for c in (cands or []) if isinstance(c, dict)]
+            if not pool:
+                return None
+            want = ""
+            areas: list = []
+            for sl in (tgt or []):
+                if not isinstance(sl, dict):
+                    continue
+                a = str(sl.get("area") or "").strip()
+                if a:
+                    areas.append(a)
+                for d in (sl.get("devices") or []):
+                    nm = str((d or {}).get("name") or "").strip()
+                    if nm and not want:
+                        want = nm
+            if not want:
+                return None                       # 没点名：整区/全屋批量语义，不判
+            # ① 全等名（集成端 6 级匹配第 1 级即全等：传全等名就锁死这一台）
+            for c in pool:
+                if cls._cand_name(c) == want:
+                    return want
+            # ② 同区域（区域继承补好后这一层才真的有数据）
+            if areas:
+                same = [c for c in pool
+                        if str((entity_area or {}).get(
+                            str(c.get("entity_id") or ""), "") or "") in areas]
+                if len(same) == 1:
+                    return cls._cand_name(same[0])
+                if same:
+                    pool = same                   # 仍多台：带证据继续往下收窄
+            # ③ 域匹配：候选域 ∈ 计划主域
+            if main_domains:
+                hit = [c for c in pool
+                       if str(c.get("entity_id") or "").split(".", 1)[0]
+                       in main_domains]
+                if len(hit) == 1:
+                    return cls._cand_name(hit[0])
+                if len(hit) > 1:
+                    # 同域同名孪生（真机实锤：办公室/客厅两台 light 都叫「射灯」）：
+                    # 名字层面已无法区分，唯一可用的那一台才是用户想要的那一台
+                    # （resolve_candidates 已把 unavailable 沉底）。名字不同的一律
+                    # 不许从这里挑（那就是替用户猜）；**名字还必须与用户说的词全等**
+                    # （#17：说「指示灯」而归一成 name=灯时，把目标改写成「射灯」＝替
+                    # 用户认了另一台设备，须走 clarify）。
+                    names = list(dict.fromkeys(cls._cand_name(c) for c in hit))
+                    if len(names) == 1 and names[0] == want:
+                        avail = [c for c in hit if str(c.get("state")) != "unavailable"]
+                        if avail:
+                            return cls._cand_name(avail[0])
+            return None
+        except Exception:  # noqa: BLE001 判定故障=当"不收敛"（绝不猜一台）
+            logger.exception("[级联] 歧义收敛异常（按不收敛处理）")
+            return None
+
+    @staticmethod
+    def _ambiguity_clarify_say(names: list, n_entities: int = 0) -> str:
+        """收不住候选时的话术：列出来让用户说清，绝不替他挑一台（v1.1.28）。
+
+        n_entities＝候选**实体**台数（同名孪生时 distinct 只有一个名字，但确实是两台
+        设备——话术按台数说，免得念成"有 1 台设备名字相近"）。"""
+        nm: list = [str(n) for n in (names or []) if str(n)]
+        others = "、".join(nm[:3]) + ("…" if len(nm) > 3 else "")
+        n = max(int(n_entities or 0), len(nm))
+        return (f"家里有 {n} 台设备名字相近（{others}），我没法确定你要哪一台，"
+                f"这次先不动。带上房间名再说一次（比如「打开办公室的射灯」）。")
+
+    def _ambiguity_ask(self, plan, origin):
+        """点了名、却在本家匹配到**多台不同设备**时先问一句再动。
+
+        真机 A 组实锤：指定 name=平开窗，实际命中的是隔壁「测试平开窗」——回执
+        修好了"谎报成功"，但**动错设备**这件事仍然会发生。这里把计划收窄到最优
+        候选（全等名 > 同区域 > 域匹配）后借现成确认环问一句，不新增答案解析器，
+        也不动集成端。没点名的整区/全屋批量语义**不问**（那是用户明确的批量意图）。
+
+        v1.1.28 两条硬改（2026-09-29 金标复测实锤）：
+          · 三级证据全落空 ⇒ **列候选让用户说清**（返回 clarify Reply），绝不静默替他
+            挑一台 —— 旧式在这种情况下写回 `cands[0]`，用户回「确认」即一次误动作；
+          · 证据能唯一定位 ⇒ 不打扰用户：把精确名与**主域**写回目标后照常执行
+            （域这一笔是必要的：t0 给的是域并集，留着并集下发＝让集成把兄弟零件
+            一起动，正是 #9「开关取主域」那条已验收的语义）。
+        """
+        try:
+            if plan is None or plan.intent not in self._AMB_INTENTS:
+                return None
+            if not self.settings.get("dialog.confirm_ambiguous", True):
+                return None
+            origin = origin or "panel"
+            if origin in self._confirm:
+                return None                      # 已有挂起问题（含风险确认）不叠加
+            args = plan.args or {}
+            tgt = args.get("target")
+            if not isinstance(tgt, list) or not tgt:
+                return None
+            if not any(str((d or {}).get("name") or "").strip()
+                       for sl in tgt if isinstance(sl, dict)
+                       for d in (sl.get("devices") or [])):
+                return None
+            entity_area = getattr(self.ha, "_entity_area", {}) or {}
+            cands = capability.resolve_candidates(
+                getattr(self.ha, "_states", {}) or {},
+                entity_area, tgt)
+            names = [self._cand_name(c) for c in cands]
+            distinct = list(dict.fromkeys([n for n in names if n]))
+            if len(cands) < 2:
+                return None
+            want = ""
+            for sl in tgt:
+                if not isinstance(sl, dict):
+                    continue
+                for d in (sl.get("devices") or []):
+                    nm = str((d or {}).get("name") or "").strip()
+                    if nm and not want:
+                        want = nm
+            exact = bool(want) and any(n == want for n in names)
+            if len(distinct) < 2 and (not want or exact):
+                # 多台候选**同名**：用户说的词与候选名全等（或压根没点名）⇒ 照旧按名
+                # 下发（集成端 6 级匹配第 1 级就是全等，不存在"替他挑一台"）。不全等
+                # （#17 反向钉：说「打开指示灯」归一成 name=灯，候选两台都叫「射灯」）
+                # ⇒ 不许静默下发，落到下面按三级证据收；收不住就列候选。
+                return None
+            main = self._plan_main_domains(plan.intent, args)
+            # 主域先做一次**收窄**：candidate 的域落在计划主域外的（同一台设备的按钮/
+            # 数值兄弟）不是"名字相近的设备"，而是同一台设备的零件，不该参与投票。
+            pool = cands
+            if main:
+                hit = [c for c in cands
+                       if str(c.get("entity_id") or "").split(".", 1)[0] in main]
+                if hit:
+                    pool = hit
+            narrowed_strict = pool is not cands
+            domain_note = main if (main and narrowed_strict) else None
+            pick = self._best_candidate(pool, tgt, plan.intent, entity_area, main)
+            if pick and len(list(dict.fromkeys(
+                    [self._cand_name(c) for c in pool if self._cand_name(c)]))) < 2:
+                # 证据已唯一定位（收窄后只剩一个名字）⇒ 不打扰用户，直接落到这一台。
+                # 金标复测 #5/#10/#11：这三条的真机形态都是"名字点对了、域证据也足够"，
+                # 旧码却在这里挂确认环 + 把 cands[0] 写回目标 ⇒ 用户说一次根本不动。
+                self._narrow_target(args, pick, domain_note)
+                logger.info("[级联] 歧义候选 %d 台 → 主域证据唯一定位到「%s」，"
+                            "直接执行（不打扰用户）", len(cands), pick)
+                return None
+            if not pick:
+                # 收不住 ⇒ 不许替用户挑：列出来请他说清（零下发、不挂执行桩）
+                text = self._ambiguity_clarify_say(distinct, len(cands))
+                logger.info("[级联] 歧义目标 %d 台（%s）→ 无收敛证据，列出让用户说清",
+                            len(distinct), "、".join(distinct[:3]))
+                return Reply(text, "clarify", ok=False,
+                             trace=list(getattr(plan, "trace", []))
+                             + [f"歧义未收敛{len(cands)}"])
+            # 域收敛：t0 给的是域并集，带着并集下发＝兄弟零件一起动（#9 同族语义）
+            self._narrow_target(args, pick, domain_note)
+            others = "、".join(distinct[:3]) + ("…" if len(distinct) > 3 else "")
+            text = (f"家里有 {len(distinct)} 台设备名字相近（{others}）。"
+                    f"我先对「{pick}」执行，说「确认」就这么办，说「取消」先不动。")
+            self._confirm[origin] = {"plan": plan, "ts": time.time(),
+                                     "ttl": self._confirm_ttl(text)}
+            self._origin_ts[origin] = time.time()
+            logger.info("[级联] 歧义目标 %d 台（%s）→ 收窄到「%s」并挂确认环",
+                        len(distinct), others, pick)
+            return Reply(
+                text,
+                "confirm", ok=True,
+                trace=list(getattr(plan, "trace", [])) + [f"确认环:歧义{len(distinct)}"])
+        except Exception:  # noqa: BLE001 判定故障=照旧执行，绝不新增哑口
+            logger.exception("[级联] 歧义确认异常（放行）")
+            return None
+
+    @staticmethod
+    def _narrow_target(args, name, domains=None) -> None:
+        """把计划目标换成选中的那台：集成端 6 级匹配第 1 级就是**全等**，
+        因此传精确 friendly_name 即可锁死设备，不需要新槽位形态。
+
+        domains：只在"我们是靠主域证据才认出这一台"时才传（v1.1.28）——t0 字面表
+        给的是动态词表的**域并集**（「关闭平开窗」落成 button+cover+number），带着
+        并集下发等于把同一台设备的按钮/数值兄弟实体一起交给集成；收窄到承载域是
+        #9「开关取主域」那条已经验收过的同一条语义。
+        """
+        for sl in (args.get("target") or []):
+            for d in ((sl or {}).get("devices") or []):
+                if isinstance(d, dict) and str(d.get("name") or "").strip():
+                    d["name"] = name
+                    if domains:
+                        cur = capability._domain_slots(d.get("domains"))
+                        want = [x for x in (domains or ()) if x in cur]
+                        # 主域必须是"已声明域"之一：凭空新增一个目标里没有的域，
+                        # 那是替用户换设备（比不收窄更危险）。
+                        if want:
+                            d["domains"] = list(want)
+                    return
+
+    async def _confirm_answer(self, text: str, origin: str) -> Optional[Reply]:
+        origin = origin or "panel"
+        pend = self._confirm.get(origin)
+        if pend is None:
+            return None
+        if time.time() - pend["ts"] > float(
+                pend.get("ttl")
+                or self.settings.get("dialog.confirm_ttl_s", CONFIRM_TTL_S)):
+            self._confirm.pop(origin, None)
+            return None
+        token = _strip_punct(text).lower()
+        if token in _CONFIRM_YES:
+            self._confirm.pop(origin, None)
+            plan = pend["plan"]
+            ok, speech = await self.executor.run(plan)
+            if ok:
+                self._note_target(origin, plan)
+            self._remember_turn(origin, text, speech)
+            return Reply(speech, "confirm_exec", ok,
+                         list(getattr(plan, "trace", [])) + ["确认环:已确认"])
+        if token in _CONFIRM_NO:
+            self._confirm.pop(origin, None)
+            return Reply("好的，已取消", "confirm_cancel", True, ["确认环:取消"])
+        # 改口：撤挂起计划，本句按新指令走级联
+        self._confirm.pop(origin, None)
+        return None
+
+    # ── Web UI「理解调试」用：只走级联不执行 ────────────────────
+    async def dry_run(self, text: str) -> dict:
+        """调试面板内核：只跑理解，不执行设备指令；查询族为只读 REST，可放心真答。
+
+        v1.0.9：plan 展示**真实会被执行的裁决结果**（scene>慧尖独占>klar>
+        字面表剩余），并附 fast_path / klar 两路原始命中，调试面板直视分派依据。"""
+        llm_on = bool(self.agent and self.agent.enabled)
+        if not self.settings.get("nlu.enabled", True):
+            # 本地理解已关：面板必须如实说"没有任何本地命中"，否则调试结论全错
+            out: dict = {"nlu_enabled": False, "plan": None, "fast_path": None,
+                         "klar": None, "llm_enabled": llm_on}
+            if not llm_on:
+                out["final"] = _NLU_OFF_TEXT
+            return out
+        # v1.1.29 复核 A12：面板必须展示**真实会被执行**的裁决——真流量里复合链
+        # 优先于单发（_cascade 里 _try_compound 在 _match_pair 之前），旧 dry_run
+        # 不含它 ⇒ 面板说「未命中」而设备其实已按链执行。复用同一条逐腿裁决
+        # （零执行、零记账；origin 固定 "panel"）。
+        chain_reply, chain_plan, _chain_legs, _chain_end = await self._chain_decide(
+            text, "panel")
+        fp_plan, kl_plan = await self._match_pair(text)   # 与真流量同构（并行）
+        plan = chain_plan or select_primary_plan(fp_plan, kl_plan, self._known_areas(),
+                                       self._device_names(), self._real_areas())
+
+        def _dump(p):
+            return None if p is None else {
+                "intent": p.intent, "args": p.args, "source": p.source,
+                "trace": p.trace, "speech": getattr(p, "speech", ""),
+                "extra_steps": getattr(p, "extra_steps", []),
+                "whole_house": bool(getattr(p, "whole_house", False))}
+        out = {"nlu_enabled": True, "plan": _dump(plan),
+               "fast_path": _dump(fp_plan), "klar": _dump(kl_plan)}
+        if chain_plan is not None:
+            out["compound"] = True               # 这句会走复合链（逐腿）
+        elif chain_reply is not None:
+            # 链被闸拦下（过宽/区域/歧义）：如实显示拦截话术，而不是「未命中」
+            out["compound"] = True
+            out["blocked"] = chain_reply.text
+            out["final"] = chain_reply.text
+        if plan is None:
+            try:
+                out["query_answer"] = await self.query.answer(text)
+            except Exception as exc:
+                out["query_answer"] = None
+                out["query_error"] = str(exc)
+            out["llm_enabled"] = bool(self.agent and self.agent.enabled)
+            if not out["llm_enabled"]:
+                out["final"] = const.FALLBACK_TEXT
+        return out

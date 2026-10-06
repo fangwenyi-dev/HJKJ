@@ -1,0 +1,868 @@
+import asyncio
+import html as html_mod
+import logging
+import re
+from datetime import datetime
+from pathlib import Path
+
+from aiohttp import web
+from homeassistant.const import ATTR_FRIENDLY_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import intent as ha_intent
+from homeassistant.helpers.http import KEY_HASS, HomeAssistantView
+
+from .const import DOMAIN
+from .intent_automation import (get_automation_manager,
+                                get_automation_store,
+                                peek_automation_manager)
+from .intent_voice_scene import get_voice_scene_store, legacy_auto_window_area
+from .intent_result import fold_action_ok
+
+_LOGGER = logging.getLogger(__name__)
+
+_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+_TEMPLATE_CACHE: dict[str, str] = {}
+
+
+def _load_template(filename: str) -> str:
+    if filename not in _TEMPLATE_CACHE:
+        template_path = _TEMPLATES_DIR / filename
+        _TEMPLATE_CACHE[filename] = template_path.read_text(encoding="utf-8")
+    return _TEMPLATE_CACHE[filename]
+
+
+def _js(s) -> str:
+    """嵌入 onclick='f(\'…\')' 的字符串：先 JS 单引号层转义（反斜杠/单引号/换行），
+    再 HTML 属性层转义（& < > " '）。顺序不可反。
+
+    v1.0.41（F1）：onclick 属性值要过**两层解析器**（HTML 属性 → JS 词法）。
+    只做 html 转义时，`'` 解码回 JS 单引号直接把字符串截断（XSS 注入面）；
+    而"先 html 转义再嵌、页面上再 escape 一次"的双层转义会让浏览器解码
+    一层后 JS 拿到 `a&#x27;b` 字面量——编辑弹窗回写即数据污染。
+    凡进 onclick 的值一律 _js(原始值)；纯展示上下文（id 属性/正文 span）仍用
+    html_mod.escape(原始值)，两不相干。"""
+    t = str(s).replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r")
+    return html_mod.escape(t, quote=True)
+
+
+async def async_setup_api(hass: HomeAssistant):
+    """Set up the voice scenes and automations API."""
+    hass.http.register_view(VoiceScenesListView)
+    hass.http.register_view(VoiceSceneDeleteView)
+    hass.http.register_view(AutomationsListView)
+    hass.http.register_view(AutomationDeleteView)
+    hass.http.register_view(AutomationsManageView)
+    hass.http.register_view(CombinedManageView)
+    hass.http.register_view(AutomationLogView)
+    hass.http.register_view(TestSceneView)
+    hass.http.register_view(TestAutomationView)
+
+
+def _extract_device_info(action: dict) -> str:
+    """Extract device info from action for display."""
+    intent_name = action.get("intent") or action.get("name", "Unknown")
+    params = action.get("params") or action.get("parameters", {})
+    target = params.get("target", [])
+
+    device_info_parts = []
+    for t in target:
+        area = t.get("area", "")
+        devices = t.get("devices", [])
+        for device in devices:
+            domains = device.get("domains", [])
+            name = device.get("name", "")
+            if area:
+                device_info_parts.append(f"{area} {'/'.join(domains)}")
+            elif name:
+                device_info_parts.append(f"{name}({','.join(domains)})")
+            else:
+                device_info_parts.append("/".join(domains))
+
+    if not device_info_parts:
+        return intent_name
+
+    return f"{intent_name} -> {', '.join(device_info_parts)}"
+
+
+def _get_action_summary(action: dict) -> str:
+    """Get a short summary of an action."""
+    intent_name = action.get("intent") or action.get("name", "Unknown")
+    params = action.get("params") or action.get("parameters", {})
+    target = params.get("target", [])
+
+    summaries = []
+    for t in target:
+        area = t.get("area", "")
+        devices = t.get("devices", [])
+        for device in devices:
+            domains = device.get("domains", [])
+            name = device.get("name", "")
+            if area:
+                if domains:
+                    summaries.append(f"{area} {'/'.join(domains)}")
+                else:
+                    summaries.append(area)
+            elif name:
+                summaries.append(f"{name}")
+            else:
+                summaries.append("/".join(domains) if domains else "")
+
+    return f"{intent_name} {', '.join(filter(None, summaries))}"
+
+
+_TRIGGER_ENTITY_RE = re.compile(r"[a-z0-9_]{1,64}\.[a-z0-9_]{1,64}")
+
+
+_SCENE_INTENT_WHITELIST = frozenset({
+    "TurnDeviceOn", "TurnDeviceOff", "ControlWindow", "WindowControl",
+    "AdjustDeviceAttribute", "SetDeviceMode",
+})  # 与 intent_voice_scene._execute_intent 的运行时白名单严格同步
+
+
+def _validate_scene_body(body) -> str:
+    """M7（2026-09-23 深审）PUT 场景形态闸（v1.0.41 F2 自动化侧同族）：
+    过闸返回 ""，违规返回字段名。
+
+    旧实现 `{"actions":"xx"}` 一发改渲染层 `for a in actions` 即 AttributeError
+    → CombinedManageView/TestSceneView 循环体在 try 外无兜底 → 管理页对全员
+    永久 500、脏值重启不消。规则：
+      · actions 若给必须 list[dict]，intent/name 在运行时白名单内（语音删不
+        掉的"僵尸动作"从一开始就不该进 .storage）；
+      · params 若给必须 dict；
+      · trigger_phrase 若给必须 1..40 字符非空白 str（绕 F8 字符闸造"语音
+        永远触发不到又删不掉"脏场景的 PUT 旁路）。
+    永不抛。"""
+    try:
+        if not isinstance(body, dict):
+            return "body"
+        tp = body.get("trigger_phrase")
+        if tp is not None:
+            if not isinstance(tp, str) or not (1 <= len(tp.strip()) <= 40) \
+                    or any(ord(c) < 32 for c in tp):
+                return "trigger_phrase"
+        acts = body.get("actions")
+        if acts is not None:
+            if not isinstance(acts, list) or len(acts) > 50:
+                return "actions"
+            for a in acts:
+                if not isinstance(a, dict):
+                    return "actions"
+                name = a.get("intent") or a.get("name")
+                if name not in _SCENE_INTENT_WHITELIST:
+                    return "actions.intent"
+                params = a.get("params") or a.get("parameters") or {}
+                if not isinstance(params, dict):
+                    return "actions.params"
+        return ""
+    except Exception:  # noqa: BLE001
+        return "body"
+
+
+def _validate_automation_actions(actions) -> str:
+    """PUT 自动化的 actions 形态闸（v1.1.38，外部审计 #13）：过闸返回 ""，违规返回字段名。
+
+    旧形只闸 trigger、对 actions **零校验**即入库，而 `intent_automation._execute_actions`
+    在 try **之外**裸调 `action.get("intent")` ⇒ 一个 `["不是dict"]` 就令该自动化
+    静默永不执行（或测试口 500），且脏值重启不消——与 v1.0.41 F2 的 trigger 案同族。
+
+    刻意**只校形状、不校 intent 白名单**：场景侧白名单是给"语音删不掉的僵尸场景"设的，
+    自动化动作集由 LLM/面板生成、域更宽，误用会把合法自动化一并拒掉（宁欠勿过）。
+    永不抛。
+    """
+    try:
+        if actions is None:
+            return ""
+        if not isinstance(actions, list) or len(actions) > 50:
+            return "actions"
+        for a in actions:
+            if not isinstance(a, dict):
+                return "actions"
+            params = a.get("params") or a.get("parameters") or {}
+            if not isinstance(params, dict):
+                return "actions.params"
+        return ""
+    except Exception:  # noqa: BLE001
+        return "actions"
+
+
+def _validate_trigger(trigger) -> str:
+    """PUT 形态闸（v1.0.41 F2）：过闸返回 ""，违规返回字段名。
+
+    局域网任意客户端可 PUT 任意 trigger dict：不带闸时 `above:"a',alert(
+    document.cookie),('"` 原样入库（喂给渲染层的 XSS 面），非数值 junk 又让
+    trigger_eval 误判恒不触发。规则（与仓内既有 trigger 形态兼容）：
+      · trigger 必须是 dict；
+      · entity_id（若给）必须是标准小写 HA id：``[a-z0-9_]{1,64}\\.[a-z0-9_]{1,64}``；
+      · above/below（若给）必须 int/float 且不得是 bool（JSON true 不是阈值）；
+      · to/attribute/platform（若给）只许 str(≤128)/bool/int/float；
+      · 未知键：标量放行（at/for 等合法形态要过），dict/list 拒。
+    """
+    if not isinstance(trigger, dict):
+        return "trigger"
+    for key, val in trigger.items():
+        if key == "entity_id":
+            if not isinstance(val, str) or not _TRIGGER_ENTITY_RE.fullmatch(val):
+                return "entity_id"
+        elif key in ("above", "below"):
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return key
+        elif key in ("to", "attribute", "platform"):
+            if isinstance(val, (dict, list)):
+                return key
+            if isinstance(val, str) and len(val) > 128:
+                return key
+        elif isinstance(val, (dict, list)):
+            return key
+    return ""
+
+
+class VoiceScenesListView(HomeAssistantView):
+    requires_auth = False
+    url = "/api/huijian-ai/voice-scenes"
+    name = "api:huijian-ai:voice-scenes"
+
+    async def get(self, request: web.Request):
+        """Get all voice scenes with detailed info."""
+        hass = request.app[KEY_HASS]
+        try:
+            store = get_voice_scene_store(hass)
+            scenes = await store.get_all_scenes()
+
+            scene_list = []
+            for scene in scenes:
+                actions = scene.get("actions", [])
+                if not isinstance(actions, list):
+                    actions = []          # M7 存量脏形态韧性：非 list 按空处理
+                safe_actions = [a for a in actions if isinstance(a, dict)]
+                device_details = [_extract_device_info(a) for a in safe_actions]
+                action_summaries = [_get_action_summary(a) for a in safe_actions]
+
+                scene_list.append(
+                    {
+                        "scene_id": scene.get("scene_id"),
+                        "trigger_phrase": scene.get("trigger_phrase"),
+                        "action_count": len(actions),
+                        "device_details": device_details,
+                        "action_summaries": action_summaries,
+                        "created_at": scene.get("created_at"),
+                    }
+                )
+
+            return self.json({"success": True, "scenes": scene_list})
+        except Exception as e:
+            _LOGGER.error("Failed to get voice scenes: %s", e)
+            return self.json({"success": False, "error": str(e)}, 500)
+
+
+class VoiceSceneDeleteView(HomeAssistantView):
+    # v1.1.29 复核 A11：破坏性写（delete/put）——同上令牌闸。
+    requires_auth = True
+    url = "/api/huijian-ai/voice-scenes/{scene_id}"
+    name = "api:huijian-ai:voice-scenes:delete"
+
+    async def delete(self, request: web.Request, scene_id: str):
+        """Delete a voice scene."""
+        hass = request.app[KEY_HASS]
+        try:
+            store = get_voice_scene_store(hass)
+            success, message = await store.delete_scene(scene_id=scene_id)
+
+            if success:
+                return self.json({"success": True, "message": message})
+            else:
+                return self.json({"success": False, "error": message}, 404)
+        except Exception as e:
+            _LOGGER.error("Failed to delete voice scene: %s", e)
+            return self.json({"success": False, "error": str(e)}, 500)
+
+    async def put(self, request: web.Request, scene_id: str):
+        """Update a voice scene's trigger phrase and/or actions."""
+        hass = request.app[KEY_HASS]
+        try:
+            body = await request.json()
+            _LOGGER.info("Updating voice scene %s: body=%s", scene_id, body)
+            bad = _validate_scene_body(body)
+            if bad:
+                # M7（2026-09-23 深审）：F2 自动化侧入库闸的场景侧遗漏——
+                # 零校验直存 .storage 的 {"actions":"xx"} 一发改管理页全员
+                # 永久 500（重启不消）+ 绕 F8 造语音删不掉的脏场景。
+                _LOGGER.warning("拒绝非法场景 PUT %s：%s 形态不符", scene_id, bad)
+                return self.json(
+                    {"success": False, "error": f"字段 {bad} 形态非法，拒写"},
+                    status_code=400)
+            store = get_voice_scene_store(hass)
+            success, message = await store.update_scene(
+                scene_id,
+                trigger_phrase=body.get("trigger_phrase"),
+                actions=body.get("actions"),
+            )
+            _LOGGER.info("Update scene result: success=%s, message=%s", success, message)
+            return self.json(
+                {
+                    "success": success,
+                    "message": message if success else None,
+                    "error": message if not success else None,
+                },
+                200 if success else 400,
+            )
+        except Exception as e:
+            _LOGGER.error("Failed to update voice scene %s: %s", scene_id, e, exc_info=True)
+            return self.json({"success": False, "error": str(e)}, 500)
+
+
+class AutomationLogView(HomeAssistantView):
+    requires_auth = False
+    url = "/api/huijian-ai/automation-logs"
+    name = "api:huijian-ai:automation-logs"
+
+    async def get(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+        # v1.1.27-r2（金标复测）：本视图 requires_auth=False——只读面不得建实例/
+        # 武装监听（旧写法一次匿名 GET 就会把状态监听+整点 tick 拉起）。未武装
+        # 时无日志可看，如实空表。
+        mgr = peek_automation_manager(hass)
+        return self.json(mgr.trigger_logs if mgr is not None else [])
+
+
+class TestSceneView(HomeAssistantView):
+    # v1.1.29 复核 A11：真执行端点（ha_intent.async_handle，物理动作）——与
+    # huijian/http.py 的「写命令通道必须 HA 令牌」同规（匿名可被局域网任意客户端触发）。
+    requires_auth = True
+    url = "/api/huijian-ai/test-scene"
+    name = "api:huijian-ai:test-scene"
+
+    async def post(self, request: web.Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"success": False, "error": "Invalid JSON"}, status_code=400)
+        trigger_phrase = (body.get("trigger_phrase", "") or "").strip()
+        if not trigger_phrase:
+            return self.json({"success": False, "error": "trigger_phrase is required"}, status_code=400)
+        hass = request.app[KEY_HASS]
+        try:
+            store = get_voice_scene_store(hass)
+            scene = await store.get_scene_by_trigger(trigger_phrase)
+            if not scene:
+                return self.json(
+                    {"success": False, "error": f"未找到触发词'{trigger_phrase}'对应的场景"},
+                    status_code=404,
+                )
+
+            actions = scene.get("actions", [])
+            actions = [a for a in actions if isinstance(a, dict)] \
+                if isinstance(actions, list) else []   # M7 存量脏形态韧性
+            if not actions:
+                return self.json(
+                    {"success": False, "error": "场景没有配置任何动作"},
+                    status_code=400,
+                )
+
+            executed = []
+            skipped_legacy: list = []
+            partial_notes: list = []      # 修③：该步可用但有个别台没动 ⇒ 如实点名
+            has_errors = False
+            for action in actions:
+                intent_name = action.get("intent") or action.get("name")
+                params = action.get("params") or action.get("parameters", {})
+                # 第四轮对抗复核：本端点自建循环直调意图，绕过了
+                # HassTriggerVoiceScene 的存量自动补窗闸 ⇒ 管理页点「测试」照样按区
+                # 压全区窗钮。两条回放执行器必须共用同一道闸（同判据同收窄）。
+                _lw_area = legacy_auto_window_area(action, actions,
+                                                   scene.get("created_at"))
+                if _lw_area:
+                    _lw_dir = {"open": "开窗", "close": "关窗"}.get(
+                        str(params.get("action") or "").strip().lower(), "窗动作")
+                    _LOGGER.warning("场景测试「%s」跳过存量自动补窗动作（区域=%s %s）",
+                                    trigger_phrase, _lw_area, _lw_dir)
+                    executed.append({"intent": intent_name,
+                                     "result": "skipped_legacy",
+                                     "reason": f"旧版自动补的「{_lw_area}」"
+                                               f"{_lw_dir}动作已跳过"})
+                    skipped_legacy.append(f"「{_lw_area}」{_lw_dir}")
+                    continue
+                ha_slots = {k: {"value": v} for k, v in params.items()}
+                try:
+                    async with asyncio.timeout(30):
+                        response = await ha_intent.async_handle(
+                            hass, DOMAIN, intent_name, slots=ha_slots,
+                        )
+                    # H3 同判据（2026-09-23 深审）：test 路径不读 response 内容
+                    # =折叠失败也报「成功」——测试的意义就是见真相。
+                    # 修③：本口此前自判 `response.get("success") is not False`——
+                    # `{"results":[{成},{败}]}` 顶层无 success 键 ⇒ 恒真 ⇒ 测试口把
+                    # "有一台没动"报成全绿。折算了必须走单点 intent_result。
+                    ok, _perr = fold_action_ok(response)
+                    if ok:
+                        executed.append({"intent": intent_name, "result": "success"})
+                        if _perr:
+                            partial_notes.append(f"{intent_name}：{str(_perr)[:40]}")
+                    else:
+                        has_errors = True
+                        err = (response.get("error") if isinstance(response, dict)
+                               else str(getattr(response, "error", None)
+                                        or "执行未成功"))
+                        executed.append({"intent": intent_name, "result": "error",
+                                         "error": str(err or "执行未成功")})
+                except asyncio.TimeoutError:
+                    has_errors = True
+                    _LOGGER.error("Test scene action timed out: %s", intent_name)
+                    executed.append({"intent": intent_name, "result": "error", "error": "执行超时"})
+                except Exception as e:
+                    has_errors = True
+                    _LOGGER.error("Test scene action failed: %s: %s", intent_name, e)
+                    executed.append({"intent": intent_name, "result": "error", "error": str(e)})
+
+            if has_errors:
+                return self.json({"success": False, "error": "部分动作执行失败", "executed": executed})
+            _p = "；".join(dict.fromkeys(partial_notes))
+            note = ("测试完成" + ("，旧版自动补的 " + "、".join(skipped_legacy)
+                                 + "动作已跳过（本版不再执行它；想留开窗请重新创建场景"
+                                 "并把那扇窗的名字说出来）")
+                    if skipped_legacy else "测试完成")
+            if _p:
+                note += "，有设备没动：" + _p
+            return self.json({"success": True, "message": note, "note": _p})
+        except Exception as e:
+            _LOGGER.error("Test scene failed: %s", e, exc_info=True)
+            return self.json({"success": False, "error": str(e)}, status_code=500)
+
+
+class TestAutomationView(HomeAssistantView):
+    # v1.1.29 复核 A11：真执行端点（mgr._execute_actions）——同上令牌闸。
+    requires_auth = True
+    url = "/api/huijian-ai/test-automation"
+    name = "api:huijian-ai:test-automation"
+
+    async def post(self, request: web.Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"success": False, "error": "Invalid JSON"}, status_code=400)
+        automation_id = (body.get("automation_id", "") or "").strip()
+        if not automation_id:
+            return self.json({"success": False, "error": "automation_id is required"}, status_code=400)
+        try:
+            store = get_automation_store(request.app[KEY_HASS])
+            automations = await store.get_all_automations()
+            automation = None
+            for a in automations:
+                if a.get("automation_id") == automation_id:
+                    automation = a
+                    break
+            if not automation:
+                return self.json({"success": False, "error": "Automation not found"}, status_code=404)
+            mgr = get_automation_manager(request.app[KEY_HASS])
+            async with asyncio.timeout(30):
+                outcomes = await mgr._execute_actions(automation.get("actions", []))
+            # v1.0.41（F4）：动作级折算——上方 TestSceneView 已是诚实口径，这里
+            # 不再"全失败也报成功"（旧版 _execute_actions 吞异常，success 恒 True）。
+            # 保持 HTTP 200，靠 success 旗标 + error 文案如实上报。
+            ntotal = len(outcomes)
+            fails = [(intent, err) for intent, ok, err in outcomes if not ok]
+            if fails:
+                first_err = next((e for _i, e in fails if e), "动作执行失败")
+                return self.json(
+                    {
+                        "success": False,
+                        "error": f"{len(fails)}/{ntotal} 个动作执行失败：{first_err[:120]}",
+                    }
+                )
+            mgr._add_trigger_log(automation_id, "", "test", "手动测试触发")
+            _p = "；".join(f"{i}：{str(e)[:40]}" for i, _ok, e in outcomes if e)
+            return self.json({"success": True, "executed": ntotal, "note": _p,
+                              "message": ("测试成功，动作已执行"
+                                          + (f"，有设备没动：{_p}" if _p else ""))})
+        except Exception as e:
+            return self.json({"success": False, "error": str(e)}, status_code=500)
+
+
+class CombinedManageView(HomeAssistantView):
+    requires_auth = False
+    url = "/api/huijian-ai/manage-page"
+    name = "api:huijian-ai:manage-page"
+
+    async def get(self, request: web.Request):
+        hass = request.app[KEY_HASS]
+
+        scene_store = get_voice_scene_store(hass)
+        auto_store = get_automation_store(hass)
+        scenes_raw = await scene_store.get_all_scenes()
+        automations_raw = await auto_store.get_all_automations()
+
+        scene_cards_html = ""
+        auto_cards_html = ""
+
+        for scene in scenes_raw:
+          try:
+            # M7（2026-09-23 深审）：单卡渲染异常（历史脏 .storage 形态）此前
+            # 裸抛 → 管理页对全员永久 500 且重启不消。入库闸（PUT
+            # _validate_scene_body）管增量，本兜底救存量：坏卡降级为提示卡。
+            scene_id_raw = str(scene.get("scene_id", ""))
+            trigger_raw = str(scene.get("trigger_phrase", ""))
+            scene_id = html_mod.escape(scene_id_raw)
+            trigger = html_mod.escape(trigger_raw)
+            created = scene.get("created_at", "")
+            created_display = ""
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    created_display = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    created_display = str(created)
+            actions_raw = scene.get("actions", [])
+            action_summaries = [_action_to_text(a) for a in actions_raw]
+            action_count = len(action_summaries)
+
+            actions_html = ""
+            for s in action_summaries:
+                actions_html += f'<div class="action-item">- {html_mod.escape(s)}</div>'
+
+            scene_cards_html += f"""
+<div class="card scene" id="scene-{scene_id}">
+    <div class="card-header">
+        <div><span class="card-trigger scene">"{trigger}"</span><span class="card-tag scene">语音场景</span></div>
+        <div>
+            <button class="delete-btn" onclick="deleteScene('{_js(scene_id_raw)}', '{_js(trigger_raw)}', event)">删除</button>
+            <button class="edit-btn" onclick="openEditScene('{_js(scene_id_raw)}', '{_js(trigger_raw)}')">编辑</button>
+            <button class="test-btn" onclick="testScene('{_js(trigger_raw)}', event)">测试</button>
+        </div>
+    </div>
+    <div class="info">创建时间: {created_display}</div>
+    <div class="actions-box">
+        <div class="actions-title">执行动作 ({action_count}个):</div>
+        {actions_html}
+    </div>
+</div>"""
+          except Exception as e:  # noqa: BLE001
+            _LOGGER.error("场景卡渲染异常（脏 .storage 形态），已降级提示卡: %s", e)
+            scene_cards_html += (
+                '<div class="card scene"><div class="card-header">'
+                '<div><span class="card-trigger scene">⚠ 数据异常场景</span>'
+                '<span class="card-tag scene">语音场景</span></div></div>'
+                '<div class="info">存储形态非法（已拒绝新写入，'
+                '请用 DELETE /api/huijian-ai/voice-scenes/{id} 或面板删除本条）</div></div>'
+            )
+
+        for auto in automations_raw:
+          try:
+            # M7 同口收口：自动化卡一视同仁（trigger 非 dict 等脏形态）
+            auto_id_raw = str(auto.get("automation_id", ""))
+            auto_id = html_mod.escape(auto_id_raw)
+            trigger_entity = auto.get("trigger", {}).get("entity_id", "")
+            friendly = _entity_id_to_friendly(hass, trigger_entity)
+            above = auto.get("trigger", {}).get("above")
+            below = auto.get("trigger", {}).get("below")
+            at = str(auto.get("trigger", {}).get("at") or "").strip()
+            to_val = auto.get("trigger", {}).get("to")
+            cond_parts = []
+            if above is not None:
+                cond_parts.append(f"> {above}度")
+            if below is not None:
+                cond_parts.append(f"< {below}度")
+            if at:
+                # v1.0.32 时间触发卡（旧渲染 entity 为空 → 标题整个空白）
+                trigger_display = f"每天 {at} 自动执行"
+                kind_tag = "时间自动化"
+                edit_btn_html = ""      # 编辑弹窗仅支持传感器形态，时间档给删除重建
+            else:
+                if to_val is not None:
+                    cond_parts.append(
+                        "检测到有人" if str(to_val) == "on" else f"状态={to_val}")
+                trigger_display = (
+                    f"{friendly} {'、'.join(cond_parts)}" if cond_parts else friendly
+                )
+                kind_tag = "状态自动化" if to_val is not None else "传感器自动化"
+                # 编辑弹窗只认 entity+above/below——to/at 形态给了会误导
+                # （保存即覆盖成丢 to 的形态），一律以删除重建为准（v1.0.32）
+                # v1.0.41（F1）：onclick 内四个实参全部 _js(原始值)。旧实现
+                # above/below 裸插值（JS+HTML 双层皆穿），entity 只 html 转义
+                # （单引号解码后照样截断 JS 字符串）。
+                above_js = _js("" if above is None else above)
+                below_js = _js("" if below is None else below)
+                edit_btn_html = "" if to_val is not None else (
+                    f"""<button class="edit-btn" onclick="openEditAuto('{_js(auto_id_raw)}', """
+                    f"""'{_js(trigger_entity)}', '{above_js}', '{below_js}')">编辑</button>"""
+                )
+
+            created = auto.get("created_at", "")
+            created_display = ""
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    created_display = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    created_display = str(created)
+
+            last_triggered = auto.get("last_triggered")
+            trigger_info = " | 尚未触发"
+            if last_triggered:
+                try:
+                    dt = datetime.fromisoformat(
+                        str(last_triggered).replace("Z", "+00:00")
+                    )
+                    trigger_info = f" | 上次触发: {dt.strftime('%Y-%m-%d %H:%M')}"
+                except Exception:
+                    trigger_info = " | 已触发"
+
+            actions_raw = auto.get("actions", [])
+            summaries = [_action_to_text(a) for a in actions_raw]
+            count = len(summaries)
+            actions_html = ""
+            for s in summaries:
+                actions_html += f'<div class="action-item">- {html_mod.escape(s)}</div>'
+
+            auto_cards_html += f"""
+<div class="card auto" id="auto-{auto_id}">
+    <div class="card-header">
+        <div><span class="card-trigger auto">{html_mod.escape(trigger_display)}</span><span class="card-tag auto">{kind_tag}</span></div>
+        <button class="delete-btn" onclick="deleteAutomation('{_js(auto_id_raw)}', '{_js(trigger_display)}', event)">删除</button>
+        {edit_btn_html}
+        <button class="test-btn" onclick="testAutomation('{_js(auto_id_raw)}', event)">测试</button>
+    </div>
+    <div class="info">创建时间: {created_display}{trigger_info}</div>
+    <div class="actions-box">
+        <div class="actions-title">执行动作 ({count}个):</div>
+        {actions_html}
+    </div>
+</div>"""
+          except Exception as e:  # noqa: BLE001
+            _LOGGER.error("自动化卡渲染异常（脏 .storage 形态），已降级提示卡: %s", e)
+            auto_cards_html += (
+                '<div class="card auto"><div class="card-header">'
+                '<div><span class="card-trigger auto">⚠ 数据异常自动化</span>'
+                '<span class="card-tag auto">自动化</span></div></div>'
+                '<div class="info">存储形态非法（请用面板删除本条）</div></div>'
+            )
+
+        has_scenes = len(scene_cards_html) > 0
+        has_autos = len(auto_cards_html) > 0
+
+        if not has_scenes and not has_autos:
+            content_html = '<div class="empty-state">暂无智能场景<br><br>通过语音创建语音场景，如："当我说晚安的时候，帮我关灯"<br>或<br>创建传感器自动化，如："当温度大于29度就打开窗户"</div>'
+        else:
+            parts = ""
+            if has_scenes:
+                parts += '<div class="section-title">语音场景</div>' + scene_cards_html
+            if has_autos:
+                parts += (
+                    '<div class="section-title">传感器自动化</div>' + auto_cards_html
+                )
+            content_html = parts
+
+        template = _load_template("manage.html")
+        html_content = template.replace("{content_html}", content_html)
+        return web.Response(text=html_content, content_type="text/html")
+
+
+def _entity_id_to_friendly(hass: HomeAssistant, entity_id: str) -> str:
+    """Resolve entity_id to a human-friendly name."""
+    if not entity_id:
+        return ""
+    ent_reg = er.async_get(hass)
+    entry = ent_reg.async_get(entity_id)
+    if entry and (entry.name or entry.original_name):
+        return entry.name or entry.original_name
+    parts = entity_id.split(".")
+    if len(parts) > 1:
+        return parts[1].replace("_", "").replace("-", "")
+    return entity_id
+
+
+def _action_to_text(action: dict) -> str:
+    """Convert an action dict to user-friendly text like '打开办公室筒灯'."""
+    intent_name = action.get("name") or action.get("intent", "")
+    params = action.get("parameters") or action.get("params", {})
+    target = params.get("target", [])
+    action_text = ""
+    if intent_name == "ControlWindow":
+        action_map = {"open": "打开", "close": "关闭", "pause": "暂停", "a": "内倒"}
+        raw_action = params.get("action", "")
+        action_text = action_map.get(raw_action, raw_action + "窗户")
+    elif intent_name == "TurnDeviceOn":
+        action_text = "打开"
+    elif intent_name == "TurnDeviceOff":
+        action_text = "关闭"
+    elif intent_name == "AdjustDeviceAttribute":
+        action_text = "调节"
+    elif intent_name == "SetDeviceMode":
+        action_text = "设置模式"
+    else:
+        action_text = intent_name
+
+    device_parts = []
+    for t in target:
+        area = t.get("area", "")
+        devices = t.get("devices", [])
+        for d in devices:
+            name = d.get("name", "")
+            domains = d.get("domains", [])
+            if area:
+                device_parts.append(f"{area}的{name or '/'.join(domains)}")
+            elif name:
+                device_parts.append(name)
+            else:
+                device_parts.append("/".join(domains))
+
+    if device_parts:
+        return f"{action_text}{'、'.join(device_parts)}"
+    return action_text
+
+
+def _trigger_to_text(trigger: dict) -> str:
+    """Convert a trigger dict to user-friendly text like '办公室温度 > 27度'."""
+    entity_id = trigger.get("entity_id", "")
+    above = trigger.get("above")
+    below = trigger.get("below")
+    condition = ""
+    if above is not None:
+        condition += f" > {above}度"
+    if below is not None:
+        condition += f" < {below}度" if condition else f" < {below}度"
+    return f"{entity_id}{condition}"
+
+
+def _extract_automation_info(
+    automation: dict, hass: HomeAssistant | None = None
+) -> dict:
+    """Extract automation info for display with user-friendly names."""
+    trigger = automation.get("trigger", {})
+    actions = automation.get("actions", [])
+
+    entity_id = trigger.get("entity_id", "")
+    friendly_name = entity_id
+    if hass:
+        friendly_name = _entity_id_to_friendly(hass, entity_id)
+
+    above = trigger.get("above")
+    below = trigger.get("below")
+    condition_parts = []
+    if above is not None:
+        condition_parts.append(f"> {above}度")
+    if below is not None:
+        condition_parts.append(f"< {below}度")
+
+    trigger_display = (
+        f"{friendly_name} {'、'.join(condition_parts)}"
+        if condition_parts
+        else friendly_name
+    )
+
+    action_summaries = [_action_to_text(a) for a in actions]
+
+    return {
+        "automation_id": automation.get("automation_id"),
+        "trigger_entity": entity_id,
+        "trigger_friendly": friendly_name,
+        "trigger_condition": "、".join(condition_parts) if condition_parts else "",
+        "trigger_display": trigger_display,
+        "action_count": len(actions),
+        "action_summaries": action_summaries,
+        "created_at": automation.get("created_at"),
+        "last_triggered": automation.get("last_triggered"),
+    }
+
+
+class AutomationsListView(HomeAssistantView):
+    requires_auth = False
+    url = "/api/huijian-ai/automations"
+    name = "api:huijian-ai:automations"
+
+    async def get(self, request: web.Request):
+        """Get all automations."""
+        hass = request.app[KEY_HASS]
+        try:
+            store = get_automation_store(hass)
+            automations = await store.get_all_automations()
+
+            automation_list = [_extract_automation_info(a, hass) for a in automations]
+
+            return self.json({"success": True, "automations": automation_list})
+        except Exception as e:
+            _LOGGER.error("Failed to get automations: %s", e)
+            return self.json({"success": False, "error": str(e)}, 500)
+
+
+class AutomationDeleteView(HomeAssistantView):
+    # v1.1.29 复核 A11：破坏性写（delete/put）——同上令牌闸。
+    requires_auth = True
+    url = "/api/huijian-ai/automations/{automation_id}"
+    name = "api:huijian-ai:automations:delete"
+
+    async def delete(self, request: web.Request, automation_id: str):
+        """Delete an automation."""
+        hass = request.app[KEY_HASS]
+        try:
+            store = get_automation_store(hass)
+            success, message = await store.delete_automation(automation_id)
+
+            if success:
+                return self.json({"success": True, "message": message})
+            else:
+                return self.json({"success": False, "error": message}, 404)
+        except Exception as e:
+            _LOGGER.error("Failed to delete automation: %s", e)
+            return self.json({"success": False, "error": str(e)}, 500)
+
+    async def put(self, request: web.Request, automation_id: str):
+        """Update an automation's trigger and/or actions."""
+        hass = request.app[KEY_HASS]
+        try:
+            body = await request.json()
+            _LOGGER.info("Updating automation %s: body=%s", automation_id, body)
+            store = get_automation_store(hass)
+            existing = await store.get_automation(automation_id)
+            if not existing:
+                return self.json(
+                    {"success": False, "error": f"未找到自动化ID'{automation_id}'"}, 404
+                )
+
+            trigger = body.get("trigger")
+            actions = body.get("actions")
+            if not trigger and not actions:
+                return self.json(
+                    {"success": False, "error": "请提供要修改的trigger或actions"}, 400
+                )
+            # v1.0.41（F2）：入库前形态闸——渲染层 _js 只是最后一道防御，
+            # junk entity_id / 非数值阈值这类 trigger 从一开始就不该进 .storage。
+            if trigger is not None:
+                bad = _validate_trigger(trigger)
+                if bad:
+                    return self.json(
+                        {"success": False, "error": f"trigger 字段不合规: {bad}"}, 400
+                    )
+            # v1.1.38（外部审计 #13）：actions 侧原来零校验即落库——同族 F2 的 trigger
+            # 案只修了一半，脏 actions 让该自动化在执行侧裸取 intent 时静默失效。
+            if actions is not None:
+                bad = _validate_automation_actions(actions)
+                if bad:
+                    return self.json(
+                        {"success": False, "error": f"actions 字段不合规: {bad}"}, 400
+                    )
+
+            success, message = await store.update_automation(
+                automation_id, trigger, actions
+            )
+            _LOGGER.info("Update automation result: success=%s, message=%s", success, message)
+            return self.json(
+                {
+                    "success": success,
+                    "message": message if success else None,
+                    "error": message if not success else None,
+                },
+                200 if success else 400,
+            )
+        except Exception as e:
+            _LOGGER.error("Failed to update automation %s: %s", automation_id, e, exc_info=True)
+            return self.json({"success": False, "error": str(e)}, 500)
+
+
+class AutomationsManageView(HomeAssistantView):
+    requires_auth = False
+    url = "/huijian-ai/automations/manage"
+    name = "huijian-ai:automations:manage"
+
+    async def get(self, request: web.Request):
+        html_content = _load_template("automations.html")
+        return web.Response(text=html_content, content_type="text/html")

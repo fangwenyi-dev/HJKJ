@@ -49,3 +49,31 @@ screenshots/
 *SecretKey*
 *.key
 *.pem
+
+# ── 语音加载项并入商店仓（2026-10-06）────────────────────────────────
+# 从 huijian-gateway-plugin-yy 逐条搬来的忽略规则，只取"保护并入的 huijian_voice/
+# 与语音侧会话产物"这一目的。`/huijian_voice/_*` 覆盖 _e2e_data/、_smoke_data/ 与
+# 目录内会话日志（旧仓里 `_v1097_full.log` 就是这么挡住的）。
+/huijian_voice/_*
+huijian_voice/nlu_mining.jsonl
+huijian_voice/.tmp-hj/
+# 语音侧本地物料（模型母本/上游源码/台架/隔离区）：旧仓里是未跟踪工作区，
+# 并入后若有人原地重建，同样不许入库
+/asr/
+/tts/
+/nlu/
+/yyjicheng/
+/_bench/
+/_quarantine/
+/_winlibs/
+/_hjmodels/
+*.tar.bz2
+*.onnx.bak
+.venv/
+venv/
+# 仓根 `_*` 整片忽略（旧仓 v1.1.6 泄漏面收口的原样采纳）：会话期探针/变异/回归台账
+# 历来只靠"不去 add"保命，而本仓 ci.yaml 是 push main 即构建发版——一次 `git add -A`
+# 就会把现场令牌与客户内网 IP 推给全体用户。长期工具请落 scripts/（不受此规则影响）。
+/_*
+# 旧仓还有一条 `/*.md`（内部文档禁发）**故意未采纳**：它会顺带忽略本网关仓将来新增
+# 的仓根 .md（AGENTS.md/SECURITY.md 之类），超出本次合并的必要范围。

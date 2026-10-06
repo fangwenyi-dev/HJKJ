@@ -1,0 +1,503 @@
+"""管理 API(:8002) HTTP 级测试——每个路由真发请求。
+
+钉桩动机（E2E-lite 实战教训）：admin 处理器群曾全体引用不存在的全局 ctx，
+纯逻辑测试无一命中，真实 curl 才炸出 NameError → 路由级全量覆盖常态化。
+"""
+import asyncio
+import json
+import threading
+import time
+from types import SimpleNamespace
+from pathlib import Path
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import ClientSession  # 仅需可用性判据
+
+from conftest import FakeHAClient
+from core.admin_api import make_admin_app
+from core.ws_server import AppContext
+
+
+class StoreSnap:
+    # v1.0.41：快照键形对齐 model_store.snapshot() 真形态 {state,pct,detail,ready}
+    # （F6 前端就按此消费；旧的 {"status":…} 假形曾让页面字段错位无人察觉）。
+    def snapshot(self):
+        return {"asr_paraformer_bilingual": {"state": "ready", "pct": 100,
+                                             "detail": "已就绪", "ready": True}}
+    def is_ready(self, k): return True
+    def keys(self): return ["asr_paraformer_bilingual", "tts_kokoro_multilang"]
+    def ensure_async(self, key, force=False): pass  # 对齐 model_store 真签名（M11 接 force）
+
+
+class ScenesFake:
+    triggers = ["观影模式"]
+    async def refresh(self, force=False):
+        return True        # v1.0.41（F5）：refresh 契约改为返回成败 bool
+    def all(self):
+        return [{"trigger_phrase": "观影模式", "name": "观影", "scene_id": "s1",
+                 "created_at": "2026-09-01T00:00:00",
+                 "actions": [{"intent": "HassTurnOff", "params": {"entity_id": "light.客厅"}}]}]
+
+
+class PipelineFake:
+    fast_path = None
+    executor = None
+    async def dry_run(self, text):
+        return {"plan": {"intent": "TurnDeviceOn", "args": {"target": []},
+                         "source": "t0", "trace": ["测试轨迹"]}}
+
+    def __init__(self, with_telemetry=False):
+        # v1.0.62 P0-1：路由双态都要真过（带遥测/不带=旧构造纵深 getattr 兜底）
+        if with_telemetry:
+            import tempfile
+            from pathlib import Path as _P
+            from core.nlu.telemetry import Telemetry
+            from core.settings import Settings
+            self.telemetry = Telemetry(
+                Settings(_P(tempfile.mkdtemp()) / "s.json"), _P(tempfile.mkdtemp()))
+            self.telemetry.funnel.record("t0", True, 0.1)
+            self.telemetry.funnel.record("fallback", False, 0.2)
+        else:
+            self.telemetry = None
+
+
+class TtsFake:
+    last_used = 0
+    def ready(self): return True
+    def unload(self): return True
+    async def synthesize_pcm(self, text):
+        return b"\x00\x01" * 8000
+    async def stream_opus(self, text, engine_out=None):
+        yield b"x"
+
+
+class SettingsFake:
+    def __init__(self):
+        self.data = {"security": {"ws_token": "tok123", "require_token": False},
+                     "stt": {"provider": "local_paraformer"}, "tts": {"sid": 45},
+                     "llm": {"enabled": False}, "nlu": {}, "power": {}, "dialog": {}}
+    def get(self, k, d=None):
+        cur = self.data
+        for part in k.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return d
+            cur = cur[part]
+        return cur
+    def masked(self): return json.loads(json.dumps(self.data))
+    def update(self, patch, persist=True): self.data.update(patch)
+    def add_listener(self, fn): pass
+    def endpoint_urls(self, host):
+        return {c: f"ws://{host}:8000/xiaozhi/v1/{c}?token=tok123" for c in ("stt", "tts", "llm")}
+
+
+def _admin_serve(with_telemetry=False):
+    ha = FakeHAClient(
+        states={"automation.auto1": {"entity_id": "automation.auto1", "state": "on",
+                                     "attributes": {}},
+                "light.x": {"entity_id": "light.x", "state": "off", "attributes": {}}},
+        rest={"/api/config/automations/config": {"automations": [
+            {"id": "auto1", "alias": "回家开灯", "description": "地理围栏到家",
+             "last_triggered": "2026-09-12T10:00:00"},
+            {"id": "auto2", "alias": "YAML 未重载"}]},
+            # v1.0.41（F5）：语音自动化通道显式给空表——缺键=集成未装，
+            # _automations 现在会如实挂 note，本 fixture 测的是双引擎"皆正常"路径。
+            "/api/huijian-ai/automations": {"automations": []}})
+    ctx = AppContext(settings=SettingsFake(), ha=ha, asr=None, tts=TtsFake(),
+                     pipeline=PipelineFake(with_telemetry=with_telemetry),
+                     scenes=ScenesFake(), textcnn=None,
+                     store=StoreSnap(), started_at=time.time())
+    app = make_admin_app(ctx)
+    loop = asyncio.new_event_loop()
+    holder = {}
+
+    def run():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+
+    async def start():
+        runner = web.AppRunner(app, access_logger=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        holder["runner"] = runner
+        return runner.addresses[0][1]
+
+    port = asyncio.run_coroutine_threadsafe(start(), loop).result(10)
+    yield port
+    asyncio.run_coroutine_threadsafe(holder["runner"].cleanup(), loop).result(10)
+    loop.call_soon_threadsafe(loop.stop)
+    th.join(5)
+
+
+@pytest.fixture()
+def admin():
+    yield from _admin_serve()
+
+
+@pytest.fixture()
+def admin_tele():
+    yield from _admin_serve(with_telemetry=True)
+
+
+def _run(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _get(port, path):
+    import aiohttp
+    async def go():
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://127.0.0.1:{port}{path}") as r:
+                return r.status, await r.text()
+    return _run(go())
+
+
+def _post(port, path, body=None, raw=False):
+    import aiohttp
+    async def go():
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"http://127.0.0.1:{port}{path}",
+                              json=body if not raw else None,
+                              data=body if raw else None) as r:
+                return r.status, await r.text()
+    return _run(go())
+
+
+def test_health(admin):
+    st, body = _get(admin, "/api/health")
+    assert st == 200
+    j = json.loads(body)
+    assert j["ok"] and "version" in j and j["models_ready"]
+    # 两个总开关都要透出：本地理解关掉＝场景触发词/本地建改删/查询族/音乐带全停，
+    # 首页必须能一眼看见（settings 桩里 nlu 无键 → 默认按"开"）
+    assert j["nlu_enabled"] is True and "llm_enabled" in j
+
+
+def test_telemetry_route(admin):
+    """v1.0.62 P0-1 降级路径：pipeline 无遥测件（旧构造/测试面）也必须 200。"""
+    st, body = _get(admin, "/api/telemetry")
+    assert st == 200
+    j = json.loads(body)
+    assert j["funnel"]["total"] == 0 and j["mining"]["enabled"] is False
+
+
+def test_telemetry_route_real(admin_tele):
+    st, body = _get(admin_tele, "/api/telemetry")
+    assert st == 200
+    j = json.loads(body)
+    assert j["funnel"]["total"] == 2
+    assert j["funnel"]["by_source"]["t0"]["n"] == 1
+    assert j["funnel"]["by_source"]["fallback"]["ok_pct"] == 0.0
+    assert j["mining"]["file"] == "nlu_mining.jsonl"
+
+
+def test_settings_roundtrip(admin):
+    st, body = _get(admin, "/api/settings")
+    assert st == 200 and "security" in json.loads(body)
+    st2, b2 = _post(admin, "/api/settings", {"tts": {"sid": 47}})
+    assert st2 == 200 and json.loads(b2)["ok"]
+
+
+def test_models_and_download(admin):
+    st, body = _get(admin, "/api/models")
+    assert st == 200 and "asr_paraformer_bilingual" in json.loads(body)
+    st2, b2 = _post(admin, "/api/models/download", {"key": "asr_paraformer_bilingual"})
+    assert st2 == 200
+    st3, _ = _post(admin, "/api/models/download", {"key": "不存在的包"})
+    assert st3 == 400
+
+
+def test_endpoints_and_regen(admin):
+    st, body = _get(admin, "/api/endpoints")
+    j = json.loads(body)
+    assert st == 200 and "?token=tok123" in j["stt_endpoint"]
+    st2, b2 = _post(admin, "/api/token/regenerate", {})
+    assert st2 == 200 and json.loads(b2)["ok"]
+
+
+def test_nlu_test_route(admin):
+    st, body = _post(admin, "/api/nlu/test", {"text": "打开客厅的灯"})
+    assert st == 200
+    j = json.loads(body)
+    assert j["cascade"]["plan"]["intent"] == "TurnDeviceOn"
+    st2, _ = _post(admin, "/api/nlu/test", {})     # 空 text → 400
+    assert st2 == 400
+
+
+def test_tts_test_returns_wav(admin):
+    import aiohttp
+    async def go():
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"http://127.0.0.1:{admin}/api/tts/test", json={"text": "你好"}) as r:
+                data = await r.read()
+                assert r.status == 200 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+    _run(go())
+
+
+def test_scenes_and_reload(admin):
+    st, body = _get(admin, "/api/scenes")
+    j = json.loads(body)
+    assert st == 200 and "观影模式" in j["triggers"]        # 兼容键仍在
+    assert j["error"] == ""
+    row = j["scenes"][0]
+    assert row["trigger"] == "观影模式" and row["action_count"] == 1
+    assert row["actions"] == ["HassTurnOff light.客厅"]      # 动作压成人读摘要
+
+
+def test_automations_route(admin):
+    st, body = _get(admin, "/api/automations")
+    j = json.loads(body)
+    assert st == 200 and j["error"] == ""
+    a1, a2 = j["automations"]
+    assert a1 == {"kind": "core", "id": "auto1", "alias": "回家开灯",
+                  "description": "地理围栏到家",
+                  "last_triggered": "2026-09-12T10:00:00", "state": "on"}
+    assert a2["state"] == ""                                  # 无 automation.auto2 实体
+
+
+def test_automations_huijian_merge():
+    """v1.0.32 双引擎合并：语音自动化（.storage 经集成视图）必须出现在
+    加载项「场景」tab 列表，trigger/action 压成人读中文。"""
+    import asyncio
+    from types import SimpleNamespace
+    from core.admin_api import CTX_KEY, _automations
+    rest = {
+        "/api/huijian-ai/automations": {"automations": [
+            {"automation_id": "automation_1", "trigger": {"at": "07:00"},
+             "actions": [{"intent": "TurnDeviceOn",
+                          "params": {"target": [{"area": "客厅",
+                                                 "devices": [{"name": "窗帘"}]}]}}],
+             "last_triggered": "2026-09-14T07:00:00"},
+            {"automation_id": "automation_2",
+             "trigger": {"entity_id": "办公室温湿度传感器温度", "above": 30},
+             "actions": [{"intent": "SetDeviceMode",
+                          "params": {"mode": "sleep"}}]},
+            {"automation_id": "automation_3",
+             "trigger": {"entity_id": "书房人体", "to": "on"}, "actions": []},
+        ]},
+        "/api/config/automations/config": {"automations": []},
+    }
+    ctx = AppContext(settings=SettingsFake(), ha=FakeHAClient(rest=rest), asr=None,
+                     tts=TtsFake(), pipeline=PipelineFake(), scenes=ScenesFake(),
+                     textcnn=None, store=StoreSnap(), started_at=time.time())
+    resp = asyncio.run(_automations(SimpleNamespace(app={CTX_KEY: ctx})))
+    j = json.loads(resp.body)
+    hv = [a for a in j["automations"] if a.get("kind") == "huijian"]
+    assert len(hv) == 3 and j["error"] == ""
+    assert hv[0]["alias"] == "每天早上7点" and hv[0]["description"] == "打开客厅窗帘"
+    assert hv[1]["alias"] == "办公室温湿度传感器温度（高于30）"
+    assert hv[1]["description"] == "设为睡眠模式"
+    assert hv[2]["alias"] == "书房人体 有人"
+
+
+def test_hv_helpers_never_raise():
+    from core.admin_api import _hv_trigger_cn, _hv_action_cn
+    assert isinstance(_hv_trigger_cn({"at": "垃圾"}), str)     # 脏值兜底不死
+    assert _hv_trigger_cn({}) == "?"
+    assert _hv_action_cn({"intent": "TurnDeviceOff", "params": {"target": [
+        {"area": "卧室", "devices": [{"name": "灯"}]}]}}) == "关闭卧室灯"
+
+
+def test_scene_row_renders_list_target_in_chinese():
+    """v1.0.40 回归钉（实机缺陷）：现役 pipeline._build_actions 存的是
+    **list 形态** `params.target=[{area,devices:[{name}]}]`，而 _scene_row 旧实现
+    按 dict 读 → area/设备名全丢，场景页「执行动作」列只剩英文意图名
+    （TurnDeviceOn/SetDeviceMode）。上方 test_scenes_and_reload 的假夹具用的是
+    平铺形态，正是它让此缺陷长期假绿。"""
+    from core.admin_api import _scene_row
+    row = _scene_row({
+        "trigger_phrase": "观影模式", "scene_id": "s1",
+        "actions": [
+            {"intent": "TurnDeviceOn", "params": {"target": [
+                {"area": "客厅", "devices": [{"name": "射灯"}]}]}},
+            {"intent": "SetDeviceMode", "params": {"mode": "sleep"}},
+        ]})
+    assert row["actions"] == ["打开客厅射灯", "设为睡眠模式"]
+    assert row["action_count"] == 2
+
+
+def test_scene_row_flat_shape_fallback_unchanged():
+    """兜底钉：平铺形态（entity_id/state…）行为与旧实现完全一致，防修 A 时回归。"""
+    from core.admin_api import _scene_row
+    row = _scene_row({"trigger_phrase": "T", "actions": [
+        {"intent": "HassTurnOff", "params": {"entity_id": "light.客厅"}}]})
+    assert row["actions"] == ["HassTurnOff light.客厅"]
+
+
+def test_hv_action_cn_window_and_attribute_gain_detail():
+    """v1.0.40：ControlWindow 补开/关动作、AdjustDeviceAttribute 补属性+数值
+    （旧 _scene_row 本想显示 brightness/temperature，list 形态下被吃掉）。"""
+    from core.admin_api import _hv_action_cn
+    assert _hv_action_cn({"intent": "ControlWindow", "params": {
+        "action": "open",
+        "target": [{"area": "客厅", "devices": [{"name": "窗帘"}]}]}}) == "打开客厅窗帘"
+    assert _hv_action_cn({"intent": "AdjustDeviceAttribute", "params": {
+        "attribute": "brightness", "delta": "50",
+        "target": [{"area": "客厅", "devices": [{"name": "射灯"}]}]}}) == "调节客厅射灯亮度50"
+    assert _hv_action_cn({"intent": "AdjustDeviceAttribute", "params": {
+        "attribute": "brightness", "delta": "max",
+        "target": [{"area": "书房", "devices": [{"name": "灯"}]}]}}) == "调节书房灯亮度最大"
+    # 脏 params（非 dict）不许抛，交回 "" 让场景页走平铺兜底
+    assert _hv_action_cn({"intent": "TurnDeviceOn", "params": ["坏"]}) == ""
+
+
+def test_manage_page_render_three_trigger_shapes():
+    """集成 manage-page 源码级钉（HA 依赖不可本地导入；行为在 CI e2e）：
+    at/to 形态必须有渲染分支，且不给编辑弹窗（防保存覆盖丢字段）。"""
+    src = (Path(__file__).resolve().parents[1] / "custom_components"
+           / "huijian_ai" / "api.py").read_text(encoding="utf-8")
+    assert "每天 {at} 自动执行" in src and "时间自动化" in src
+    assert "检测到有人" in src and "状态自动化" in src
+    assert src.count('edit_btn_html = ""') == 2               # at 与 to 双分支
+    assert '{kind_tag}' in src and "{edit_btn_html}" in src
+
+
+def test_automations_no_bridge():
+    """HA API 不可达（rest_get 折叠 None）→ 空表 + 诚实错误，绝不 500。"""
+    import asyncio
+    from types import SimpleNamespace
+    from core.admin_api import CTX_KEY, _automations
+    ctx = AppContext(settings=SettingsFake(), ha=FakeHAClient(), asr=None, tts=TtsFake(),
+                     pipeline=PipelineFake(), scenes=ScenesFake(), textcnn=None,
+                     store=StoreSnap(), started_at=time.time())
+    resp = asyncio.run(_automations(SimpleNamespace(app={CTX_KEY: ctx})))
+    j = json.loads(resp.body)
+    assert j["automations"] == [] and "不可达" in j["error"]
+
+
+# ── v1.0.34 页内生命周期操作 ─────────────────────────────────────
+def _op_ctx(ha=None, scenes=None):
+    from core.admin_api import CTX_KEY
+    ctx = SimpleNamespace(
+        ha=ha or FakeHAClient(),
+        scenes=scenes or SimpleNamespace(refresh=None),
+        settings=SettingsFake())
+    return ctx, CTX_KEY
+
+
+def _op_req(ctx, CTX_KEY, body):
+    async def json():
+        return body
+
+    async def refresh(force=False):
+        pass
+    ctx.scenes.refresh = refresh
+    return SimpleNamespace(app={CTX_KEY: ctx}, json=json)
+
+
+def _resp_json(resp):
+    return json.loads(resp.body)
+
+
+def test_scene_delete_via_intent():
+    import asyncio
+    from core.admin_api import _scene_delete
+    ctx, K = _op_ctx()
+    req = _op_req(ctx, K, {"trigger_phrase": "晚安"})
+    r = _resp_json(asyncio.run(_scene_delete(req)))
+    assert r["ok"] is True
+    assert ctx.ha.calls[-1] == ("HassDeleteVoiceScene", {"trigger_phrase": "晚安"})
+    # 无名 → 直接拒，不触后端
+    r2 = _resp_json(asyncio.run(_scene_delete(_op_req(ctx, K, {}))))
+    assert r2["ok"] is False and "缺场景名" in r2["error"]
+    assert len(ctx.ha.calls) == 1
+
+
+def test_scene_rename_and_test_rest():
+    import asyncio
+    from core.admin_api import _scene_rename, _scene_test
+    ha = FakeHAClient(writes={
+        ("PUT", "/api/huijian-ai/voice-scenes/s9"): {"success": True},
+        ("POST", "/api/huijian-ai/test-scene"): {"success": False,
+                                                 "error": "未找到触发词"}})
+    ctx, K = _op_ctx(ha=ha)
+    r = _resp_json(asyncio.run(
+        _scene_rename(_op_req(ctx, K, {"scene_id": "s9", "new_phrase": "午安"}))))
+    assert r["ok"] is True
+    assert ha.written[-1][:2] == ("PUT", "/api/huijian-ai/voice-scenes/s9")
+    r2 = _resp_json(asyncio.run(
+        _scene_test(_op_req(ctx, K, {"trigger_phrase": "晚安"}))))
+    assert r2["ok"] is False and "未找到触发词" in r2["error"]
+    # 超长新名拒（1~12 字与语音侧同界）
+    r3 = _resp_json(asyncio.run(_scene_rename(
+        _op_req(ctx, K, {"scene_id": "s9", "new_phrase": "一" * 13}))))
+    assert r3["ok"] is False
+
+
+def test_automation_ops():
+    import asyncio
+    from core.admin_api import _auto_delete, _auto_test, _auto_edit
+    ha = FakeHAClient(writes={
+        ("POST", "/api/huijian-ai/test-automation"): {"success": True},
+        ("PUT", "/api/huijian-ai/automations/a1"): {"success": True}})
+    ctx, K = _op_ctx(ha=ha)
+    assert _resp_json(asyncio.run(_auto_delete(
+        _op_req(ctx, K, {"automation_id": "a1"}))))["ok"] is True
+    assert ctx.ha.calls[-1] == ("HassDeleteAutomation", {"automation_id": "a1"})
+    assert _resp_json(asyncio.run(_auto_test(
+        _op_req(ctx, K, {"automation_id": "a1"}))))["ok"] is True
+    # 区间编辑：高于必须小于低于（否则永不触发）
+    bad = _resp_json(asyncio.run(_auto_edit(_op_req(ctx, K, {
+        "automation_id": "a1",
+        "trigger": {"entity_id": "sensor.t", "above": 30, "below": 20}}))))
+    assert bad["ok"] is False and "区间" in bad["error"]
+    ok = _resp_json(asyncio.run(_auto_edit(_op_req(ctx, K, {
+        "automation_id": "a1",
+        "trigger": {"entity_id": "sensor.t", "above": 28, "below": ""}}))))
+    assert ok["ok"] is True
+    body = ha.written[-1][2]
+    assert body["trigger"] == {"entity_id": "sensor.t", "above": 28.0}
+
+
+def test_ops_never_500_when_ha_down():
+    import asyncio
+    from core.admin_api import _auto_test, _scene_delete
+
+    class Dead:
+        async def handle_intent(self, n, d, timeout=10.0):
+            raise RuntimeError("bridge down")
+        async def rest_write(self, m, p, b=None, timeout=8.0):
+            raise RuntimeError("bridge down")
+        calls = []
+    ctx, K = _op_ctx(ha=Dead())
+    async def refresh(force=False):
+        raise RuntimeError("no")
+    ctx.scenes.refresh = refresh
+    r1 = _resp_json(asyncio.run(_scene_delete(_op_req(ctx, K, {"trigger_phrase": "x"}))))
+    # handle_intent 抛 → admin handler 由 aiohttp 兜 500？不允许：路由级必须折叠
+    assert r1["ok"] is False
+
+
+def test_scene_page_lifecycle_pins():
+    """v1.0.34 页内操作承诺钉：入口齐全 + 引流文案清零 + 非数值不给编辑按钮
+    （页面承诺=可实现承诺纪律的 web 侧延伸）。"""
+    www = (Path(__file__).resolve().parents[1] / "www" / "index.html"
+           ).read_text(encoding="utf-8")
+    for promise in ("scTest", "scRename", "scDel", "auTest", "auDel", "auEdit",
+                    "sceneMsg", "/api/scenes/test", "/api/automations/edit"):
+        assert promise in www, f"页面缺页内操作入口：{promise}"
+    for stale in ("删除/编辑在 HA 集成配置页", "修改与测试在 HA 集成配置页",
+                  "HA → 设置 → 设备与服务 → 慧尖AI → 管理"):
+        assert stale not in www, f"引流去外部页的旧文案未清除：{stale}"
+    assert "t.at==null" in www, "非数值形态行不给改阈值按钮"
+
+
+def test_scene_ops_routes_registered():
+    ctx = AppContext(settings=SettingsFake(), ha=FakeHAClient(), asr=None,
+                     tts=TtsFake(), pipeline=PipelineFake(),
+                     scenes=ScenesFake(), textcnn=None, store=StoreSnap(),
+                     started_at=time.time())
+    app = make_admin_app(ctx)
+    paths = {r.resource.canonical for r in app.router.routes()
+             if getattr(r, "resource", None) is not None}
+    assert {"/api/scenes/delete", "/api/scenes/rename", "/api/scenes/test",
+            "/api/automations/delete", "/api/automations/test",
+            "/api/automations/edit"} <= paths

@@ -476,10 +476,100 @@ jobs:
       - name: Run real-stack E2E
         run: bash huijian_mqtt_broker/tests/e2e/run_e2e.sh
 
-  # ========== 4. Gitee Release 自动补发 —— v1.7.24 起整段移除 ==========
-  # v1.7.33：本节注释曾写"用户裁定（2026-09-16）此后只推 GitHub"——该裁定
-  # 已于 2026-09-17 被推翻（见 CLAUDE.md 推送与验证流程）：停推代价实证是
-  # **已配置 Gitee 源的 HA 实例商店 latest 永久停在 1.7.24、升级提示静默失效**，
-  # 故每次发版必须双推 main+tag（Gitee push 用系统 git 或一次性 token 注入）。
-  # gitee-release job 仍是墓碑（不自动建 Gitee Release；商店只读仓库内
-  # config.yaml，不受影响，但 Web UI 升级徽章并集源会因此偏旧）。
+  # ========== 6. Gitee Release 自动补发（2026-10-06 复活，接管此前每次手工 POST） ==========
+  # 历史三段：v1.7.24 按"只推 GitHub"裁定整段移除 → 2026-09-17 该裁定被推翻
+  # （停推代价实证＝已配 Gitee 源的 HA 实例商店 latest 永久停在 1.7.24、升级提示
+  # 静默失效，见 CLAUDE.md 推送与验证流程）→ 但 job 没跟着回来，改成发版时手工
+  # POST，v1.7.63/64/65 三条 Gitee Release 全是手工建的（漏一条＝徽章偏旧且无人知）。
+  # 本次语音侧并入商店仓时把它一并自动化，判据沿用语音侧那条 job 攒下的实得教训：
+  #   · body 取 CHANGELOG 对应版本段，缺段回落 prepare 产物（不再 ValueError 崩 job）
+  #   · target_commitish 必带（API 缺省行为不可靠）
+  #   · 幂等且**正文自愈**：同 tag 已存在则 PATCH 同步最新正文——PUT 必 405，且
+  #     PATCH 必须同载 tag_name+name（只发 body 直接 400 "tag_name is missing"）
+  #   · token 必须是纯 ASCII：.gitee_token 曾带 UTF-8 BOM，混进来会 401 长得像过期
+  #   · **先等 Gitee 侧真有本次 sha 再建 Release**：双推里 gitee push 排在 CI 之后，
+  #     sha 不在 Gitee 时 target_commitish 会被解成镜像仓的旧提交＝Release 静默指错
+  #     版本。等不到就响亮失败（并提示"先 git push gitee main"），不静默将就。
+  gitee-release:
+    name: Gitee Release
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_REPO: ${{ github.repository }}   # gitee 侧同名仓（双远端规矩）
+      COMMIT: ${{ github.sha }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PREPARED: ${{ needs.prepare.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for this commit to exist on the Gitee mirror
+        run: |
+          set -eu
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "::error title=GITEE_TOKEN 未配置::仓库 Settings→Secrets→Actions 添加 GITEE_TOKEN（纯 ASCII，勿带 BOM）"
+            exit 1
+          fi
+          case "$GITEE_TOKEN" in
+            *[![:print:]]*|$'\xef'*) echo "::error title=GITEE_TOKEN 含异常字节::疑似复制进 BOM/换行，重新设置纯 token"; exit 1;;
+          esac
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -m 20 \
+                   "https://gitee.com/api/v5/repos/${GITEE_REPO}/commits/${COMMIT}?access_token=${GITEE_TOKEN}" \
+                   || echo 000)
+            if [ "$code" = "200" ]; then echo "Gitee 已有 ${COMMIT:0:8}（第 $i 次探测）"; exit 0; fi
+            sleep 20
+          done
+          echo "::error title=Gitee 镜像仓 10 分钟内没有本次提交::target_commitish 会指到旧提交，故拒绝建 Release。请先 git push gitee main（与 tag 一并双推）后重跑本 job。"
+          exit 1
+
+      - name: Create or sync Gitee Release (idempotent)
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import io, json, os, sys, urllib.error, urllib.request
+          ver, sha = os.environ["VERSION"], os.environ["COMMIT"]
+          tok = os.environ["GITEE_TOKEN"].strip()
+          if not tok.isascii():
+              print("::error title=GITEE_TOKEN 非 ASCII::含 BOM 或不可见字符"); sys.exit(1)
+          api = "https://gitee.com/api/v5/repos/" + os.environ["GITEE_REPO"]
+          tag = "v" + ver
+
+          def call(url, data=None, method=None):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(data).encode() if data else None,
+                  method=method or ("POST" if data else "GET"),
+                  headers={"Content-Type": "application/json"} if data else {})
+              return json.load(urllib.request.urlopen(req, timeout=30))
+
+          body = ""
+          if os.path.exists("CHANGELOG.md"):
+              log = io.open("CHANGELOG.md", encoding="utf-8").read()
+              if "## [%s]" % ver in log:
+                  i = log.index("## [%s]" % ver)
+                  rest = log[i + 1:]
+                  j = rest.index("## [", 3) if "## [" in rest[3:] else len(rest)
+                  body = log[i:i + 1 + j].strip()
+          if not body:
+              body = (os.environ.get("PREPARED") or "").strip()
+              if not body:
+                  body = "## v%s\n\n完整变更记录见 GitHub Release %s。" % (ver, tag)
+          body = body + "\n\n---\n完整记录见 GitHub 仓库 CHANGELOG.md 与 Release %s。" % tag
+
+          try:
+              existing = call("%s/releases/tags/%s?access_token=%s" % (api, tag, tok))
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+              existing = None
+          if existing and existing.get("id"):
+              r = call("%s/releases/%s?access_token=%s" % (api, existing["id"], tok),
+                       {"body": body, "tag_name": tag, "name": tag}, method="PATCH")
+              print("Gitee Release 已同步正文: id=%s tag=%s" % (r.get("id", existing["id"]), tag))
+              sys.exit(0)
+          r = call("%s/releases?access_token=%s" % (api, tok), {
+              "tag_name": tag, "name": tag, "body": body,
+              "target_commitish": sha, "prerelease": False})
+          print("Gitee Release 已创建: id=%s tag=%s" % (r["id"], r["tag_name"]))
+          PY

@@ -1,0 +1,1103 @@
+<!DOCTYPE html>
+<!--
+  慧尖HA语音插件 · 加载项管理页（「星辰大海」设计体系——与 LoRa 网关加载项同源：
+  css/huijian.css 令牌与星野层 + js/starsky.js 固定种子星空 + css/voice.css 页面补充层）。
+  离线 LAN 可用：全部本地相对路径资源，零 CDN。
+  访问路径：HA 侧边栏 Ingress（Supervisor 代理，源 IP 在白名单内）或宿主 :8001。
+  数据面全部走同域 /api/（nginx→127.0.0.1:8002 admin），前端零凭据。
+  CURRENT_VERSION 与 config.yaml/CHANGELOG 一致性由 tests/test_release_consistency.py 钉桩；
+  ?v= cache-bust 与该版本同步 bump（网关 v1.7.1 同款教训：不硬刷拿不到新 UI）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 定案②：主底色四处同步 #071426（ea92e36c 方案A「深蓝夜空」，母本 98ebc5b v1.4.15）；
+     v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
+<meta name="theme-color" content="#071426">
+<title>慧尖HA语音插件</title>
+<link rel="stylesheet" href="css/huijian.css?v=1.1.41">
+<link rel="stylesheet" href="css/voice.css?v=1.1.41">
+</head>
+<body>
+<!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
+     z0 固定星空（氛围底/三团星云/星点/行星群由 css + starsky.js 生成，流星 7 颗），
+     内容层 .page z1 悬浮玻璃。aria-hidden：纯装饰，不进辅助技术。 -->
+<div class="star-bg" aria-hidden="true">
+  <div class="nebula"></div>
+  <div class="nebula3"></div>
+  <div class="stars-far" id="starsFar"></div>
+  <div class="stars-near" id="starsNear"></div>
+  <div class="stars-cluster" id="clusters"></div>
+  <div class="planets" id="planets"></div>
+  <span class="meteor meteor-1"></span><span class="meteor meteor-2 m-blue"></span><span class="meteor meteor-3"></span><span class="meteor meteor-4 m-amber"></span><span class="meteor meteor-5 m-blue"></span><span class="meteor meteor-6"></span><span class="meteor meteor-7"></span>
+</div>
+<div class="page">
+<header class="header">
+  <div class="brand">
+    <span class="brand-logo"><img src="img/logo.png" alt="慧尖 logo"></span>
+    <div class="brand-text">
+      <h1>慧尖HA语音插件</h1>
+      <span class="ver">v<span id="ver">–</span> · <span id="haver">检测中</span></span>
+    </div>
+  </div>
+</header>
+<nav class="hj-nav">
+  <button data-tab="status" class="on">状态</button>
+  <button data-tab="settings">设置</button>
+  <button data-tab="models">模型</button>
+  <button data-tab="ota">设备/固件</button>
+  <button data-tab="scenes">场景/自动化</button>
+  <button data-tab="debug">调试</button>
+  <button data-tab="pair">设备配对</button>
+</nav>
+<main>
+
+<!-- ══ 状态 ══ -->
+<section id="tab-status" class="on">
+  <div class="card"><h3>服务</h3>
+    <div class="grid" id="statusGrid">
+      <div class="stat-row"><span class="stat-label">服务</span><span class="stat-val"><span class="pill warn">加载中…</span></span></div>
+    </div>
+    <div class="hint">端口：WS :8000（小智协议三通道）· 管理 :8002（仅本机）· Ingress :8001</div>
+  </div>
+  <div class="card"><h3>模型就绪度</h3><div id="modelPills" class="grid">–</div>
+    <div class="hint">未就绪时到「模型」页手动触发下载，或将解包目录投放到 /data/models/import/。</div>
+  </div>
+  <div class="card"><h3>最近识别（点「调试」页做干跑；此处为统计）</h3>
+    <div class="hint" id="rtip">运行时长、会话数见上方服务卡片。</div>
+  </div>
+</section>
+
+<!-- ══ 设置 ══ -->
+<section id="tab-settings">
+  <div class="card"><h3>语音识别（STT）</h3>
+    <div class="hj-row">
+      <div><label class="hj-field">引擎</label>
+        <select id="stt_provider">
+          <option value="local_paraformer">本地 · 离线识别（默认，模型可选见下）</option>
+          <option value="cloud">云端 · OpenAI 兼容 /audio/transcriptions</option>
+        </select></div>
+      <div id="sttLocalBox"><label class="hj-field">本地模型（离线引擎切换）</label>
+        <select id="stt_local_model">
+          <option value="sensevoice">SenseVoice-Small · 中英粤（默认，整句离线识别）</option>
+          <option value="paraformer">Paraformer · 中英双语流式（逐字出字，纯中文场景对比档）</option>
+          <option value="firered_ctc">FireRedASR2-CTC · 中英+20多种方言（离线整句，实测对比档，包 776MB）</option>
+        </select></div>
+    </div>
+    <div id="sttCloudBox" style="display:none">
+      <div class="hj-row"><div style="flex:1 1 100%"><label class="hj-field">平台预设（选完只需粘贴 API Key）</label><select id="stt_preset"></select></div></div>
+      <div id="stt_preset_hint" class="hint" style="display:none"></div>
+      <div class="hj-row">
+        <div><label class="hj-field">Base URL</label><input id="stt_cloud_base" placeholder="https://api.example.com/v1"></div>
+        <div><label class="hj-field">模型名</label><input id="stt_cloud_model" placeholder="whisper-1"></div>
+      </div>
+      <label class="hj-field">API Key（显示为 **** 即未变更；输入新值才覆盖）</label><input id="stt_cloud_key" type="password">
+    </div>
+    <div class="hint">默认引擎本地优先；云端失败自动回落本地（日志可见）。本地模型切换保存后自动生效（未装的模型自动下载，约 1 分钟内换绑，进行中的会话不受影响；进度见「模型」页）。</div>
+  </div>
+
+  <div class="card"><h3>语音合成（TTS）</h3>
+    <div class="hj-row">
+      <div><label class="hj-field">引擎</label>
+        <select id="tts_provider">
+          <option value="local_kokoro">本地 · Kokoro 多语（离线可用，音色可选）</option>
+          <option value="local_matcha">本地 · Matcha 中英（单女声，最快档，离线可用）</option>
+          <option value="local_melo">本地 · MeloTTS 中英（单女声，默认，离线可用）</option>
+          <option value="cloud">云端 · OpenAI 兼容 /audio/speech</option>
+        </select></div>
+      <div><label class="hj-field">音色（本地）</label><select id="tts_sid"></select>
+        <span class="hint" id="tts_single_hint" style="display:none"></span></div>
+      <div style="flex:0 1 140px"><label class="hj-field">语速 0.6–2.0</label><input id="tts_speed" type="number" step="0.05" min="0.6" max="2"></div>
+    </div>
+    <div class="hj-row" style="align-items:flex-end" id="tv_row">
+      <div style="flex:1 1 240px"><label class="hj-field">自定义音色上传（单路 .bin，尺寸自动校验；v1.1 RAW 音色库直接可用）</label><input id="tv_file" type="file" accept=".bin"></div>
+      <div style="flex:0 0 auto"><button type="button" class="act gray" id="tv_upload">上传</button></div>
+      <div style="flex:0 0 auto"><button type="button" class="act gray" id="tv_scan">重扫生效</button></div>
+      <div style="flex:1 1 100%"><span class="hint" id="tv_panel"></span></div>
+    </div>
+    <div id="ttsCloudBox" style="display:none">
+      <div class="hj-row"><div style="flex:1 1 100%"><label class="hj-field">平台预设（选完只需粘贴 API Key）</label><select id="tts_preset"></select></div></div>
+      <div id="tts_preset_hint" class="hint" style="display:none"></div>
+      <div class="hj-row">
+        <div><label class="hj-field">Base URL</label><input id="tts_cloud_base"></div>
+        <div><label class="hj-field">模型名</label><input id="tts_cloud_model" placeholder="tts-1"></div>
+        <div><label class="hj-field">音色名</label><input id="tts_cloud_voice" placeholder="可选（如 anna；留空=平台默认嗓）"></div>
+      </div>
+      <div class="hint">音色归属：本地=本页所选音色；云=云端+此音色名（留空用平台默认，部分平台默认是英文男声）；云失败回落本地时用**本地默认音色 sid28（zf_044 女声）**（会换嗓，日志逐句点名引擎）</div>
+      <label class="hj-field">API Key</label><input id="tts_cloud_key" type="password">
+    </div>
+  </div>
+
+  <div class="card"><h3>理解与执行（NLU）</h3>
+    <div class="hj-row">
+      <div><label><input id="nlu_enabled" type="checkbox" style="width:auto"> 启用本地理解（正则+分类器+查询族+场景/自动化本地承接；关掉后只剩大模型兜底）</label></div>
+      <div><label><input id="nlu_textcnn" type="checkbox" style="width:auto"> 启用 TextCNN 意图分类（T1）</label></div>
+      <div><label><input id="nlu_query" type="checkbox" style="width:auto"> 启用本地查询（时间/温度/状态）</label></div>
+    </div>
+    <div id="nluOffWarn" class="hint" style="display:none;color:#c0392b">
+      ⚠ 本地理解已关闭：语音场景触发词、场景/自动化本地建・改・删、本地查询、音乐带全部停止工作，
+      所有话都改由大模型处理；大模型也没启用时，助手只会回一句固定兜底。
+    </div>
+    <div class="hj-row">
+      <div><label><input id="nlu_creation" type="checkbox" style="width:auto"> 场景/自动化本地承接（说「当我说X就Y」零大模型可用；关掉后只能靠大模型创建）</label></div>
+    </div>
+    <div class="hj-row">
+      <div><label><input id="dlg_context" type="checkbox" style="width:auto"> 上下文继承（"把它打开"跟随上一轮目标）</label></div>
+      <div><label><input id="dlg_chain" type="checkbox" style="width:auto"> 复合句链发（"开灯再关窗帘"分步执行）</label></div>
+      <div><label><input id="dlg_confirm" type="checkbox" style="width:auto"> 风险确认（解锁/删场景先问再办）</label></div>
+    </div>
+    <label class="hj-field">自定义纠错词条（JSON，一行一组；在内置 61 条之上叠加）</label>
+    <textarea id="nlu_corr" placeholder='{"西顶灯": "吸顶灯"}'></textarea>
+    <label class="hj-field">卫星→区域映射（JSON；"开灯"类无目标句落在说话卫星所在区域。例：{"192.168.1.31": "卧室"}）</label>
+    <textarea id="sat_areas" placeholder='{"192.168.1.31": "卧室"}'></textarea>
+  </div>
+
+  <div class="card"><h3>音乐（语音点歌 · 过渡带）</h3>
+    <div class="hj-row" style="align-items:flex-end">
+      <div style="flex:1 1 240px"><label class="hj-field">播放端点（自动取自 HA 的 media_player 实体列表；需先安装 Music Assistant 加载项并把本地曲库/电台挂进它，由其托管该播放器；说"播放周杰伦/暂停/下一首/停止播放/现在放的是什么歌"即达。留空=点歌只回配置指引，不抢闲聊）</label><select id="music_player"></select></div>
+      <div style="flex:0 0 auto"><button type="button" class="act gray" id="mp_refresh">刷新列表</button></div>
+      <div style="flex:1 1 100%"><span class="hint" id="mp_panel"></span></div>
+    </div>
+    <div class="hj-row"><div style="flex:1 1 100%"><label class="hj-field">区域→播放端点映射（"在客厅放音乐/用卧室的音箱播放周杰伦"按此选端点，未映射区域自动回退默认端点并如实播报。区域名可用 HA 区域联想，也可手填）</label>
+      <div id="music_areas_box"></div>
+      <button type="button" class="act gray" id="ma_add" style="margin-top:6px">＋ 添加区域映射</button></div></div>
+    <datalist id="mp_areas_dl"></datalist>
+    <div class="hj-row"><div><label><input id="music_wait" type="checkbox" style="width:auto"> 点歌后提示"可能要等一小会儿"（慧尖卫星整曲下载形态的首音预期管理；第三方秒开音箱可关）</label></div></div>
+  </div>
+
+  <div class="card"><h3>大模型兜底（LLM，默认关闭）</h3>
+    <div class="hj-row">
+      <div><label><input id="llm_enabled" type="checkbox" style="width:auto"> 启用（只做兜底：本地理解命中就不经过大模型；场景/自动化本地句无需大模型）</label></div>
+      <div><label><input id="llm_stream" type="checkbox" style="width:auto"> 流式回答（SSE 逐句播报；平台不支持自动整包回退）</label></div>
+    </div>
+    <div class="hj-row">
+      <div><label><input id="llm_scene_write" type="checkbox" style="width:auto"> 允许大模型创建/删除语音场景（本地句零大模型已覆盖，默认开）</label></div>
+      <div><label><input id="llm_auto_write" type="checkbox" style="width:auto"> 允许大模型创建/修改/删除语音自动化（默认关，建议留给本地句式）</label></div>
+    </div>
+    <div class="hj-row"><div style="flex:1 1 100%"><label class="hj-field">平台预设（选完只需粘贴 API Key）</label><select id="llm_preset"></select></div></div>
+    <div id="llm_preset_hint" class="hint" style="display:none"></div>
+    <div class="hj-row">
+      <div><label class="hj-field">Base URL（OpenAI 兼容）</label><input id="llm_base" placeholder="https://…/v1"></div>
+      <div><label class="hj-field">模型</label><input id="llm_model" placeholder="qwen-plus / gpt-4o-mini …"></div>
+      <div><label class="hj-field">API Key</label><input id="llm_key" type="password"></div>
+    </div>
+    <div class="hint">启用后可通过受控工具面下发设备指令（场景/自动化写默认禁）。</div>
+  </div>
+
+  <div class="card"><h3>安全与省电</h3>
+    <div class="hj-row">
+      <div><label><input id="req_token" type="checkbox" style="width:auto"> 设备连接强制校验 token（默认关=局域网免配直连）</label></div>
+      <div style="flex:0 1 180px"><label class="hj-field">空闲 N 分钟卸载模型（0=常驻）</label><input id="unload" type="number" min="0"></div>
+    </div>
+    <label class="hj-field">兜底话术（未理解时播报）</label><input id="fallback">
+    <div class="hint" style="margin-top:10px">
+      <button class="act" id="saveBtn">保存设置</button>
+      <span id="saveMsg" class="mut"></span>
+    </div>
+  </div>
+</section>
+
+<!-- ══ 模型 ══ -->
+<section id="tab-models">
+  <div class="card"><h3>模型包</h3>
+    <table id="modelTable"><thead><tr><th>模型</th><th>状态</th><th>大小/进度</th><th></th></tr></thead><tbody></tbody></table>
+    <div class="hint">下载中断可直接点重试（断点校验 sha256）。手动投放：把<b>解包后</b>的模型目录放到
+      加载项 /data/models/import/&lt;顶层目录名&gt;/（如 sherpa-onnx-streaming-paraformer-bilingual-zh-en/），重启即可识别，零网络。</div>
+  </div>
+  <div class="card"><h3>热操作</h3>
+    <button class="act gray" id="reloadBtn">释放/重载模型（改配置后想立即生效可点）</button>
+    <span id="reloadMsg" class="mut"></span>
+  </div>
+</section>
+
+<!-- ══ 设备/固件（OTA 方案 Phase 2：台账+固件仓+近场链接兜底，2026-09-23）══ -->
+<section id="tab-ota">
+  <div class="card"><h3>卫星台账</h3>
+    <table id="otaDevTable"><thead><tr><th>设备</th><th>区域</th><th>在线</th><th>固件版本</th><th></th><th>连续对话</th><th></th></tr></thead><tbody></tbody></table>
+    <div id="otaDevNote" class="hint"></div>
+    <div class="hint">版本由设备入驻（小程序配网/CMD20）时自动上报；HA 重启后等设备重报，「未上报」属正常态。
+      「远程可用」徽标=该设备已暴露 OTA 接收口（固件 ≥v2.1.36 起支持）；现网固件为「近场链接」形态。</div>
+  </div>
+  <div class="card"><h3>固件仓 <span id="fwLatest" class="mut"></span></h3>
+    <table id="fwTable"><thead><tr><th>版本</th><th>来源</th><th>在盘</th><th>大小/哈希</th><th></th></tr></thead><tbody></tbody></table>
+    <div id="fwHint" class="hint"></div>
+  </div>
+  <div class="card"><h3>发放结果</h3>
+    <div id="otaOut" class="hint">点设备行「发放」生成一次性近场下发链接（10 分钟、单次消费），复制到小程序代发；设备支持远程后此按钮自动变「远程下发」。</div>
+  </div>
+</section>
+
+<!-- ══ 场景（语音场景与自动化·独立页）══ -->
+<section id="tab-scenes">
+  <div class="card"><h3>语音场景（来自慧尖 AI 集成）</h3>
+    <div id="sceneList" class="hint">–</div>
+    <div id="sceneMsg" class="hint"></div>
+    <button class="act gray" id="sceneBtn">刷新</button>
+    <div class="hint">说「当我说晚安，就关闭客厅灯」创建；测试/改名/删除在下方操作列，改动作说「把场景晚安改成……」。</div>
+  </div>
+  <div class="card"><h3>自动化（语音创建 + HA 核心，双引擎合并）</h3>
+    <table><thead><tr><th>触发条件 / 别名</th><th>状态</th><th>最近触发</th><th>执行动作 / 说明</th><th>操作</th></tr></thead><tbody id="autoBody"></tbody></table>
+    <div id="autoMsg" class="hint"></div>
+    <button class="act gray" id="autoBtn">刷新</button>
+    <div class="hint">「语音引擎」= 说「当客厅温度超过28度就打开空调」这类话创建的自动化（测试/删除/改阈值就在操作列）；「无实体」多为 YAML 定义未重载。</div>
+  </div>
+  <div class="card"><details class="help-collapse">
+    <summary>场景和自动化怎么使用 <span class="mut">（点此展开 / 收起）</span></summary>
+    <div class="hint" style="line-height:2.0">
+      <b>① 语音场景——一句话当开关</b>：对语音助手说「<b>当我说晚安，就关闭客厅灯</b>」；
+      创建成功后，任何时候说「晚安」就执行。一条场景最多带 3 个动作：
+      「当我说我回来了，就打开玄关灯并打开客厅窗帘」；
+      动作直接连着说也行（不用带"并/然后"）：「…就打开玄关灯关闭客厅窗帘」。<br>
+      <b>② 语音自动化——条件到了自动执行</b>，三种条件：<br>
+      　数值阈值：「当客厅温度超过28度，就打开空调」（也认中文数字与小数：「超过二十六点五度」）<br>
+      　人体感应：「当书房检测到有人，就开灯」「客厅没人就把灯关了」<br>
+      　每日定时：「每天早上7点帮我打开客厅窗帘」「每天晚上10点半关闭卧室灯」<br>
+      <b>③ 即刻生效</b>：创建成功的播报里会复述触发词和条件，说完马上就能用，无需刷新。<br>
+      <b>④ 只保存听得懂的</b>：句子里任一动作不明确，会当场取消并示范正确说法——
+      不会保存半知半解的设置。撤销：场景说「删除场景晚安」，自动化说「删除自动化1」；说了「有哪些自动化」
+      之后紧接一句「删第2条」即删清单第 2 项；也可用上方操作列删除。<br>
+      <b>⑤ 可创建的动作范围</b>：设备开关、窗帘/窗户开合、亮度/色温/风量/开合度调节、
+      空调与风扇模式（睡眠/节能/舒适/静音/强力/标准等）。<br>
+      <b>⑥ 改与测，全在本页</b>：场景——操作列可<b>测试执行</b>、<b>改名</b>、<b>删除</b>，
+      换动作说「把场景晚安改成关闭所有灯」；自动化——操作列可<b>测试执行</b>、<b>删除</b>、
+      数值条件<b>改阈值</b>；要改触发条件本身，删掉再说一句新的（语音/web 均可）。
+    </div>
+    </details>
+  </div>
+</section>
+
+<!-- ══ 调试 ══ -->
+<section id="tab-debug">
+  <div class="card"><h3>NLU 理解漏斗（v1.0.63 · 本进程累计，重启清零）</h3>
+    <div id="funnelBox" class="hint">点「刷新」拉取 /api/telemetry。兜底/LLM 档占比偏高＝语料缺口信号（回流语料在 nlu_mining.jsonl，只存本机）。</div>
+    <div class="hj-row"><div style="flex:0 1 120px"><button class="act" id="funnelBtn">刷新</button></div>
+      <div id="funnelMeta" class="hint" style="flex:1"></div></div>
+  </div>
+  <div class="card"><h3>一句话理解（干跑不执行；勾选后可真执行）</h3>
+    <div class="hj-row">
+      <div style="flex:3"><label class="hj-field">输入语句</label><input id="dbgText" placeholder="打开客厅的灯"></div>
+      <div style="flex:0 1 150px"><label><input id="dbgExec" type="checkbox" style="width:auto"> 真执行</label></div>
+      <div style="flex:0 1 120px"><button class="act" id="dbgBtn">测试</button></div>
+    </div>
+    <pre id="dbgOut" class="hj-term">—</pre>
+  </div>
+  <div class="card"><h3>TTS 试听</h3>
+    <div class="hj-row">
+      <div style="flex:3"><input id="ttsText" value="好的，客厅的灯打开了。" placeholder="要合成的句子"></div>
+      <div style="flex:0 1 120px"><button class="act" id="ttsBtn">合成</button></div>
+    </div>
+    <div id="ttsPlayer" style="margin-top:8px"></div>
+  </div>
+</section>
+
+<!-- ══ 配对 ══ -->
+<section id="tab-pair">
+  <div class="card"><h3>设备端点（填到固件/小程序的同名三项）</h3>
+    <table><tbody id="epTable"></tbody></table>
+    <div class="hint">token 仅在本页与 /api/endpoints 出现（管理面白名单来源限定）。若开启了强制校验，
+      设备上的地址必须是<b>整串带 token</b> 复制。</div>
+    <p style="margin-top:10px">
+      <button class="act red" id="regenBtn">重置 token</button>
+      <span class="mut"> 重置后所有设备需重新配对。</span>
+    </p>
+  </div>
+  <div class="card"><h3>huijian_ai 集成</h3>
+    <div id="intBox" class="hint">状态由加载项启动日志与 HA 集成页对照：安装/升级后需重启 HA Core 首次加载。</div>
+    <div class="hint">固件端（matter-broker 卫星）与小程序把「服务器地址」指向 <code>ws://&lt;本机IP&gt;:8000/xiaozhi/v1/…</code> 即可；局域网免 token 模式下无需粘贴 token。</div>
+  </div>
+</section>
+
+</main>
+<footer class="footer"><p>慧尖HA语音插件 <span id="footerVer"></span></p></footer>
+</div><!-- /.page -->
+<div id="toast"></div>
+
+<script>
+"use strict";
+const CURRENT_VERSION = "1.1.41";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+// 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
+// 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
+// sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
+const VOICES = [
+  [0,"af_maple（英文）"],[1,"af_sol（英文）"],[2,"bf_vale（英文）"],[3,"zf_001 · 女声"],
+  [4,"zf_002 · 女声"],[5,"zf_003 · 女声"],[6,"zf_004 · 女声"],[7,"zf_005 · 女声"],
+  [8,"zf_006 · 女声"],[9,"zf_007 · 女声"],[10,"zf_008 · 女声"],[11,"zf_017 · 女声"],
+  [12,"zf_018 · 女声"],[13,"zf_019 · 女声"],[14,"zf_021 · 女声"],[15,"zf_022 · 女声"],
+  [16,"zf_023 · 女声"],[17,"zf_024 · 女声"],[18,"zf_026 · 女声（最似晓晓）"],[19,"zf_027 · 女声"],
+  [20,"zf_028 · 女声"],[21,"zf_032 · 女声"],[22,"zf_036 · 女声"],[23,"zf_038 · 女声"],
+  [24,"zf_039 · 女声"],[25,"zf_040 · 女声"],[26,"zf_042 · 女声"],[27,"zf_043 · 女声"],
+  [28,"zf_044 · 女声（默认）"],[29,"zf_046 · 女声"],[30,"zf_047 · 女声"],[31,"zf_048 · 女声"],
+  [32,"zf_049 · 女声"],[33,"zf_051 · 女声"],[34,"zf_059 · 女声"],[35,"zf_060 · 女声"],
+  [36,"zf_067 · 女声"],[37,"zf_070 · 女声"],[38,"zf_071 · 女声"],[39,"zf_072 · 女声"],
+  [40,"zf_073 · 女声"],[41,"zf_074 · 女声"],[42,"zf_075 · 女声"],[43,"zf_076 · 女声"],
+  [44,"zf_077 · 女声"],[45,"zf_078 · 女声"],[46,"zf_079 · 女声"],[47,"zf_083 · 女声"],
+  [48,"zf_084 · 女声"],[49,"zf_085 · 女声"],[50,"zf_086 · 女声"],[51,"zf_087 · 女声"],
+  [52,"zf_088 · 女声"],[53,"zf_090 · 女声"],[54,"zf_092 · 女声"],[55,"zf_093 · 女声"],
+  [56,"zf_094 · 女声"],[57,"zf_099 · 女声"],[58,"zm_009 · 男声"],[59,"zm_010 · 男声"],
+  [60,"zm_011 · 男声"],[61,"zm_012 · 男声"],[62,"zm_013 · 男声"],[63,"zm_014 · 男声"],
+  [64,"zm_015 · 男声"],[65,"zm_016 · 男声"],[66,"zm_020 · 男声"],[67,"zm_025 · 男声"],
+  [68,"zm_029 · 男声"],[69,"zm_030 · 男声"],[70,"zm_031 · 男声"],[71,"zm_033 · 男声"],
+  [72,"zm_034 · 男声"],[73,"zm_035 · 男声"],[74,"zm_037 · 男声"],[75,"zm_041 · 男声"],
+  [76,"zm_045 · 男声"],[77,"zm_050 · 男声"],[78,"zm_052 · 男声"],[79,"zm_053 · 男声"],
+  [80,"zm_054 · 男声"],[81,"zm_055 · 男声（最似云扬）"],[82,"zm_056 · 男声"],[83,"zm_057 · 男声"],
+  [84,"zm_058 · 男声"],[85,"zm_061 · 男声"],[86,"zm_062 · 男声"],[87,"zm_063 · 男声"],
+  [88,"zm_064 · 男声"],[89,"zm_065 · 男声"],[90,"zm_066 · 男声"],[91,"zm_068 · 男声"],
+  [92,"zm_069 · 男声"],[93,"zm_080 · 男声"],[94,"zm_081 · 男声"],[95,"zm_082 · 男声"],
+  [96,"zm_089 · 男声"],[97,"zm_091 · 男声"],[98,"zm_095 · 男声"],[99,"zm_096 · 男声"],
+  [100,"zm_097 · 男声"],[101,"zm_098 · 男声"],[102,"zm_100 · 男声"]
+];
+/* 音色表随引擎档重建（2026-09-22）——每档只列该引擎**真有**的嗓：
+   Matcha/Melo 台架实测 num_speakers=1 且包内无 voices.bin（自定义音色的追加
+   载体在 Kokoro 包里），故各只有 1 项；云档实际发声=失败回落本地固定嗓，
+   tts.sid 在云档完全不参与（core/tts.py:1323），故只列该固定嗓。 */
+const KOKORO_DEFAULT_SID = 28;   // = 后端 _DEFAULT_SID（core/tts.py:183，zf_044）
+const VOICE_TABLES = {
+  local_kokoro: VOICES,
+  local_matcha: [[0, "内置女声（Matcha zh-en · 该档唯一）"]],
+  local_melo:   [[0, "内置女声（MeloTTS zh-en · 该档唯一）"]],
+  cloud:        [[KOKORO_DEFAULT_SID, "云失败回落嗓：Kokoro zf_044 女声（固定，不可选）"]],
+};
+const VOICE_HINTS = {
+  local_matcha: "本档为引擎内置单女声（唯一音色，不可更换）；自定义音色仅 Kokoro 档可用。",
+  local_melo:   "本档为引擎内置单女声（唯一音色，不可更换）；自定义音色仅 Kokoro 档可用。",
+  cloud:        "云档音色以「音色名」为准；本表仅为云失败/钉扎回落时的固定本地嗓，不可选。",
+};
+const TTS_SID_OWNER = "local_kokoro";   // tts.sid 的写权只属 Kokoro 档：单音色/云档保存时不提交
+let _kokoroSid = null;                  // Kokoro 档记住的选择（切档再切回不丢，含自定义音色主名）
+const MODEL_NAMES = {asr_sensevoice_small:"STT · SenseVoice-Small 中英粤", asr_paraformer_bilingual:"STT · Paraformer 中英双语流式", asr_firered_ctc:"STT · FireRedASR2-CTC 中英+方言", tts_kokoro_multilang:"TTS · Kokoro 多语包"};
+const $ = s => document.querySelector(s);
+/* Ingress 适配（网关同款实证）：页面挂在 /api/hassio_ingress/<token>/ 下，
+   根绝对路径 fetch 会打到 HA Core。由 location.pathname 推导前缀；
+   直连 :8001（pathname="/"或"/index.html"）时退化为 "/"，同样正确。 */
+const INGRESS_BASE = window.location.pathname.replace(/\/[^/]*$/, '/');
+const U = p => INGRESS_BASE + String(p).replace(/^\//, '');
+const toast = m => { const t=$("#toast"); t.textContent=m; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2600); };
+async function api(path, opt) {
+  const r = await fetch(U(path), opt);
+  const j = await r.json().catch(()=>({message:"响应解析失败"}));
+  if (!r.ok) throw new Error(j.message || ("HTTP "+r.status));
+  return j;
+}
+const post = (p,b) => api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
+let _sc = [], _au = [];      // 场景/页与自动化页的行数据缓存（操作列按下标取行）
+// v1.0.40：模块级转义器（此前只有函数内局部 esc，导致 pill/statRow/错误文案漏转义）
+const esc0 = s => String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function pill(txt, cls){ return `<span class="pill ${esc0(cls)}">${esc0(txt)}</span>`; }
+function statRow(label, valHtml){ return `<div class="stat-row"><span class="stat-label">${esc0(label)}</span><span class="stat-val">${valHtml}</span></div>`; }
+function fmtBytes(n){ if(!n) return "–"; const u=["B","KB","MB","GB"]; let i=0; while(n>=1024&&i<3){n/=1024;i++;} return n.toFixed(i?1:0)+u[i]; }
+
+/* ── tabs ── */
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("nav button").forEach(x=>x.classList.remove("on"));
+  document.querySelectorAll("main section").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); $("#tab-"+b.dataset.tab).classList.add("on");
+  if(b.dataset.tab==="settings") loadSettings();
+  if(b.dataset.tab==="models") loadModels();
+  if(b.dataset.tab==="pair") loadEndpoints();
+  if(b.dataset.tab==="scenes"){ loadScenes(); loadAutomations(); }
+  if(b.dataset.tab==="ota") loadOta();
+});
+
+/* ── 状态 ── */
+/* v1.0.42（F7）：status.json 是核心心跳写出的静态文件（nginx 直出）——核心进程
+   死掉后文件冻结，页面会永远显示"正常"。纯客户端时效判据：连续 ≥3 次轮询
+   （4s×3≈12s）拿到同一个 ts 即认定状态停更；不用本地时钟与 ts 作差（无时钟
+   假设），只比较 ts 是否推进。 */
+let _stTs = null, _stSame = 0, _stBusy = false;
+async function refreshStatus(){ if (_stBusy) return; _stBusy = true;   // v1.1.27：在飞闩——慢响应下旧形态多轮并发互踩冻结计数/DOM（释放见函数末 finally）
+  try {
+    const st = await api("/status.json", {});
+    const _ts = (st && st.ts != null) ? st.ts : null;
+    _stSame = (_ts !== null && _ts === _stTs) ? _stSame + 1 : 0;
+    _stTs = _ts;
+    const frozen = _stSame >= 3;   // ts 停更（核心可能已退出），会话数一并按陈旧处理
+    $("#ver").textContent = st.version || CURRENT_VERSION;
+    $("#footerVer").textContent = "v" + (st.version || CURRENT_VERSION);
+    $("#haver").textContent = (st.version===CURRENT_VERSION) ? "核心正常" : "前端/核心版本不一致";
+    const up = st.uptime_s>=0 ? (st.uptime_s>86400 ? (st.uptime_s/86400).toFixed(1)+" 天" : Math.floor(st.uptime_s/3600)+" 时 "+ (st.uptime_s%3600/60|0)+" 分") : "–";
+    $("#statusGrid").innerHTML = [
+      statRow("服务运行", frozen ? pill("状态停更（核心可能已退出）","warn")
+                                 : `<span class="pill ok">正常 ${up}</span>`),
+      statRow("HA 桥接", st.ha_bridge?pill("在线","ok")
+        :pill("不可达","bad")+(st.ha_error?`<span class="hint" style="margin-left:8px">${esc0(String(st.ha_error).slice(0,60))}</span>`:"")),
+      statRow("STT 引擎", st.stt_loaded?pill("已加载 · "+(st.stt_kind==="paraformer"?"Paraformer 流式":st.stt_kind==="sensevoice"?"SenseVoice":st.stt_kind==="firered_ctc"?"FireRedASR2-CTC":(st.stt_kind||"本地")),"ok"):pill("未就绪","warn")),
+      statRow("TTS 引擎", st.tts_loaded?pill("已加载","ok"):pill("未就绪","warn")),
+      statRow("意图分类", st.textcnn?pill("可用","ok"):pill("缺资产","warn")),
+      statRow("本地理解", st.nlu_enabled!==false?pill("已启用","ok")
+        :pill("已关闭（只剩大模型）","bad")),
+      statRow("LLM 兜底", st.llm_enabled?pill("已启用","ok"):pill("关闭","warn")),
+      statRow("活动会话", `<span class="pill ${(st.sessions>0&&!frozen)?'ok':'warn'}">${st.sessions}${frozen?" · 停更":""}</span>`),
+    ].join("");
+  } catch(e) { _stTs = null; _stSame = 0;   // 拉不到文件=另一条真实失败路径，重新起算
+              $("#haver").textContent = "核心未就绪"; $("#statusGrid").innerHTML = statRow("服务状态", '<span class="pill warn">状态不可读（status.json 拉取失败）</span>'); }   // v1.1.27：拉不到即置灰，旧形态留着上一轮绿字「正常」继续骗人
+  try {
+    const ms = await api("/models_status.json", {});
+    // v1.0.35 修复三连：①事实文件外壳是 {updated, models}（model_store 双写者
+    // 协议），此前直接 entries(外壳) 把 updated/models 渲染成两行红问号，真实
+    // 模型状态永远不可见；②内层字段是 state/pct/detail，旧代码找 status/
+    // progress 全落空；③pending/checking/extracting 被兜底成红色"坏"。
+    const mm = (ms && typeof ms === "object" && ms.models && typeof ms.models === "object") ? ms.models : (ms || {});
+    $("#modelPills").innerHTML = Object.entries(mm).map(([k,v])=>{
+      const o = (v && typeof v === "object") ? v : {state:String(v||"?")};
+      // v1.1.20：在盘优先判就绪——台账 state 只有后台 ensure 过才写 ready，
+      // 已就绪的模型会一直显示黄色 pending（与 /healthz 的 models 同病，同处方）
+      const s = o.ready ? "ready" : (o.state || o.status || "?");
+      const cls = (s==="ready"||s==="ok") ? "ok" : (s==="failed" ? "bad" : "warn");
+      const pct = (o.pct!=null) ? Math.round(o.pct) : (o.progress!=null ? Math.round(o.progress*100) : null);
+      const extra = (pct!=null && s!=="ready" ? ` <span class="mut">${pct}%</span>` : "")
+                  + (o.detail ? ` <span class="hint">${esc0(String(o.detail).slice(0,42))}</span>` : "");
+      return statRow(MODEL_NAMES[k]||k, pill(s,cls)+extra);
+    }).join("") || '<span class="mut">暂无状态</span>';
+    if (mm !== ms && ms && ms.updated) {
+      $("#modelPills").innerHTML += `<div class="hint" style="grid-column:1/-1">状态更新于 ${new Date(ms.updated*1000).toLocaleTimeString()}</div>`;
+    }
+  } catch(e){ $("#modelPills").textContent = "models_status.json 未生成"; } finally { _stBusy = false; }
+}
+setInterval(refreshStatus, 4000); refreshStatus();
+
+/* ── 设置 ── */
+/* 平台预设目录（v1.0.8）：只收录标准 OpenAI 兼容端点——选中即填好 Base URL/模型/音色，
+   用户只剩粘贴 API Key 一步。讯飞星火/火山豆包/腾讯云/百度云/MiniMax 的语音接口为
+   私有协议，本加载项云通道不兼容，故不收录（LLM 档位讯飞/火山是标准兼容，收录）。 */
+const PRESETS = {
+  stt: [
+    {id:"bailian", name:"阿里百炼 · Qwen3-ASR（国内推荐）", base:"https://dashscope.aliyuncs.com/compatible-mode/v1", model:"qwen3-asr-flash", key:"bailian.console.aliyun.com → API-KEY", hint:"模型名如平台调整以百炼文档为准"},
+    {id:"siliconflow", name:"硅基流动 · SenseVoice（有免费额度）", base:"https://api.siliconflow.cn/v1", model:"FunAudioLLM/SenseVoiceSmall", key:"cloud.siliconflow.cn → API 密钥"},
+    {id:"groq", name:"Groq · Whisper turbo（免费快）", base:"https://api.groq.com/openai/v1", model:"whisper-large-v3-turbo", key:"console.groq.com", hint:"需可直连海外"},
+    {id:"openai", name:"OpenAI · Whisper", base:"https://api.openai.com/v1", model:"whisper-1", key:"platform.openai.com"},
+    {id:"302ai", name:"302.AI · 聚合代理（国内直连）", base:"https://api.302ai.cn/v1", model:"whisper-1", key:"302.ai"},
+  ],
+  tts: [
+    {id:"siliconflow", name:"硅基流动 · CosyVoice2（中文，推荐）", base:"https://api.siliconflow.cn/v1", model:"FunAudioLLM/CosyVoice2-0.5B", voice:"anna", fmt:"pcm", rate:24000, key:"cloud.siliconflow.cn → API 密钥", hint:"预置音色：男 alex/benjamin/charles/david，女 anna/bella/claire/diana，可改音色名"},
+    {id:"openai", name:"OpenAI · TTS", base:"https://api.openai.com/v1", model:"tts-1", voice:"alloy", fmt:"pcm", rate:24000, key:"platform.openai.com", hint:"模型名可换 gpt-4o-mini-tts；音色 alloy/echo/fable 等"},
+    {id:"302ai", name:"302.AI · 聚合代理（国内直连）", base:"https://api.302ai.cn/v1", model:"tts-1", voice:"alloy", fmt:"pcm", rate:24000, key:"302.ai"},
+  ],
+  llm: [
+    {id:"deepseek", name:"DeepSeek（性价比高）", base:"https://api.deepseek.com/v1", model:"deepseek-chat", key:"platform.deepseek.com"},
+    {id:"bailian", name:"阿里百炼 · 通义千问", base:"https://dashscope.aliyuncs.com/compatible-mode/v1", model:"qwen-plus", key:"bailian.console.aliyun.com → API-KEY"},
+    {id:"volc", name:"火山引擎 · 豆包", base:"https://ark.cn-beijing.volces.com/api/v3", model:"doubao-seed-1-6-250615", key:"console.volcengine.com → 火山方舟", hint:"模型名=推理接入点(ep-xxx)或模型 ID，按方舟控制台填"},
+    {id:"zhipu", name:"智谱 GLM（glm-4-flash 免费）", base:"https://open.bigmodel.cn/api/paas/v4", model:"glm-4-flash", key:"open.bigmodel.cn"},
+    {id:"kimi", name:"Kimi · Moonshot", base:"https://api.moonshot.cn/v1", model:"moonshot-v1-8k", key:"platform.moonshot.cn", hint:"可按控制台切换 kimi 新模型名"},
+    {id:"siliconflow", name:"硅基流动", base:"https://api.siliconflow.cn/v1", model:"deepseek-ai/DeepSeek-V3", key:"cloud.siliconflow.cn"},
+    {id:"spark", name:"科大讯飞 · 星火", base:"https://spark-api-open.xf-yun.com/v1", model:"4.0Ultra", key:"讯飞开放平台 → Spark 大模型 HTTP", hint:"模型名按控制台（如 generalv3.5 / 4.0Ultra）"},
+    {id:"gemini", name:"Google Gemini（免费档）", base:"https://generativelanguage.googleapis.com/v1beta/openai", model:"gemini-2.5-flash", key:"aistudio.google.com", hint:"需可直连海外"},
+    {id:"ollama", name:"Ollama · 局域网（免 Key）", base:"http://192.168.1.100:11434/v1", model:"qwen2.5:7b", hint:"把 IP 改成你 Ollama 主机的局域网地址；无需 API Key"},
+    {id:"openai", name:"OpenAI", base:"https://api.openai.com/v1", model:"gpt-4o-mini", key:"platform.openai.com"},
+  ]
+};
+let ttsFmt = "", ttsRate = 0;
+function wirePresets(){
+  ["stt","tts","llm"].forEach(function(kind){
+    const sel = $("#"+kind+"_preset"), hint = $("#"+kind+"_preset_hint");
+    if (!sel) return; sel.add(new Option("（未选）", ""));   // v1.1.27：占位项（旧形态首项被隐式选中，用户以为已选平台）
+    PRESETS[kind].forEach(function(p){ sel.add(new Option(p.name, p.id)); });
+    sel.onchange = function(){
+      const p = PRESETS[kind].find(function(x){ return x.id===sel.value; });
+      if (!p) { hint.style.display="none"; return; }
+      if (kind==="stt"){ $("#stt_provider").value="cloud"; $("#stt_cloud_base").value=p.base; $("#stt_cloud_model").value=p.model; }
+      else if (kind==="tts"){ $("#tts_provider").value="cloud"; $("#tts_cloud_base").value=p.base; $("#tts_cloud_model").value=p.model; $("#tts_cloud_voice").value=p.voice; ttsFmt=p.fmt||""; ttsRate=p.rate||0; }
+      else { $("#llm_base").value=p.base; $("#llm_model").value=p.model; $("#llm_enabled").checked=true; }
+      hint.textContent = (p.key ? "Key 申请："+p.key+"。" : "") + (p.hint||"");
+      hint.style.display=""; syncBoxes(); toast("预设已填入，粘贴 API Key 后点保存");
+    };
+  });
+}
+let S = null;
+async function loadSettings(){
+  try { S = await api("/api/settings"); } catch(e){ toast("读取设置失败："+e.message); return; }
+  _kokoroSid = String(S.tts.sid ?? KOKORO_DEFAULT_SID);   // Kokoro 档的选择；音色表由 syncBoxes() 按引擎重建
+  $("#tts_speed").value = S.tts.speed ?? 1.25;
+  $("#stt_provider").value = String(S.stt.provider||"").startsWith("cloud") ? "cloud" : "local_paraformer";
+  // v1.0.99+ 本地模型切换（stt.local_model：sensevoice|paraformer|firered_ctc）：
+  // 未知值按默认档显示（引擎读侧同判据——_primary_kind 非表值一律回落 sensevoice）。
+  // 旧写法是 paraformer/其余 的二元三元式：第三档会被显示成默认档（用户以为切了
+  // 实际没切，且下一次保存静默改写 settings），故改成员判断。
+  const _STT_KINDS = ["sensevoice", "paraformer", "firered_ctc"];
+  $("#stt_local_model").value = _STT_KINDS.includes(S.stt.local_model) ? S.stt.local_model : "sensevoice";
+  // v1.0.65（TTS 深审 F11）：云档存在两个"正统"拼法（引擎读侧 startswith
+  // ("cloud") 双吃：UI 的 "cloud" 与 settings 注释/测试沿用的
+  // "cloud_openai_compat"）。旧版严格判等：手改的 cloud_openai_compat 下拉框
+  // 显示"本地"而实际跑云，且下一次任意保存把它静默改写成 local_kokoro（云配
+  // 置丢失、行为翻转、无警告）。放宽为前缀判等，未知值如实提示不静默。
+  $("#tts_provider").value = String(S.tts.provider||"").startsWith("cloud") ? "cloud"
+    : ["local_kokoro","local_matcha","local_melo"].includes(S.tts.provider) ? S.tts.provider : "local_melo";
+  if (S.tts.provider && !["local_kokoro","local_matcha","local_melo","cloud","cloud_openai_compat"].includes(S.tts.provider))
+    toast("tts.provider 值 "+S.tts.provider+" 未知，已按默认档 local_melo 显示（与后端回落一致）；保存将写入下拉框选项");
+  $("#stt_cloud_base").value = S.stt.cloud?.base_url||""; $("#stt_cloud_model").value = S.stt.cloud?.model||"";
+  $("#tts_cloud_base").value = S.tts.cloud?.base_url||""; $("#tts_cloud_voice").value = S.tts.cloud?.voice||"";
+  $("#tts_cloud_model").value = S.tts.cloud?.model||""; ttsFmt = S.tts.cloud?.response_format||""; ttsRate = S.tts.cloud?.sample_rate||0;
+  $("#stt_cloud_key").value = ""; $("#stt_cloud_key").placeholder = S.stt.cloud?.api_key||"";
+  $("#tts_cloud_key").value = ""; $("#tts_cloud_key").placeholder = S.tts.cloud?.api_key||"";
+  $("#nlu_enabled").checked = S.nlu.enabled !== false;
+  $("#nlu_creation").checked = S.nlu.creation_enabled !== false;
+  $("#nlu_textcnn").checked = S.nlu.textcnn_enabled !== false;
+  $("#nlu_query").checked = S.nlu.query_local !== false;
+  try { $("#nlu_corr").value = JSON.stringify(S.nlu.corrections_extra||{},null,0); } catch(e){}
+  $("#dlg_context").checked = S.dialog?.context_enabled !== false;
+  $("#dlg_chain").checked = S.dialog?.chain_enabled !== false;
+  $("#dlg_confirm").checked = S.dialog?.confirm_risky !== false;
+  try { $("#sat_areas").value = JSON.stringify(S.spatial?.satellite_areas||{},null,0); } catch(e){}
+  $("#music_wait").checked = S.music?.expect_wait_note !== false;
+  seedMusicPanel();   // 先按已存值播种下拉/行编辑器，再异步拉 HA 播放器列表
+  $("#llm_enabled").checked = !!S.llm.enabled;
+  $("#llm_stream").checked = S.llm.stream !== false;
+  $("#llm_scene_write").checked = S.llm.allow_scene_write !== false;
+  $("#llm_auto_write").checked = S.llm.allow_automation_write === true;
+  $("#llm_base").value = S.llm.base_url||""; $("#llm_model").value = S.llm.model||"";
+  $("#llm_key").value = ""; $("#llm_key").placeholder = S.llm.api_key||"";
+  $("#req_token").checked = !!S.security.require_token;
+  $("#unload").value = S.power?.unload_when_idle_min ?? 0;
+  $("#fallback").value = S.dialog?.fallback_text||"";
+  syncBoxes(); syncNluWarn();
+}
+function syncBoxes(){
+  $("#sttCloudBox").style.display = $("#stt_provider").value==="cloud"?"":"none";
+  $("#sttLocalBox").style.display = $("#stt_provider").value==="cloud"?"none":"";
+  $("#ttsCloudBox").style.display = $("#tts_provider").value==="cloud"?"":"none";
+  renderVoiceTable();
+}
+/* 音色表随引擎档重建（2026-09-22）：旧形态是一张 Kokoro 103 项表走天下，
+   非 Kokoro 档只盖一句通用提示——下拉里显示的嗓与实际发声的引擎对不上，
+   云档还摆着一份根本不生效的可选表（tts.sid 在云档不参与）。现在按档重建，
+   并把切档前的 Kokoro 选择留在 _kokoroSid（保存路径见 ttsSidPatch）。 */
+const voiceEngine = () => {          // 下拉值 → 生效引擎档（未知 local_* 回落 Kokoro，同后端 _provider()）
+  const p = String($("#tts_provider").value);
+  if (p.startsWith("cloud")) return "cloud";
+  return Object.prototype.hasOwnProperty.call(VOICE_TABLES, p) ? p : "local_melo";
+};
+function renderVoiceTable(){
+  const sel = $("#tts_sid"), eng = voiceEngine(), was = sel.dataset.eng;
+  const fixed = eng !== TTS_SID_OWNER;                  // 单音色/云档=不可换嗓
+  // 留档只在**离开** Kokoro 档时做：每次渲染都取 DOM 会用陈旧值盖掉设置里刚载入的选择
+  if (was === TTS_SID_OWNER && fixed && sel.value) _kokoroSid = sel.value;
+  const table = VOICE_TABLES[eng];
+  sel.innerHTML = "";
+  table.forEach(([v,n])=>sel.add(new Option(n, v)));
+  sel.dataset.eng = eng;
+  sel.disabled = fixed;
+  // 显式选中（不赖"加第一项自动选中"的隐式行为）：单音色/云档=表里唯一那项
+  sel.value = String(fixed ? table[0][0] : (_kokoroSid ?? KOKORO_DEFAULT_SID));
+  if (!fixed) refreshVoicesPanel();     // 追加自定义音色项（异步；追加后按 _kokoroSid 复选）
+  const hint = $("#tts_single_hint");
+  hint.textContent = VOICE_HINTS[eng] || "";
+  hint.style.display = fixed ? "" : "none";
+  $("#tv_row").style.display = fixed ? "none" : "";     // 自定义音色上传只服务 Kokoro
+}
+$("#stt_provider").onchange=syncBoxes; $("#tts_provider").onchange=syncBoxes;
+function syncNluWarn(){ $("#nluOffWarn").style.display = $("#nlu_enabled").checked ? "none" : ""; }
+$("#nlu_enabled").onchange = syncNluWarn;
+// 关掉本地理解 = 场景触发词/本地建改删/查询族/音乐带一起停（防手滑：保存前显式确认）
+function llmReady(){ return $("#llm_enabled").checked && !!$("#llm_base").value.trim(); }
+wirePresets();
+/* ── 自定义音色（投递口 /data/tts_voices；机制：官方 voices.bin 尾部定长追加，
+   sid 自官方音色数起；尺寸权威=面板读数）── */
+let _tvmeta = null;
+/* tts.sid 的写权只属 Kokoro 档（2026-09-22）：单音色/云档保存时不提交 sid——
+   否则"切到 Matcha/Melo 存一次"就会把 Kokoro 档的选择静默改写成该档的表值。 */
+function ttsSidPatch(){
+  if ($("#tts_provider").value !== TTS_SID_OWNER) return {};
+  const v = $("#tts_sid").value;
+  if (!v) return {};               // 自定义项异步注入窗口 → 不写，保住已存值
+  return {sid: /^-?\d+$/.test(v) ? parseInt(v,10) : v};
+}
+async function refreshVoicesPanel() {      // 只服务 Kokoro 档（其余档的表由 renderVoiceTable 定死）
+  const sid = $("#tts_sid");
+  if (sid.dataset.eng !== TTS_SID_OWNER) return;
+  [...sid.options].forEach(o => { if (o.dataset.custom) o.remove(); });
+  try {
+    const v = _tvmeta = await api("/api/tts/voices");
+    const bad = (v.preview || []).filter(p => !p.valid);
+    (v.preview || []).filter(p => p.valid).forEach(p => {
+      const o = new Option(`\u{1F3A4} ${p.name}（自定义 sid${p.sid}）`, p.name);
+      o.dataset.custom = "1"; sid.add(o);
+    });
+    $("#tv_panel").textContent =
+      `官方 ${v.official_count} 路 · 单音尺寸 ${v.per_voice_bytes || "?"} B · `
+      + `已注入 ${Object.keys(v.injected || {}).length} 路`
+      + (bad.length ? ` · ⚠ ${bad.length} 个尺寸不符文件被忽略` : "")
+      + ` · 投递目录 ${v.dir}`;
+    sid.value = String(_kokoroSid ?? KOKORO_DEFAULT_SID);
+    if (sid.selectedIndex < 0) sid.value = String(KOKORO_DEFAULT_SID);   // 自定义项已撤/未注入 → 防把空值存回
+    _kokoroSid = sid.value;
+  } catch (e) { $("#tv_panel").textContent = "音色面板读数失败：" + e.message; }
+}
+$("#tv_upload").onclick = async () => {
+  const f = $("#tv_file").files[0]; if (!f) { toast("先选择 .bin 文件"); return; }
+  const name = f.name.replace(/\.bin$/i, "").trim();
+  if (!name) { toast("文件名（去 .bin）即音色主名，不能为空"); return; }
+  if (!_tvmeta || !_tvmeta.per_voice_bytes) { toast("官方模型未就绪，无法校验单音尺寸"); return; }
+  if (f.size !== _tvmeta.per_voice_bytes) { toast(`尺寸不符：需恰好 ${_tvmeta.per_voice_bytes} B，当前 ${f.size} B`); return; }
+  try {
+    const r = await fetch(U("/api/tts/voices/upload?name=" + encodeURIComponent(name)), { method: "POST", body: f });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.message || ("HTTP " + r.status));
+    await post("/api/system/reload_models", {});
+    await refreshVoicesPanel();
+    _kokoroSid = name;                        // 上传成功即选中新嗓（保存后播报生效）
+    $("#tts_sid").value = name;
+    toast(`「${name}」已投递并重载`);
+  } catch (e) { toast("上传失败：" + e.message); }
+};
+$("#tv_scan").onclick = async () => {
+  try { const r = await post("/api/system/reload_models", {}); toast(r.note || "已重新扫描"); await refreshVoicesPanel(); }
+  catch (e) { toast(e.message); }
+};
+/* ── 音乐播放端点：自动拉 HA 的 media_player 列表供选择（现场 2026-09-14：
+   手填 entity_id 拼错 → 点歌永远"端点没有响应"死循环）。区域映射同批从
+   JSON 文本升级为行编辑器，序列化形态与旧 settings（{区域: entity}）不变。── */
+let _mps = [], _mpAreas = [], _maSeed = {};
+function _mpOptions(sel, cur) {
+  cur = String(cur || "");
+  sel.innerHTML = "";
+  sel.add(new Option("（不指定 = 点歌只回配置指引）", ""));
+  _mps.forEach(p => sel.add(new Option(
+    (p.state === "unavailable" ? "⚠ " : "") + `${p.name} · ${p.entity_id}`, p.entity_id)));
+  if (cur && !_mps.some(p => p.entity_id === cur))
+    sel.add(new Option(`⚠ ${cur}（当前 HA 中未找到，请改选或清空）`, cur));
+  sel.value = cur;   // 空值=「不指定」；stale 值有上项兜底，绝不静默丢
+}
+function _maCollect() {
+  const out = {}; let bad = false;
+  $("#music_areas_box").querySelectorAll(".ma-row").forEach(r => {
+    const a = r.querySelector("[data-role=area]").value.trim();
+    const e = r.querySelector("[data-role=ent]").value;
+    if (!a && !e) return;                    // 空行跳过
+    if (!a || !e) { bad = true; return; }    // 半配行拦下
+    out[a] = e;
+  });
+  if (bad) { toast("区域映射每行都要填「区域名 + 播放端点」；不需要的行请点删除"); return undefined; }
+  return out;
+}
+function _maRow(area, ent) {
+  const r = document.createElement("div");
+  r.className = "hj-row ma-row";
+  const d1 = document.createElement("div"); d1.style.cssText = "flex:1 1 140px";
+  const a = document.createElement("input");
+  a.placeholder = "区域名（如 客厅）"; a.value = area; a.dataset.role = "area"; a.setAttribute("list", "mp_areas_dl");
+  const d2 = document.createElement("div"); d2.style.cssText = "flex:2 1 240px";
+  const s = document.createElement("select"); s.dataset.role = "ent";
+  const d3 = document.createElement("div"); d3.style.cssText = "flex:0 0 auto";
+  const del = document.createElement("button");
+  del.type = "button"; del.className = "act gray"; del.textContent = "删除";
+  del.onclick = () => r.remove();
+  d1.append(a); d2.append(s); d3.append(del);
+  r.append(d1, d2, d3);
+  _mpOptions(s, ent);
+  return r;
+}
+function _maPaint(map) {
+  const box = $("#music_areas_box");
+  box.innerHTML = "";
+  const rows = Object.entries(map || {});
+  if (!rows.length) {
+    const h = document.createElement("div"); h.className = "hint";
+    h.textContent = "（未配置：带区域的点歌将统一用上方默认端点，并如实播报）";
+    h.style.cssText = "flex:1 1 100%";
+    box.append(h); return;
+  }
+  rows.forEach(([a, e]) => box.append(_maRow(a, e)));
+}
+async function refreshMusicPanel() {
+  try {
+    const d = await api("/api/media_players");
+    _mps = d.players || []; _mpAreas = d.areas || [];
+    $("#mp_panel").textContent =
+      (_mps.length ? `已从 HA 发现 ${_mps.length} 个播放器` : "HA 中暂未发现播放器（media_player）实体")
+      + (!_mps.length && d.note ? `（${d.note}）` : "")
+      + (_mpAreas.length ? ` · 区域 ${_mpAreas.length} 个` : "");
+  } catch (e) {
+    _mps = []; _mpAreas = [];
+    $("#mp_panel").textContent = "播放器列表读取失败：" + e.message + "（已存配置仍原样可保存）";
+  }
+  const dl = $("#mp_areas_dl");
+  dl.innerHTML = ""; _mpAreas.forEach(a => dl.append(new Option(a)));
+  _mpOptions($("#music_player"), $("#music_player").value);   // 保住用户已选/已存值
+  document.querySelectorAll("#music_areas_box select[data-role=ent]")
+    .forEach(s => _mpOptions(s, s.value));                    // 行内下拉同步刷新
+}
+function seedMusicPanel() {
+  const saved = (S && S.music) || {};
+  _mpOptions($("#music_player"), saved.player_entity || "");
+  _maSeed = (saved.area_entities && typeof saved.area_entities === "object" && !Array.isArray(saved.area_entities))
+    ? saved.area_entities : {};
+  _maPaint(_maSeed);
+  refreshMusicPanel();   // 异步补列表；失败时上面已按已存值渲染，不阻塞编辑
+}
+$("#mp_refresh").onclick = refreshMusicPanel;
+$("#ma_add").onclick = () => {
+  const m = _maCollect(); if (m === undefined) return;
+  _maPaint(m);
+  $("#music_areas_box").append(_maRow("", ""));
+};
+$("#saveBtn").onclick = async ()=>{
+  const _ma = _maCollect();          // 区域映射行编辑器 → {区域: entity}；半配行已 toast 拦下
+  if (_ma === undefined) return; const _spd = parseFloat($("#tts_speed").value); if (!Number.isFinite(_spd) || _spd < 0.6 || _spd > 2) { const _cur = (S && S.tts && S.tts.speed != null) ? S.tts.speed : 1.25; $("#tts_speed").value = _cur; toast("语速需填 0.6–2.0（已回填当前生效值 " + _cur + "），确认后请再点保存"); return; }   // v1.1.27：留空不得静默改写 1.0（旧写法 parseFloat("")||1）
+  const body = {
+    stt:{ provider:$("#stt_provider").value, local_model:$("#stt_local_model").value, cloud:{ base_url:$("#stt_cloud_base").value, model:$("#stt_cloud_model").value, ...( $("#stt_cloud_key").value?{api_key:$("#stt_cloud_key").value}:{}) } },
+    tts:{ provider:$("#tts_provider").value, ...ttsSidPatch(), speed:_spd,
+          cloud:{ base_url:$("#tts_cloud_base").value, model:$("#tts_cloud_model").value, voice:$("#tts_cloud_voice").value, ...(ttsFmt?{response_format:ttsFmt}:{}), ...(ttsRate?{sample_rate:ttsRate}:{}), ...( $("#tts_cloud_key").value?{api_key:$("#tts_cloud_key").value}:{}) } },
+    nlu:{ enabled:$("#nlu_enabled").checked, textcnn_enabled:$("#nlu_textcnn").checked, query_local:$("#nlu_query").checked, creation_enabled:$("#nlu_creation").checked, corrections_extra: safeJson($("#nlu_corr").value, {}) },
+    llm:{ enabled:$("#llm_enabled").checked, base_url:$("#llm_base").value, model:$("#llm_model").value, stream:$("#llm_stream").checked, allow_scene_write:$("#llm_scene_write").checked, allow_automation_write:$("#llm_auto_write").checked, ...( $("#llm_key").value?{api_key:$("#llm_key").value}:{}) },
+    security:{ require_token:$("#req_token").checked },
+    power:{ unload_when_idle_min: parseInt($("#unload").value,10)||0 },
+    dialog:{ fallback_text: $("#fallback").value, context_enabled:$("#dlg_context").checked,
+             chain_enabled:$("#dlg_chain").checked, confirm_risky:$("#dlg_confirm").checked },
+    spatial:{ satellite_areas: safeJson($("#sat_areas").value, {}) },
+    music:{ player_entity: $("#music_player").value.trim(),
+            area_entities: _ma,
+            expect_wait_note: $("#music_wait").checked },
+  };
+  // H6（2026-09-23 深审）：dict 数据字段三态守卫——undefined(解析失败)/null/
+  // 数组/标量全拦。旧判据 `typeof x!=="object"` 对 null、[] 恒假=死守卫。
+  const isObj = v => v !== undefined && v !== null && typeof v === "object" && !Array.isArray(v);
+  if(!isObj(body.nlu.corrections_extra)){ toast("纠错词条需为合法 JSON 对象"); return; }
+  if(!isObj(body.spatial.satellite_areas)){ toast("卫星区域映射需为合法 JSON 对象"); return; }
+  if(!isObj(body.music.area_entities)){ toast("音乐区域映射需为合法 JSON 对象"); return; }
+  if(!$("#nlu_enabled").checked){
+    const msg = llmReady()
+      ? "关掉本地理解后：语音场景触发词、场景/自动化本地建・改・删、本地查询、音乐带全部停止，所有话改由大模型处理。确定保存？"
+      : "本地理解关闭，大模型也没配好——保存后助手只会回一句固定兜底。确定保存？";
+    if(!confirm(msg)) return;
+  }
+  if(!$("#nlu_creation").checked && !llmReady()){
+    if(!confirm("大模型未启用，关掉本地承接后「当我说X就Y」将无法创建任何场景/自动化。确定保存？")) return;
+  }
+  try { await post("/api/settings", body); toast("已保存并即时生效"); $("#saveMsg").textContent="✓ "+new Date().toLocaleTimeString(); }
+  catch(e){ toast("保存失败："+e.message); }
+};
+function safeJson(t, d){ if(!t||!t.trim()) return d; try{ return JSON.parse(t);}catch(e){ return undefined; } }  // H6：解析失败必须与合法值可区分——旧版返回 null，而 typeof null==="object" 恒真，下方守卫全为死代码，脏输入 POST null 后端静默清空已存数据还报「已保存」
+
+/* ── 模型 ── */
+/* v1.0.42（F6）：后端 /api/models 发的是 model_store.snapshot() 形态
+   {state,pct,detail,ready}（states: pending/checking/downloading/extracting/
+   ready/failed/manual/incomplete）——旧实现读 v.status/v.size_mb/v.path 三个
+   不存在的键，状态列永远"未下载"、进度列永远空。与「状态」页模型卡同一映射。 */
+const MODEL_STATE_CN = {pending:"排队",checking:"校验",downloading:"下载中",
+                        extracting:"解包中",ready:"就绪",failed:"失败",
+                        manual:"待手动",incomplete:"不完整"};
+async function loadModels(){
+  let snap={}; try { snap = await api("/api/models"); } catch(e){ toast(e.message); return; }
+  const tb = $("#modelTable tbody"); tb.innerHTML="";
+  for (const [k,v] of Object.entries(snap)) {
+    const tr = document.createElement("tr");
+    const o = (v && typeof v === "object") ? v : {};
+    const s = String(o.state || "");
+    const cls = (o.ready || s==="ready") ? "ok" : (s==="failed" ? "bad" : "warn");
+    const cn = MODEL_STATE_CN[s] || (o.ready ? "就绪" : "未下载");
+    const prog = (o.pct != null && s === "downloading") ? o.pct+"%" : "";
+    tr.innerHTML = `<td>${MODEL_NAMES[k]||k}<br><span class="mut code">${k}</span></td>
+      <td>${pill(cn,cls)}</td><td>${prog}<br><span class="mut">${esc0(String(o.detail||"").slice(0,60))}</span></td>
+      <td>${o.ready?"":`<button class="act" data-dl="${esc0(k)}">下载</button>`}</td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("button[data-dl]").forEach(b=>b.onclick=async()=>{
+    try { await post("/api/models/download",{key:b.dataset.dl}); toast("已加入下载队列，进度看「状态」页"); }
+    catch(e){ toast(e.message); }
+  });
+}
+$("#reloadBtn").onclick = async ()=>{ try{ const r=await post("/api/system/reload_models",{}); $("#reloadMsg").textContent=r.note||"ok";}catch(e){toast(e.message);} };
+
+/* ── 设备/固件（OTA Phase 2，近场链接兜底形态）── */
+let _otaLatest = "";
+// v1.0.87：连续对话按钮话术改按集成诊断码出。v1.0.80 把「真无实体／实体在 HA
+// 被禁用／设备离线／实体未就绪」四种因混成一句"需固件≥2.1.46"（现场据此换固件
+// 仍不亮，白折腾）。数据源=集成台账 continuous_dialogue_diag，判据在 HA 侧，
+// 面板不复装（F-OTA-04 纪律：一种文案不背两种锅）。
+const CONT_LABELS = {on:"开启中", off:"已关闭", no_entity:"需固件≥2.1.46",
+                     disabled:"实体被禁用", offline:"设备离线", pending:"待就绪"};
+async function loadOta(){
+  let dv={devices:[]}, fw={items:[]};
+  try { dv = await api("/api/devices"); } catch(e){ dv={devices:[],error:e.message}; }
+  try { fw = await api("/api/firmware"); } catch(e){ fw={items:[],error:e.message}; }
+  _otaLatest = String(dv.latest||"") || (dv.error ? String(fw.latest||"") : "");   // v1.1.27：严格源（/api/devices.latest=仅可 OTA 版本）优先；宽松源（/api/firmware.latest=只按在盘且非哈希不符）只在严格源不可得（台账请求失败）时兜底——0 字节包/装不进槽的产线合并镜像不得再进升级话术
+  $("#otaDevNote").textContent = dv.error || fw.error || "";
+  $("#fwLatest").textContent = _otaLatest ? ("最新在盘版本 v"+_otaLatest) : "（尚无已上架固件）";
+  const tb = $("#otaDevTable tbody"); tb.innerHTML="";
+  const devs = dv.devices||[];
+  if(!devs.length){
+    tb.innerHTML = `<tr><td colspan="7" class="mut">${dv.error ? esc0(dv.error) : "暂无已入驻卫星——小程序配网入驻后自动出现"}</td></tr>`;
+  }
+  for(const d of devs){
+    const tr=document.createElement("tr");
+    const remote=(d.ota_services||[]).length>0;
+    const badge = d.updatable ? pill("可升级→"+_otaLatest,"warn")
+                : (d.fw_version ? (_otaLatest ? pill(remote?"已最新·可远程":"已最新","ok") : pill("无可升级包","mut")) : pill("未上报","mut"));   // v1.1.27：无在架包时不得说「已最新」
+    const fv=d.fw_version?`${esc0(d.fw_version)}${d.fw_source==="入驻时"?' <span class="mut">（入驻时）</span>':""}`:"未上报";
+    tr.innerHTML = `<td>${esc0(d.name||d.mac||d.speak_id)}<br><span class="mut code">${esc0(d.mac||"")}</span></td>
+      <td>${esc0(d.area||"-")}</td>
+      <td>${pill(d.online?"在线":"离线", d.online?"ok":"bad")}</td>
+      <td>${fv}</td>
+      <td>${badge}</td>
+      <td>${d.mac?`<button class="act" data-cont="${esc0(d.mac)}" data-on="${d.continuous_dialogue===true?1:0}">${CONT_LABELS[d.continuous_dialogue_diag]||"需固件≥2.1.46"}</button>`:""}</td>
+      <td>${_otaLatest?`<button class="act" data-issue="${esc0(d.mac||d.name)}" data-remote="${remote?1:0}">${remote?"下发":"发放链接"}</button>`:""}</td>`;
+    tb.appendChild(tr);
+  }
+  // v1.0.80：连续对话开关——中继到集成写设备 switch 实体（真源=设备 NVS，三边
+  // 同源回显）；None 态（固件旧）按钮仍可点，失败由服务端话术点名
+  tb.querySelectorAll("button[data-cont]").forEach(b=>b.onclick=async()=>{
+    // v1.0.87：在飞禁点（旧形态连点两次会把开关打乒乓——两下都按渲染时的旧态取反）
+    const want = b.dataset.on!=="1";
+    b.disabled = true; const _txt = b.textContent; b.textContent = "下发中";
+    let r = {success:false, error:"?"};
+    try { r = await post("/api/device/continuous",{mac:b.dataset.cont, enabled:want}); }
+    catch(e){ r = {success:false, error:e.message}; }
+    b.disabled = false; b.textContent = _txt;
+    // success 只代表"服务调用返回"（esphome switch_command 即发即回）；真出声
+    // 效果由集成侧 ≤1.6s 回显复核报 echoed，三分话术，不再拿 success 当"已生效"。
+    toast(!r.success ? ("失败："+(r.error||"?"))
+        : r.echoed === true ? (want?"连续对话已开启":"连续对话已关闭")
+        : (want?"连续对话：指令已下发，设备未回显（查在线/固件版本）"
+               :"连续对话：关闭指令已下发，设备未回显"));
+    loadOta();
+  });
+  // v1.0.74：有 ota_upgrade 接收口（≥v2.1.36）→真下发（离线等失败由服务端视图
+  // 结构化折叠回显，面板不复装）；无接收口→保留签发链接备存形态
+  tb.querySelectorAll("button[data-issue]").forEach(b=>b.onclick=()=>
+    b.dataset.remote==="1"?dispatchOta(b.dataset.issue):issueOta(b.dataset.issue));
+  const ft = $("#fwTable tbody"); ft.innerHTML="";
+  // 显示面瘦身：表只列最新 2 版（items 为 vkey 降序全量合并视图；API 仍回全量供排障）
+  const items = (fw.items||[]).slice(0, 2);
+  if(!items.length){
+    ft.innerHTML = `<tr><td colspan="5" class="mut">尚无登记版本——投递口放包，或在 firmware.lock.json 登记后点「拉取」</td></tr>`;
+  }
+  for(const it of items){
+    const tr=document.createElement("tr");
+    const pull = (!it.on_disk && it.source==="lock" && (it.urls_count||0))
+      ? `<button class="act" data-dl="${esc0(it.version)}">拉取</button>` : "";
+    const disk = !it.on_disk ? pill("未拉取","warn")
+      : it.sha_mismatch ? pill("哈希不符!","bad")
+      : (!it.size) ? pill("空包!","bad") : pill("在盘","ok");
+    // v1.1.17：装不进 OTA 槽的登记（产线合并镜像）如实标出来 + 渲染登记时的实话。
+    // 旧形态这些只躺在加载项日志里，面板照样显示"最新/可升级"。
+    const otaBadge = (it.on_disk && it.ota_ok === false)
+      ? " " + pill("装不进 OTA · 仅近场/产线","warn") : "";
+    const noteLine = it.notes_zh
+      ? `<br><span class="mut">${esc0(String(it.notes_zh).slice(0, 80))}</span>` : "";
+    tr.innerHTML = `<td>v${esc0(it.version)} ${(it.version===_otaLatest && it.ota_ok!==false)?pill("最新","ok"):""}</td>
+      <td>${it.source==="lock"?"lock 登记":"投递收编"}</td>
+      <td>${disk}${otaBadge}</td>
+      <td><span class="mut">${fmtBytes(it.size)}</span><br><span class="mut code">${esc0(String(it.sha256||"").slice(0,16))}…</span>
+        ${it.urls_count?`<br><span class="mut">${it.urls_count} 源：${esc0((it.urls_hosts||[]).join(" · "))}</span>`:""}${noteLine}</td>
+      <td>${pull}</td>`;
+    ft.appendChild(tr);
+  }
+  ft.querySelectorAll("button[data-dl]").forEach(b=>b.onclick=async()=>{
+    toast("拉取中…（sha256 必核）");
+    try{ const r=await post("/api/firmware/download",{version:b.dataset.dl});
+      toast(r.success?("已上架 v"+b.dataset.dl):("拉取失败：" + (r.message||""))); }
+    catch(e){ toast("拉取失败："+e.message); }
+    loadOta();
+  });
+  $("#fwHint").textContent = "投递口："+(fw.import_dir||"/data/firmware/import")+
+    " —— 放 <-x.y.z.bin> 自动收编（现场算 sha256）；lock 版本点「拉取」显式下载（GitHub→Gitee 容灾序），加载项从不后台自动拉公网。"+
+    (fw.lock_override?"（持久卷 lock 覆盖中）":"");
+}
+async function issueOta(mac){
+  const out=$("#otaOut"); out.innerHTML="<span class='mut'>签发中…</span>";
+  try{
+    const r = await post("/api/firmware/issue",{mac, version:_otaLatest});
+    if(!r.success){ out.innerHTML = `<span class="pill bad">${esc0(r.error||"签发失败")}</span>`; return; }
+    out.innerHTML = `<div>目标 <b>v${esc0(r.version)}</b> · ${fmtBytes(r.size)} · sha256
+        <span class="code">${esc0(String(r.sha256).slice(0,16))}…</span> · ${esc0(r.expires_in)}s 一次性</div>
+      <p><input id="otaUrl" class="code" readonly style="width:100%" value="${esc0(r.url)}"></p>
+      <button class="act" id="otaCopy">复制链接</button>
+      <span class="mut">v1.0.74 起：≥v2.1.36 设备已切「下发」按钮真下发（同源链接经 :6053 接收口）；本备存形态留给无接收口的老固件/小程序代发场景。</span>
+      <div class="hint">${esc0(r.warn_zh)}</div>`;
+    $("#otaCopy").onclick=()=>{ const i=$("#otaUrl"); i.select();
+      try{ document.execCommand("copy"); toast("已复制"); }catch(e){ toast("请手动长按复制"); } };
+  }catch(e){ out.innerHTML = `<span class="pill bad">${esc0(e.message)}</span>`; }
+}
+async function dispatchOta(mac){
+  const out=$("#otaOut"); out.innerHTML="<span class='mut'>下发中…（签发→中继→设备受理）</span>";
+  try{
+    const r = await post("/api/firmware/dispatch",{mac, version:_otaLatest});
+    if(!r.success){
+      out.innerHTML = `<span class="pill bad">下发失败：${esc0(r.error||"?")}</span>`+
+        ` <span class="mut">目标 mac=${esc0(mac)}</span>`;
+      return;
+    }
+    out.innerHTML = `<div><span class="pill ok">已下发</span> 目标 <b>v${esc0(r.version)}</b>`+
+      ` · ${fmtBytes(r.size)} · sha256 <span class="code">${esc0(String(r.sha256).slice(0,16))}…</span></div>`+
+      `<div class="hint">${esc0(r.note||"设备已受理，稍后刷新台账核对版本")}</div>`;
+    setTimeout(loadOta, 1500);
+  }catch(e){ out.innerHTML = `<span class="pill bad">${esc0(e.message)}</span>`; }
+}
+
+/* ── 调试 ── */
+/* v1.0.63 P0-1：NLU 理解漏斗（GET /api/telemetry，本进程累计） */
+const SRC_NAMES = {t0:"字面表",t0_strip:"字面表·剥",t0_prefix:"字面表·前缀",t0_pinyin:"字面表·同音",
+  scene:"场景触发",t1:"TextCNN",klar:"klar 引擎",creation:"语音创作",query:"本地查询",
+  music:"音乐",llm:"LLM 兜底",fallback:"拒答/未定",clarify:"澄清追问",confirm:"待确认",
+  confirm_exec:"确认·执行",confirm_cancel:"确认·取消",dedup:"去重"};
+async function loadFunnel(){
+  try{
+    const r = await api("/api/telemetry");
+    const f = r.funnel||{by_source:{}}, rows = Object.entries(f.by_source||{}).sort((a,b)=>b[1].n-a[1].n);
+    if(!rows.length){ $("#funnelBox").innerHTML='<span class="mut">本进程尚无识别记录（说一句话或真执行干跑后再刷新）。</span>';
+      $("#funnelMeta").textContent=""; return; }
+    let h='<table><thead><tr><th>档位</th><th>命中数</th><th>成功率</th><th>平均时延</th><th>1h 滑窗</th></tr></thead><tbody>';
+    for(const [k,v] of rows) h+=`<tr><td>${SRC_NAMES[k]||k}</td><td>${v.n}</td><td>${v.ok_pct==null?"–":v.ok_pct+"%"}</td><td>${v.avg_ms==null?"–":v.avg_ms+" ms"}</td><td>${v.win1h||0}${v.win1h_ok_pct==null?"":" / 成功"+v.win1h_ok_pct+"%"}</td></tr>`;
+    $("#funnelBox").innerHTML = h+"</tbody></table>";
+    const mi = r.mining||{};
+    $("#funnelMeta").textContent = `累计 ${f.total||0} 句；回流语料 ${mi.file||""} ${mi.enabled?(mi.lines+" 条，仅本机"):"已停用"}`;
+  }catch(e){ $("#funnelBox").innerHTML='<span style="color:var(--red)">读取失败：'+esc0(e.message)+"</span>"; }   // v1.1.27：错误串进 innerHTML 必须先转义
+}
+$("#funnelBtn").onclick = loadFunnel;
+$("#dbgBtn").onclick = async ()=>{
+  const t = $("#dbgText").value.trim(); if(!t){ toast("输入一句话"); return; }
+  $("#dbgOut").textContent = "…";
+  try {
+    const r = await post("/api/nlu/test",{text:t, execute:$("#dbgExec").checked});
+    const c = r.cascade||{}; let out = "";
+    out += `输入：${r.input}\nT1 分类器：${r.textcnn?.available?"可用":"缺资产（上传 nlu_data 后重启）"}\n`;
+    if (c.nlu_enabled === false) out += "本地理解已在设置里关闭：不跑正则/分类器/查询族/场景自动化本地承接。\n";
+    if (c.plan) out += `命中快速通道 → ${c.plan.intent}\n参数：${JSON.stringify(c.plan.args)}\n来源：${c.plan.source}\n级联轨迹：\n  ${(c.plan.trace||[]).join("\n  ")}\n`;
+    else {
+      out += "快速通道未命中。\n";
+      if (c.query_answer) out += `本地查询作答：${c.query_answer}\n`;
+      out += c.llm_enabled ? "→ 将交 LLM 兜底（已启用）\n" : `→ 将播固定兜底：${c.final||""}\n`;
+    if (c.compound) out += c.blocked
+      ? `复合链被闸拦下（真实裁决）：${c.blocked}\n`
+      : "该句会走复合链：按逐腿执行（参数/轨迹见上）\n";
+    }
+    if (r.executed) out += `\n【真执行】${r.executed.ok?"成功":"失败"}（走 ${r.executed.source}）：${r.executed.speech}` + (r.executed.trace?.length ? `\n执行轨迹：\n  ${r.executed.trace.join("\n  ")}` : "");
+    $("#dbgOut").textContent = out;
+  } catch(e){ $("#dbgOut").textContent="失败："+e.message; }
+};
+$("#ttsBtn").onclick = async ()=>{
+  $("#ttsPlayer").innerHTML='<span class="mut">合成中…（首句含模型加载可能 10s+）</span>';
+  try {
+    const r = await fetch(U("/api/tts/test"),{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({text:$("#ttsText").value||"你好，我是慧尖。"})});
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.message||("HTTP "+r.status)); }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    $("#ttsPlayer").innerHTML = `<audio controls autoplay src="${url}"></audio><div class="hint">24kHz 原始采样，经下载解码为 wav 播放；设备端实际收到 16k opus。</div>`;
+  } catch(e){ $("#ttsPlayer").innerHTML = '<span style="color:var(--red)">'+esc0(e.message)+"</span>"; }   // v1.1.27：同上（错误串含 <>&" 时不得裸拼）
+};
+async function loadScenes(){
+  try { const r = await api("/api/scenes");
+    const esc = s => String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+    _sc = r.scenes||[];
+    const rows = _sc.map((s,i)=>`<tr><td><b>${esc(s.trigger)}</b></td>`+
+      `<td>${esc((s.actions||[]).join("；") || (s.action_count+" 步"))}</td>`+
+      `<td class="mut">${esc((s.created_at||"").replace("T"," ").slice(0,16)||"–")}</td>`+
+      `<td style="white-space:nowrap"><span class="copy" data-op="scTest:${i}">测试</span> `+
+      `<span class="copy" data-op="scRename:${i}">改名</span> `+
+      `<span class="copy" data-op="scDel:${i}">删除</span></td></tr>`).join("");
+    $("#sceneList").innerHTML =
+      (r.error? `<div class="pill warn" style="margin-bottom:6px">${esc(r.error)}</div>`:"") +
+      (rows? `<table><thead><tr><th>触发口令</th><th>动作</th><th>创建</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
+           : (r.error? "" : "（暂无语音场景——说「当我说晚安，就关闭客厅灯」即可创建）"));
+  } catch(e){ $("#sceneList").textContent = "读取失败："+e.message; }
+}
+$("#sceneBtn").onclick = loadScenes;
+/* v1.0.42（F9）：行操作在飞守卫——操作列全是 <span class="copy">，连点即并行
+   POST（改名后写覆盖先写、删除重复触发）。同一 op 键在飞只许一发，期间给该
+   span 挂 .busy（pointer-events:none），finally 释放。 */
+const _opBusy = new Set();
+function opGuard(key, el, fn){
+  if (_opBusy.has(key)) return;
+  _opBusy.add(key); if (el && el.classList) el.classList.add("busy");
+  Promise.resolve().then(fn).finally(()=>{
+    _opBusy.delete(key); if (el && el.classList) el.classList.remove("busy");
+  });
+}
+$("#sceneList").addEventListener("click", ev=>{
+  const op=(ev.target.dataset||{}).op; if(!op) return;
+  const [k,i]=op.split(":"); const s=_sc[+i]; if(!s) return;
+  if(k==="scTest") opGuard(op, ev.target, ()=>sceneOp("/api/scenes/test",{trigger_phrase:s.trigger}));
+  if(k==="scDel" && confirm(`删除语音场景「${s.trigger}」？`))
+    opGuard(op, ev.target, ()=>sceneOp("/api/scenes/delete",{trigger_phrase:s.trigger}));
+  if(k==="scRename"){
+    const nw = prompt(`把触发词「${s.trigger}」改成：`, s.trigger);
+    if(nw && nw.trim() && nw.trim()!==s.trigger)
+      opGuard(op, ev.target, ()=>sceneOp("/api/scenes/rename",{scene_id:s.scene_id, new_phrase:nw.trim()}));
+  }
+});
+async function sceneOp(path, body){
+  try{ const j = await post(path, body);
+    if(!j.ok) throw new Error(j.error||"操作失败");
+    await loadScenes(); $("#sceneMsg").textContent = "✓ 完成";
+  }catch(e){ $("#sceneMsg").textContent = "✗ "+e.message; }
+}
+
+function autoRowOps(a,i,esc){
+  if(a.kind!=="huijian") return "–";
+  const t=a.trigger_raw||{};
+  let ops = `<span class="copy" data-op="auTest:${i}">测试</span> `+
+            `<span class="copy" data-op="auDel:${i}">删除</span>`;
+  if(t.entity_id && t.at==null && t.to==null)
+    ops += ` <span class="copy" data-op="auEdit:${i}">改阈值</span>`;
+  return ops;
+}
+async function loadAutomations(){
+  const esc = s => String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  try { const r = await api("/api/automations");
+    _au = r.automations||[];
+    $("#autoBody").innerHTML = _au.map((a,i)=>`<tr><td>${esc(a.alias)}</td><td>`+
+      (a.kind==="huijian"? pill("语音引擎","ok") : a.state==="on"? pill("已启用","ok")
+       : a.state==="off"? pill("已禁用","warn") : pill("无实体","mut"))+
+      `</td><td class="mut">${esc(a.last_triggered?String(a.last_triggered).replace("T"," ").slice(0,16):"待触发")}</td>`+
+      `<td class="mut">${esc(a.description||"")}</td>`+
+      `<td style="white-space:nowrap">${autoRowOps(a,i,esc)}</td></tr>`).join("")
+      || `<tr><td colspan="5" class="mut">暂无自动化</td></tr>`;
+    $("#autoMsg").textContent = r.error||"";
+  } catch(e){ $("#autoMsg").textContent = "读取失败："+e.message; }
+}
+$("#autoBtn").onclick = loadAutomations;
+$("#autoBody").addEventListener("click", ev=>{
+  const op=(ev.target.dataset||{}).op; if(!op) return;
+  const [k,i]=op.split(":"); const a=_au[+i]; if(!a) return;
+  if(k==="auTest") opGuard(op, ev.target, ()=>autoOp("/api/automations/test",{automation_id:a.id},"已触发执行，看设备动作"));
+  if(k==="auDel" && confirm(`删除自动化「${a.alias}」？`))
+    opGuard(op, ev.target, ()=>autoOp("/api/automations/delete",{automation_id:a.id}));
+  if(k==="auEdit"){
+    const t=a.trigger_raw||{};
+    const inp = prompt(`改「${a.alias}」阈值：输入高于值（如 28），或 高于,低于（如 20,28 表示区间）`,
+                       t.above!=null?String(t.above):"");
+    if(inp==null) return;
+    const ps = String(inp).split(/[,，]/).map(x=>x.trim()).filter(x=>x!=="");
+    if(!ps.length) return;
+    const nt = {entity_id:t.entity_id};
+    if(ps.length===1){ nt.above=ps[0]; if(t.below!=null) nt.below=t.below; }
+    else { nt.above=ps[0]; nt.below=ps[1]; }
+    opGuard(op, ev.target, ()=>autoOp("/api/automations/edit",{automation_id:a.id, trigger:nt}));
+  }
+});
+async function autoOp(path, body, msg){
+  try{ const j = await post(path, body);
+    if(!j.ok) throw new Error(j.error||"操作失败");
+    await loadAutomations(); $("#autoMsg").textContent = "✓ "+(msg||"完成");
+  }catch(e){ $("#autoMsg").textContent = "✗ "+e.message; }
+}
+
+/* ── 配对 ── */
+async function loadEndpoints(){
+  try {
+    const r = await api("/api/endpoints");
+    // v1.0.42（F10）：端点/token 由 settings 用户可写——raw 插 innerHTML 与 data-c
+    // 一律过 esc0（属性双引号语境下 & < > " 四个转义即闭合；复制消费走
+    // dataset.c，浏览器解码后拿回原值，不受影响）。
+    const MAP = [["stt_endpoint","识别 STT"],["tts_endpoint","播报 TTS"],["llm_endpoint","对话 LLM"]];
+    $("#epTable").innerHTML = MAP.filter(([k])=>r[k]).map(([k,n])=>
+      `<tr><td style="width:80px"><b>${n}</b></td>
+       <td class="mono">${esc0(r[k])}</td><td style="width:50px"><span class="copy" data-c="${esc0(r[k])}">复制</span></td></tr>`).join("")
+      + `<tr><td>校验</td><td colspan="2">${r.require_token?pill("强制 token 校验中","ok"):pill("局域网免 token（可在设置页开启强制）","warn")}
+         <span class="mut">· 当前 token：</span><span class="mono">${esc0(r.token)}</span> <span class="copy" data-c="${esc0(r.token)}">复制</span></td></tr>`
+      + `<tr><td>发现</td><td colspan="2" class="mono">_huijian-voice._tcp.local（mDNS，固件自动发现）</td></tr>`;
+    document.querySelectorAll("#tab-pair .copy").forEach(x=>x.onclick=async()=>{
+      try { await navigator.clipboard.writeText(x.dataset.c); toast("已复制"); }
+      catch(e){ prompt("手动复制：", x.dataset.c); }
+    });
+  } catch(e){ toast("读取端点失败："+e.message); }
+}
+$("#regenBtn").onclick = async ()=>{
+  if(!confirm("重置 token 后所有已配对设备需更新地址，确定？")) return;
+  try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
+};
+</script>
+<script src="js/starsky.js?v=1.1.41"></script>
+</body>
+</html>

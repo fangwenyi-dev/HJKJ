@@ -1,0 +1,494 @@
+"""LLM 档（默认关闭；开启需用户在 Web UI 填 OpenAI 兼容端点）。
+
+v4.1 定案：4C8G 无可用本地 LLM → llm.enabled 默认 False；云端填 base_url/api_key/model
+（百炼/火山方舟[慧尖 SFT 模板]/LAN ollama 皆可）。工具面 = huijian_ai 14 意图 +
+HA 内置快捷意图的 function-calling 表（与 custom_llm_api 的 15 tools 同构，schema 按
+《语音集成源码盘点》§2 意图注册表逐条构造）。工具调用经 Executor 真实执行，
+每轮把执行结果回喂模型；最多 max_tool_rounds 轮。
+LLM 输出仅进 TTS/屏显文本，不再生成音频（协议 §1.4：LLM 通道禁 binary）。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import AsyncIterator, Optional
+
+import aiohttp
+
+from . import const
+from . import capability
+
+from .nlu.schema import ADDRESSABLE_ATTRIBUTES
+
+logger = logging.getLogger("huijian.agent")
+
+# 流式句读（P2-15）：与 _sentences 同一终止符集，增量切句用
+_SENT_END = re.compile(r"[。！？；!?;\n]")
+_ROUND_END = object()          # 单轮句子队列的收束哨兵
+
+_TARGET_SCHEMA = {
+    "type": "array",
+    "description": "目标列表，每项 {area: 区域名, devices: [{name: 设备名(不带区域), domains: [light/cover/climate/fan/...]}]}；全屋则该项省略 devices",
+    "items": {"type": "object", "properties": {
+        "area": {"type": "string"},
+        "devices": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "domains": {"type": "array", "items": {"type": "string"}}}}}}},
+}
+
+TOOLS: list[dict] = [
+    {"type": "function", "function": {
+        "name": "TurnDeviceOn", "description": "打开设备", "parameters": {
+            "type": "object", "properties": {"target": _TARGET_SCHEMA}, "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "TurnDeviceOff", "description": "关闭设备（锁域例外：关闭门锁=解锁属风险操作，会被执行闸拒绝，此类请引导用户直接说解锁指令走本地确认）", "parameters": {
+            "type": "object", "properties": {"target": _TARGET_SCHEMA}, "required": ["target"]}}},
+    {"type": "function", "function": {
+        # v1.0.42 家电族：暂停运行中的设备（扫地机器人/电视音响/窗帘停走）。
+        "name": "PauseDevice", "description": "暂停正在运行的设备：扫地机器人暂停清扫、电视/音箱暂停播放、窗帘停止移动",
+        "parameters": {
+            "type": "object", "properties": {"target": _TARGET_SCHEMA}, "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "ControlWindow",
+        "description": ("控制窗户：action=open 开 / close 关 / pause 暂停 / a 内倒；"
+                        "「开窗器/开合器/推窗器」就是窗户设备（button 域），一律用本工具，"
+                        "绝不用 TurnDeviceOn/Off、绝不给 domains=cover；"
+                        "开窗器参数设定用 speed/strength(0-100，网关 v1.4.3+ 滑动条)，"
+                        "如「平开窗速度设为30%」→ speed=30（不带 action）"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["open", "close", "pause", "a"]},
+            "speed": {"type": "integer", "description": "开窗速度 0-100"},
+            "strength": {"type": "integer", "description": "开窗力度 0-100"},
+            "target": _TARGET_SCHEMA}, "required": ["target"]}}},
+    {"type": "function", "function": {
+        "name": "AdjustDeviceAttribute", "description": "调节设备属性", "parameters": {
+            "type": "object", "properties": {
+                # v1.1.1 #2：枚举必须=集成 register_adjustment 的注册名。旧表里
+                # colour_temperature 是**注册表外死字段**（light 色温注册名
+                # temperature），LLM 照表发即 unsupported；补 color（RGB 色值）。
+                # v1.1.3：枚举由契约单点生成，不再手抄（历史上这里躺过一个注册表
+                # 不存在的 colour_temperature，LLM 照表发即 unsupported）。
+                "attribute": {"type": "string", "enum": list(ADDRESSABLE_ATTRIBUTES)},
+                "delta": {"type": "string", "description": "绝对值 '50' / 相对 '+10','-20' / max / min"},
+                "target": _TARGET_SCHEMA}, "required": ["attribute", "delta"]}}},
+    {"type": "function", "function": {
+        "name": "SetDeviceMode", "description": "设置设备模式", "parameters": {
+            "type": "object", "properties": {
+                "mode": {"type": "string"}, "target": _TARGET_SCHEMA}, "required": ["mode"]}}},
+    {"type": "function", "function": {
+        "name": "huijianGetLiveContext", "description": "查询所有设备实时状态（回答状态类问题的第一工具）",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "HassTriggerVoiceScene", "description": "触发已创建的语音场景", "parameters": {
+            "type": "object", "properties": {"trigger_phrase": {"type": "string"}}, "required": ["trigger_phrase"]}}},
+    {"type": "function", "function": {
+        "name": "HassCreateVoiceScene", "description": (
+            "创建语音场景（「当我说X就Y」句式）。actions 每项固定 {intent, params}，"
+            "intent ∈ TurnDeviceOn/TurnDeviceOff/ControlWindow/AdjustDeviceAttribute/"
+            "SetDeviceMode，params 与该意图直接下令的槽位一致。"
+            "一句话涉及多个设备时，actions 数组一个动作一项（窗户→ControlWindow+button，"
+            "窗帘→TurnDeviceOn/Off+cover），不要把多种设备塞进同一个 action"), "parameters": {
+            "type": "object", "properties": {
+                "trigger_phrase": {"type": "string"},
+                "actions": {"type": "array", "items": {"type": "object"},
+                            "description": "每动作 {intent, params}，多设备=多项"}},
+            "required": ["trigger_phrase", "actions"]}}},
+    {"type": "function", "function": {
+        "name": "HassDeleteVoiceScene", "description": "删除语音场景", "parameters": {
+            "type": "object", "properties": {"trigger_phrase": {"type": "string"}}, "required": ["trigger_phrase"]}}},
+    {"type": "function", "function": {
+        "name": "HassListVoiceScenes", "description": "列出语音场景", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "HassCreateAutomation", "description": (
+            "创建语音自动化（「当[事件]就[动作]」事件型触发，区别于「当我说X」的语音场景）。"
+            "传感器阈值 trigger={entity_id:客厅温度, above:28}（低于用 below）；"
+            "人体状态 trigger={entity_id:书房人体, to:'on'或'off'}；"
+            "每天定时 trigger={at:'07:30'}（24小时制 HH:MM）。"
+            "actions 每项 {intent, params}，intent 同设备控制五类；"
+            "一句话涉及多个设备时，每个设备动作在 actions 数组里单独占一项"), "parameters": {
+            "type": "object", "properties": {
+                "trigger": {"type": "object", "properties": {
+                    "entity_id": {"type": "string"},
+                    "above": {"type": "number"}, "below": {"type": "number"},
+                    "to": {"type": "string"}, "at": {"type": "string"}}},
+                "actions": {"type": "array", "items": {"type": "object"},
+                            "description": "每动作 {intent, params}"}},
+            "required": ["trigger", "actions"]}}},
+    {"type": "function", "function": {
+        "name": "HassListAutomations", "description": "列出语音自动化（返回 automation_id 供删除/修改）",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "HassDeleteAutomation", "description": "删除语音自动化", "parameters": {
+            "type": "object", "properties": {"automation_id": {"type": "string"}},
+            "required": ["automation_id"]}}},
+    {"type": "function", "function": {
+        "name": "HassUpdateAutomation", "description": "修改语音自动化（trigger 或 actions 给其一）", "parameters": {
+            "type": "object", "properties": {"automation_id": {"type": "string"},
+                "trigger": {"type": "object"}, "actions": {"type": "array", "items": {"type": "object"}}},
+            "required": ["automation_id"]}}},
+]
+
+# 场景/自动化写入类工具（本地级联已零 LLM 全覆盖，LLM 只是兜底，所以写权限
+# 必须显式开关——默认口径见 settings.DEFAULTS：场景放行、自动化关）。
+_SCENE_WRITE_TOOLS = frozenset({
+    "HassCreateVoiceScene", "HassDeleteVoiceScene",
+})
+_AUTOMATION_WRITE_TOOLS = frozenset({
+    "HassCreateAutomation", "HassUpdateAutomation", "HassDeleteAutomation",
+})
+# 带 actions 的写入类工具（删除类没有动作面，走同一条判断也只是空转）
+_CHAIN_WRITE_TOOLS = _SCENE_WRITE_TOOLS | _AUTOMATION_WRITE_TOOLS
+
+
+def _actions_target_lock(node) -> bool:
+    """任意嵌套的 `actions` 里，是否有一条动作指向锁/安防目标。
+
+    判据就是顶层那道 `args_target_lock`（中文名 ∪ 域闭包 ∪ entity_id 前缀），
+    只是改为**递归遍历动作节点**——与 `custom_llm_api.scene_actions_hit_risk` 同族。
+    刻意不复用它：那份在集成侧（HA 环境），这份在加载项 core（无 HA 依赖），
+    两侧本来各有一套 `args_target_lock`（同纪律的受控重复，见 targets.py 头注）。
+    永不抛：形制异常按 False（与顶层同口径，漏判由执行面/话术兜，绝不误拦正常句）。
+    """
+    from .nlu.targets import args_target_lock
+    try:
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for pk in ("params", "parameters"):
+                    p = cur.get(pk)
+                    if isinstance(p, dict) and args_target_lock(p):
+                        return True
+                stack.extend(v for v in cur.values()
+                             if isinstance(v, (dict, list, tuple)))
+            elif isinstance(cur, (list, tuple)):
+                stack.extend(cur)
+    except Exception:  # noqa: BLE01
+        return False
+    return False
+
+SYSTEM_PROMPT = (
+    "你是慧尖智能家居语音助手。规则：1) 控制设备必须调用工具，不要凭空声称已完成；"
+    "2) 设备状态问题先调用 huijianGetLiveContext 再回答；3) 最终回答是口播短句，"
+    "不超过两句话，不要用列表和 Markdown；4) 没有对应设备或工具失败时如实告知。"
+    "5) 用户报出的房间/设备若不在设备清单内，先反问确认，不要臆测执行。"
+    "6) 「当我说X就Y」用 HassCreateVoiceScene；「当传感器/温度/时间到条件就Y」用"
+    "HassCreateAutomation；两者的 actions 一律 {intent, params} 形态。"
+    "7) 窗/帘铁律：名称带「窗」或叫开窗器/开合器/推窗器且不带帘字的都是窗户"
+    "（清单里标 button(窗)）→ 一律 ControlWindow（domains=button），"
+    "禁用 TurnDeviceOn/Off 和 cover；带「帘/百叶」的才是窗帘 → Turn*（cover）。"
+    "8) 一句话要多件事（「打开空调，并关闭平开窗」）：同一轮并行发起多个工具调用"
+    "逐个执行；建场景/自动化时同理，每个设备动作在 actions 数组里单独占一项。"
+    "9) 门锁铁律：对锁域设备**禁止**发 TurnDeviceOff/HassTurnOff/HassToggle——"
+    "本系统语义里关锁=解锁，属风险操作且执行闸会拒绝。用户说「关闭门锁/把锁关掉」"
+    "这类话时不要试调用，直接口播引导：「解锁要先确认，请说解锁门锁」。"
+    "打开/上锁（TurnDeviceOn 对锁）不受此限。"
+)
+
+
+# v1.0.41 安全（审查 S2 第一层）：LLM 回吐的工具名不可信——模型可被话术/friendly_names
+# 诱导吐出含 `../` 的名字，而下游 legacy 回落把名字裸拼进 URL 路径（yarl 归一化
+# dot-segment → 携 Supervisor 全权 token 可打任意 HA REST 写端点）。白名单唯一真源=
+# 工具 schema 本身（TOOLS 增删自动同步，单点维护）。
+_TOOL_NAMES = frozenset(
+    t["function"]["name"] for t in TOOLS
+    if isinstance(t, dict) and isinstance(t.get("function"), dict)
+    and isinstance(t["function"].get("name"), str))
+
+
+class Agent:
+    def __init__(self, settings, ha, executor):
+        self.settings = settings
+        self.ha = ha
+        self.executor = executor
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._no_stream = False        # 平台不认 SSE 一次即 latch（本实例不再试）
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.settings.get("llm.enabled") and self.settings.get("llm.base_url"))
+
+    async def _sess(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45, connect=8))
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # 窗户在慧尖体系是 button 按压语义（开窗器/开合器），实体名多含"窗"；
+    # 这些域默认被简报过滤掉，若不点名 LLM 根本看不到窗户设备 → 只能靠
+    # 名称含"窗/开合器/内倒/推拉门"豁免纳入。
+    _BRIEF_DOMAINS = ("light", "cover", "climate", "fan", "switch", "media_player",
+                      "humidifier", "lock", "vacuum")
+    _WINDOW_HINT_WORDS = ("窗", "开合器", "内倒", "推拉门")
+
+    async def _device_brief(self, limit: int = 60) -> str:
+        """把 HA 实体清单压成一行一设备的简报（喂 system 尾部，控制 token 量）。"""
+        states = await self.ha.states()
+        lines = []
+        for eid, ent in list(states.items()):
+            dom = eid.split(".", 1)[0]
+            attrs = ent.get("attributes") or {}
+            fname = str(attrs.get("friendly_name", eid))
+            is_window = (dom == "button"
+                         and any(w in fname for w in self._WINDOW_HINT_WORDS)
+                         and "窗帘" not in fname and "纱窗" not in fname)
+            if dom not in self._BRIEF_DOMAINS and not is_window:
+                continue
+            area = self.ha._entity_area.get(eid, "")
+            tag = "button(窗)" if is_window else dom
+            lines.append(f"{fname}[{tag}]{('@' + area) if area else ''}={ent.get('state')}")
+            if len(lines) >= limit:
+                break
+        return "\n".join(lines)
+
+    def _req(self, messages: list, tools: bool, stream: bool) -> tuple[str, dict, dict]:
+        base = str(self.settings.get("llm.base_url", "")).rstrip("/")
+        body = {
+            "model": self.settings.get("llm.model", ""),
+            "messages": messages,
+            "temperature": float(self.settings.get("llm.temperature", 0.3)),
+        }
+        if tools:
+            body["tools"] = TOOLS
+            body["tool_choice"] = "auto"
+        if stream:
+            body["stream"] = True
+        headers = {"Content-Type": "application/json"}
+        if key := self.settings.get("llm.api_key"):
+            headers["Authorization"] = f"Bearer {key}"
+        return f"{base}/chat/completions", body, headers
+
+    async def _chat(self, messages: list, tools: bool) -> dict:
+        url, body, headers = self._req(messages, tools, stream=False)
+        sess = await self._sess()
+        async with sess.post(url, json=body, headers=headers) as r:
+            if r.status != 200:
+                text = (await r.text())[:300]
+                raise RuntimeError(f"LLM {r.status}: {text}")
+            return await r.json()
+
+    class StreamUnsupported(Exception):
+        """平台不认 stream=true（4xx 或返回非 SSE）——answer 内本回合回退整包。"""
+
+    async def _chat_stream(self, messages: list, tools: bool,
+                           emit) -> dict:
+        """SSE 增量：句读完整即 emit(sentence)（async 回调）；返回组装的 assistant 消息。
+        只兼容 OpenAI 式 `data:{choices:[{delta:{content|tool_calls}}]}` 事件流。"""
+        url, body, headers = self._req(messages, tools, stream=True)
+        sess = await self._sess()
+        content = ""
+        calls: dict[int, dict] = {}
+        buf = ""
+        flushed = 0                          # content 中已 emit 的字符数
+        done = False
+        async with sess.post(url, json=body, headers=headers) as r:
+            ctype = r.headers.get("Content-Type", "")
+            if r.status != 200:
+                raise Agent.StreamUnsupported(f"HTTP {r.status}")
+            if "event-stream" not in ctype and "ndjson" not in ctype and "json" in ctype:
+                raise Agent.StreamUnsupported(f"非 SSE 响应({ctype[:40]})")
+            while not done:
+                raw = await r.content.read(4096)
+                if not raw:
+                    break
+                buf += raw.decode("utf-8", "ignore")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        done = True
+                        break
+                    try:
+                        ev = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    ch = (ev.get("choices") or [{}])[0]
+                    delta = ch.get("delta") or {}
+                    if delta.get("content"):
+                        content += delta["content"]
+                        # 增量句切：到达终止标点即 emit（半句留在 buffer 等下轮）
+                        while True:
+                            m = _SENT_END.search(content, flushed)
+                            if not m:
+                                break
+                            seg = content[flushed:m.end()].strip()
+                            flushed = m.end()
+                            if seg:
+                                await emit(seg)
+                    for tc in delta.get("tool_calls") or []:
+                        idx = int(tc.get("index") or 0)
+                        slot = calls.setdefault(idx, {"id": "", "type": "function",
+                                                      "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += fn["arguments"]
+        tail = content[flushed:].strip()
+        if tail:
+            await emit(tail)
+        return {"role": "assistant",
+                "content": content or None,
+                **({"tool_calls": [calls[k] for k in sorted(calls)]} if calls else {})}
+
+    async def _one_round(self, messages: list, tools: bool, q: "asyncio.Queue") -> tuple[dict, bool]:
+        """单轮对话（流式优先）。文本句随到随入 q；返回 (assistant 消息, 是否已流式送出)。
+        StreamUnsupported 只可能在首事件前抛（q 尚空），整轮安全改走非流式并永久 latch。"""
+        streamed = False
+        try:
+            if not self.settings.get("llm.stream", True) or self._no_stream:
+                resp = await self._chat(messages, tools=tools)
+                msg = (resp.get("choices") or [{}])[0].get("message", {})
+            else:
+                async def _emit(s: str) -> None:
+                    await q.put(s)
+                try:
+                    msg = await self._chat_stream(messages, tools, _emit)
+                    streamed = True
+                except Agent.StreamUnsupported as e:
+                    logger.warning("[LLM] 平台不支持流式(%s) → 本实例回退整包", str(e)[:80])
+                    self._no_stream = True
+                    resp = await self._chat(messages, tools=tools)
+                    msg = (resp.get("choices") or [{}])[0].get("message", {})
+            return msg, streamed
+        finally:
+            await q.put(_ROUND_END)
+
+    async def answer(self, text: str, history: list[dict]) -> AsyncIterator[str]:
+        """流式产出最终口播文本（按句 yield）。失败抛异常由 pipeline 兜底。
+        体验批 P2-15：SSE 真流式——最终答案句读一合成即 yield，长答案感知延迟大降。"""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n当前设备清单：\n" + await self._device_brief()}]
+        # v1.1.20：0/负值都按"不带上下文"处理（旧式 history[-0*2:] == history[0:]
+        # 反而把**全量**历史喂给 LLM，负值更会变成"丢最前 N 条"）
+        _n = max(0, int(self.settings.get("llm.history_rounds", 10) or 0))
+        messages += history[-_n * 2:] if _n else []
+        messages.append({"role": "user", "content": text})
+        max_rounds = int(self.settings.get("llm.max_tool_rounds", 3))
+        for _ in range(max_rounds + 1):
+            q: asyncio.Queue = asyncio.Queue()
+            task = asyncio.create_task(self._one_round(messages, max_rounds > 0, q))
+            try:
+                while True:
+                    item = await q.get()
+                    if item is _ROUND_END:
+                        break
+                    yield item
+                msg, streamed = await task
+            except BaseException:
+                task.cancel()
+                raise
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                final = (msg.get("content") or "").strip()
+                if streamed:
+                    if not final:
+                        yield const.FALLBACK_TEXT
+                else:
+                    for sent in _sentences(final or const.FALLBACK_TEXT):
+                        yield sent
+                return
+            messages.append(msg)
+            for call in calls:
+                fn = (call.get("function") or {})
+                name = fn.get("name", "")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                ok, speech = await self._tool(name, args)
+                messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                                 "content": json.dumps({"success": ok, "speech": speech}, ensure_ascii=False)})
+            # 工具回喂后继续（末轮不再给 tools → 强制出文本）
+            max_rounds -= 1
+        yield const.FALLBACK_TEXT
+
+    async def _tool(self, name: str, args: dict) -> tuple[bool, str]:
+        from .nlu.fast_path import Plan
+        from .nlu.targets import args_target_lock
+        # v1.0.41 安全（审查 S2 第一层）：白名单外的工具名直接拒（含一切路径形态），
+        # 永不带入执行/回落链。非 str 名也在此拦下（LLM 可吐任意 JSON）。
+        if not isinstance(name, str) or name not in _TOOL_NAMES:
+            logger.warning("[Agent] LLM 回吐非法工具名，已拒绝: %r", str(name)[:80])
+            return False, "工具名不合法"
+        # 2026-09-22 审查批 C2：pipeline 的 P2-13 确认环罩不住 LLM 工具通道——
+        # D7 语义下 TurnDeviceOff 对锁目标即解锁，不拦等于「开了 LLM 就有一条
+        # 免确认拔锁的后门」（工具白名单没有 HassUnlock/HassToggle，但
+        # TurnDeviceOff 完全够得着 lock 域）。拒答话术给正路：同一句话直接说
+        # 会命中本地字面表/klar 接地，由级联先问后办。confirm_risky=false
+        # 的用户已明示不要确认，此处随其配置放行（与 pipeline._risky 同开关）。
+        if (name in ("TurnDeviceOff", "HassTurnOff", "HassToggle")
+                and self.settings.get("dialog.confirm_risky", True)
+                and args_target_lock(args if isinstance(args, dict) else {})):
+            return False, ("解锁是风险操作，我不能替您跳过确认——请直接说「解锁大门」"
+                           "这类指令，会先问您一声再执行")
+        if name == "huijianGetLiveContext":
+            result = await self.ha.handle_intent(name, {})
+            raw = json.dumps(result.get("raw", result), ensure_ascii=False)[:2000]
+            return bool(result.get("success")), raw
+        if (name in _AUTOMATION_WRITE_TOOLS
+                and not self.settings.get("llm.allow_automation_write", False)):
+            return False, ("自动化的创建/修改/删除没开启——直接说「当客厅温度超过28度"
+                           "就打开空调」这类句子，本地就能建，不需要大模型")
+        if (name in _SCENE_WRITE_TOOLS
+                and not self.settings.get("llm.allow_scene_write", True)):
+            return False, "语音场景的创建/删除没开启"
+        # v1.1.36 复核批二（对抗复核抓到、我复现）：**第二条 LLM 通道整条没进动作链闸**。
+        # 上面 C2 那道只闸单发控制（TurnDeviceOff/HassTurnOff/HassToggle），而创建类
+        # 工具带 `actions[]` 时从没看过——同一条
+        # `{intent:TurnDeviceOff, params:{target:[{devices:[{name:"大门"}]}]}}`
+        # 走 custom_llm_api 那条道今天被拦，走本通道照样入库、触发时免确认解锁
+        # （`intent_turn.py:326 # off = unlock`；运行期 `_execute_actions` 无闸，
+        # 全靠创建侧）。判据沿用同一个 `args_target_lock`（中文名 ∪ 域闭包），
+        # 只是改为递归看每条动作。
+        if (name in _CHAIN_WRITE_TOOLS
+                and self.settings.get("dialog.confirm_risky", True)
+                and isinstance(args, dict)
+                and _actions_target_lock(args.get("actions"))):
+            return False, ("场景/自动化里带锁或安防动作，我不能替您跳过确认——"
+                           "这类动作请在语音里直接说，会先问您一声再执行")
+        # v1.1.24：写场景/自动化前做**区域可解析性**预检（与本地创建侧同口径）——
+        # LLM 的 actions 里带一个 HA 注册表里不存在的区域，入库后触发必半失败；
+        # 注册表未同步 ⇒ 放行（fail-open，同 capability 纪律）。
+        if isinstance(args, dict):
+            acts = args.get("actions")
+            if isinstance(acts, list):
+                targets = []
+                for a in acts:
+                    if isinstance(a, dict) and isinstance(a.get("params"), dict):
+                        targets += list((a["params"].get("target") or []))
+                if targets:
+                    reg = await capability.registry_areas(self.ha)
+                    # v1.1.28 补：`bad_target_area` 的聚合口径已是"**所有**带区域槽
+                    # 都不合格才拦"（即时执行侧靠就地剪槽兜底，创建侧不剪槽）。这里是
+                    # **入库前**预检，口径必须与本地创建侧 `_creation_area_problem`
+                    # 一致：任一槽区域不在册即拦——入库后是无人值守执行，不许带着未知
+                    # 区域落库（混合槽＝放走一个必半失败的动作）。
+                    bads = capability.bad_area_slots(targets, reg)
+                    bad = str((bads[0] or {}).get("area") or "").strip() if bads else ""
+                    if bad:
+                        return False, (f"「{bad}」这个房间在 Home Assistant 里不存在，"
+                                       f"动作没执行——请核对房间名后重试")
+        plan = Plan(intent=name, args=args, source="llm")
+        return await self.executor.run(plan)
+
+
+def _sentences(text: str) -> list[str]:
+    parts, buf = [], ""
+    for ch in text:
+        buf += ch
+        if ch in "。！？；!?;\n":
+            if buf.strip():
+                parts.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        parts.append(buf.strip())
+    return parts or ([text.strip()] if text.strip() else [])

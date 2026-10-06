@@ -1,0 +1,1773 @@
+"""Manager for esphome devices."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import secrets
+import struct
+import time
+from functools import partial
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+import voluptuous as vol
+from aioesphomeapi import APIClient, APIConnectionError, APIVersion
+from aioesphomeapi import DeviceInfo as EsphomeDeviceInfo
+from aioesphomeapi import (EncryptionPlaintextAPIError, ExecuteServiceResponse,
+                           HomeassistantServiceCall, InvalidAuthAPIError,
+                           InvalidEncryptionKeyAPIError, LogLevel,
+                           ReconnectLogic, RequiresEncryptionAPIError,
+                           SupportsResponseType, UserService,
+                           UserServiceArgType, ZWaveProxyRequest,
+                           ZWaveProxyRequestType, parse_log_message)
+from awesomeversion import AwesomeVersion
+from homeassistant.components import bluetooth, tag, zeroconf
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import (ATTR_DEVICE_ID, CONF_MODE, CONF_PORT,
+                                 EVENT_HOMEASSISTANT_CLOSE,
+                                 EVENT_LOGGING_CHANGED, Platform)
+from homeassistant.core import (CALLBACK_TYPE, Event, EventStateChangedData,
+                                HomeAssistant, ServiceCall, ServiceResponse,
+                                State, SupportsResponse, callback)
+from homeassistant.exceptions import (HomeAssistantError, ServiceNotFound,
+                                      ServiceValidationError, TemplateError)
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import json as json_helper
+from homeassistant.helpers import template
+from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.issue_registry import (IssueSeverity,
+                                                  async_create_issue,
+                                                  async_delete_issue)
+from homeassistant.helpers.service import async_set_service_schema
+from homeassistant.helpers.template import Template
+from homeassistant.util.json import json_loads_object
+
+from .bluetooth import async_connect_scanner
+from .const import (CONF_ALLOW_SERVICE_CALLS, CONF_BLUETOOTH_MAC_ADDRESS,
+                    CONF_DEVICE_NAME, CONF_NOISE_PSK, CONF_SUBSCRIBE_LOGS,
+                    DEFAULT_ALLOW_SERVICE_CALLS, DEFAULT_PORT, DEFAULT_URL,
+                    DOMAIN, PROJECT_URLS, STABLE_BLE_VERSION,
+                    STABLE_BLE_VERSION_STR)
+from .dashboard import async_get_dashboard
+from .domain_data import DomainData
+from .encryption_key_storage import async_get_encryption_key_storage
+# Import config flow so that it's added to the registry
+from .entry_data import ESPHomeConfigEntry, RuntimeEntryData
+from .enum_mapper import EsphomeEnumMapper
+
+DEVICE_CONFLICT_ISSUE_FORMAT = "device_conflict-{}"
+SATELLITE_UNREACHABLE_ISSUE_FORMAT = "satellite_unreachable-{}"
+# v1.0.55 重连可观测性（2026-09-12 现场定谳）：设备换 IP/链路黑洞后，HA 其实
+# 每个失败尝试都在敲旧地址的门，但 aioesphomeapi 只对每个重连周期的**首次**
+# 尝试记 WARNING、其余全 DEBUG——现场看就是"HA 没有动静"。持续断连 ≥5 分钟
+# 即建 repair issue（含目标地址/失败次数/时长/最后错误），并按 5 分钟一条
+# 的限频打 WARNING；恢复连接自动删 issue。配合本批恢复的 zeroconf 声明
+# （_esphomelib._tcp.local.），"设备改 IP → 语音永久哑且无人知晓"两头闭环。
+UNREACHABLE_ISSUE_THRESHOLD_S = 300.0
+UNREACHABLE_WARN_INTERVAL_S = 300.0
+UNPACK_UINT32_BE = struct.Struct(">I").unpack_from
+
+
+if TYPE_CHECKING:
+    from aioesphomeapi.api_pb2 import \
+        SubscribeLogsResponse  # type: ignore[attr-defined]  # noqa: I001
+
+
+_LOGGER = logging.getLogger(__name__)
+
+# v1.0.49：卫星实体缺失自愈的限频（重载会掉一次连接，别把抖动放大成重载风暴）
+_SATELLITE_SELFHEAL_COOLDOWN = 600.0
+_SATELLITE_SELFHEAL_DELAY = 5.0
+# v1.0.52 修重载风暴：冷却时戳必须**进程级**而非实例级——async_reload 会重建
+# ESPHomeManager，实例属性随旧实例清零，600s 限频在"重载→重连→再重载"回路里
+# 形同虚设（正是本限频注释声明要防的重载风暴）。keyed by entry_id；自愈本就是
+# 罕见路径，进程生命周期内保留即够，无需落盘。
+_SATELLITE_SELFHEAL_LAST: dict[str, float] = {}
+
+LOG_LEVEL_TO_LOGGER = {
+    LogLevel.LOG_LEVEL_NONE: logging.DEBUG,
+    LogLevel.LOG_LEVEL_ERROR: logging.ERROR,
+    LogLevel.LOG_LEVEL_WARN: logging.WARNING,
+    LogLevel.LOG_LEVEL_INFO: logging.INFO,
+    LogLevel.LOG_LEVEL_CONFIG: logging.INFO,
+    LogLevel.LOG_LEVEL_DEBUG: logging.DEBUG,
+    LogLevel.LOG_LEVEL_VERBOSE: logging.DEBUG,
+    LogLevel.LOG_LEVEL_VERY_VERBOSE: logging.DEBUG,
+}
+LOGGER_TO_LOG_LEVEL = {
+    logging.NOTSET: LogLevel.LOG_LEVEL_VERY_VERBOSE,
+    logging.DEBUG: LogLevel.LOG_LEVEL_VERY_VERBOSE,
+    logging.INFO: LogLevel.LOG_LEVEL_CONFIG,
+    logging.WARNING: LogLevel.LOG_LEVEL_WARN,
+    logging.ERROR: LogLevel.LOG_LEVEL_ERROR,
+    logging.CRITICAL: LogLevel.LOG_LEVEL_ERROR,
+}
+
+
+@callback
+def _async_check_firmware_version(
+    hass: HomeAssistant, device_info: EsphomeDeviceInfo, api_version: APIVersion
+) -> None:
+    """Create or delete an the ble_firmware_outdated issue."""
+    # ESPHome device_info.mac_address is the unique_id
+    issue = f"ble_firmware_outdated-{device_info.mac_address}"
+    if (
+        not device_info.bluetooth_proxy_feature_flags_compat(api_version)
+        # If the device has a project name its up to that project
+        # to tell them about the firmware version update so we don't notify here
+        or (device_info.project_name and device_info.project_name not in PROJECT_URLS)
+        or AwesomeVersion(device_info.esphome_version) >= STABLE_BLE_VERSION
+    ):
+        async_delete_issue(hass, DOMAIN, issue)
+        return
+    async_create_issue(
+        hass,
+        DOMAIN,
+        issue,
+        is_fixable=False,
+        severity=IssueSeverity.WARNING,
+        learn_more_url=PROJECT_URLS.get(device_info.project_name, DEFAULT_URL),
+        translation_key="ble_firmware_outdated",
+        translation_placeholders={
+            "name": device_info.name,
+            "version": STABLE_BLE_VERSION_STR,
+        },
+    )
+
+
+@callback
+def _async_check_using_api_password(
+    hass: HomeAssistant, device_info: EsphomeDeviceInfo, has_password: bool
+) -> None:
+    """Create or delete an the api_password_deprecated issue."""
+    # ESPHome device_info.mac_address is the unique_id
+    issue = f"api_password_deprecated-{device_info.mac_address}"
+    if not has_password:
+        async_delete_issue(hass, DOMAIN, issue)
+        return
+    async_create_issue(
+        hass,
+        DOMAIN,
+        issue,
+        is_fixable=False,
+        severity=IssueSeverity.WARNING,
+        learn_more_url="https://esphome.io/components/api.html",
+        translation_key="api_password_deprecated",
+        translation_placeholders={
+            "name": device_info.name,
+        },
+    )
+
+
+class ESPHomeManager:
+    """Class to manage an ESPHome connection."""
+
+    __slots__ = (
+        "_cancel_subscribe_logs",
+        "_log_level",
+        # v1.0.51 热修：本类有 __slots__（无 __dict__），新增实例属性**必须同时
+        # 登记在此**，否则 __init__ 赋值即 AttributeError → 整个 config entry
+        # setup 失败（现场：Error setting up entry HUIJIAN-0BD0 for huijian_ai，
+        # v1.0.49/1.0.50 实发）。钉桩：tests/test_v1051_manager_slots.py 静态校验
+        # "类内所有 self.X = 赋值都在 __slots__ 里"，防同类再犯。
+        # v1.0.52：_satellite_selfheal_at 已删除（改模块级冷却表，见
+        # _SATELLITE_SELFHEAL_LAST），勿再加回——实例级限频跨 reload 无效。
+        # v1.0.55：不可达观测窗四件（见 UNREACHABLE_* 常量注释）。
+        "_conn_fail_count",
+        "_conn_fail_since",
+        "_conn_warn_at",
+        "_unreachable_issue_open",
+        # v1.0.82：VA 链路活性看门狗（见 _va_link_watchdog docstring）。
+        "_va_watch_task",
+        "_link_up",
+        "cli",
+        "device_id",
+        "domain_data",
+        "entry",
+        "entry_data",
+        "hass",
+        "host",
+        "password",
+        "reconnect_logic",
+        "zeroconf_instance",
+    )
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ESPHomeConfigEntry,
+        host: str,
+        password: str | None,
+        cli: APIClient,
+        zeroconf_instance: zeroconf.HaZeroconf,
+        domain_data: DomainData,
+    ) -> None:
+        """Initialize the esphome manager."""
+        self.hass = hass
+        self.host = host
+        self.password = password
+        self.entry = entry
+        self.cli = cli
+        self.device_id: str | None = None
+        self.domain_data = domain_data
+        self.reconnect_logic: ReconnectLogic | None = None
+        self.zeroconf_instance = zeroconf_instance
+        self.entry_data = entry.runtime_data
+        self._cancel_subscribe_logs: CALLBACK_TYPE | None = None
+        self._log_level = LogLevel.LOG_LEVEL_NONE
+        # v1.0.52：卫星自愈冷却时戳已上移为模块级 _SATELLITE_SELFHEAL_LAST
+        # （实例级会随 reload 清零 → 限频失效 → 重载风暴），此处不再持有属性。
+        # v1.0.55 重连可观测性状态（见 UNREACHABLE_* 常量注释）。
+        self._conn_fail_since: float | None = None
+        self._conn_fail_count = 0
+        self._conn_warn_at = 0.0
+        self._unreachable_issue_open = False
+        # v1.0.82：看门狗任务句柄 + 连接位（on_connect 成功置真、on_disconnect 置假）
+        self._va_watch_task = None
+        self._link_up = False
+
+    @property
+    def _unreachable_issue_id(self) -> str:
+        """Return the unreachable-repair issue id for this entry.
+
+        v1.1.27（批7）：旧实现 `unique_id or entry_id`——unique_id 由设备
+        握手后写入/可能变更，id 会漂（旧 id 的 repair 成孤儿，删不掉）。
+        issue 是持久化实据，id 必须只用条目标识（entry_id 永不变）。
+        """
+        return SATELLITE_UNREACHABLE_ISSUE_FORMAT.format(self.entry.entry_id)
+
+    @property
+    def _unreachable_legacy_issue_id(self) -> str | None:
+        """旧 id 形态（unique_id 版）——历史版本建过的 repair 需一并清。"""
+        uid = getattr(self.entry, "unique_id", None)
+        if not uid:
+            return None
+        legacy = SATELLITE_UNREACHABLE_ISSUE_FORMAT.format(uid)
+        return None if legacy == self._unreachable_issue_id else legacy
+
+    async def on_stop(self, event: Event) -> None:
+        """Cleanup the socket client on HA close."""
+        await cleanup_instance(self.entry)
+
+    @property
+    def services_issue(self) -> str:
+        """Return the services issue name for this entry."""
+        return f"service_calls_not_enabled-{self.entry.unique_id}"
+
+    @callback
+    def async_on_service_call(self, service: HomeassistantServiceCall) -> None:
+        """Call service when user automation in ESPHome config is triggered."""
+        hass = self.hass
+        domain, service_name = service.service.split(".", 1)
+        service_data = service.data
+
+        if service.data_template:
+            try:
+                data_template = {
+                    key: Template(value, hass)
+                    for key, value in service.data_template.items()
+                }
+                service_data.update(
+                    template.render_complex(data_template, service.variables)
+                )
+            except TemplateError as ex:
+                _LOGGER.error(
+                    "Error rendering data template %s for %s: %s",
+                    service.data_template,
+                    self.host,
+                    ex,
+                )
+                return
+
+        if service.is_event:
+            device_id = self.device_id
+            # ESPHome uses service call packet for both events and service calls
+            # Ensure the user can only send events of form 'esphome.xyz'
+            if domain != DOMAIN:
+                _LOGGER.error(
+                    "Can only generate events under esphome domain! (%s)", self.host
+                )
+                return
+
+            # Call native tag scan
+            if service_name == "tag_scanned" and device_id is not None:
+                tag_id = service_data["tag_id"]
+                hass.async_create_task(tag.async_scan_tag(hass, tag_id, device_id))
+                return
+
+            hass.bus.async_fire(
+                service.service,
+                {
+                    ATTR_DEVICE_ID: device_id,
+                    **service_data,
+                },
+            )
+        elif self.entry.options.get(
+            CONF_ALLOW_SERVICE_CALLS, DEFAULT_ALLOW_SERVICE_CALLS
+        ):
+            call_id = service.call_id
+            if call_id and service.wants_response:
+                # Service call with response expected
+                self.entry.async_create_task(
+                    hass,
+                    self._handle_service_call_with_response(
+                        domain,
+                        service_name,
+                        service_data,
+                        call_id,
+                        service.response_template,
+                    ),
+                )
+            elif call_id:
+                # Service call without response but needs success/failure notification
+                self.entry.async_create_task(
+                    hass,
+                    self._handle_service_call_with_notification(
+                        domain, service_name, service_data, call_id
+                    ),
+                )
+            else:
+                # Fire and forget service call
+                self.entry.async_create_task(
+                    hass, hass.services.async_call(domain, service_name, service_data)
+                )
+        else:
+            device_info = self.entry_data.device_info
+            assert device_info is not None
+            async_create_issue(
+                hass,
+                DOMAIN,
+                self.services_issue,
+                is_fixable=False,
+                severity=IssueSeverity.WARNING,
+                translation_key="service_calls_not_allowed",
+                translation_placeholders={
+                    "name": device_info.friendly_name or device_info.name,
+                },
+            )
+            _LOGGER.error(
+                "%s: Service call %s.%s: with data %s rejected; "
+                "If you trust this device and want to allow access for it to make "
+                "Home Assistant service calls, you can enable this "
+                "functionality in the options flow",
+                device_info.friendly_name or device_info.name,
+                domain,
+                service_name,
+                service_data,
+            )
+
+    async def _handle_service_call_with_response(
+        self,
+        domain: str,
+        service_name: str,
+        service_data: dict,
+        call_id: int,
+        response_template: str | None = None,
+    ) -> None:
+        """Handle service call that expects a response and send response back to ESPHome."""
+        try:
+            # Call the service with response capture enabled
+            action_response = await self.hass.services.async_call(
+                domain=domain,
+                service=service_name,
+                service_data=service_data,
+                blocking=True,
+                return_response=True,
+            )
+
+            if response_template:
+                try:
+                    # Render response template
+                    tmpl = Template(response_template, self.hass)
+                    response = tmpl.async_render(
+                        variables={"response": action_response},
+                        strict=True,
+                    )
+                    response_dict = {"response": response}
+
+                except TemplateError as ex:
+                    raise HomeAssistantError(
+                        f"Error rendering response template: {ex}"
+                    ) from ex
+            else:
+                response_dict = {"response": action_response}
+
+            # JSON encode response data for ESPHome
+            response_data = json_helper.json_bytes(response_dict)
+
+        except (
+            ServiceNotFound,
+            ServiceValidationError,
+            vol.Invalid,
+            HomeAssistantError,
+        ) as ex:
+            self._send_service_call_response(
+                call_id, success=False, error_message=str(ex), response_data=b""
+            )
+
+        else:
+            # Send success response back to ESPHome
+            self._send_service_call_response(
+                call_id=call_id,
+                success=True,
+                error_message="",
+                response_data=response_data,
+            )
+
+    async def _handle_service_call_with_notification(
+        self, domain: str, service_name: str, service_data: dict, call_id: int
+    ) -> None:
+        """Handle service call that needs success/failure notification."""
+        try:
+            await self.hass.services.async_call(
+                domain, service_name, service_data, blocking=True
+            )
+        except (ServiceNotFound, ServiceValidationError, vol.Invalid) as ex:
+            self._send_service_call_response(call_id, False, str(ex), b"")
+        else:
+            self._send_service_call_response(call_id, True, "", b"")
+
+    def _send_service_call_response(
+        self,
+        call_id: int,
+        success: bool,
+        error_message: str,
+        response_data: bytes,
+    ) -> None:
+        """Send service call response back to ESPHome device."""
+        _LOGGER.debug(
+            "Service call response for call_id %s: success=%s, error=%s",
+            call_id,
+            success,
+            error_message,
+        )
+        self.cli.send_homeassistant_action_response(
+            call_id,
+            success,
+            error_message,
+            response_data,
+        )
+
+    @callback
+    def _send_home_assistant_state(
+        self, entity_id: str, attribute: str | None, state: State | None
+    ) -> None:
+        """Forward Home Assistant states to ESPHome."""
+        if state is None or (attribute and attribute not in state.attributes):
+            return
+
+        send_state = state.state
+        if attribute:
+            attr_val = state.attributes[attribute]
+            # ESPHome only handles "on"/"off" for boolean values
+            if isinstance(attr_val, bool):
+                send_state = "on" if attr_val else "off"
+            else:
+                send_state = attr_val
+
+        self.cli.send_home_assistant_state(entity_id, attribute, str(send_state))
+
+    @callback
+    def _send_home_assistant_state_event(
+        self,
+        attribute: str | None,
+        event: Event[EventStateChangedData],
+    ) -> None:
+        """Forward Home Assistant states updates to ESPHome."""
+        event_data = event.data
+        new_state = event_data["new_state"]
+        old_state = event_data["old_state"]
+
+        if new_state is None or old_state is None:
+            return
+
+        # Only communicate changes to the state or attribute tracked
+        if (not attribute and old_state.state == new_state.state) or (
+            attribute
+            and old_state.attributes.get(attribute)
+            == new_state.attributes.get(attribute)
+        ):
+            return
+
+        self._send_home_assistant_state(event.data["entity_id"], attribute, new_state)
+
+    @callback
+    def async_on_state_subscription(
+        self, entity_id: str, attribute: str | None = None
+    ) -> None:
+        """Subscribe and forward states for requested entities."""
+        hass = self.hass
+        self.entry_data.disconnect_callbacks.add(
+            async_track_state_change_event(
+                hass,
+                [entity_id],
+                partial(self._send_home_assistant_state_event, attribute),
+            )
+        )
+        # Send initial state
+        self._send_home_assistant_state(
+            entity_id, attribute, hass.states.get(entity_id)
+        )
+
+    @callback
+    def async_on_state_request(
+        self, entity_id: str, attribute: str | None = None
+    ) -> None:
+        """Forward state for requested entity."""
+        self._send_home_assistant_state(
+            entity_id, attribute, self.hass.states.get(entity_id)
+        )
+
+    async def on_connect(self) -> None:
+        """Subscribe to states and list entities on successful API login."""
+        # v1.0.55：连上了 = 观测清零。_conn_fail_since 只在曾持续断连时置位，
+        # 正常瞬时重试不留痕，避免每次闪断都刷"已恢复"日志。
+        if self._conn_fail_since is not None:
+            outage = time.monotonic() - self._conn_fail_since
+            if outage >= UNREACHABLE_ISSUE_THRESHOLD_S:
+                _LOGGER.info(
+                    "设备 %s 已重连成功（此前不可达约 %d 分钟，失败 %d 次）",
+                    self.entry.title,
+                    int(outage // 60),
+                    self._conn_fail_count,
+                )
+            self._conn_fail_since = None
+            self._conn_fail_count = 0
+        if self._unreachable_issue_open:
+            self._unreachable_issue_open = False
+        # v1.1.27（批7）：issue 是持久化实据，_unreachable_issue_open 只是实例态
+        # ——reload/重启后新实例标志为假，旧 repair「设备不可达」长挂说谎（连接
+        # 明明已恢复）。连接成功即**无条件幂等**删（issue 不存在时 delete 是
+        # no-op）：当前 id + 历史 unique_id 形态 id 一并清。
+        async_delete_issue(self.hass, DOMAIN, self._unreachable_issue_id)
+        legacy_issue_id = self._unreachable_legacy_issue_id
+        if legacy_issue_id:
+            async_delete_issue(self.hass, DOMAIN, legacy_issue_id)
+        try:
+            await self._on_connect()
+            # v1.0.82：连接确认健康（含订阅/实体重建全链走通）——置连接位并
+            # 武装 VA 链路活性看门狗（仅具语音助手能力的设备）。
+            self._link_up = True
+            self._arm_va_link_watchdog()
+        except InvalidAuthAPIError as err:
+            _LOGGER.warning("Authentication failed for %s: %s", self.host, err)
+            await self._start_reauth_and_disconnect()
+        except APIConnectionError as err:
+            _LOGGER.warning(
+                "Error getting setting up connection for %s: %s", self.host, err
+            )
+            # Re-connection logic will trigger after this
+            await self.cli.disconnect()
+
+    def _async_on_log(self, msg: SubscribeLogsResponse) -> None:
+        """Handle a log message from the API."""
+        for line in parse_log_message(
+            msg.message.decode("utf-8", "backslashreplace"), "", strip_ansi_escapes=True
+        ):
+            _LOGGER.log(
+                LOG_LEVEL_TO_LOGGER.get(msg.level, logging.DEBUG),
+                "%s: %s",
+                self.entry.title,
+                line,
+            )
+
+    @callback
+    def _async_get_equivalent_log_level(self) -> LogLevel:
+        """Get the equivalent ESPHome log level for the current logger."""
+        return LOGGER_TO_LOG_LEVEL.get(
+            _LOGGER.getEffectiveLevel(), LogLevel.LOG_LEVEL_VERY_VERBOSE
+        )
+
+    @callback
+    def _async_subscribe_logs(self, log_level: LogLevel) -> None:
+        """Subscribe to logs."""
+        if self._cancel_subscribe_logs is not None:
+            self._cancel_subscribe_logs()
+            self._cancel_subscribe_logs = None
+        self._log_level = log_level
+        self._cancel_subscribe_logs = self.cli.subscribe_logs(
+            self._async_on_log, self._log_level
+        )
+
+    async def _on_connect(self) -> None:
+        """Subscribe to states and list entities on successful API login."""
+        entry = self.entry
+        unique_id = entry.unique_id
+        entry_data = self.entry_data
+        reconnect_logic = self.reconnect_logic
+        assert reconnect_logic is not None, "Reconnect logic must be set"
+        hass = self.hass
+        cli = self.cli
+        stored_device_name: str | None = entry.data.get(CONF_DEVICE_NAME)
+        unique_id_is_mac_address = unique_id and ":" in unique_id
+        if entry.options.get(CONF_SUBSCRIBE_LOGS):
+            self._async_subscribe_logs(self._async_get_equivalent_log_level())
+        device_info, entity_infos, services = await cli.device_info_and_list_entities()
+
+        device_mac = format_mac(device_info.mac_address)
+        mac_address_matches = unique_id == device_mac
+        if (
+            bluetooth_mac_address := device_info.bluetooth_mac_address
+        ) and entry.data.get(CONF_BLUETOOTH_MAC_ADDRESS) != bluetooth_mac_address:
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_BLUETOOTH_MAC_ADDRESS: bluetooth_mac_address},
+            )
+        #
+        # Migrate config entry to new unique ID if the current
+        # unique id is not a mac address.
+        #
+        # This was changed in 2023.1
+        if not mac_address_matches and not unique_id_is_mac_address:
+            hass.config_entries.async_update_entry(entry, unique_id=device_mac)
+
+        issue = DEVICE_CONFLICT_ISSUE_FORMAT.format(entry.entry_id)
+        if not mac_address_matches and unique_id_is_mac_address:
+            # If the unique id is a mac address
+            # and does not match we have the wrong device and we need
+            # to abort the connection. This can happen if the DHCP
+            # server changes the IP address of the device and we end up
+            # connecting to the wrong device.
+            if stored_device_name == device_info.name:
+                # If the device name matches it might be a device replacement
+                # or they made a mistake and flashed the same firmware on
+                # multiple devices. In this case we start a repair flow
+                # to ask them if its a mistake, or if they want to migrate
+                # the config entry to the replacement hardware.
+                shared_data = {
+                    "name": device_info.name,
+                    "mac": format_mac(device_mac),
+                    "stored_mac": format_mac(unique_id),
+                    "model": device_info.model,
+                    "ip": self.host,
+                }
+                async_create_issue(
+                    hass,
+                    DOMAIN,
+                    issue,
+                    is_fixable=True,
+                    severity=IssueSeverity.ERROR,
+                    translation_key="device_conflict",
+                    translation_placeholders=shared_data,
+                    data={**shared_data, "entry_id": entry.entry_id},
+                )
+            _LOGGER.error(
+                "Unexpected device found at %s; "
+                "expected `%s` with mac address `%s`, "
+                "found `%s` with mac address `%s`",
+                self.host,
+                stored_device_name,
+                unique_id,
+                device_info.name,
+                device_mac,
+            )
+            await cli.disconnect()
+            await reconnect_logic.stop()
+            # We don't want to reconnect to the wrong device
+            # so we stop the reconnect logic and disconnect
+            # the client. When discovery finds the new IP address
+            # for the device, the config entry will be updated
+            # and we will connect to the correct device when
+            # the config entry gets reloaded by the discovery
+            # flow.
+            return
+
+        async_delete_issue(hass, DOMAIN, issue)
+        # Make sure we have the correct device name stored
+        # so we can map the device to ESPHome Dashboard config
+        # If we got here, we know the mac address matches or we
+        # did a migration to the mac address so we can update
+        # the device name.
+        if stored_device_name != device_info.name:
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_DEVICE_NAME: device_info.name}
+            )
+
+        api_version = cli.api_version
+        assert api_version is not None, "API version must be set"
+        entry_data.async_on_connect(hass, device_info, api_version)
+
+        await self._handle_dynamic_encryption_key(device_info)
+
+        if device_info.name:
+            reconnect_logic.name = device_info.name
+
+        if not device_info.friendly_name:
+            _LOGGER.info(
+                "No `friendly_name` set in the `esphome:` section of the "
+                "YAML config for device '%s' (MAC: %s); It's recommended "
+                "to add one for easier identification and better alignment "
+                "with Home Assistant naming conventions",
+                device_info.name,
+                device_mac,
+            )
+        # Build device_id_to_name mapping for efficient lookup
+        entry_data.device_id_to_name = {
+            sub_device.device_id: sub_device.name or device_info.name
+            for sub_device in device_info.devices
+        }
+        self.device_id = _async_setup_device_registry(hass, entry, entry_data)
+
+        entry_data.async_update_device_state()
+        await entry_data.async_update_static_infos(
+            hass, entry, entity_infos, device_info.mac_address
+        )
+        _setup_services(hass, entry_data, services)
+
+        if device_info.bluetooth_proxy_feature_flags_compat(api_version):
+            entry_data.disconnect_callbacks.add(
+                async_connect_scanner(
+                    hass, entry_data, cli, device_info, self.device_id
+                )
+            )
+        else:
+            bluetooth.async_remove_scanner(
+                hass, device_info.bluetooth_mac_address or device_info.mac_address
+            )
+
+        if device_info.voice_assistant_feature_flags_compat(api_version) and (
+            Platform.ASSIST_SATELLITE not in entry_data.loaded_platforms
+        ):
+            # Create assist satellite entity
+            await self.hass.config_entries.async_forward_entry_setups(
+                self.entry, [Platform.ASSIST_SATELLITE]
+            )
+            entry_data.loaded_platforms.add(Platform.ASSIST_SATELLITE)
+
+        # v1.0.49：订阅自愈兜底（详见 _async_selfheal_missing_satellite）
+        self._async_selfheal_missing_satellite(device_info, api_version)
+
+        if device_info.zwave_proxy_feature_flags:
+            entry_data.disconnect_callbacks.add(
+                cli.subscribe_zwave_proxy_request(self._async_zwave_proxy_request)
+            )
+
+        cli.subscribe_home_assistant_states_and_services(
+            on_state=entry_data.async_update_state,
+            on_service_call=self.async_on_service_call,
+            on_state_sub=self.async_on_state_subscription,
+            on_state_request=self.async_on_state_request,
+        )
+
+        entry_data.async_save_to_store()
+        _async_check_firmware_version(hass, device_info, api_version)
+        _async_check_using_api_password(hass, device_info, bool(self.password))
+
+    def _async_zwave_proxy_request(self, request: ZWaveProxyRequest) -> None:
+        """Handle a request to create a zwave_js config flow."""
+        if request.type != ZWaveProxyRequestType.HOME_ID_CHANGE:
+            return
+        # ESPHome will send a home id change on every connection
+        # if the Z-Wave controller is connected to the ESPHome device
+        # so we know for sure that the Z-Wave controller is connected
+        # when we get the message. This makes it safe to start
+        # the zwave_js config flow automatically even if the zwave_home_id
+        # is 0 (not yet provisioned) as we know for sure the controller
+        # is connected to the ESPHome device and do not have to guess
+        # if it's a broken connection or Z-Wave controller or a not
+        # yet provisioned controller.
+        zwave_home_id: int = UNPACK_UINT32_BE(request.data[0:4])[0]
+        assert self.entry_data.device_info is not None
+        self.entry_data.async_create_zwave_js_flow(
+            self.hass, self.entry_data.device_info, zwave_home_id
+        )
+
+    @callback
+    def _async_selfheal_missing_satellite(
+        self, device_info: EsphomeDeviceInfo, api_version: APIVersion
+    ) -> None:
+        """设备宣告了语音助手、但本条目没有存活中的卫星实体 → 限频自愈重载。
+
+        v1.0.49（现场 2026-09-21"语音全哑数分钟"）：设备 `api_client_`（订阅槽）
+        唯一的重新订阅通路是"卫星实体被移除再添加"（aioesphomeapi 不会在重连后
+        自动重发 SubscribeVoiceAssistantRequest）。任何让实体不再重建的路径
+        （卸载后 loaded_platforms 闩锁未复位、实体 add 抛错被 HA 记成
+        "Error adding entity"…）都会把设备永久钉在 "VA not subscribed yet"：
+        唤醒有提示音、却永远等不到会话，设备侧除那行 WARN 外**零日志**，
+        用户只能重启 HA 或设备。
+        这里在**连接已建立**的安全点做一次存在性核对：实体活着时必注册
+        set_wake_words 回调、被移除即摘除——用它当探针（不猜 entity_id、
+        不碰状态机）。确凿缺失才以独立任务限频重载整条目
+        （重载 = 实体重建 = 重发订阅，即官方文档给的恢复手段）。
+
+        v1.0.52 修两处自伤（上线前实锤，见 tests/test_v1052_satellite_selfheal.py）：
+        ① 探针在 `_on_connect` 里紧跟 `await async_forward_entry_setups` 的**同
+        tick** 执行，而 `async_add_entities` 是 EntityPlatform 的推迟任务、回调
+        注册在实体 `async_added_to_hass` 末尾——首连/重连时探针**必然**看到空列表。
+        故"缺失"不是同 tick 定案，而是 sleep 后**复查仍缺失**才定案。
+        ② 冷却时戳改模块级：reload 重建 manager，实例属性归零会让 600s 限频
+        在重载回路里失效（连接→5s→重载→重连→再重载的自增强风暴）。
+        """
+        if self.hass.is_stopping:
+            return
+        try:
+            if not device_info.voice_assistant_feature_flags_compat(api_version):
+                return
+        except Exception:  # noqa: BLE001 —— 兼容包装器版本差异：判不了就不自愈
+            return
+        if self.entry_data.assist_satellite_set_wake_words_callbacks:
+            return
+        now = time.monotonic()
+        entry_id = self.entry.entry_id
+        # 哨兵必须是 None 而非 0.0：time.monotonic() 基准是**开机时刻**，刚断电
+        # 重启的机器上 now 本身 < 600——get(entry_id, 0.0) 会让"从未自愈"被误判
+        # 成"距上次自愈不足限频"，恰好在最需要自愈的冷启动窗口把首次自愈吞掉
+        # （tests/test_v1052_fixes.py 在 uptime<600s 的 WSL 上实锤此坑）。
+        last = _SATELLITE_SELFHEAL_LAST.get(entry_id)
+        if last is not None and now - last < _SATELLITE_SELFHEAL_COOLDOWN:
+            _LOGGER.info(
+                "%s：卫星实体仍未注册（可能为首连竞态），但距上次自愈仅 %ss"
+                "——限频中，本次不重载",
+                self.entry.title,
+                int(now - last),
+            )
+            return
+        _SATELLITE_SELFHEAL_LAST[entry_id] = now
+        _LOGGER.warning(
+            "%s：设备已宣告语音助手，但本条目没有存活中的 assist_satellite 实体"
+            "（设备侧会永久停在 'VA not subscribed yet'）——%ss 后**复查**，"
+            "仍缺失才重载配置条目重建实体并重新订阅（限频 %ss）",
+            self.entry.title,
+            int(_SATELLITE_SELFHEAL_DELAY),
+            int(_SATELLITE_SELFHEAL_COOLDOWN),
+        )
+        self.hass.async_create_task(self._async_reload_entry_after_delay())
+
+    async def _async_reload_entry_after_delay(self) -> None:
+        """延迟复查并自愈重载本条目（脱离 ReconnectLogic 的 _connected_lock 再动连接）。"""
+        await asyncio.sleep(_SATELLITE_SELFHEAL_DELAY)
+        if self.hass.is_stopping:
+            return
+        # 复查：首连/重连时这只是"实体 add 还没跑完"的正常竞态（5s 足够跑完），
+        # 只有复查**仍**无回调才是真缺失（loaded_platforms 闩锁卡死、实体 add
+        # 抛错等），那时 reload 才对症。不复查直接 reload = 每次连接都掉线一次。
+        if self.entry_data.assist_satellite_set_wake_words_callbacks:
+            _LOGGER.info(
+                "%s：自愈窗口内 assist_satellite 实体已完成注册"
+                "（探针属首连竞态）——取消重载",
+                self.entry.title,
+            )
+            return
+        if self.entry.state is not ConfigEntryState.LOADED:
+            # 已被别的路径在卸载/重载/迁移中，不必叠加操作
+            _LOGGER.info(
+                "%s：条目当前状态 %s，跳过卫星订阅自愈重载",
+                self.entry.title,
+                self.entry.state,
+            )
+            return
+        _LOGGER.warning("%s：复查仍无卫星实体，执行卫星订阅自愈重载", self.entry.title)
+        try:
+            await self.hass.config_entries.async_reload(self.entry.entry_id)
+        except Exception:  # noqa: BLE001 —— 自愈路径不得反杀 ReconnectLogic 任务
+            _LOGGER.exception("%s：卫星订阅自愈重载失败", self.entry.title)
+
+    async def on_disconnect(self, expected_disconnect: bool) -> None:
+        """Run disconnect callbacks on API disconnect."""
+        self._link_up = False   # v1.0.82：看门狗停探（重连路上交给 ReconnectLogic）
+        entry_data = self.entry_data
+        hass = self.hass
+        host = self.host
+        name = entry_data.device_info.name if entry_data.device_info else host
+        _LOGGER.debug(
+            "%s: %s disconnected (expected=%s), running disconnected callbacks",
+            name,
+            host,
+            expected_disconnect,
+        )
+        entry_data.async_on_disconnect()
+        entry_data.expected_disconnect = expected_disconnect
+        # Mark state as stale so that we will always dispatch
+        # the next state update of that type when the device reconnects
+        entry_data.stale_state = {
+            (type(entity_state), entity_state.device_id, key)
+            for state_dict in entry_data.state.values()
+            for key, entity_state in state_dict.items()
+        }
+        if not hass.is_stopping:
+            # Avoid marking every esphome entity as unavailable on shutdown
+            # since it generates a lot of state changed events and database
+            # writes when we already know we're shutting down and the state
+            # will be cleared anyway.
+            entry_data.async_update_device_state()
+
+        if Platform.ASSIST_SATELLITE in self.entry_data.loaded_platforms:
+            # v1.0.49 重订阅闩锁根治（现场 2026-09-21：设备侧反复
+            # "VA not subscribed yet -> bounded wait" 数分钟、而 apiClients 非零）。
+            # 设备 `api_client_`（订阅槽）**唯一**的重新订阅通路是"卫星实体被移除
+            # 再添加"——aioesphomeapi 不会在重连后自动重发
+            # SubscribeVoiceAssistantRequest（全库只在 subscribe_voice_assistant()
+            # 内发一次）。而本方法跑在 aioesphomeapi ReconnectLogic 的 _on_disconnect
+            # **持锁 await 期间**：这里的 await 一旦抛错/被取消，紧随的 remove 就永不
+            # 执行 → 下次连接时 _on_connect 的
+            # `ASSIST_SATELLITE not in loaded_platforms` 门控为假 → 平台永不再
+            # forward → 实体不再重建 → 订阅永不再发 → 设备永久哑火，只能整条目重载
+            # 或重启 HA。故：unload 失败也必须复位闩锁（discard 幂等）。
+            try:
+                await self.hass.config_entries.async_unload_platforms(
+                    self.entry, [Platform.ASSIST_SATELLITE]
+                )
+            except Exception:  # noqa: BLE001 —— 卸载失败不能连带闩锁一起卡死
+                _LOGGER.exception(
+                    "卸载 assist_satellite 平台失败（%s）：仍复位 loaded_platforms "
+                    "闩锁，保证重连后能重建实体并重新订阅",
+                    self.entry.title,
+                )
+            finally:
+                self.entry_data.loaded_platforms.discard(Platform.ASSIST_SATELLITE)
+
+    @callback
+    def _async_note_connect_failure(self, err: Exception) -> None:
+        """v1.0.55：连通类失败计数；持续 ≥5min → repair issue + 限频 WARNING。
+
+        每次尝试都会进来（aioesphomeapi 46.3：on_connect_error 逐失败调用），
+        成本须保持常数级：无锁、单调钟、两处幂等写。
+        """
+        now = time.monotonic()
+        if self._conn_fail_since is None:
+            self._conn_fail_since = now
+            self._conn_fail_count = 0
+        self._conn_fail_count += 1
+        outage = now - self._conn_fail_since
+        if outage < UNREACHABLE_ISSUE_THRESHOLD_S:
+            return
+        # 限频节奏 = issue 刷新节奏：同一把闸，占位里的时长/次数不会停在旧值。
+        if now - self._conn_warn_at >= UNREACHABLE_WARN_INTERVAL_S:
+            self._conn_warn_at = now
+            self._unreachable_issue_open = True
+            async_create_issue(
+                self.hass,
+                DOMAIN,
+                self._unreachable_issue_id,
+                is_fixable=False,
+                severity=IssueSeverity.WARNING,
+                translation_key="satellite_unreachable",
+                translation_placeholders={
+                    "name": self.entry.title,
+                    "address": (
+                        f"{self.host}:"
+                        f"{self.entry.data.get(CONF_PORT, DEFAULT_PORT)}"
+                    ),
+                    "minutes": str(int(outage // 60)),
+                    "attempts": str(self._conn_fail_count),
+                    "error": f"{type(err).__name__}: {err}",
+                },
+            )
+            _LOGGER.warning(
+                "设备 %s 已不可达 %d 分钟（连续失败 %d 次，最近=%s），"
+                "HA 正在拨 %s；若设备换了 IP，mDNS/DHCP 发现会自动改写地址并重载条目",
+                self.entry.title,
+                int(outage // 60),
+                self._conn_fail_count,
+                type(err).__name__,
+                self.host,
+            )
+
+    @callback
+    def _arm_va_link_watchdog(self) -> None:
+        """v1.0.82：一次性武装（reload/重连幂等）。只对宣告 voice_assistant
+        能力的设备开探——纯蓝牙/传感器板不背这个负担。"""
+        if self._va_watch_task is not None:
+            return
+        device_info = self.entry_data.device_info
+        if device_info is None:
+            return
+        try:
+            if not device_info.voice_assistant_feature_flags_compat(
+                    self.entry_data.api_version):
+                return
+        except Exception:  # noqa: BLE001 —— api_version 未就绪等：留待下次 on_connect
+            return
+        self._va_watch_task = self.entry.async_create_background_task(
+            self.hass, self._va_link_watchdog(), "huijian-va-link-watchdog")
+
+    async def _va_link_watchdog(self) -> None:
+        """v1.0.82：治"连接活着、派发死了"的半僵死链路（现场 09-15 18:14 案残余面）。
+
+        案征：设备侧 apiClients=1/vaSubscribed=1、keepalive pong 正常，但
+        VoiceAssistantRequest 8s 无人应答且不重连——aioesphomeapi 重连状态机只认
+        TCP 断，不认"应用层不应答"。设备侧 v2.1.48 补播救回了那句话的手感，
+        但链路可以一直瘫下去，直到风暴自停或人工 reload。
+
+        本看门狗每 ~90s（按 entry_id 确定性错峰 0~20s）在活连接上做一次
+        `device_info()` 应用层往返——它与 VoiceAssistantRequest 走同一条
+        读→派发→回写路径；6s 不回 = 该路径已瘫，`cli.disconnect()` 强制整
+        client 重建（经 on_disconnect 走 v1.0.49 全链：unload→重连→重建实体
+        →重新订阅），设备侧等待窗/补播无缝衔接。探针自身抛 APIConnectionError
+        = 本来就在断线路上，静默交给 ReconnectLogic。
+
+        诚实边界：若 HA **整个**事件循环瘫死，本协程同样得不到调度——那种
+        形态由设备侧熔断+升级梯+受控重启兜底（设备是独立进程，看得见到不到
+        应答）。本狗覆盖的是"循环活着、这条连接/派发半死"的大多数真实形态。
+        """
+        # v1.0.87：节奏 90s → 45s。现场（13:07:28 案）设备侧耐心是 8s×2=16s
+        # （两次无应答即自拆链+升级梯+唤醒词 parked replay），96s 才探一次的狗
+        # 永远赶不上；降到 45s 后最坏 51s，仍慢于设备熔断——**设备自拆链仍是
+        # 第一味药**（它是独立进程，看得见到不到应答），本狗的职责是别让 HA 侧
+        # 在这之后还抱着一条瘫连接不放。再往下加密探针（每 ~10s 一次全量
+        # device_info）性价比不划算，且假阳性会误拆活轮，不做。
+        entry_key = self.entry.entry_id or ""
+        await asyncio.sleep(45.0 + (sum(map(ord, entry_key[-4:])) % 15))
+        while True:
+            await asyncio.sleep(45.0)
+            if not self._link_up:
+                continue  # 断线中：ReconnectLogic 的地盘，狗不插手
+            try:
+                await asyncio.wait_for(self.cli.device_info(), timeout=6.0)
+            except TimeoutError:
+                # v1.0.89（F5-d）：单次探针超时**不再拆连**——隔 1s 再探一次。
+                # 真机实证（2026-09-16 19:47:11 与 19:52:37 两轮，均本狗误判）：
+                # 会话期一次 6s 探针不回，本狗就 reload 整条条目；而 reload 自己
+                # 又踩 `disconnect()` 库内 10s + 二次 unload `ValueError: Config
+                # entry was never loaded!` + 新连接握手 69s 超时 ⇒ **一次误判 = 94
+                # 秒语音全哑**（19:47:11→19:48:45 实测）。这是"播报中再唤醒就
+                # 熔断"的主放大器，比设备侧任何一环都贵。真僵死的链路不会 7s 后
+                # 就活过来（设备侧 keepalive 50s / 升级梯 90s 才动，仍有窗口），
+                # 而一次拥塞抖动不再把好连接拆掉。双探皆无回才执行原处置。
+                try:
+                    await asyncio.sleep(1.0)
+                    await asyncio.wait_for(self.cli.device_info(), timeout=6.0)
+                    continue          # 第二探针通了＝抖动，不动这条链路
+                except asyncio.CancelledError:
+                    raise
+                except TimeoutError:
+                    pass              # 双探无回 → 落回原断连+重载处置
+                except Exception:  # noqa: BLE001 连接类异常交给 ReconnectLogic
+                    continue
+                _LOGGER.warning(
+                    "%s: VA 链路半僵死（device_info 双探针 6s+6s 均无回）"
+                    "→ 主动断连重建（设备侧补播/等待窗将无缝续起）",
+                    self.entry.title,
+                )
+                # 现场 12:17:36：disconnect() 自己等 DisconnectResponse 10s 超时
+                # 并抛库级 ERROR 栈——半僵死的连接本就回不了 ack，等它就是再瘫
+                # 10s。改为 3s 短等；拿不到回执就直接走条目 reload（公开 API，
+                # unload 路径关 client 不等设备 ack），重建不再排队。
+                rebuilt = False
+                try:
+                    await asyncio.wait_for(self.cli.disconnect(), timeout=3.0)
+                    rebuilt = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:  # noqa: BLE001 —— 断开失败也已达目的
+                    _LOGGER.debug("%s: 断开回执未取回（%s）→ 转条目重载",
+                                  self.entry.title, err)
+                if not rebuilt:
+                    try:
+                        # v1.1.27（批7）：async_schedule_reload 是 @callback 返
+                        # None——旧写法把它塞进 async_create_task(None) 必抛
+                        # TypeError 并被本 except 吞成 DEBUG（排期看似"失败"，
+                        # 现场零痕迹不可归因）。它自己就负责排期，直接调。
+                        self.hass.config_entries.async_schedule_reload(
+                            self.entry.entry_id)
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.warning("%s: 重载排期失败", self.entry.title,
+                                        exc_info=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 —— 连接类异常=正在重连路上
+                _LOGGER.debug(
+                    "%s: VA 链路探测连接异常（交给 ReconnectLogic）: %s",
+                    self.entry.title, err)
+
+    async def on_connect_error(self, err: Exception) -> None:
+        """Start reauth flow if appropriate connect error type."""
+        if not isinstance(
+            err,
+            (
+                EncryptionPlaintextAPIError,
+                RequiresEncryptionAPIError,
+                InvalidEncryptionKeyAPIError,
+                InvalidAuthAPIError,
+            ),
+        ):
+            # v1.0.55：连通类失败（SocketAPIError=拒绝/不可达/超时）此前
+            # 现场零痕迹（aioesphomeapi 每个重连周期只有首次尝试记 WARNING），
+            # 进可观测窗口。
+            self._async_note_connect_failure(err)
+            return
+        # 认证类失败有自己的 reauth/ERROR 通道：不叠加"不可达"叙事，清窗口
+        self._conn_fail_since = None
+        self._conn_fail_count = 0
+
+        if isinstance(err, InvalidEncryptionKeyAPIError):
+            if (
+                (received_name := err.received_name)
+                and (received_mac := err.received_mac)
+                and (unique_id := self.entry.unique_id)
+                and ":" in unique_id
+            ):
+                formatted_received_mac = format_mac(received_mac)
+                formatted_expected_mac = format_mac(unique_id)
+                if formatted_received_mac != formatted_expected_mac:
+                    _LOGGER.error(
+                        "Unexpected device found at %s; "
+                        "expected `%s` with mac address `%s`, "
+                        "found `%s` with mac address `%s`",
+                        self.host,
+                        self.entry.data.get(CONF_DEVICE_NAME),
+                        formatted_expected_mac,
+                        received_name,
+                        formatted_received_mac,
+                    )
+                    # If the device comes back online, discovery
+                    # will update the config entry with the new IP address
+                    # and reload which will try again to connect to the device.
+                    # In the mean time we stop the reconnect logic
+                    # so we don't keep trying to connect to the wrong device.
+                    if self.reconnect_logic:
+                        await self.reconnect_logic.stop()
+                    return
+        await self._start_reauth_and_disconnect()
+
+    async def _start_reauth_and_disconnect(self) -> None:
+        """Start reauth flow and stop reconnection attempts."""
+        self.entry.async_start_reauth(self.hass)
+        await self.cli.disconnect()
+        if self.reconnect_logic:
+            await self.reconnect_logic.stop()
+
+    async def _handle_dynamic_encryption_key(
+        self, device_info: EsphomeDeviceInfo
+    ) -> None:
+        """Handle dynamic encryption keys.
+
+        If a device reports it supports encryption, but we connected without a key,
+        we need to generate and store one.
+        """
+        noise_psk: str | None = self.entry.data.get(CONF_NOISE_PSK)
+        if noise_psk:
+            # we're already connected with a noise PSK - nothing to do
+            return
+
+        if not device_info.api_encryption_supported:
+            # device does not support encryption - nothing to do
+            return
+
+        # Connected to device without key and the device supports encryption
+        storage = await async_get_encryption_key_storage(self.hass)
+
+        # First check if we have a key in storage for this device
+        from_storage: bool = False
+        if self.entry.unique_id and (
+            stored_key := await storage.async_get_key(self.entry.unique_id)
+        ):
+            _LOGGER.debug(
+                "Retrieved encryption key from storage for device %s",
+                self.entry.unique_id,
+            )
+            # Use the stored key
+            new_key = stored_key.encode()
+            new_key_str = stored_key
+            from_storage = True
+        else:
+            # No stored key found, generate a new one
+            _LOGGER.debug(
+                "Generating new encryption key for device %s", self.entry.unique_id
+            )
+            new_key = base64.b64encode(secrets.token_bytes(32))
+            new_key_str = new_key.decode()
+
+        try:
+            # Store the key on the device using the existing connection
+            result = await self.cli.noise_encryption_set_key(new_key)
+        except APIConnectionError as ex:
+            _LOGGER.error(
+                "Connection error while storing encryption key for device %s (%s): %s",
+                self.entry.data.get(CONF_DEVICE_NAME, self.host),
+                self.entry.unique_id,
+                ex,
+            )
+            return
+        else:
+            if not result:
+                _LOGGER.error(
+                    "Failed to set dynamic encryption key on device %s (%s)",
+                    self.entry.data.get(CONF_DEVICE_NAME, self.host),
+                    self.entry.unique_id,
+                )
+                return
+
+        # Key stored successfully on device
+        assert self.entry.unique_id is not None
+
+        # Only store in storage if it was newly generated
+        if not from_storage:
+            await storage.async_store_key(self.entry.unique_id, new_key_str)
+
+        # Always update config entry
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_NOISE_PSK: new_key_str},
+        )
+
+        if from_storage:
+            _LOGGER.info(
+                "Set encryption key from storage on device %s (%s)",
+                self.entry.data.get(CONF_DEVICE_NAME, self.host),
+                self.entry.unique_id,
+            )
+        else:
+            _LOGGER.info(
+                "Generated and stored encryption key for device %s (%s)",
+                self.entry.data.get(CONF_DEVICE_NAME, self.host),
+                self.entry.unique_id,
+            )
+
+    @callback
+    def _async_handle_logging_changed(self, _event: Event) -> None:
+        """Handle when the logging level changes."""
+        self.cli.set_debug(_LOGGER.isEnabledFor(logging.DEBUG))
+        if self.entry.options.get(CONF_SUBSCRIBE_LOGS) and self._log_level != (
+            new_log_level := self._async_get_equivalent_log_level()
+        ):
+            self._async_subscribe_logs(new_log_level)
+
+    @callback
+    def _async_cleanup(self) -> None:
+        """Cleanup stale issues and entities."""
+        assert self.entry_data.device_info is not None
+        ent_reg = er.async_get(self.hass)
+        # Cleanup stale assist_in_progress entity and issue,
+        # Remove this after 2026.4
+        if not (
+            stale_entry_entity_id := ent_reg.async_get_entity_id(
+                DOMAIN,
+                Platform.BINARY_SENSOR,
+                f"{self.entry_data.device_info.mac_address}-assist_in_progress",
+            )
+        ):
+            return
+        stale_entry = ent_reg.async_get(stale_entry_entity_id)
+        assert stale_entry is not None
+        ent_reg.async_remove(stale_entry_entity_id)
+        issue_reg = ir.async_get(self.hass)
+        if issue := issue_reg.async_get_issue(
+            DOMAIN, f"assist_in_progress_deprecated_{stale_entry.id}"
+        ):
+            issue_reg.async_delete(DOMAIN, issue.issue_id)
+
+    async def async_start(self) -> None:
+        """Start the esphome connection manager."""
+        hass = self.hass
+        entry = self.entry
+        entry_data = self.entry_data
+
+        if entry.options.get(CONF_ALLOW_SERVICE_CALLS, DEFAULT_ALLOW_SERVICE_CALLS):
+            async_delete_issue(hass, DOMAIN, self.services_issue)
+
+        reconnect_logic = ReconnectLogic(
+            client=self.cli,
+            on_connect=self.on_connect,
+            on_disconnect=self.on_disconnect,
+            zeroconf_instance=self.zeroconf_instance,
+            name=entry.data.get(CONF_DEVICE_NAME, self.host),
+            on_connect_error=self.on_connect_error,
+        )
+        self.reconnect_logic = reconnect_logic
+
+        # Use async_listen instead of async_listen_once so that we don't deregister
+        # the callback twice when shutting down Home Assistant.
+        # "Unable to remove unknown listener
+        # <function EventBus.async_listen_once.<locals>.onetime_listener>"
+        # We only close the connection at the last possible moment
+        # when the CLOSE event is fired so anything using a Bluetooth
+        # proxy has a chance to shut down properly.
+        bus = hass.bus
+        cleanups = (
+            bus.async_listen(EVENT_HOMEASSISTANT_CLOSE, self.on_stop),
+            bus.async_listen(EVENT_LOGGING_CHANGED, self._async_handle_logging_changed),
+            reconnect_logic.stop_callback,
+        )
+        entry_data.cleanup_callbacks.extend(cleanups)
+
+        infos, services = await entry_data.async_load_from_store()
+        if entry.unique_id:
+            await entry_data.async_update_static_infos(
+                hass, entry, infos, entry.unique_id.upper()
+            )
+        _setup_services(hass, entry_data, services)
+
+        if (device_info := entry_data.device_info) is not None:
+            self._async_cleanup()
+            if device_info.name:
+                reconnect_logic.name = device_info.name
+            if (
+                bluetooth_mac_address := device_info.bluetooth_mac_address
+            ) and entry.data.get(CONF_BLUETOOTH_MAC_ADDRESS) != bluetooth_mac_address:
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        **entry.data,
+                        CONF_BLUETOOTH_MAC_ADDRESS: bluetooth_mac_address,
+                    },
+                )
+            if entry.unique_id is None:
+                hass.config_entries.async_update_entry(
+                    entry, unique_id=format_mac(device_info.mac_address)
+                )
+
+        await reconnect_logic.start()
+
+
+@callback
+def _async_setup_device_registry(
+    hass: HomeAssistant, entry: ESPHomeConfigEntry, entry_data: RuntimeEntryData
+) -> str:
+    """Set up device registry feature for a particular config entry."""
+    device_info = entry_data.device_info
+    if TYPE_CHECKING:
+        assert device_info is not None
+
+    device_registry = dr.async_get(hass)
+    # Build sets of valid device identifiers and connections
+    valid_connections = {
+        (dr.CONNECTION_NETWORK_MAC, format_mac(device_info.mac_address))
+    }
+    valid_identifiers = {
+        (DOMAIN, f"{device_info.mac_address}_{sub_device.device_id}")
+        for sub_device in device_info.devices
+    }
+
+    # Remove devices that no longer exist
+    for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
+        # Skip devices we want to keep
+        if (
+            device.connections & valid_connections
+            or device.identifiers & valid_identifiers
+        ):
+            continue
+        # Remove everything else
+        device_registry.async_remove_device(device.id)
+
+    sw_version = device_info.esphome_version
+    if device_info.compilation_time:
+        sw_version += f" ({device_info.compilation_time})"
+
+    configuration_url = None
+    if device_info.webserver_port > 0:
+        entry_host = entry.data["host"]
+        host = f"[{entry_host}]" if ":" in entry_host else entry_host
+        configuration_url = f"http://{host}:{device_info.webserver_port}"
+    elif (
+        (dashboard := async_get_dashboard(hass))
+        and dashboard.data
+        and dashboard.data.get(device_info.name)
+    ):
+        configuration_url = f"homeassistant://hassio/ingress/{dashboard.addon_slug}"
+
+    manufacturer = "espressif"
+    if device_info.manufacturer:
+        manufacturer = device_info.manufacturer
+    model = device_info.model
+    if device_info.project_name:
+        project_name = device_info.project_name.split(".")
+        manufacturer = project_name[0]
+        model = project_name[1]
+        sw_version = (
+            f"{device_info.project_version} (ESPHome {device_info.esphome_version})"
+        )
+
+    suggested_area: str | None = None
+    if device_info.area and device_info.area.name:
+        # Prefer device_info.area over suggested_area when area name is not empty
+        suggested_area = device_info.area.name
+    elif device_info.suggested_area:
+        suggested_area = device_info.suggested_area
+
+    # Create/update main device
+    device_entry = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        configuration_url=configuration_url,
+        connections={(dr.CONNECTION_NETWORK_MAC, device_info.mac_address)},
+        name=entry_data.friendly_name or entry_data.name,
+        manufacturer=manufacturer,
+        model=model,
+        sw_version=sw_version,
+        suggested_area=suggested_area,
+    )
+
+    # Handle sub devices
+    # Find available areas from device_info
+    areas_by_id = {area.area_id: area for area in device_info.areas}
+    # Add the main device's area if it exists
+    if device_info.area:
+        areas_by_id[device_info.area.area_id] = device_info.area
+    # Create/update sub devices that should exist
+    for sub_device in device_info.devices:
+        # Determine the area for this sub device
+        sub_device_suggested_area: str | None = None
+        if sub_device.area_id is not None and sub_device.area_id in areas_by_id:
+            sub_device_suggested_area = areas_by_id[sub_device.area_id].name
+
+        sub_device_entry = device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, f"{device_info.mac_address}_{sub_device.device_id}")},
+            name=sub_device.name or device_entry.name,
+            manufacturer=manufacturer,
+            model=model,
+            sw_version=sw_version,
+            suggested_area=sub_device_suggested_area,
+        )
+
+        # Update the sub device to set via_device_id
+        device_registry.async_update_device(
+            sub_device_entry.id,
+            via_device_id=device_entry.id,
+        )
+
+    return device_entry.id
+
+
+class ServiceMetadata(NamedTuple):
+    """Metadata for services."""
+
+    validator: Any
+    example: str
+    selector: dict[str, Any]
+    description: str | None = None
+
+
+ARG_TYPE_METADATA = {
+    UserServiceArgType.BOOL: ServiceMetadata(
+        validator=cv.boolean,
+        example="False",
+        selector={"boolean": None},
+    ),
+    UserServiceArgType.INT: ServiceMetadata(
+        validator=vol.Coerce(int),
+        example="42",
+        selector={"number": {CONF_MODE: "box"}},
+    ),
+    UserServiceArgType.FLOAT: ServiceMetadata(
+        validator=vol.Coerce(float),
+        example="12.3",
+        selector={"number": {CONF_MODE: "box", "step": 1e-3}},
+    ),
+    UserServiceArgType.STRING: ServiceMetadata(
+        validator=cv.string,
+        example="Example text",
+        selector={"text": None},
+    ),
+    UserServiceArgType.BOOL_ARRAY: ServiceMetadata(
+        validator=[cv.boolean],
+        description="A list of boolean values.",
+        example="[True, False]",
+        selector={"object": {}},
+    ),
+    UserServiceArgType.INT_ARRAY: ServiceMetadata(
+        validator=[vol.Coerce(int)],
+        description="A list of integer values.",
+        example="[42, 34]",
+        selector={"object": {}},
+    ),
+    UserServiceArgType.FLOAT_ARRAY: ServiceMetadata(
+        validator=[vol.Coerce(float)],
+        description="A list of floating point numbers.",
+        example="[ 12.3, 34.5 ]",
+        selector={"object": {}},
+    ),
+    UserServiceArgType.STRING_ARRAY: ServiceMetadata(
+        validator=[cv.string],
+        description="A list of strings.",
+        example="['Example text', 'Another example']",
+        selector={"object": {}},
+    ),
+}
+
+
+async def execute_service(
+    entry_data: RuntimeEntryData,
+    service: UserService,
+    call: ServiceCall,
+    *,
+    supports_response: SupportsResponseType,
+) -> ServiceResponse:
+    """Execute a service on a node and optionally wait for response."""
+    # Determine if we should wait for a response
+    # NONE: fire and forget
+    # OPTIONAL/ONLY/STATUS: always wait for success/error confirmation
+    wait_for_response = supports_response != SupportsResponseType.NONE
+
+    if not wait_for_response:
+        # Fire and forget - no response expected
+        try:
+            await entry_data.client.execute_service(service, call.data)
+        except APIConnectionError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="action_call_failed",
+                translation_placeholders={
+                    "call_name": service.name,
+                    "device_name": entry_data.name,
+                    "error": str(err),
+                },
+            ) from err
+        else:
+            return None
+
+    # Determine if we need response_data from ESPHome
+    # ONLY: always need response_data
+    # OPTIONAL: only if caller requested it
+    # STATUS: never need response_data (just success/error)
+    need_response_data = supports_response == SupportsResponseType.ONLY or (
+        supports_response == SupportsResponseType.OPTIONAL and call.return_response
+    )
+
+    try:
+        response: ExecuteServiceResponse | None = (
+            await entry_data.client.execute_service(
+                service,
+                call.data,
+                return_response=need_response_data,
+            )
+        )
+    except APIConnectionError as err:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="action_call_failed",
+            translation_placeholders={
+                "call_name": service.name,
+                "device_name": entry_data.name,
+                "error": str(err),
+            },
+        ) from err
+    except TimeoutError as err:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="action_call_timeout",
+            translation_placeholders={
+                "call_name": service.name,
+                "device_name": entry_data.name,
+            },
+        ) from err
+
+    assert response is not None
+
+    if not response.success:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="action_call_failed",
+            translation_placeholders={
+                "call_name": service.name,
+                "device_name": entry_data.name,
+                "error": response.error_message,
+            },
+        )
+
+    # Parse and return response data as JSON if we requested it
+    if need_response_data and response.response_data:
+        try:
+            return json_loads_object(response.response_data)
+        except ValueError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="action_call_failed",
+                translation_placeholders={
+                    "call_name": service.name,
+                    "device_name": entry_data.name,
+                    "error": f"Invalid JSON response: {err}",
+                },
+            ) from err
+    return None
+
+
+def build_service_name(device_info: EsphomeDeviceInfo, service: UserService) -> str:
+    """Build a service name for a node."""
+    return f"{device_info.name.replace('-', '_')}_{service.name}"
+
+
+# Map ESPHome SupportsResponseType to Home Assistant SupportsResponse
+# STATUS (100) is ESPHome-specific: waits for success/error internally but
+# doesn't return data to HA, so it maps to NONE from HA's perspective
+_RESPONSE_TYPE_MAPPER = EsphomeEnumMapper[SupportsResponseType, SupportsResponse](
+    {
+        SupportsResponseType.NONE: SupportsResponse.NONE,
+        SupportsResponseType.OPTIONAL: SupportsResponse.OPTIONAL,
+        SupportsResponseType.ONLY: SupportsResponse.ONLY,
+        SupportsResponseType.STATUS: SupportsResponse.NONE,
+    }
+)
+
+
+@callback
+def _async_register_service(
+    hass: HomeAssistant,
+    entry_data: RuntimeEntryData,
+    device_info: EsphomeDeviceInfo,
+    service: UserService,
+) -> None:
+    """Register a service on a node."""
+    service_name = build_service_name(device_info, service)
+    schema = {}
+    fields = {}
+
+    for arg in service.args:
+        if arg.type not in ARG_TYPE_METADATA:
+            _LOGGER.error(
+                "Can't register service %s because %s is of unknown type %s",
+                service_name,
+                arg.name,
+                arg.type,
+            )
+            return
+        metadata = ARG_TYPE_METADATA[arg.type]
+        schema[vol.Required(arg.name)] = metadata.validator
+        fields[arg.name] = {
+            "name": arg.name,
+            "required": True,
+            "description": metadata.description,
+            "example": metadata.example,
+            "selector": metadata.selector,
+        }
+
+    # Get the supports_response from the service, defaulting to NONE
+    esphome_supports_response = service.supports_response or SupportsResponseType.NONE
+    ha_supports_response = _RESPONSE_TYPE_MAPPER.from_esphome(esphome_supports_response)
+
+    hass.services.async_register(
+        DOMAIN,
+        service_name,
+        partial(
+            execute_service,
+            entry_data,
+            service,
+            supports_response=esphome_supports_response,
+        ),
+        vol.Schema(schema),
+        supports_response=ha_supports_response,
+    )
+    async_set_service_schema(
+        hass,
+        DOMAIN,
+        service_name,
+        {
+            "description": (
+                f"Performs the action {service.name} of the node {device_info.name}"
+            ),
+            "fields": fields,
+        },
+    )
+
+
+@callback
+def _setup_services(
+    hass: HomeAssistant, entry_data: RuntimeEntryData, services: list[UserService]
+) -> None:
+    device_info = entry_data.device_info
+    if device_info is None:
+        # Can happen if device has never connected or .storage cleared
+        return
+    old_services = entry_data.services.copy()
+    to_unregister: list[UserService] = []
+    to_register: list[UserService] = []
+    for service in services:
+        if service.key in old_services:
+            # Already exists
+            if (matching := old_services.pop(service.key)) != service:
+                # Need to re-register
+                to_unregister.append(matching)
+                to_register.append(service)
+        else:
+            # New service
+            to_register.append(service)
+
+    to_unregister.extend(old_services.values())
+
+    entry_data.services = {serv.key: serv for serv in services}
+
+    for service in to_unregister:
+        service_name = build_service_name(device_info, service)
+        hass.services.async_remove(DOMAIN, service_name)
+
+    for service in to_register:
+        _async_register_service(hass, entry_data, device_info, service)
+
+
+async def cleanup_instance(entry: ESPHomeConfigEntry) -> RuntimeEntryData:
+    """Cleanup the esphome client if it exists."""
+    data = entry.runtime_data
+    if not isinstance(data, RuntimeEntryData):
+        return data
+
+    data.async_on_disconnect()
+    for cleanup_callback in data.cleanup_callbacks:
+        cleanup_callback()
+    # v1.0.89（F5-c2）：**先摘 assist_satellite 的 loaded 闩锁，再关连接**。
+    # 现场 18:14:48.740：正常 unload 已把平台弹出，但 `entry_data.loaded_platforms`
+    # 里 ASSIST_SATELLITE 还在；紧接着本函数关 client → ReconnectLogic 回调
+    # on_disconnect（:880）判"仍 loaded"→ **二次 async_unload_platforms** → core
+    # entity_component.py:200 抛 `ValueError: Config entry was never loaded!` 整栈落
+    # ERROR。except 虽兜住不影响结果，但现场看像"集成把自己 unload 炸了"，且与
+    # 设备侧升级梯同时自愈会让观测面塌成"全线失联"。discard 幂等，摘早无副作用。
+    data.loaded_platforms.discard(Platform.ASSIST_SATELLITE)
+    try:
+        await data.async_cleanup()
+    finally:
+        # v1.0.89（F5-c1）：断连必须**有界**。aioesphomeapi 的 disconnect() 内部等
+        # DisconnectResponse 满 10.0s（库常量 DISCONNECT_RESPONSE_TIMEOUT），半僵死
+        # 链路本就回不了 ack——现场实测条目 reload 因此在 38.7s 之后又白瘫 10s
+        # （18:14:38.7 → 18:14:48.737 才抛 "disconnect request failed"）。v1.0.87 的
+        # 3s 短等只罩住了看门狗体内那一次（:1015），本条必经路径是修一漏一。
+        # 2s 拿不到回执即转强制关闭（force_disconnect 为同步原语，不等 ack）；库版本
+        # 无该原语时静默略过——client 随后随条目重载重建，绝不因"关不干净"再拖 unload。
+        try:
+            await asyncio.wait_for(data.client.disconnect(), timeout=2.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 —— 关不掉也要收口
+            _LOGGER.debug(
+                "%s: 断连回执未取回（%s）→ 转强制关闭，不再占用 unload 时间窗",
+                entry.title, err,
+            )
+            force = getattr(data.client, "force_disconnect", None)
+            if callable(force):
+                try:
+                    force()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug("%s: 强制关闭亦失败", entry.title, exc_info=True)
+    return data
+
+
+async def async_replace_device(
+    hass: HomeAssistant,
+    entry_id: str,
+    old_mac: str,  # will be lower case (format_mac)
+    new_mac: str,  # will be lower case (format_mac)
+) -> None:
+    """Migrate an ESPHome entry to replace an existing device."""
+    entry = hass.config_entries.async_get_entry(entry_id)
+    assert entry is not None
+    hass.config_entries.async_update_entry(entry, unique_id=new_mac)
+
+    dev_reg = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        dev_reg.async_update_device(
+            device.id,
+            new_connections={(dr.CONNECTION_NETWORK_MAC, new_mac)},
+        )
+
+    ent_reg = er.async_get(hass)
+    upper_mac = new_mac.upper()
+    old_upper_mac = old_mac.upper()
+    for entity in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        # <upper_mac>-<entity type>-<object_id>
+        old_unique_id = entity.unique_id.split("-")
+        new_unique_id = "-".join([upper_mac, *old_unique_id[1:]])
+        if entity.unique_id != new_unique_id and entity.unique_id.startswith(
+            old_upper_mac
+        ):
+            ent_reg.async_update_entity(entity.entity_id, new_unique_id=new_unique_id)
+
+    domain_data = DomainData.get(hass)
+    store = domain_data.get_or_create_store(hass, entry)
+    if data := await store.async_load():
+        data["device_info"]["mac_address"] = upper_mac
+        await store.async_save(data)

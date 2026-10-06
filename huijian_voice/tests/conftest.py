@@ -1,0 +1,153 @@
+"""pytest 基建：把持久卷指向临时目录，NLU 资产指向仓内 vendored nlu_data/。
+跑法（本机实证环境）：cd huijian_voice && python -m pytest tests -q
+"""
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HERE))
+
+# 「tests」命名空间抢占：个别发行包会把带 __init__.py 的顶层 tests/ 直接装进
+# site-packages（本机实证 D:\progrem\python\Lib\site-packages\tests）。常规包
+# 优先级高于无 __init__ 的命名空间目录——一旦存在就遮蔽仓内 tests/，
+# `from tests.test_fast_path import ...` 当场 ImportError。此处显式把仓内
+# tests 注册为该命名空间的唯一路径，环境无关地钉死解析（测试运行时无人依赖
+# site 侧 tests 包：那是发行方的自测试目录）。
+import types  # noqa: E402
+
+_TESTS_DIR = str(HERE / "tests")
+_existing = sys.modules.get("tests")
+if _existing is None or not any(_TESTS_DIR in str(p) for p in getattr(_existing, "__path__", [])):
+    _pkg = types.ModuleType("tests")
+    _pkg.__path__ = [_TESTS_DIR]
+    _pkg.__package__ = "tests"
+    sys.modules["tests"] = _pkg
+
+os.environ["HUIJIAN_DATA"] = tempfile.mkdtemp(prefix="huijian_test_")
+os.environ.setdefault("HUIJIAN_NLU_DATA", str(HERE / "nlu_data"))
+
+# Windows：py3.13 下 ctypes 找 opus.dll 只认 os.add_dll_directory。e2e_server /
+# e2e_client / _conv_bench* 都各自探测了仓旁 _winlibs/，**唯独 pytest 进程没做**
+# ⇒ 22 条 TTS 流 / 云档测试以「opus 绑定缺失」全红（环境性，非产品缺陷）。
+# 此处统一补上，语义与它们完全一致：HUIJIAN_OPUS_DLL_DIR 显式覆盖，否则自动
+# 探测仓旁 _winlibs/。必须在任何 core.* 导入之前执行（opuslib_next 装载即时
+# 解析 DLL）。
+if os.name == "nt":
+    _opus_dir = os.environ.get("HUIJIAN_OPUS_DLL_DIR") or str(HERE.parent / "_winlibs")
+    if os.path.isdir(_opus_dir):
+        os.environ["PATH"] = _opus_dir + os.pathsep + os.environ["PATH"]
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(_opus_dir)
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture()
+def settings():
+    from core.settings import Settings
+    return Settings(Path(os.environ["HUIJIAN_DATA"]) / f"settings-{os.getpid()}.json")
+
+
+_REAL_INTENTS_CACHE = None
+
+
+def _real_executable_intents():
+    """真实可执行意图全集（集成 intent_type ∪ HA core 内置；懒载一次）。
+
+    v1.0.52（A-F6）：FakeHAClient 默认裁决依据——替身不得比真机更宽容
+    （v1.0.20 HassUnlock 恒成功事故教训，派生自 test_intent_contract 同一张表）。
+    """
+    global _REAL_INTENTS_CACHE
+    if _REAL_INTENTS_CACHE is None:
+        from test_intent_contract import real_executable_intents
+        _REAL_INTENTS_CACHE = real_executable_intents()
+    return _REAL_INTENTS_CACHE
+
+
+class FakeStore:
+    """离线仓内模型目录袋（E2E 机上有解包资产时用真目录，CI 上返回 None 走跳过分支）。"""
+    def __init__(self, dirs=None):
+        self.dirs = dirs or {}
+    def model_dir_for(self, key):
+        p = self.dirs.get(key)
+        return Path(p) if p and Path(p).exists() else None
+    def is_ready(self, key):
+        return self.model_dir_for(key) is not None
+    def ensure(self, key):
+        return self.is_ready(key)
+    def keys(self):
+        return list(self.dirs)
+
+
+class FakeHAClient:
+    def __init__(self, results=None, states=None, areas=None, entity_area=None,
+                 rest=None, writes=None):
+        self.calls = []
+        self.results = results or {}
+        self._states = states or {}
+        self.ok = True
+        self.reachable = True
+        self._areas = areas or {}
+        self._entity_area = entity_area or {}
+        self._rest = rest or {}
+        self._writes = writes or {}       # {(method, path): 返回 dict}
+        self.written = []                 # [(method, path, body)] 留痕
+
+    async def refresh_states(self, force=False):
+        """真客户端有这条（TTL 刷新）——替身缺它会让"判据的确证读路径"在测试里
+        走样（v1.1.17 复审：executor 改为指控空操作前 force 重读一次）。替身按
+        真机形态存在但**不回灌状态**：即"刷完还是这个值"⇒ 空操作指控照旧成立。"""
+        self.refreshed = getattr(self, "refreshed", [])
+        self.refreshed.append(bool(force))
+        return None
+
+    async def rest_get(self, path, timeout=6.0):
+        return self._rest.get(path)   # 无条目=None（真实语义：一切失败折叠 None）
+
+    async def rest_write(self, method, path, body=None, timeout=8.0):
+        self.written.append((method, path, body))
+        key = (method, path)
+        if key in self._writes:
+            v = self._writes[key]
+            return dict(v) if isinstance(v, dict) else v
+        return {"success": True}
+
+    async def handle_intent(self, name, data, timeout=10.0):
+        self.calls.append((name, data))
+        if name in self.results:
+            return self.results[name]
+        # v1.0.52（A-F6）：替身不得比真机更宽容——未知意图恒成功正是
+        # v1.0.20 HassUnlock 事故的放行通道。默认按**真实注册表派生**裁决
+        # （集成 intent_type ∪ HA core 内置）；测试确需自定义意图名时显式
+        # 传 results= 注入，属有意行为。
+        if name not in _real_executable_intents():
+            return {"success": False,
+                    "error": (f"intent {name!r} 未在集成注册且非 HA core 内置"
+                              "（FakeHAClient 按真实注册表裁决，见 "
+                              "tests/test_intent_contract.py）")}
+        return {"success": True}
+
+    async def states(self):
+        return dict(self._states)
+
+    async def area_names(self):
+        return sorted(set(self._areas.values()))
+
+    async def get_config(self):
+        return {"time_zone": "Asia/Shanghai"}
+
+    async def find_entities(self, area="", domains=(), name_contains=""):
+        out = []
+        for eid, ent in self._states.items():
+            dom = eid.split(".", 1)[0]
+            if domains and dom not in domains:
+                continue
+            if area and self._entity_area.get(eid) != area:
+                continue
+            out.append(ent)
+        return out
+
+    async def fire_event(self, t, d):
+        pass
