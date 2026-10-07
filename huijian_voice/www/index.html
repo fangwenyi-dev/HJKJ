@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.2.4">
-<link rel="stylesheet" href="css/voice.css?v=1.2.4">
+<link rel="stylesheet" href="css/huijian.css?v=1.2.5">
+<link rel="stylesheet" href="css/voice.css?v=1.2.5">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -81,6 +81,7 @@
       <div id="sttLocalBox"><label class="hj-field">本地模型（离线引擎切换）</label>
         <select id="stt_local_model">
           <option value="firered_ctc">FireRedASR2-CTC · 中英+20多种方言（默认，离线整句，包 776MB）</option>
+          <option value="firered_aed">FireRedASR2-AED · 中英（同权重带 attention decoder，中文同音段更稳，慢约 15×，包 1.23GB）</option>
           <option value="sensevoice">SenseVoice-Small · 中英粤（旧默认，现作回落档）</option>
           <option value="paraformer">Paraformer · 中英双语流式（逐字出字，兼容回落档）</option>
         </select></div>
@@ -315,7 +316,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.2.4";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.2.5";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -515,7 +516,7 @@ async function loadSettings(){
   // 实际没切，且下一次保存静默改写 settings），故改成员判断。
   // v1.2.4 默认档＝FireRedASR2-CTC：白名单与"回落显示值"两处都跟着改，
   // 写死旧默认＝面板显示一个档、引擎跑另一个档（本仓记过的显示/读侧不同形同族坑）。
-  const _STT_KINDS = ["firered_ctc", "sensevoice", "paraformer"];
+  const _STT_KINDS = ["firered_ctc", "firered_aed", "sensevoice", "paraformer"];
   $("#stt_local_model").value = _STT_KINDS.includes(S.stt.local_model) ? S.stt.local_model : "firered_ctc";
   // v1.0.65（TTS 深审 F11）：云档存在两个"正统"拼法（引擎读侧 startswith
   // ("cloud") 双吃：UI 的 "cloud" 与 settings 注释/测试沿用的
@@ -1100,6 +1101,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.2.4"></script>
+<script src="js/starsky.js?v=1.2.5"></script>
 </body>
 </html>

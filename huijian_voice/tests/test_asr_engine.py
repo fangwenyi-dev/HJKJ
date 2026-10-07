@@ -295,9 +295,14 @@ def test_settings_defaults_local_model_present_for_merge():
                       .read_text(encoding="utf-8"))
     must_be_on_disk = {k for k, v in lock.items()
                        if isinstance(v, dict) and v.get("default_provider")}
+    # 必检集＝**只有默认档**（＋默认 TTS）。回落档一律 false：生产侧 `_loop_models` 只下
+    # "当下选的那档"，把回落档放进必检集＝门等一个没人下的模型直到超时
+    # ——v1.2.4 的 E2E 就是这么红的（该 run Release 腿被跳过，等于没发出去）。
     assert {m for m in must_be_on_disk if m.startswith("asr_")} == {
-        _a._KIND_KEY[_a._DEFAULT_KIND], _a._KIND_KEY[_a._FALLBACK_KIND]}, \
-        f"就绪门必检集必须＝{{默认档, 回落档}}（回落档不在盘则 fail-open 形虚）：{sorted(must_be_on_disk)}"
+        _a._KIND_KEY[_a._DEFAULT_KIND]}, \
+        f"ASR 必检集必须＝{{默认档}}：{sorted(must_be_on_disk)}"
+    assert _a._KIND_KEY[_a._FALLBACK_KIND] not in must_be_on_disk, \
+        "回落档进了必检集＝E2E 就绪门会等一个没人下的模型（v1.2.4 实伤回归）"
     assert DEFAULTS["stt"]["provider"] == "local_paraformer", "provider 值空间兼容 pin 不得改"
 
 
@@ -342,8 +347,8 @@ def test_e2e_need_is_derived_from_lock_not_hardcoded():
     lock = json.loads((root / "models.lock.json").read_text(encoding="utf-8"))
     want = {k for k, v in lock.items()
             if isinstance(v, dict) and v.get("default_provider")}
-    assert want == {KEY_FR, KEY_SV, PROVIDER_MODEL_KEYS[DEFAULTS["tts"]["provider"]]}, \
-        f"就绪门必检集＝{{默认档, 回落档, 默认 TTS}}：{sorted(want)}"
+    assert want == {KEY_FR, PROVIDER_MODEL_KEYS[DEFAULTS["tts"]["provider"]]}, \
+        f"就绪门必检集＝{{默认 ASR 档, 默认 TTS}}（回落档不进，v1.2.4 的 E2E 超时就是这么来的）：{sorted(want)}"
     for rel in ("tests/e2e/run_e2e.sh", "tests/e2e/run_local.sh"):
         src = (root / rel).read_text(encoding="utf-8")
         assert "default_provider" in src, f"{rel}: need 集未从 lock 派生（写死的键会漂）"

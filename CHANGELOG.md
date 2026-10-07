@@ -3226,6 +3226,41 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
 
+## [1.2.5] - 2026-10-07 · 接入 FireRedASR2-AED（可选档）＋修 v1.2.4 自己打穿的 E2E 就绪门（本版含 1.2.4 全部改动）
+
+**先说 1.2.4 的账**：`vo-1.2.4` 标签与双推都在，但那一版 **从未发布**——CI run 的
+`E2E real image` 腿失败，Manifest / Release / Gitee Release 全被跳过，ACR 也没推。
+GitHub 上查无 `vo-1.2.4` release。根因是我在 v1.2.4 里把**回落档 SenseVoice 也放进了
+`default_provider=true`**，而就绪门（`tests/e2e/run_e2e.sh` 按 `default_provider` 派生必检集）
+因此等它落盘；可生产侧 `_loop_models` 只下「当下选的那档」，没人会去下回落档 ⇒ 门等到超时。
+**历史规矩本来就是"只有默认档进必检集"**（旧回落档 Paraformer 就是 false），我没去读那条
+规矩的来源就"加固"，等于自己造了个永远等不到的条件。本版改回：必检集＝{FireRed-CTC, MeloTTS}，
+并把这条写成钉（回落档进必检集当场红）。
+
+- **新增可选档 `asr_firered_aed`**＝FireRedASR2 的 **AED 分支**（官方 sherpa-onnx 导出件
+  `sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2`，本机 gh-proxy 直下实测
+  838,589,068B，sha256 `43015b3f…`；解包 1.23GB：encoder.int8 817,286,833 ＋
+  decoder.int8 417,291,928 ＋ tokens 79,172）。入口 `from_fire_red_asr`（1.13.7 实测 12 参）。
+  它是家族里**唯一有官方 CER 数字**的一档（3.05% 中文那张表就是 AED/LLM 口径；CTC 导出
+  丢了 attention decoder，无公开 CER）。
+- **实测（开发机 `num_threads=2`，非 4核8G 靶机）**：加载 3.25s、RTF **0.31–0.38**、
+  峰值 RSS **1813MB**；同 6 句 SenseVoice 是 RTF 0.02 / RSS 370MB ⇒ **AED 慢约 15 倍**
+  （自回归 attention decoder），仍 <1 可用但靶机上必须实测过再谈换默认。
+  中文同音段 AED 更稳（「一般现在时」vs SV「一般现代时」、「频繁」vs「平凡」）——
+  **这是包自带 6 句厂商素材，不是我们 307 句/真清单，不足以下结论**，本版不写任何收益数字。
+- **它不吃热词**（实测签名里没有 `hotwords`），与现役 CTC 档一样只有 `hr_*` 同音 FST 挂点；
+  也**没有 `sample_rate` 形参**（照 SenseVoice 传参＝TypeError→现场"模型加载失败"，
+  与 CTC 档同坑，已钉）。非默认、不进就绪门必检集、不参与 fail-open、不选就不落盘。
+- **为什么这档的钉比一般多**：AED 与现役默认档**同源权重**，且文件名与 Paraformer 回落档
+  **逐字同名**（`encoder.int8.onnx`/`decoder.int8.onnx`/`tokens.txt`）——分派错不报错，
+  只会拿错模型静默跑。故钉到"取数目录必须＝自己的 lock 键"这一格，并留一条
+  "前提变了就删钉"的反向说明，防它变成假承重。
+
+**量具**：语音全量 **2787 passed / 8 skipped / 0 failed**（collected 2795，含离线金标 83 零回退）；`compileall` 覆盖 core+tests+custom_components；
+AED 新增 7 钉；改既有钉 2 条（就绪门必检集，v1.2.4 写错了方向）；变异**七臂**（AED 归回流式集合、构造多传 sample_rate、构造多传 hotwords、取数目录写成 CTC 的、AED 失败被允许回落、回落档重回必检集＝v1.2.4 原 bug、AED 塞进必检集）各自只打中该打的钉，七臂后源文件逐字节还原并复跑全绿。
+**未收口**：AED 的靶机 RTF/RSS 未测；三档同句对比（SenseVoice / CTC / AED，我们自己的
+307 句＋真清单靶名）仍欠——那才是"要不要换默认"的判据；1.2.4 的 dry 轮换靶重跑也还欠着。
+
 ## [1.2.4] - 2026-10-07 · 删掉两档热词引擎，默认 STT 换成 FireRedASR2-CTC（同日回退 v1.2.3 的引擎接线）
 
 用户在 .91 真机升级后对比：FireRedASR2-CTC 识别更好、且明显快于 Qwen3-ASR / FunASR-nano。

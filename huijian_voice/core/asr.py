@@ -67,9 +67,11 @@ _CHUNK = 1600   # 100ms 分块喂入（实测与整段喂入结果一致，分�
 KEY_SV = "asr_sensevoice_small"
 KEY_PF = "asr_paraformer_bilingual"
 KEY_FR = "asr_firered_ctc"
-_KIND_KEY = {"sensevoice": KEY_SV, "paraformer": KEY_PF, "firered_ctc": KEY_FR}
+KEY_FA = "asr_firered_aed"
+_KIND_KEY = {"sensevoice": KEY_SV, "paraformer": KEY_PF, "firered_ctc": KEY_FR,
+             "firered_aed": KEY_FA}
 _KIND_LABEL = {"sensevoice": "SenseVoice-Small", "paraformer": "Paraformer 双语流式",
-               "firered_ctc": "FireRedASR2-CTC"}
+               "firered_ctc": "FireRedASR2-CTC", "firered_aed": "FireRedASR2-AED"}
 # v1.2.4 换默认档（用户 2026-10-07 在 .91 真机对比后点名）：主档＝FireRedASR2-CTC，
 # 回落目标＝SenseVoice。这个常量是**唯一真源**：`_primary_kind()` 的非法值回落、
 # `ensure_loaded()` 的 fail-open 判据、settings.DEFAULTS 三处都指它，不许再写死字面
@@ -78,7 +80,7 @@ _DEFAULT_KIND = "firered_ctc"
 _FALLBACK_KIND = "sensevoice"
 # 离线＝整句一次解码；其余走流式收流（is_ready/get_result_all + 1s 尾静音）。
 # CTC 是 OfflineRecognizer，归错集合＝调用它没有的收流接口，结果是空串。
-_OFFLINE_KINDS = ("sensevoice", "firered_ctc")
+_OFFLINE_KINDS = ("sensevoice", "firered_ctc", "firered_aed")
 
 # SenseVoice 输出的语言/情感/事件标签：zh/yue/EN/NEUTRAL/Speech/woitn 等
 _STRIP_TAGS = re.compile(r"<\|[^<>|]*\|>")
@@ -148,6 +150,19 @@ class AsrEngine:
             # 现场表现为"模型加载失败"而非可读分因。
             rec = sherpa_onnx.OfflineRecognizer.from_fire_red_asr_ctc(
                 model=str(d / "model.int8.onnx"),
+                tokens=str(d / "tokens.txt"),
+                num_threads=2,
+                provider="cpu",
+            )
+        elif kind == "firered_aed":
+            # v1.2.5：FireRedASR2 的 AED 分支（encoder + attention decoder 都在，与 CTC
+            # 同源权重）。**没有 sample_rate 形参**——照 SenseVoice 那套传参是 TypeError，
+            # 现场表现为"模型加载失败"而非可读分因（CTC 档同坑，实测过）。
+            # 文件名与 Paraformer 回落档**逐字同名**（encoder.int8/decoder.int8/tokens.txt），
+            # 分派错了不会报错、只会拿错模型 ⇒ 靠 lock 的 required_files 与取数目录钉住。
+            rec = sherpa_onnx.OfflineRecognizer.from_fire_red_asr(
+                encoder=str(d / "encoder.int8.onnx"),
+                decoder=str(d / "decoder.int8.onnx"),
                 tokens=str(d / "tokens.txt"),
                 num_threads=2,
                 provider="cpu",
