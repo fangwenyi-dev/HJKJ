@@ -3226,6 +3226,53 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
 
+## [1.2.3] - 2026-10-07 · 远场批第三刀：别名与近音档进先验 + 首次接入「解码期吃热词」的 STT
+
+四件事。前两件是识别侧收窄与补口，后两件把"热词"第一次做到解码期。
+
+- **刀A 别名进先验**：同音改写层的先验过去只吃 `friendly_name`，而 HA 注册表里用户亲手写的语音别名
+  （`ha_client._entity_alias`）从 v1.1.4 起就进了路由词表、却没进这一层 ⇒ 说「小兰」而别名是「小蓝」时
+  字面查无、拼音键里也没有「小蓝」，整句原样放行给 klar——用户已付出的配置被浪费。现补
+  `prior_names(raw_names, extra)` 的 `extra` 通道与新口 `pipeline._alias_names()`（剔掉与该实体
+  friendly_name 重复的条目，注册表缺失＝退化回 v1.2.2 行为）。**别名通道不许把刀1 请出去的能力词再请回来**：
+  不写禁词表，改由清单自身推（每条 friendly_name 除首段外的段），命中即丢。
+- **刀B 近音档（Tier 2）**：同长度、逐音节比，只认三类远场可解释的单音节差——同部位送气↔不送气
+  （带灯↔台灯）、鼻音尾↔无尾（-n↔-ng）、介音丢/多；跨发音部位不算（`平台窗` 的 tai↔kai 是另一个词），
+  韵母主体不同也不算。候选必须是本家真名且唯一命中，歧义不改。
+  **今日现网真清单实测：第一档 4/11，加近音档仍 4/11 —— 净增 0、误纠 0。** 这一档今天是"射程声明"，
+  不是疗效声明；留着的理由与判据写在钉里，撤与留都随时可翻。
+- **先验收进单口 `pipeline.prior_universe()`**：级联改写与 STT 偏置共用同一份本家名。两套词表必然各自漂移
+  （用户在 HA 里改个名，一路生效一路不生效＝现场只能看到"有时认有时不认"）。既有三条接线钉随之从
+  "改写调用那 260 字符里能看到 `_device_names()`"升级为"单口函数体内能看到"——旧锚点在收口后会抓到
+  `_alias_names()` 的 docstring 同名字面，属假绿形态，已当场改掉并写明理由。
+- **接入两档吃热词的 STT（用户点名，非默认可选）**：`qwen3_asr`（Qwen3-ASR-0.6B int8）与
+  `funasr_nano`（FunASR-nano int8）。1.13.7 实测签名里，构造期吃 `hotwords` 的入口就这唯二的 LLM 档
+  （`sense_voice`/`paraformer`/`whisper`/各 `*_ctc` **没有**这个形参，传了是 TypeError 而非"没生效"）。
+  上游实现逐行读过：热词拼进 prompt（qwen3 放 system 段、funasr 放 user 段），
+  `offline-recognizer-qwen3-asr-impl.cc:49-59,459-465`、`offline-recognizer-funasr-nano-impl.cc:94,148-166`
+  ⇒ **热词挤占 `max_total_len`**（上游告警原话"Reduce hotwords: fewer or shorter"），故只喂
+  `prior_universe()` 的本家名，不喂整份拆词（与刀1 同一条教训）。含逗号的名字整条丢弃：名字带逗号会把
+  一台设备切成两个热词，偏置面静默变形。
+  两档均 `default_provider=false`：不进 E2E 就绪门的必检集；不参与 fail-open（显式选的对比档被顶替＝
+  用户的实测作废，与 firered_ctc 同判例）；不选它就不落盘，选了则首启是 GB 级下载（解包 954MB/972MB，
+  逃生门 `/data/models/import/`）。
+  ⚠ **两包 onnx 是第三方导出件**（README 实写 ModelScope `zengshuishui/Qwen3-ASR-onnx`、
+  `zengshuishui/FunASR-nano-onnx`，导出者 Wasser1462）⇒ 阿里官方 CER 榜单不适用本档，
+  **本版不写任何收益数字**。开发机（非 4核8G 靶机）`num_threads=2` 实测只有可行性三格：
+  加载 2.60–3.89s、RTF 0.190–0.199、峰值 RSS 1425–1645MB（现役 SenseVoice 370MB ⇒ 靶机只开一路）。
+  另实测：两档 `result.ys_log_probs` 同样为 `[]` ⇒ "置信度闸"不是换引擎能解的，仍待重设判据来源。
+
+**量具**：语音全量 **2793 passed / 8 skipped / 0 failed**（collected 2801，含离线金标 `test_golden_set.py`
+83 项零回退）；`compileall` 覆盖 `core`+`tests`+`custom_components`；**变异九臂**各自只打中该打的钉
+（不传热词×2、装配点不挂 provider、归回流式集合、默认档翻转、lock 少登记一个文件名、UI 白名单漏档、
+逗号护栏、取数兜底），九臂后源文件逐字节还原并复跑全绿。真机 dry 轮：PASS 11 / FAIL 2 / NOTE 1，
+两条 FAIL 用 `421aeb1` 基线 worktree 复现同红 ⇒ 靶子过期（今日 .91 清单无"平开窗"、办公室无窗设备），
+**不是本批回归**；换靶重跑仍待办。
+
+**未收口（如实挂着）**：真清单端到端只验到改写层，两档新 STT 的字准/热词收益**未经真机实测**；
+靶机 RSS/RTF 未复测；`prior_universe` 是构造期快照——引擎在载时新建设备名不会立刻进偏置，
+要等下一次换绑/重载，属已知滞后（不改写层每轮现读的行为）。
+
 ## [1.2.2] - 2026-10-07 · 远场批第二刀：先验只收「可当目标的本家名」＋上行 opus 首次显式设码率（含固件同步 2.1.79）
 
 范围＝**只动 `huijian_voice/`，零固件改动**。两刀都有实测对象，都有变异自证；另有一条**否证**。

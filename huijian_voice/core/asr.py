@@ -25,6 +25,24 @@
     3.05% 那张表是 AED/LLM 口径，不得张冠李戴。解包 776MB（现役 239MB）。
   - 该档构建失败**不回落 Paraformer**：显式选的对比档若被顶替，用户会把回落档
     的识别结果当成 FireRed 的成绩，对比实测直接失效。
+2026-10-07 追加（用户点名接入的**热词对比档**，非默认、不参与 fail-open）：
+  - `qwen3_asr` / `funasr_nano`：1.13.7 实测签名里，构造期吃 `hotwords` 的 LLM 解码档
+    只有这两个（离线 transducer 也吃 `hotwords_file`，但要 `modified_beam_search`，
+    与现役 greedy 口径不同；sense_voice/paraformer/whisper/各 *_ctc **没有** hotwords
+    形参，传了是 TypeError）。两档的偏置实现读过上游源码：热词拼进 prompt
+    （funasr-nano user 段、qwen3-asr system 段），故**挤占 max_total_len**——喂整份
+    拆词会顶穿，只喂 `pipeline.prior_universe()` 的本家名（与改写层同一份词表）。
+  - 两包 onnx 是**第三方导出件**（ModelScope `zengshuishui/Qwen3-ASR-onnx`、
+    `zengshuishui/FunASR-nano-onnx`，导出者 Wasser1462）⇒ 阿里官方榜单数字不得张冠
+    李戴到这两档，收益以真机为准。
+  - `default_provider=false` 的消费者是 **E2E 就绪门**（`tests/e2e/run_e2e.sh:53` 按它派生
+    need 集），不是下载器；生产侧下载由 `_loop_models` 取 `asr.model_key`（＝用户当下选的
+    那档）驱动 ⇒ 不选它就不落盘，选了它首启会后台补下 0.8GB 级（慢，手动导入
+    `/data/models/import/` 是逃生门）。
+  - 开发机实测（num_threads=2，非 4核8G 靶机）：加载 2.60–3.89s、RTF 0.190–0.199、
+    峰值 RSS 1425–1645MB（现役 SenseVoice 370MB）⇒ 靶机上**只开一路**，且两档都不自动
+    下载（default_provider=false，逃生门 /data/models/import/）。
+  - 两档 result.ys_log_probs 同样为 `[]` ⇒ 「置信度闸」不是换引擎能解的（与现役同坑）。
 云档 = OpenAI 兼容 /audio/transcriptions（whisper 形态），任何异常回落本地（v4.1-②）。
 """
 from __future__ import annotations
@@ -46,12 +64,21 @@ _CHUNK = 1600   # 100ms 分块喂入（实测与整段喂入结果一致，分�
 KEY_SV = "asr_sensevoice_small"
 KEY_PF = "asr_paraformer_bilingual"
 KEY_FR = "asr_firered_ctc"
-_KIND_KEY = {"sensevoice": KEY_SV, "paraformer": KEY_PF, "firered_ctc": KEY_FR}
+KEY_QA = "asr_qwen3_asr_06b"
+KEY_FN = "asr_funasr_nano"
+_KIND_KEY = {"sensevoice": KEY_SV, "paraformer": KEY_PF, "firered_ctc": KEY_FR,
+             "qwen3_asr": KEY_QA, "funasr_nano": KEY_FN}
 _KIND_LABEL = {"sensevoice": "SenseVoice-Small", "paraformer": "Paraformer 双语流式",
-               "firered_ctc": "FireRedASR2-CTC"}
+               "firered_ctc": "FireRedASR2-CTC",
+               "qwen3_asr": "Qwen3-ASR-0.6B（解码期吃热词）",
+               "funasr_nano": "FunASR-nano（解码期吃热词）"}
+# v1.2.3：只有这两档在**构造期**吃热词（`hotwords` CSV）。1.13.7 实测：sense_voice /
+# paraformer / whisper / 各 *_ctc 的签名里**没有** hotwords 形参，只有 hr_* 同音替换 FST
+# ⇒ 给它们传热词是 TypeError，不是"没生效"。
+_HOTWORD_KINDS = ("qwen3_asr", "funasr_nano")
 # 离线＝整句一次解码；其余走流式收流（is_ready/get_result_all + 1s 尾静音）。
 # CTC 是 OfflineRecognizer，归错集合＝调用它没有的收流接口，结果是空串。
-_OFFLINE_KINDS = ("sensevoice", "firered_ctc")
+_OFFLINE_KINDS = ("sensevoice", "firered_ctc", "qwen3_asr", "funasr_nano")
 
 # SenseVoice 输出的语言/情感/事件标签：zh/yue/EN/NEUTRAL/Speech/woitn 等
 _STRIP_TAGS = re.compile(r"<\|[^<>|]*\|>")
@@ -69,6 +96,42 @@ class AsrEngine:
         # 本轮拿不到结果的具名分因。空串与"用户没说话"在设备侧逐字节同形，
         # 没有这个字段就只能靠人猜（与 v1.0.96「每条路带回具名分因」同口径）。
         self.last_reason = ""
+        # v1.2.3：热词取数口（默认 None＝不喂热词）。由 main.py 接 `pipeline.prior_universe`，
+        # 与级联改写层共用同一份本家名——两套词表会让"改了设备名后一路生效一路不生效"。
+        self._hw_provider = None
+
+    # ── 热词（仅 _HOTWORD_KINDS 消费）───────────────────────────
+    def set_hotwords_provider(self, fn) -> None:
+        """挂上"本家名全集"的取数口（无参可调用，返回可迭代名字）。
+
+        只在**构造 recognizer 时**读一次： recognizer 是常驻对象，热词是解码期偏置、
+        改词表得重建才生效。清单后补（切档/重载/换绑主档）时会自然重新取一份；
+        用户新建设备但引擎已在载 ⇒ 新名要到下一次换绑/重载才进偏置，**这是已知滞后**，
+        不改写层（那一层每轮现读）的行为，故不阻塞发版。
+        """
+        self._hw_provider = fn
+
+    def _hotwords_csv(self) -> str:
+        """把本家名全集压成引擎要的 CSV（ASCII 逗号）。
+
+        含逗号的名字**整条丢掉**——上游格式是 `"a,b,c"` 一行一词，名字里塞逗号会把一个
+        设备切成两个热词，偏置面悄悄变形。空 provider/异常一律回空串＝不喂热词（与
+        v1.2.2 之前的行为逐值相同，宁漏不造）。
+        """
+        fn = self._hw_provider
+        if fn is None:
+            return ""
+        try:
+            names = fn() or ()
+        except Exception:  # noqa: BLE01 —— 偏置词表面不得把识别打挂
+            logger.debug("[STT] 热词取数异常（本轮不喂热词）", exc_info=True)
+            return ""
+        out = []
+        for w in names:
+            w = str(w or "").strip()
+            if w and "," not in w and w not in out:
+                out.append(w)
+        return ",".join(out)
 
     # ── 引擎选择 ────────────────────────────────────────────────
     def _set_reason(self, msg: str, sink: dict | None = None) -> None:
@@ -125,6 +188,34 @@ class AsrEngine:
                 num_threads=2,
                 provider="cpu",
             )
+        elif kind in _HOTWORD_KINDS:
+            # v1.2.3：两路"解码期吃热词"的对比档。文件形状由 lock 的 required_files
+            # 钉住（导出方改名/拆包会在这里以 TypeError/IOError 现形，不是静默空串）。
+            hw = self._hotwords_csv()
+            if kind == "qwen3_asr":
+                rec = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
+                    conv_frontend=str(d / "conv_frontend.onnx"),
+                    encoder=str(d / "encoder.int8.onnx"),
+                    decoder=str(d / "decoder.int8.onnx"),
+                    tokenizer=str(d / "tokenizer"),
+                    num_threads=2,
+                    sample_rate=const.SAMPLE_RATE,
+                    provider="cpu",
+                    hotwords=hw,
+                )
+            else:
+                # tokenizer 目录名 `Qwen3-0.6B` 是导出包自带的字面（两包的解码器同源），
+                # 不猜、由 required_files 守：换名即缺文件⇒加载失败分因，不会静默降级。
+                rec = sherpa_onnx.OfflineRecognizer.from_funasr_nano(
+                    encoder_adaptor=str(d / "encoder_adaptor.int8.onnx"),
+                    llm=str(d / "llm.int8.onnx"),
+                    embedding=str(d / "embedding.int8.onnx"),
+                    tokenizer=str(d / "Qwen3-0.6B"),
+                    num_threads=2,
+                    sample_rate=const.SAMPLE_RATE,
+                    provider="cpu",
+                    hotwords=hw,
+                )
         else:
             rec = sherpa_onnx.OnlineRecognizer.from_paraformer(
                 tokens=str(d / "tokens.txt"),
@@ -168,7 +259,13 @@ class AsrEngine:
         with self._lock:
             self._rec = rec
         self.last_used = time.time()
-        logger.warning("[STT] %s 已加载 @ %s", _KIND_LABEL.get(kind, kind), d)
+        if kind in _HOTWORD_KINDS:
+            _hw = self._hotwords_csv()
+            logger.warning("[STT] %s 已加载 @ %s（热词 %d 条）",
+                           _KIND_LABEL.get(kind, kind), d,
+                           len(_hw.split(",")) if _hw else 0)
+        else:
+            logger.warning("[STT] %s 已加载 @ %s", _KIND_LABEL.get(kind, kind), d)
         return True
 
     def ensure_loaded(self, sink: dict | None = None) -> bool:

@@ -9,7 +9,8 @@
     "2026-09-08 复核：asr/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2 经 tar 内 README 实证实为 WSChuan 四川话模型（ASLP-lab/WSChuan-ASR Paraformer-large-Chuan 导出），非普通话——已从清单剔除，主 ASR 定案为 bilingual 流式包（实测 RTF 0.042/RSS ~400MB）。",
     "2026-09-13 A/B 台架定案（_bench/bench_result.txt，用户批准换引擎）：主 ASR=SenseVoice-Small int8（真实录音不丢尾/粤语/code-switch 显著强、命令推理快 2.3×、单引擎 RSS 370MB≤旧档 413MB）；bilingual 流式降为兼容回落档保留（stt.local_model=paraformer 显式回退，主档故障自动降级）。sv sha256=gh-proxy 直下实测；hf-mirror 无该包同名仓（实测 404），不设第三源，手动导入 /data/models/import/ 为逃生门。",
     "2026-09-13 TTS 换代调研（维持 v1_0 包）：v1_1（int8/fp32 同份 voices.bin 实测 sha 一致）103 音色全为编号名 zf_001…zm_100（k2-fsa 官方 sid 表+pykokoro 双源核），zf_xiaoxiao/zm_yunyang 等具名中文音色只存在于 v1_0——某公众号文章标 v1_1 实为误标；v1_0 的 53 音色向量在 v1_1 中逐比特 0 保留。RTF 四包横评（同机 2 线程）：v1.0-fp32 0.281 / v1.1-fp32 0.300 / v1.0-int8 0.685 / v1.1-int8 0.720——int8 无 VNNI 收益反慢 2.4×。用户试听拍板定晓晓=v1_0 sid47 为默认音色（原 45 小北）。同期 tts.py 真修复：lang zh→''（语言矩阵实证 lang=zh 吞英文片段=现网缺词根因，纯中零差异）；加载器兼容 model.int8.onnx/model.onnx 双命名。",
-    "2026-09-13 TTS 终案改判=升级 v1_1 fp32（用户知情拍板）：声纹溯源（CAM++ 192 维×全 157 sid，E:\\\\AI\\\\_dl\\\\voice_trace3*）实证文章试听嗓=v1_0 sid47 晓晓(0.23)/sid52 云扬(0.17)且 int8 有可测音质劣化（>8k 噪声能量 3.9×，fp32 sid47 距文章样本仅 0.076=文章即 fp32 产物）——v1_1 不含这两嗓（最近 0.45/0.50，另一人），已明确告知，用户仍决定升级 v1.1 换取 103 音色 web 全可选。默认 sid 由 47(晓晓) 改 18(zf_026，v1_1 女声声纹最似晓晓)，男声位 81=zm_055(最似云扬)，均已在 web 表标注；存量配置 sid45-52 升级后将指向 v1_1 新嗓（重映射风险已知，UI 全可选自纠）。选 fp32 弃 v1_1-int8：音质（用户否决 int8）+ RTF 0.300 vs 0.720。"
+    "2026-09-13 TTS 终案改判=升级 v1_1 fp32（用户知情拍板）：声纹溯源（CAM++ 192 维×全 157 sid，E:\\\\AI\\\\_dl\\\\voice_trace3*）实证文章试听嗓=v1_0 sid47 晓晓(0.23)/sid52 云扬(0.17)且 int8 有可测音质劣化（>8k 噪声能量 3.9×，fp32 sid47 距文章样本仅 0.076=文章即 fp32 产物）——v1_1 不含这两嗓（最近 0.45/0.50，另一人），已明确告知，用户仍决定升级 v1.1 换取 103 音色 web 全可选。默认 sid 由 47(晓晓) 改 18(zf_026，v1_1 女声声纹最似晓晓)，男声位 81=zm_055(最似云扬)，均已在 web 表标注；存量配置 sid45-52 升级后将指向 v1_1 新嗓（重映射风险已知，UI 全可选自纠）。选 fp32 弃 v1_1-int8：音质（用户否决 int8）+ RTF 0.300 vs 0.720。",
+    "2026-10-07 语音线 v1.2.3：新增两档**解码期吃热词**的对比档（asr_qwen3_asr_06b / asr_funasr_nano，均 default_provider=false 不自动下载、不参与 fail-open），理由与实测见各自 _file_note；两档热词取数与级联改写层共用 pipeline.prior_universe() 单口。"
   ],
   "asr_sensevoice_small": {
     "display_name": "STT · SenseVoice-Small 中英粤 (int8)",
@@ -51,6 +52,34 @@
     "urls": [
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2"
+    ]
+  },
+  "asr_qwen3_asr_06b": {
+    "display_name": "STT · Qwen3-ASR-0.6B 中英 (int8·吃热词)",
+    "default_provider": false,
+    "tarball": "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+    "sha256": "393f8a14e2f5fb96746aaab342997a40641001fbd5bf9592a080a8329178ee96",
+    "top_dir": "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25",
+    "required_files": ["conv_frontend.onnx", "encoder.int8.onnx", "decoder.int8.onnx", "tokenizer"],
+    "size_mb": 838,
+    "_file_note": "2026-10-07 本机 gh-proxy 直下实测 878,702,423B（与官方 gh release asset 字节数逐字相同）→ sha256 393f8a14…。解包 954MB：conv_frontend.onnx 44,148,281 + encoder.int8.onnx 182,491,662 + decoder.int8.onnx 755,914,231 + tokenizer/（vocab.json+merges.txt+tokenizer_config.json）。接入理由：1.13.7 实测签名里 `from_qwen3_asr` 带 **hotwords(CSV)**，且上游真消费它（`offline-recognizer-qwen3-asr-impl.cc:49-59,459-465` 把热词放进 chat template 的 system 段）——现役 sense_voice/paraformer/whisper/各 *_ctc 在本 build **没有** hotwords 形参，这是『清单当热词』唯一能在解码期生效的路。热词挤占 `max_total_len`（上游告警『Reduce hotwords: fewer or shorter』），故只喂 `pipeline.prior_universe()` 的本家名，不喂整份拆词。包内 onnx 是**第三方导出件**（README 实写 ModelScope `zengshuishui/Qwen3-ASR-onnx`、导出者 Wasser1462）⇒ 阿里官方 CER 榜单不适用本档。开发机实测（num_threads=2，非 4核8G 靶机）：加载 2.60-2.84s、RTF 0.190、峰值 RSS 1425MB；`result.ys_log_probs` 仍为 `[]`（与 SenseVoice 同坑⇒置信度闸不因换引擎而解）。非默认档、不参与 fail-open（显式选的对比档被顶替＝实测作废）、开机不自动下载；第三源未核⇒逃生门 /data/models/import/。",
+    "urls": [
+      "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+      "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2"
+    ]
+  },
+  "asr_funasr_nano": {
+    "display_name": "STT · FunASR-nano 中英+方言口音 (int8·吃热词)",
+    "default_provider": false,
+    "tarball": "sherpa-onnx-funasr-nano-int8-2025-12-30.tar.bz2",
+    "sha256": "eb43d7ccc2e86b243f6a03b7df361033dda66db9523d1a92bf6aca2b50c9476b",
+    "top_dir": "sherpa-onnx-funasr-nano-int8-2025-12-30",
+    "required_files": ["encoder_adaptor.int8.onnx", "llm.int8.onnx", "embedding.int8.onnx", "Qwen3-0.6B"],
+    "size_mb": 803,
+    "_file_note": "2026-10-07 本机 gh-proxy 直下实测 841,730,611B（与官方 gh release asset 字节数逐字相同）→ sha256 eb43d7cc…。解包 972MB：encoder_adaptor.int8.onnx 238,277,200 + llm.int8.onnx 600,339,316 + embedding.int8.onnx 155,583,106 + Qwen3-0.6B/（tokenizer.json+vocab.json+merges.txt）。`from_funasr_nano` 19 参含 **hotwords(CSV)**，上游把热词拼进 user prompt（`offline-recognizer-funasr-nano-impl.cc:94,148-166`「热词列表：[...]」）。包内测试集自带 far_2..far_5.wav（远场）与 dia_*（方言）——是**厂商素材**，不是我们录音，拿它当收益证据即口径造假。同 qwen3 档：第三方导出件（ModelScope `zengshuishui/FunASR-nano-onnx`），官方榜单不适用。开发机实测（num_threads=2）：加载 3.89s、RTF 0.199、峰值 RSS 1645MB；`ys_log_probs` 同为 `[]`。另注：名字骗人的 187MB 包 `sherpa-onnx-sense-voice-funasr-nano-int8-*`＝单 model.int8.onnx 的 SenseVoice 布局（非本档、无 hotwords），用 `from_paraformer` 挂它会 native abort 硬崩进程——已排除，勿凭名字再捞。非默认档、不参与 fail-open、不自动下载。",
+    "urls": [
+      "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-funasr-nano-int8-2025-12-30.tar.bz2",
+      "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-funasr-nano-int8-2025-12-30.tar.bz2"
     ]
   },
   "tts_kokoro_multilang": {

@@ -231,5 +231,10 @@ def test_hook_position_after_creation_before_compound():
     assert i_create < i_hook < i_chain, (
         "改写点必须排在创建承接之后（创建句存用户原话）、复合切分之前（链两腿同口径）")
     assert src.count("homophone.rewrite(") == 1, "改写点全链单点，多处调用会各自漂移"
-    assert "homophone.prior_names(self._device_names())" in src, \
+    # v1.2.3：先验构造收进 `prior_universe()` 单口（改写层与吃热词的 STT 档共用），
+    # 不变量从"改写调用里能看到 _device_names"升级为"单口体内能看到"。
+    assert "homophone.rewrite(text, self.prior_universe())" in src, \
+        "改写入口必须只经 prior_universe() 取先验"
+    _body = src[src.index("def prior_universe("):][:1200]
+    assert "prior_names(self._device_names()," in _body, \
         "先验来源必须与查无子闸同一份清单（同一个 _device_names()），且只取设备名段"

@@ -1179,9 +1179,10 @@ class Pipeline:
         # 位置刻意在创建承接与确认环**之后**、复合切分**之前**：创建句存的是用户原话
         # （「当我说X」的 X 不该被我们的词表改写），确认回答走原车道，而从链发/
         # fp∥klar/查询族/LLM 兜底起的整条控制面吃同一份归一文本。
-        # 先验来源＝`prior_names(_device_names()) ∪ _real_areas()`：清单与「点名设备查无」
-        # 子闸同源（同一个 `_device_names()`，本刀**不**动它的裁决语义），但先验只收每条
-        # friendly_name 的**设备名段**（`prior_names` 取首段，理由与现网实证见其 docstring）。
+        # 先验来源＝`prior_universe()`（`prior_names(_device_names(), _alias_names()) ∪ _real_areas()`）：
+        # 清单与「点名设备查无」子闸同源（同一个 `_device_names()`，本刀**不**动它的裁决语义），
+        # 但先验只收每条 friendly_name 的**设备名段**（`prior_names` 取首段，理由与现网实证见其
+        # docstring）。v1.2.3 起这个词表同时喂吃热词的 STT 档，故收成单口，见 `prior_universe()`。
         # v1.2.2 之前这里喂的是 `T.tokens_of(...)` 的整份拆词——现网真清单实证那会把
         # `开启/关闭/确认/力度/音量` 这类**动作词与属性名**当本家名收进先验，而本层产物
         # 是继续参与级联的文本 ⇒ 改的可能是"这句话是什么行为"。收窄只会漏改，不会多改。
@@ -1189,8 +1190,7 @@ class Pipeline:
         # 顺序时好时坏＝本仓记过的"全局态泄漏"同型坑），更不取静态通用词表（那会把
         # 「门所」归成本家没有的「门锁」，重犯 `_admissible` v1.1.27 的规矩）。
         # 两处清单都拿不到 ⇒ 空表 ⇒ 本层整条不生效，现网行为逐值不变。
-        text, _homophones = homophone.rewrite(
-            text, homophone.prior_names(self._device_names()) + self._real_areas())
+        text, _homophones = homophone.rewrite(text, self.prior_universe())
         if _homophones:
             logger.info("[级联] 清单同音改写 %s",
                         "、".join(f"「{a}」→「{b}」" for a, b in _homophones))
@@ -2665,6 +2665,32 @@ class Pipeline:
         except Exception:  # noqa: BLE01
             return ()
 
+    def _alias_names(self) -> tuple:
+        """本台 HA 注册表里的**语音别名**（用户在「设备与服务→实体→别名」亲手写的叫法）。
+
+        v1.2.3 补的口：`targets.sync_vocab` 从 v1.1.4 起就吃别名，同音改写层却只看
+        `friendly_name` ⇒ 说「小兰」而别名是「小蓝」时字面查无、拼音键里也没有「小蓝」，
+        整句只能原样放行给 klar（用户已经付出的配置被浪费）。
+        取数面＝`ha._entity_alias`（`{eid: [name, original_name, *aliases]}`），
+        逐条剔掉该实体当前的 friendly_name（那部分 `_device_names()` 已经给了，不重复）。
+        拿不到 ⇒ 空表 ⇒ 本层先验退化成只有 friendly_name，行为同 v1.2.2。
+        **能力词借道**由 `homophone.prior_names(..., extra)` 用清单自身挡住。
+        """
+        try:
+            states = getattr(self.ha, "_states", None) or {}
+            amap = getattr(self.ha, "_entity_alias", None) or {}
+            out = []
+            for eid, names in amap.items():
+                fn = str(((states.get(eid) or {}).get("attributes") or {})
+                         .get("friendly_name") or "").strip()
+                for a in (names or ()):
+                    a = str(a or "").strip()
+                    if a and a != fn:
+                        out.append(a)
+            return tuple(out)
+        except Exception:  # noqa: BLE01 —— 覆盖面扩充不得把级联打挂
+            return ()
+
     def _real_areas(self) -> tuple:
         """这台 HA **真注册过**的区域名（不含静态 BASE_AREAS）。
 
@@ -2687,6 +2713,18 @@ class Pipeline:
             return tuple(out)
         except Exception:  # noqa: BLE01
             return ()
+
+    def prior_universe(self) -> tuple:
+        """本台「可当目标的本家名」全集＝设备名段 ∪ 注册表别名 ∪ 真注册区域名。
+
+        v1.2.3 起两个消费者共用这一个口：①级联的清单同音改写；②吃热词的 STT 档
+        （`qwen3_asr`/`funasr_nano`）的解码期偏置词表。同源的理由与刀1 相同——
+        改写词表与偏置词表若是两套，用户在 HA 里改个设备名，一路生效一路不生效，
+        现场只能看到"有时认有时不认"。
+        两处清单都拿不到 ⇒ 空表 ⇒ 改写层整条不生效、偏置侧不传热词，现网行为逐值不变。
+        """
+        return homophone.prior_names(self._device_names(),
+                                     self._alias_names()) + self._real_areas()
 
     @staticmethod
     def _overbroad_say(area: str) -> str:

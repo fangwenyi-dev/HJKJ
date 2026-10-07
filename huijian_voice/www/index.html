@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.2.2">
-<link rel="stylesheet" href="css/voice.css?v=1.2.2">
+<link rel="stylesheet" href="css/huijian.css?v=1.2.3">
+<link rel="stylesheet" href="css/voice.css?v=1.2.3">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -83,6 +83,8 @@
           <option value="sensevoice">SenseVoice-Small · 中英粤（默认，整句离线识别）</option>
           <option value="paraformer">Paraformer · 中英双语流式（逐字出字，纯中文场景对比档）</option>
           <option value="firered_ctc">FireRedASR2-CTC · 中英+20多种方言（离线整句，实测对比档，包 776MB）</option>
+          <option value="qwen3_asr">Qwen3-ASR-0.6B · 中英（解码期吃热词，包 954MB 解包，需手动下载/导入）</option>
+          <option value="funasr_nano">FunASR-nano · 中英+方言口音（解码期吃热词，包 972MB 解包，需手动下载/导入）</option>
         </select></div>
     </div>
     <div id="sttCloudBox" style="display:none">
@@ -315,7 +317,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.2.2";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.2.3";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -509,11 +511,11 @@ async function loadSettings(){
   _kokoroSid = String(S.tts.sid ?? KOKORO_DEFAULT_SID);   // Kokoro 档的选择；音色表由 syncBoxes() 按引擎重建
   $("#tts_speed").value = S.tts.speed ?? 1.25;
   $("#stt_provider").value = String(S.stt.provider||"").startsWith("cloud") ? "cloud" : "local_paraformer";
-  // v1.0.99+ 本地模型切换（stt.local_model：sensevoice|paraformer|firered_ctc）：
+  // v1.0.99+ 本地模型切换（stt.local_model：sensevoice|paraformer|firered_ctc|qwen3_asr|funasr_nano）：
   // 未知值按默认档显示（引擎读侧同判据——_primary_kind 非表值一律回落 sensevoice）。
   // 旧写法是 paraformer/其余 的二元三元式：第三档会被显示成默认档（用户以为切了
   // 实际没切，且下一次保存静默改写 settings），故改成员判断。
-  const _STT_KINDS = ["sensevoice", "paraformer", "firered_ctc"];
+  const _STT_KINDS = ["sensevoice", "paraformer", "firered_ctc", "qwen3_asr", "funasr_nano"];
   $("#stt_local_model").value = _STT_KINDS.includes(S.stt.local_model) ? S.stt.local_model : "sensevoice";
   // v1.0.65（TTS 深审 F11）：云档存在两个"正统"拼法（引擎读侧 startswith
   // ("cloud") 双吃：UI 的 "cloud" 与 settings 注释/测试沿用的
@@ -1098,6 +1100,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.2.2"></script>
+<script src="js/starsky.js?v=1.2.3"></script>
 </body>
 </html>
