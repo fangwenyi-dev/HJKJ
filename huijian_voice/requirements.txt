@@ -8,7 +8,7 @@
 #   · sherpa-onnx wheel 覆盖 cp310–cp314，python 3.11–3.13 均安全，避开 3.14。
 # ═══════════════════════════════════════════════════════════════════
 aiohttp>=3.13,<4            # WS 服务器 + HA REST/WS 客户端（主循环）
-sherpa-onnx>=1.13.4,<1.14   # ASR paraformer 中英双语流式 + TTS kokoro-multi-lang 推理
+sherpa-onnx>=1.13.4,<1.14   # ASR 各离线档（FireRed/SenseVoice）+ TTS（Kokoro/Melo）推理
 onnxruntime>=1.22,<1.30     # TextCNN 15 类意图分类器（本仓 nlu_data/ 随镜像）
 numpy>=2,<3                 # 音频缓冲/重采样/模型 IO（研究轮实证 2.4 与上两者兼容）
 pypinyin==0.55.0            # fast_path 拼音模糊匹配（"平推车"→"平推窗"）

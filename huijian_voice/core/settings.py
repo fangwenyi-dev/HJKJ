@@ -29,7 +29,7 @@ DEFAULTS: dict[str, Any] = {
         # provider：local_paraformer(=本地引擎总开关值，历史兼容，勿改字面) | cloud_openai_compat
         # v4.2：本地具体引擎由 local_model 决定；provider 字面值保持兼容存量 settings.json
         "provider": "local_paraformer",
-        "local_model": "firered_ctc",         # v1.2.4 默认改 FireRedASR2-CTC（用户 .91 真机对比点名）| firered_aed(AED 分支·中文同音段更稳但慢约 15×·非默认) | sensevoice(旧默认·回落档) | paraformer(双语流式兼容回落档)
+        "local_model": "firered_aed",         # 2026-10-07 晚默认改 FireRedASR2-AED（用户点名）| firered_ctc(上一代默认·回落档) | sensevoice(小体积可选；paraformer 档同日已删)
         "language": "zh-CN",
         # 云档示例：{"provider":"cloud_openai_compat","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","api_key":"","model":"paraformer 或 whisper 兼容名"}
         # 云失败自动回落本地（v4.1-②）

@@ -48,12 +48,7 @@ if _settings is None:
 TOK = json.load(open(_settings, encoding="utf-8"))["security"]["ws_token"]
 BASE = "ws://127.0.0.1:8000/xiaozhi/v1"
 
-WAV = os.environ.get("E2E_WAV") or (
-    os.path.join(HERE, "assets", "0.wav")
-    if os.path.exists(os.path.join(HERE, "assets", "0.wav"))
-    else os.path.join(os.path.dirname(ROOT), "asr",
-                      "sherpa-onnx-streaming-paraformer-bilingual-zh-en",
-                      "test_wavs", "0.wav"))
+WAV = os.environ.get("E2E_WAV") or os.path.join(HERE, "assets", "0.wav")
 
 
 async def ch_stt():

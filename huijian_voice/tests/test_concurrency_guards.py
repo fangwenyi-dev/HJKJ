@@ -38,30 +38,17 @@ class DSettings:
 
 # ── F1: asr ────────────────────────────────────────────────────
 class SlowRec:
-    """is_ready 第一真时 sleep——构造卸载窗口。"""
-
-    def __init__(self):
-        self.first = True
+    """decode_stream 里 sleep——构造卸载窗口（离线形态：文本挂 stream.result）。"""
 
     def create_stream(self):
         class Stream:
+            result = SimpleNamespace(text="开 灯")
             def accept_waveform(self, rate, data):
-                pass
-            def input_finished(self):
                 pass
         return Stream()
 
-    def is_ready(self, s):
-        if self.first:
-            self.first = False
-            return True
-        return False
-
     def decode_stream(self, s):
         time.sleep(0.35)
-
-    def get_result_all(self, s):
-        return SimpleNamespace(text="开 灯")
 
     def reset(self, s):
         pass

@@ -1,4 +1,4 @@
-"""STT 引擎（v4.2 定案：默认本地 SenseVoice-Small，Paraformer 降兼容回落档；云可配、失败自动回落本地）。
+"""STT 引擎（现役：默认本地 FireRedASR2-AED，回落档 FireRedASR2-CTC；云可配、失败自动回落本地）。
 
 2026-09-08 实证裁定（晚到研究定案，两条都推翻过早期假设，代码以此为准）：
   1. `sherpa-onnx-paraformer-zh-int8-2025-10-07` 包实为 **WSChuan 四川话**模型
@@ -16,8 +16,8 @@
   - SenseVoice 输出带 <|zh|><|NEUTRAL|>… 标签 → 必须剥离（_STRIP_TAGS）。
   - 生产链路是 stop 后整句识别（session 契约「仅回一条 stt」），流式模型的增量
     优势本就未使用，换离线引擎零协议损失。
-  - Paraformer **保留为兼容/回落档**：stt.local_model=paraformer 显式回退，或
-    主档缺失/加载失败自动降级，语音链不断（fail-open）。
+  - Paraformer 当年保留为兼容/回落档（fail-open 不断链）——**该档已于 2026-10-07
+    用户点名删除**，见下文最新一节；本条为历史记录。
 2026-09-28 追加（用户点名实测的**对比档**，非默认、不参与 fail-open）：
   - `firered_ctc` = FireRedASR2-CTC int8（OfflineRecognizer，中英 + 20 多种方言）。
     它是 FireRedASR2-AED 同一份权重里**只取 encoder + CTC 分支**的导出，attention
@@ -41,11 +41,25 @@
     生成开销），故 v1.2.4 删掉两档、把默认档换成 FireRed-CTC。**代价要写清**：删掉后
     本加载项**再无任何档消费解码期热词**，"清单偏置"只剩解码后的同音/近音改写层
     （`core/nlu/homophone.py`，全档共用、零 token 成本、救不到少字与声学丢音）。
-  - 换默认带来的回落链（`ensure_loaded`，两级，判据用 `_DEFAULT_KIND`/`_FALLBACK_KIND`
-    常量而非字面）：FireRed 起不来 → SenseVoice（旧默认、239MB、台架基线最全）；
-    显式选 SenseVoice 而它起不来 → Paraformer（v4.2 的兼容档，存量用户行为不变）。
-    E2E 就绪门（`tests/e2e/run_e2e.sh:53` 按 `default_provider` 派生 need 集）因此**两档都
-    留 true**：主档与回落档都必检，否则回落形虚。生产侧下载仍只由 `asr.model_key` 驱动。
+  - 换默认带来的回落链（`ensure_loaded`，判据用 `_DEFAULT_KIND`/`_FALLBACK_KIND`
+    常量而非字面）：FireRed 起不来 → SenseVoice（旧默认、239MB、台架基线最全）。
+    E2E 就绪门按 lock `default_provider` 派生 need 集，因此**只留主档一项 true**：
+    回落档留在必检集＝门等一个没人下的模型直到超时（v1.2.4 的 E2E 实伤）。
+    生产侧下载仍只由 `asr.model_key` 驱动。
+2026-10-07 当日追加（v1.2.5 提交之后，用户点名删除 `asr_paraformer_bilingual`）：
+  - 被删档自 v4.2 起是兼容/回落档、v1.2.4 起是回落链第三级。删除后：回落链**只剩
+    一级**（默认 FireRed 坏 → SenseVoice），显式档（含显式 SenseVoice）起不来一律
+    **不回落**（对比档被顶替＝用户的实测作废）；存量 settings.json 里
+    `local_model=paraformer` 经 `_primary_kind()` 未知值回落自动迁移到默认档。
+  - 连带清理：库内最后一条**流式**引擎消失 ⇒ `_local_transcribe` 的流式收流分支
+    （1s 尾补静音 / is_ready / get_result_all）与 `_OFFLINE_KINDS`/`_CHUNK` 一并移除，
+    全部引擎统一走离线整句解码。原第三级是"FireRed 还在下、SenseVoice 也被清过"
+    窗口里的兜底——该可用性取舍随本次删除一并取消（用户拍板，别再擅自加回）。
+2026-10-07 当晚再换默认（用户点名）：主档=FireRedASR2-AED、回落档=FireRedASR2-CTC
+  （上一代默认；换默认时把回落目标挪到"旧默认"，与 v1.2.4 换默认同规格；判据仍只认
+  `_DEFAULT_KIND`/`_FALLBACK_KIND` 常量）。代价（发版说明要写）：新装首启下载面
+  776MB→1.23GB 解包（tar 520MB→838,589,068B）、单轮更慢（开发机 RTF 0.31-0.38），
+  换得的是用户真机对比的"中文同音段更稳"；SenseVoice 位置=小体积可选档。
 云档 = OpenAI 兼容 /audio/transcriptions（whisper 形态），任何异常回落本地（v4.1-②）。
 """
 from __future__ import annotations
@@ -61,26 +75,23 @@ from . import audio, const
 
 logger = logging.getLogger("huijian.asr")
 
-_CHUNK = 1600   # 100ms 分块喂入（实测与整段喂入结果一致，分块省峰值内存）
-
 # 引擎键位（models.lock.json 的 key）
 KEY_SV = "asr_sensevoice_small"
-KEY_PF = "asr_paraformer_bilingual"
 KEY_FR = "asr_firered_ctc"
 KEY_FA = "asr_firered_aed"
-_KIND_KEY = {"sensevoice": KEY_SV, "paraformer": KEY_PF, "firered_ctc": KEY_FR,
+_KIND_KEY = {"sensevoice": KEY_SV, "firered_ctc": KEY_FR,
              "firered_aed": KEY_FA}
-_KIND_LABEL = {"sensevoice": "SenseVoice-Small", "paraformer": "Paraformer 双语流式",
+_KIND_LABEL = {"sensevoice": "SenseVoice-Small",
                "firered_ctc": "FireRedASR2-CTC", "firered_aed": "FireRedASR2-AED"}
-# v1.2.4 换默认档（用户 2026-10-07 在 .91 真机对比后点名）：主档＝FireRedASR2-CTC，
-# 回落目标＝SenseVoice。这个常量是**唯一真源**：`_primary_kind()` 的非法值回落、
-# `ensure_loaded()` 的 fail-open 判据、settings.DEFAULTS 三处都指它，不许再写死字面
-# （写死＝换默认时只改一处，出现"默认档自己不落盘、回落档当主档跑"的裂口）。
-_DEFAULT_KIND = "firered_ctc"
-_FALLBACK_KIND = "sensevoice"
-# 离线＝整句一次解码；其余走流式收流（is_ready/get_result_all + 1s 尾静音）。
-# CTC 是 OfflineRecognizer，归错集合＝调用它没有的收流接口，结果是空串。
-_OFFLINE_KINDS = ("sensevoice", "firered_ctc", "firered_aed")
+# 换默认档（用户 2026-10-07 两次点名）：现主档＝FireRedASR2-AED，回落目标＝FireRedASR2-CTC
+# （上一代默认；回落只作可用性兜底，主档补就绪即换回）。这两个常量是**唯一真源**：
+# `_primary_kind()` 的非法值回落、`ensure_loaded()` 的 fail-open 判据、settings.DEFAULTS
+# 三处都指它，不许再写死字面（写死＝换默认时只改一处，出现"默认档自己不落盘、回落档当主档跑"的裂口）。
+_DEFAULT_KIND = "firered_aed"
+_FALLBACK_KIND = "firered_ctc"
+# （2026-10-07：全库引擎均为离线整句解码——最后一条流式档 Paraformer 删除后，
+#  收流分支与归错集合一并移除；若将来再接流式档，尾补静音必须一起做，
+#  否则 2026-09-08 台架实锤的丢尾事故会回来。）
 
 # SenseVoice 输出的语言/情感/事件标签：zh/yue/EN/NEUTRAL/Speech/woitn 等
 _STRIP_TAGS = re.compile(r"<\|[^<>|]*\|>")
@@ -141,7 +152,7 @@ class AsrEngine:
                 num_threads=2,
                 sample_rate=const.SAMPLE_RATE,
                 language="",                      # 自动语种判定（含粤语）
-                use_itn=False,                    # 与旧档对齐：不挂 ITN（paraformer 无 rule_fsts）
+                use_itn=False,                    # 与历史档对齐：不挂 ITN（旧档无 rule_fsts）
                 provider="cpu",
             )
         elif kind == "firered_ctc":
@@ -158,7 +169,7 @@ class AsrEngine:
             # v1.2.5：FireRedASR2 的 AED 分支（encoder + attention decoder 都在，与 CTC
             # 同源权重）。**没有 sample_rate 形参**——照 SenseVoice 那套传参是 TypeError，
             # 现场表现为"模型加载失败"而非可读分因（CTC 档同坑，实测过）。
-            # 文件名与 Paraformer 回落档**逐字同名**（encoder.int8/decoder.int8/tokens.txt），
+            # encoder.int8/decoder.int8/tokens.txt 这套文件名与历史 Paraformer 档同名过，
             # 分派错了不会报错、只会拿错模型 ⇒ 靠 lock 的 required_files 与取数目录钉住。
             rec = sherpa_onnx.OfflineRecognizer.from_fire_red_asr(
                 encoder=str(d / "encoder.int8.onnx"),
@@ -168,18 +179,8 @@ class AsrEngine:
                 provider="cpu",
             )
         else:
-            rec = sherpa_onnx.OnlineRecognizer.from_paraformer(
-                tokens=str(d / "tokens.txt"),
-                encoder=str(d / "encoder.int8.onnx"),
-                decoder=str(d / "decoder.int8.onnx"),
-                num_threads=2,
-                sample_rate=const.SAMPLE_RATE,
-                feature_dim=80,                   # 硬约束：560 会静默空串
-                enable_endpoint_detection=False,  # 断句由客户端 listen stop 驱动
-                decoding_method="greedy_search",
-                provider="cpu",
-            )
-        rec._hj_kind = kind    # 路径随 recognizer 走：快照语义 + 无标记替身默认 pf 路径
+            raise ValueError(f"未知引擎档：{kind!r}（_KIND_KEY 未登记，不得进入构建）")
+        rec._hj_kind = kind    # 路径随 recognizer 走：快照语义 + 分派校验用
         return rec
 
     def _load_one(self, kind: str, sink: dict | None = None) -> bool:
@@ -215,7 +216,7 @@ class AsrEngine:
 
     def ensure_loaded(self, sink: dict | None = None) -> bool:
         """同步加载（调用方放 to_thread）。已加载直接 True。
-        主档优先；主档缺失/损坏自动回落 Paraformer 兼容档（fail-open）。
+        主档优先；主档缺失/损坏自动回落 FireRed-CTC（fail-open）；显式档不回落。
         sink：本轮分因出参（见 _set_reason），冷却/失败分因按轮取回。"""
         with self._lock:
             if self._rec is not None:
@@ -230,19 +231,15 @@ class AsrEngine:
             if self._load_one(primary, p1):
                 return True
             primary_reason = str(p1.get("reason") or self.last_reason)
-            # 回落链（v1.2.4 换默认后重写）。三级，逐级只认"当下主档坐在哪个位置"：
-            #   默认 FireRed → SenseVoice（旧默认、239MB）→ Paraformer（v4.2 兼容档）
-            #   显式 SenseVoice → Paraformer（存量用户行为逐值不变）
-            #   显式 Paraformer / 其他对比档 → 不回落（对比档被顶替＝用户的实测作废）
+            # 回落链（2026-10-07 晚换默认后）。只认"当下主档坐在哪个位置"：
+            #   默认 AED 起不来 → FireRed-CTC（上一代默认、非自回归快、盘上最可能在）
+            #   显式档（含显式 CTC/SenseVoice）起不来 → 不回落（对比档被顶替＝实测作废）
             # 判据取 _DEFAULT_KIND/_FALLBACK_KIND 常量，不写死引擎名，见其注释。
-            # 为什么必须留第三级：升版窗口里靶机常见"FireRed 还在下、SenseVoice 也被清过"
-            # 的形态，两级链会在真下载完成前每轮都无识别——旧形（sv→pf）在这种机器上是能跑的，
-            # 少一级就是可用性回归，不是简化。
+            # 原第三级（Paraformer）是"FireRed 还在下、SenseVoice 也被清过"窗口里的
+            # 兜底，该档已删 ⇒ 窗口内本轮无识别，属用户拍板的取舍，别再擅自加回。
             chain: list = []
             if primary == _DEFAULT_KIND:
-                chain = [_FALLBACK_KIND, "paraformer"]
-            elif primary == _FALLBACK_KIND:
-                chain = ["paraformer"]
+                chain = [_FALLBACK_KIND]
             for nxt in chain:
                 p2: dict = {}
                 if self._load_one(nxt, p2):
@@ -337,8 +334,7 @@ class AsrEngine:
     def _local_transcribe(self, pcm_s16: bytes, reason_out: dict | None = None) -> str:
         # F1 双保险：锁内快照当代 rec + busy 计数。此后即便 reaper/reload 把
         # self._rec 置 None，本地快照仍持引用（旧对象析构推迟到本调用返回），
-        # 绝不出现「旧 stream 喂新 recognizer」的跨代 UB。分派按 rec 自带
-        # _hj_kind；无标记替身走 Paraformer 老路径（并发守卫测试兼容）。
+        # 绝不出现「旧 stream 喂新 recognizer」的跨代 UB。分派按 rec 自带 _hj_kind。
         if not pcm_s16:
             return ""
         with self._lock:
@@ -350,28 +346,13 @@ class AsrEngine:
             self._busy += 1
         try:
             samples = audio.pcm16_to_f32(pcm_s16)
-            if getattr(rec, "_hj_kind", "paraformer") in _OFFLINE_KINDS:
-                stream = rec.create_stream()
-                stream.accept_waveform(const.SAMPLE_RATE, samples)
-                rec.decode_stream(stream)
-                text = _STRIP_TAGS.sub("", stream.result.text or "")
-            else:
-                stream = rec.create_stream()
-                for i in range(0, len(samples), _CHUNK):
-                    stream.accept_waveform(const.SAMPLE_RATE, samples[i:i + _CHUNK])
-                # 尾部补 1s 静音（sherpa-onnx 流式 demo 同款 tail padding）：流式
-                # Paraformer encoder 以 600ms 整块消费且带 look-ahead，input_finished
-                # 时不足整块的语音尾巴直接被丢——台架仿真 2026-09-08 实测
-                # 「打开办公室射灯」→「打开办公室射」、「打开射灯」→「打开」。
-                # 补静音让末块凑整 + look-ahead 喂足，再收流。
-                # （SenseVoice 为离线模型无此坑：台架整句喂入不补静音亦无丢尾。）
-                stream.accept_waveform(const.SAMPLE_RATE, [0.0] * const.SAMPLE_RATE)
-                stream.input_finished()
-                while rec.is_ready(stream):
-                    rec.decode_stream(stream)
-                res = rec.get_result_all(stream)
-                text = (getattr(res, "text", None) if res is not None else None) or ""
-                text = text.replace("▁", " ")
+            # 2026-10-07：全部引擎均为离线整句解码（最后一条流式档已删，收流分支
+            # 与 1s 尾补静音一并移除）。若将来再接流式档，2026-09-08 那份丢尾事故
+            # （「打开办公室射灯」→「打开办公室射」）会回来，尾补静音必须一起做。
+            stream = rec.create_stream()
+            stream.accept_waveform(const.SAMPLE_RATE, samples)
+            rec.decode_stream(stream)
+            text = _STRIP_TAGS.sub("", stream.result.text or "")
             try:
                 rec.reset(stream)
             except Exception:

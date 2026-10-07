@@ -117,7 +117,7 @@ OpenAI 兼容端点：
   （glm-4-flash 免费）、Kimi、硅基流动、讯飞星火、Gemini、OpenAI、302 类代理网关、
   局域网 Ollama（免 Key，改 IP 即用）。
 - **云端 STT（5 家）**：百炼 Qwen3-ASR、硅基流动 SenseVoice、Groq Whisper、
-  OpenAI Whisper、302.AI；云端失败自动回落本地 Paraformer。
+  OpenAI Whisper、302.AI；云端失败自动回落本地引擎（当前默认档）。
 - **云端 TTS（3 家）**：硅基流动 CosyVoice2（8 种中文预置音色 anna/alex 等）、
   OpenAI TTS、302.AI；平台回 wav 自动解包取实际采样率，回 mp3/opus 会明确
   提示改输出格式。
@@ -179,7 +179,7 @@ OpenAI 兼容端点：
 - 音乐：点歌/播控/正在播放查询已支持（需 MA + 播放端点，见常见问答）；慧尖语音
   卫星本体的流式播放与固件侧播控随固件音乐批演进，旧固件卫星上「暂停/下一首」
   等指令以端点实际能力为准；平台音乐（QQ/网易云等）需用户自备会员，不随插件交付；
-- 识别语种：中文 + 中英混说（Paraformer 双语流式），纯英文长句质量一般；
+- 识别语种：中文 + 中英混说（FireRedASR2-AED 默认档），纯英文长句质量一般；
 - 唤醒词不在本加载项职责内（固件端本地唤醒）。
 
 ## 端口占用

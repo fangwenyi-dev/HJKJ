@@ -4,15 +4,17 @@
     "下载链：urls 顺序回退（国内代理→官方→镜像站），sha256 校验，tmp+rename 原子落盘；",
     "model_auto_download=false 或下载全失败时，支持手动导入：把 tarball 放进 /data/models/import/ 即可。",
     "sha256 为本地研究包实测值（2026-09-08，与官方 release 文件名一致；E2E 首跑若校验不过=官方更新同版本包，需人工复核后回填）。",
-    "2026-09-08 命中预案：E2E 对 kokoro-multi-lang-v1_0 双源 5 连败——本机直下复核：377 文件 / model.onnx 325560556B / required_files 全与旧实测一致（上游仅重打包重传，内容未变），回填新值 c5f7e2d2…（旧 c133d263…）。paraformer 双源实测未变，不动。",
+    "2026-09-08 命中预案：E2E 对 kokoro-multi-lang-v1_0 双源 5 连败——本机直下复核：377 文件 / model.onnx 325560556B / required_files 全与旧实测一致（上游仅重打包重传，内容未变），回填新值 c5f7e2d2…（旧 c133d263…）。paraformer 双源实测未变，不动。（该档 2026-10-07 已删，本条为历史。）",
     "top_dir=解包后的根目录名，解到 /data/models/<key>/ 时自动剥掉该前缀。",
     "2026-09-08 复核：asr/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2 经 tar 内 README 实证实为 WSChuan 四川话模型（ASLP-lab/WSChuan-ASR Paraformer-large-Chuan 导出），非普通话——已从清单剔除，主 ASR 定案为 bilingual 流式包（实测 RTF 0.042/RSS ~400MB）。",
-    "2026-09-13 A/B 台架定案（_bench/bench_result.txt，用户批准换引擎）：主 ASR=SenseVoice-Small int8（真实录音不丢尾/粤语/code-switch 显著强、命令推理快 2.3×、单引擎 RSS 370MB≤旧档 413MB）；bilingual 流式降为兼容回落档保留（stt.local_model=paraformer 显式回退，主档故障自动降级）。sv sha256=gh-proxy 直下实测；hf-mirror 无该包同名仓（实测 404），不设第三源，手动导入 /data/models/import/ 为逃生门。",
+    "2026-09-13 A/B 台架定案（_bench/bench_result.txt，用户批准换引擎）：主 ASR=SenseVoice-Small int8（真实录音不丢尾/粤语/code-switch 显著强、命令推理快 2.3×、单引擎 RSS 370MB≤旧档 413MB）；bilingual 流式降为兼容回落档保留（stt.local_model=paraformer 显式回退，主档故障自动降级）。sv sha256=gh-proxy 直下实测；hf-mirror 无该包同名仓（实测 404），不设第三源，手动导入 /data/models/import/ 为逃生门。（bilingual 流式档已于 2026-10-07 删除，本行为历史记录。）",
     "2026-09-13 TTS 换代调研（维持 v1_0 包）：v1_1（int8/fp32 同份 voices.bin 实测 sha 一致）103 音色全为编号名 zf_001…zm_100（k2-fsa 官方 sid 表+pykokoro 双源核），zf_xiaoxiao/zm_yunyang 等具名中文音色只存在于 v1_0——某公众号文章标 v1_1 实为误标；v1_0 的 53 音色向量在 v1_1 中逐比特 0 保留。RTF 四包横评（同机 2 线程）：v1.0-fp32 0.281 / v1.1-fp32 0.300 / v1.0-int8 0.685 / v1.1-int8 0.720——int8 无 VNNI 收益反慢 2.4×。用户试听拍板定晓晓=v1_0 sid47 为默认音色（原 45 小北）。同期 tts.py 真修复：lang zh→''（语言矩阵实证 lang=zh 吞英文片段=现网缺词根因，纯中零差异）；加载器兼容 model.int8.onnx/model.onnx 双命名。",
     "2026-09-13 TTS 终案改判=升级 v1_1 fp32（用户知情拍板）：声纹溯源（CAM++ 192 维×全 157 sid，E:\\\\AI\\\\_dl\\\\voice_trace3*）实证文章试听嗓=v1_0 sid47 晓晓(0.23)/sid52 云扬(0.17)且 int8 有可测音质劣化（>8k 噪声能量 3.9×，fp32 sid47 距文章样本仅 0.076=文章即 fp32 产物）——v1_1 不含这两嗓（最近 0.45/0.50，另一人），已明确告知，用户仍决定升级 v1.1 换取 103 音色 web 全可选。默认 sid 由 47(晓晓) 改 18(zf_026，v1_1 女声声纹最似晓晓)，男声位 81=zm_055(最似云扬)，均已在 web 表标注；存量配置 sid45-52 升级后将指向 v1_1 新嗓（重映射风险已知，UI 全可选自纠）。选 fp32 弃 v1_1-int8：音质（用户否决 int8）+ RTF 0.300 vs 0.720。",
     "2026-10-07 语音线 v1.2.3：新增两档**解码期吃热词**的对比档（asr_qwen3_asr_06b / asr_funasr_nano，均 default_provider=false 不自动下载、不参与 fail-open），理由与实测见各自 _file_note；两档热词取数与级联改写层共用 pipeline.prior_universe() 单口。",
     "2026-10-07 语音线 v1.2.4：删掉 v1.2.3 接的两档热词档（asr_qwen3_asr_06b / asr_funasr_nano，.91 真机比 FireRed 慢且差，且 62 条热词吃掉 209/512 token 预算并出现 truncated），默认档改 asr_firered_ctc，asr_sensevoice_small 转回落档，两者都 default_provider=true。",
-    "2026-10-07 语音线 v1.2.5：新增 asr_firered_aed（FireRedASR2-AED int8，官方 sherpa-onnx 导出件，非默认档）；同时把 asr_sensevoice_small 的 default_provider 改回 false——v1.2.4 我把它留在必检集里，而生产侧没人下它，E2E 就绪门等到超时（该 run 的 Release 腿因此被跳过，等于没发出去）。"
+    "2026-10-07 语音线 v1.2.5：新增 asr_firered_aed（FireRedASR2-AED int8，官方 sherpa-onnx 导出件，非默认档）；同时把 asr_sensevoice_small 的 default_provider 改回 false——v1.2.4 我把它留在必检集里，而生产侧没人下它，E2E 就绪门等到超时（该 run 的 Release 腿因此被跳过，等于没发出去）。",
+    "2026-10-07 语音线：删除 asr_paraformer_bilingual（STT · Paraformer 中英双语流式，用户点名；暂未随版本发布）。它自 v4.2 起是兼容回落档、v1.2.4 起是回落链第三级；删除后回落链为两级 FireRed→SenseVoice，全库引擎均为离线整句形态（原流式收流分支随档一并移除）。",
+    "2026-10-07 语音线当晚：默认档由 asr_firered_ctc 换成 asr_firered_aed（用户点名；暂未随版本发布）；CTC 转回落档（default_provider 翻转 AED=true/CTC=false——就绪门必检集只认默认档）。代价：新装首启下载面 tar 520MB→838,589,068B、单轮更慢（开发机 RTF 0.31-0.38 vs CTC 0.158-0.234）；换得用户真机对比的“中文同音段更稳”。"
   ],
   "asr_sensevoice_small": {
     "display_name": "STT · SenseVoice-Small 中英粤 (int8)",
@@ -22,35 +24,21 @@
     "top_dir": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
     "required_files": ["model.int8.onnx", "tokens.txt"],
     "size_mb": 1000,
-    "_file_note": "包内同带 fp32 model.onnx(937MB)：代码只引用 model.int8.onnx(239MB)，fp32 解包占盘但绝不加载；勿改引用。v1.2.5 起降为回落档且 default_provider=false：生产侧只下「当下选的那档」（_loop_models 取 asr.model_key），把它留在就绪门必检集里＝门等一个没人下的模型直到超时——v1.2.4 的 E2E 就是这么红的（实伤，非理论）。",
+    "_file_note": "包内同带 fp32 model.onnx(937MB)：代码只引用 model.int8.onnx(239MB)，fp32 解包占盘但绝不加载；勿改引用。v1.2.5 起转非默认档（default_provider=false；回落位 2026-10-07 晚起改由 FireRed-CTC 担任）：生产侧只下「当下选的那档」（_loop_models 取 asr.model_key），把它留在就绪门必检集里＝门等一个没人下的模型直到超时——v1.2.4 的 E2E 就是这么红的（实伤，非理论）。",
     "urls": [
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
     ]
   },
-  "asr_paraformer_bilingual": {
-    "display_name": "STT · Paraformer 中英双语流式 (int8)",
-    "default_provider": false,
-    "tarball": "sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2",
-    "sha256": "5462a1fce42693deae572af1e8c4687124b12aa85fe61ff4d3168bb5280e205f",
-    "top_dir": "sherpa-onnx-streaming-paraformer-bilingual-zh-en",
-    "required_files": ["tokens.txt", "encoder.int8.onnx", "decoder.int8.onnx"],
-    "size_mb": 1000,
-    "urls": [
-      "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2",
-      "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2",
-      "https://hf-mirror.com/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en/resolve/main/sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2"
-    ]
-  },
   "asr_firered_ctc": {
     "display_name": "STT · FireRedASR2-CTC 中英+方言 (int8)",
-    "default_provider": true,
+    "default_provider": false,
     "tarball": "sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2",
     "sha256": "1da8b737ecc5e29f36759a4460c754863e7c919a4ba325aea187331fbfc83274",
     "top_dir": "sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25",
     "required_files": ["model.int8.onnx", "tokens.txt"],
     "size_mb": 520,
-    "_file_note": "2026-09-28 本机 gh-proxy 直下实测 520,516,278B（与官方 gh release asset 字节数逐字相同）→ sha256 1da8b737…。解包后 model.int8.onnx **775,861,420B(740MiB)** + tokens.txt 79,172B（现役 SenseVoice 仅 239MB，这是 3.3×；/data/models 需 ~777MB，下载期另有 .part 520MB）。它是 FireRedASR2-AED 同一份权重**只取 encoder + CTC 分支**的导出、attention decoder 被排除（导出方官方文档明写）⇒ 官方那张 3.05% CER 表是 AED/LLM 口径，**此档无任何公开 CER/WER**，属实测对比档。sherpa-onnx 支持落在 1.12.27（我们 requirements >=1.13.4,<1.14 区间已含，构造签名 v1.13.4 实测无 sample_rate 形参）。与 SenseVoice 一样**不吃热词**。hf-mirror 该包实测 404⇒不设第三源，逃生门 /data/models/import/。v1.2.4 起为**默认档**（default_provider=true，进 E2E 就绪门必检集）；SenseVoice 降为回落档、同留 true——回落档不在盘则 fail-open 形虚。换档依据＝用户 2026-10-07 .91 真机对比（更好且更快：CTC 非自回归，无逐 token 生成开销），**不是** CER 表：本档至今无公开 CER（CTC 导出丢了 attention decoder），我们自己的同句 A/B 也还欠着。",
+    "_file_note": "2026-09-28 本机 gh-proxy 直下实测 520,516,278B（与官方 gh release asset 字节数逐字相同）→ sha256 1da8b737…。解包后 model.int8.onnx **775,861,420B(740MiB)** + tokens.txt 79,172B（现役 SenseVoice 仅 239MB，这是 3.3×；/data/models 需 ~777MB，下载期另有 .part 520MB）。它是 FireRedASR2-AED 同一份权重**只取 encoder + CTC 分支**的导出、attention decoder 被排除（导出方官方文档明写）⇒ 官方那张 3.05% CER 表是 AED/LLM 口径，**此档无任何公开 CER/WER**，属实测对比档。sherpa-onnx 支持落在 1.12.27（我们 requirements >=1.13.4,<1.14 区间已含，构造签名 v1.13.4 实测无 sample_rate 形参）。与 SenseVoice 一样**不吃热词**。hf-mirror 该包实测 404⇒不设第三源，逃生门 /data/models/import/。v1.2.4 起为默认档；**2026-10-07 晚转回落档**（默认换 AED；default_provider=false——就绪门必检集只认默认档，回落档留在里面＝门等一个没人下的模型，v1.2.4 超时实伤同型）。换档依据＝用户 .91 真机对比（更快：非自回归无逐 token 生成开销），**不是** CER 表：本档无公开 CER（CTC 导出丢了 attention decoder）。",
     "urls": [
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25.tar.bz2"
@@ -58,13 +46,13 @@
   },
   "asr_firered_aed": {
     "display_name": "STT · FireRedASR2-AED 中英 (int8)",
-    "default_provider": false,
+    "default_provider": true,
     "tarball": "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2",
     "sha256": "43015b3f1643a5688b4821e8ed323473d38b798c4ec291471fe00df1bcfc4f1c",
     "top_dir": "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26",
     "required_files": ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"],
     "size_mb": 800,
-    "_file_note": "2026-10-07 本机 gh-proxy 直下实测 838,589,068B（与官方 gh release asset 字节数逐字相同）→ sha256 43015b3f…。解包 1.23GB：encoder.int8.onnx 817,286,833 + decoder.int8.onnx 417,291,928 + tokens.txt 79,172（现役 CTC 档 model.int8.onnx 775,861,420，这是 1.6×）。它是 FireRedASR2 的 **AED 分支**（encoder + attention decoder 都在），与 CTC 档同源权重但解码形状不同：官方 3.05% 那张中文 CER 表**就是 AED/LLM 口径**（CTC 导出丢了 attention decoder，无公开 CER）⇒ 这一档反而是家族里唯一有官方数字的。接入入口 from_fire_red_asr 实测 12 参：**没有 sample_rate**（照 SenseVoice 传参＝TypeError，与 CTC 档同坑）、**没有 hotwords**、有 hr_* 同音替换 FST 挂点。开发机实测（num_threads=2，非 4核8G 靶机）：加载 3.25s、RTF 0.31-0.38、峰值 RSS 1813MB；同 6 句 SenseVoice RTF 0.02/RSS 370MB ⇒ AED 慢约 15×（自回归 decoder），仍 <1 可用。中文同音段 AED 更稳（「一般现在时」vs SV「一般现代时」、「频繁」vs「平凡」），但那是**包自带 6 句厂商素材**，不是我们 307 句/真清单，不足以下结论。非默认档、不参与 fail-open、不自动下载。",
+    "_file_note": "2026-10-07 本机 gh-proxy 直下实测 838,589,068B（与官方 gh release asset 字节数逐字相同）→ sha256 43015b3f…。解包 1.23GB：encoder.int8.onnx 817,286,833 + decoder.int8.onnx 417,291,928 + tokens.txt 79,172（现役 CTC 档 model.int8.onnx 775,861,420，这是 1.6×）。它是 FireRedASR2 的 **AED 分支**（encoder + attention decoder 都在），与 CTC 档同源权重但解码形状不同：官方 3.05% 那张中文 CER 表**就是 AED/LLM 口径**（CTC 导出丢了 attention decoder，无公开 CER）⇒ 这一档反而是家族里唯一有官方数字的。接入入口 from_fire_red_asr 实测 12 参：**没有 sample_rate**（照 SenseVoice 传参＝TypeError，与 CTC 档同坑）、**没有 hotwords**、有 hr_* 同音替换 FST 挂点。开发机实测（num_threads=2，非 4核8G 靶机）：加载 3.25s、RTF 0.31-0.38、峰值 RSS 1813MB；同 6 句 SenseVoice RTF 0.02/RSS 370MB ⇒ AED 慢约 15×（自回归 decoder），仍 <1 可用。中文同音段 AED 更稳（「一般现在时」vs SV「一般现代时」、「频繁」vs「平凡」），但那是**包自带 6 句厂商素材**，不是我们 307 句/真清单，不足以下结论。**2026-10-07 晚起为默认档**（default_provider=true，进 E2E 就绪门必检集；回落链 AED→CTC——本档起不来落 CTC，“显式档被顶替＝实测作废”的规矩不变）。",
     "urls": [
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2"

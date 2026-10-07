@@ -23,10 +23,10 @@ class StoreSnap:
     # v1.0.41：快照键形对齐 model_store.snapshot() 真形态 {state,pct,detail,ready}
     # （F6 前端就按此消费；旧的 {"status":…} 假形曾让页面字段错位无人察觉）。
     def snapshot(self):
-        return {"asr_paraformer_bilingual": {"state": "ready", "pct": 100,
+        return {"asr_firered_ctc": {"state": "ready", "pct": 100,
                                              "detail": "已就绪", "ready": True}}
     def is_ready(self, k): return True
-    def keys(self): return ["asr_paraformer_bilingual", "tts_kokoro_multilang"]
+    def keys(self): return ["asr_firered_ctc", "tts_kokoro_multilang"]
     def ensure_async(self, key, force=False): pass  # 对齐 model_store 真签名（M11 接 force）
 
 
@@ -208,8 +208,8 @@ def test_settings_roundtrip(admin):
 
 def test_models_and_download(admin):
     st, body = _get(admin, "/api/models")
-    assert st == 200 and "asr_paraformer_bilingual" in json.loads(body)
-    st2, b2 = _post(admin, "/api/models/download", {"key": "asr_paraformer_bilingual"})
+    assert st == 200 and "asr_firered_ctc" in json.loads(body)
+    st2, b2 = _post(admin, "/api/models/download", {"key": "asr_firered_ctc"})
     assert st2 == 200
     st3, _ = _post(admin, "/api/models/download", {"key": "不存在的包"})
     assert st3 == 400

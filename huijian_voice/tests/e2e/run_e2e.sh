@@ -39,7 +39,7 @@ curl -sf http://127.0.0.1:8002/api/health >/dev/null || { diag "health 超时"; 
 
 echo "==== 4. 等运行期所需模型真下载就绪（主档 ASR+Kokoro ≈1.4GB，给 25 分钟）===="
 # v4.2 教训（run 34364440982 实红 25min 超时）：等值集合必须是「运行期 need」，
-# 不能是 lock 全清单——paraformer 已降兼容回落档，新装根本不会主动下载它，
+# 不能是 lock 全清单——回落/对比档新装根本不会主动下载，
 # all(models_ready.values()) 恒 false。
 # v1.1.17：need 集改**从 models.lock 派生**（default_provider:true 的键）——写死模型键
 # 的那版换默认档必漂（test_asr_engine::test_e2e_need_is_derived_from_lock_not_hardcoded

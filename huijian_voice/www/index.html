@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.2.5">
-<link rel="stylesheet" href="css/voice.css?v=1.2.5">
+<link rel="stylesheet" href="css/huijian.css?v=1.2.6">
+<link rel="stylesheet" href="css/voice.css?v=1.2.6">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -80,10 +80,9 @@
         </select></div>
       <div id="sttLocalBox"><label class="hj-field">本地模型（离线引擎切换）</label>
         <select id="stt_local_model">
-          <option value="firered_ctc">FireRedASR2-CTC · 中英+20多种方言（默认，离线整句，包 776MB）</option>
-          <option value="firered_aed">FireRedASR2-AED · 中英（同权重带 attention decoder，中文同音段更稳，慢约 15×，包 1.23GB）</option>
-          <option value="sensevoice">SenseVoice-Small · 中英粤（旧默认，现作回落档）</option>
-          <option value="paraformer">Paraformer · 中英双语流式（逐字出字，兼容回落档）</option>
+          <option value="firered_ctc">FireRedASR2-CTC · 中英+20多种方言（回落档，离线整句，包 776MB）</option>
+          <option value="firered_aed">FireRedASR2-AED · 中英（默认，同权重带 attention decoder，中文同音段更稳，慢约 15×，包 1.23GB）</option>
+          <option value="sensevoice">SenseVoice-Small · 中英粤（小体积可选，离线整句）</option>
         </select></div>
     </div>
     <div id="sttCloudBox" style="display:none">
@@ -204,7 +203,7 @@
   <div class="card"><h3>模型包</h3>
     <table id="modelTable"><thead><tr><th>模型</th><th>状态</th><th>大小/进度</th><th></th></tr></thead><tbody></tbody></table>
     <div class="hint">下载中断可直接点重试（断点校验 sha256）。手动投放：把<b>解包后</b>的模型目录放到
-      加载项 /data/models/import/&lt;顶层目录名&gt;/（如 sherpa-onnx-streaming-paraformer-bilingual-zh-en/），重启即可识别，零网络。</div>
+      加载项 /data/models/import/&lt;顶层目录名&gt;/（如 sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/），重启即可识别，零网络。</div>
   </div>
   <div class="card"><h3>热操作</h3>
     <button class="act gray" id="reloadBtn">释放/重载模型（改配置后想立即生效可点）</button>
@@ -316,7 +315,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.2.5";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.2.6";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -366,7 +365,7 @@ const VOICE_HINTS = {
 };
 const TTS_SID_OWNER = "local_kokoro";   // tts.sid 的写权只属 Kokoro 档：单音色/云档保存时不提交
 let _kokoroSid = null;                  // Kokoro 档记住的选择（切档再切回不丢，含自定义音色主名）
-const MODEL_NAMES = {asr_sensevoice_small:"STT · SenseVoice-Small 中英粤", asr_paraformer_bilingual:"STT · Paraformer 中英双语流式", asr_firered_ctc:"STT · FireRedASR2-CTC 中英+方言", tts_kokoro_multilang:"TTS · Kokoro 多语包"};
+const MODEL_NAMES = {asr_sensevoice_small:"STT · SenseVoice-Small 中英粤", asr_firered_ctc:"STT · FireRedASR2-CTC 中英+方言", asr_firered_aed:"STT · FireRedASR2-AED 中英", tts_kokoro_multilang:"TTS · Kokoro 多语包"};
 const $ = s => document.querySelector(s);
 /* Ingress 适配（网关同款实证）：页面挂在 /api/hassio_ingress/<token>/ 下，
    根绝对路径 fetch 会打到 HA Core。由 location.pathname 推导前缀；
@@ -422,7 +421,7 @@ async function refreshStatus(){ if (_stBusy) return; _stBusy = true;   // v1.1.2
                                  : `<span class="pill ok">正常 ${up}</span>`),
       statRow("HA 桥接", st.ha_bridge?pill("在线","ok")
         :pill("不可达","bad")+(st.ha_error?`<span class="hint" style="margin-left:8px">${esc0(String(st.ha_error).slice(0,60))}</span>`:"")),
-      statRow("STT 引擎", st.stt_loaded?pill("已加载 · "+(st.stt_kind==="paraformer"?"Paraformer 流式":st.stt_kind==="sensevoice"?"SenseVoice":st.stt_kind==="firered_ctc"?"FireRedASR2-CTC":(st.stt_kind||"本地")),"ok"):pill("未就绪","warn")),
+      statRow("STT 引擎", st.stt_loaded?pill("已加载 · "+(st.stt_kind==="sensevoice"?"SenseVoice":st.stt_kind==="firered_ctc"?"FireRedASR2-CTC":st.stt_kind==="firered_aed"?"FireRedASR2-AED":(st.stt_kind||"本地")),"ok"):pill("未就绪","warn")),
       statRow("TTS 引擎", st.tts_loaded?pill("已加载","ok"):pill("未就绪","warn")),
       statRow("意图分类", st.textcnn?pill("可用","ok"):pill("缺资产","warn")),
       statRow("本地理解", st.nlu_enabled!==false?pill("已启用","ok")
@@ -510,14 +509,14 @@ async function loadSettings(){
   _kokoroSid = String(S.tts.sid ?? KOKORO_DEFAULT_SID);   // Kokoro 档的选择；音色表由 syncBoxes() 按引擎重建
   $("#tts_speed").value = S.tts.speed ?? 1.25;
   $("#stt_provider").value = String(S.stt.provider||"").startsWith("cloud") ? "cloud" : "local_paraformer";
-  // v1.0.99+ 本地模型切换（stt.local_model：firered_ctc|sensevoice|paraformer）：
+  // v1.0.99+ 本地模型切换（stt.local_model：firered_ctc|firered_aed|sensevoice）：
   // 未知值按默认档显示（引擎读侧同判据——_primary_kind 非表值一律回落 _DEFAULT_KIND）。
-  // 旧写法是 paraformer/其余 的二元三元式：第三档会被显示成默认档（用户以为切了
+  // 旧写法是「第一档/其余」的二元式：后续档会被显示成默认档（用户以为切了
   // 实际没切，且下一次保存静默改写 settings），故改成员判断。
-  // v1.2.4 默认档＝FireRedASR2-CTC：白名单与"回落显示值"两处都跟着改，
+  // 默认档随换档走（现＝FireRedASR2-AED）：白名单与"回落显示值"两处都跟着改，
   // 写死旧默认＝面板显示一个档、引擎跑另一个档（本仓记过的显示/读侧不同形同族坑）。
-  const _STT_KINDS = ["firered_ctc", "firered_aed", "sensevoice", "paraformer"];
-  $("#stt_local_model").value = _STT_KINDS.includes(S.stt.local_model) ? S.stt.local_model : "firered_ctc";
+  const _STT_KINDS = ["firered_ctc", "firered_aed", "sensevoice"];
+  $("#stt_local_model").value = _STT_KINDS.includes(S.stt.local_model) ? S.stt.local_model : "firered_aed";
   // v1.0.65（TTS 深审 F11）：云档存在两个"正统"拼法（引擎读侧 startswith
   // ("cloud") 双吃：UI 的 "cloud" 与 settings 注释/测试沿用的
   // "cloud_openai_compat"）。旧版严格判等：手改的 cloud_openai_compat 下拉框
@@ -1101,6 +1100,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.2.5"></script>
+<script src="js/starsky.js?v=1.2.6"></script>
 </body>
 </html>

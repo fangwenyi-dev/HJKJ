@@ -3226,6 +3226,31 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
 
+## [1.2.6] - 2026-10-07 · 默认 STT 换 FireRedASR2-AED；铲掉「Paraformer 中英双语流式」档与流式解码路径
+
+（用户当次两道令：「将 asr_firered_aed 设置为默认 stt」；「STT · Paraformer 中英双语流式 也删除掉」。两条本版一并发出。）
+
+- **默认档换 `firered_aed`**（FireRedASR2-AED 分支，家族里唯一有官方 CER 数字的一档）：回落档转
+  **`firered_ctc`**（上一代默认——"换默认＝把回落目标挪去旧默认"，与 v1.2.4 同规格）；SenseVoice
+  降为小体积可选档。换默认四处同链全改（`_DEFAULT_KIND/_FALLBACK_KIND` 常量、`settings.DEFAULTS`、
+  lock `default_provider`、面板白名单与回填显示值），**E2E 就绪门必检集＝{FireRedASR2-AED, MeloTTS}**
+  （"回落档不进必检集"的老规矩与 v1.2.4 的超时实伤见 v1.2.5 的账）。
+- **删除「STT · Paraformer 中英双语流式」档**（自 v4.2 起是兼容/回落档、v1.2.4 起是回落链第三级）：
+  lock 条目、构造分支、UI 选项、回落链挂点全撤。**库内全部引擎此后均为离线整句形态**——最后一条
+  流式档消失，收流分支与「1s 尾补静音」一并移除（若将来重接流式档，尾补必须做回来——2026-09-08
+  台架实锤的丢尾事故在案）。
+- **回落链最终态（唯一一级）**：默认 AED 起不来 → FireRed-CTC；**显式档（含显式 CTC / SenseVoice）
+  起不来一律不回落**（"对比档被顶替＝用户的实测作废"）。存量 `stt.local_model=paraformer` 的配置经
+  未知值回落**自动迁移到默认档**；未写过 `local_model` 的用户升级即切到 AED（存量显式选择不被静默翻转）。
+- **代价（明写）**：新装首启下载面 tar 520MB → 838,589,068B（解包 1.23GB）；单轮更慢
+  （开发机 RTF 0.31-0.38 vs CTC 0.158-0.234）。收益仍只以用户真机听感为准——我们自己的 307 句/
+  真清单三档同句 A/B 仍欠，本版不写收益数字。
+- 文档面：DOCS、requirements 注释、面板「手动投放」示例目录名随新口径改口。
+- 量具：语音全量 **2785 passed / 8 skipped / 0 failed（collected 2793，含离线金标 83）**；`compileall`；
+  面板内联 JS `node --check`；行尾核过（DOCS 仍 CRLF，其余 LF 未翻）。
+- 仍未收口：三档同句 A/B、真机 dry 轮（.91 可达时）、AED 靶机 RTF/RSS。
+
+
 ## [1.2.5] - 2026-10-07 · 接入 FireRedASR2-AED（可选档）＋修 v1.2.4 自己打穿的 E2E 就绪门（本版含 1.2.4 全部改动）
 
 **先说 1.2.4 的账**：`vo-1.2.4` 标签与双推都在，但那一版 **从未发布**——CI run 的

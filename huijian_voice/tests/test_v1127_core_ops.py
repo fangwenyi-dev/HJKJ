@@ -334,7 +334,7 @@ def _admin_port(store):
 
 def test_model_download_reports_single_flight_refusal():
     """单飞未受理时不得回 ok:true——「强制重取」被报成已受理＝M11 逃生门被抵消。"""
-    key = "asr_paraformer_bilingual"
+    key = "asr_firered_ctc"
     store = _StoreSingleFlight(key, busy=True)
     port, srv = _admin_port(store)
     try:

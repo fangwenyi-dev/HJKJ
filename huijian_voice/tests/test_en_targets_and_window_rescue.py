@@ -213,11 +213,13 @@ def test_bilingual_targets_idempotent_on_pure_cn():
 def test_asr_model_key_follows_local_model(settings):
     from core.asr import AsrEngine
     eng = AsrEngine(settings, None)
-    assert eng.model_key == "asr_firered_ctc"              # v1.2.4 默认档
-    settings.update({"stt": {"local_model": "paraformer"}})  # Web 保存的写入形
-    assert eng.model_key == "asr_paraformer_bilingual"
+    assert eng.model_key == "asr_firered_aed"              # 默认档（2026-10-07 晚换）
+    settings.update({"stt": {"local_model": "firered_ctc"}})  # Web 保存的写入形（回落档）
+    assert eng.model_key == "asr_firered_ctc"
+    settings.update({"stt": {"local_model": "paraformer"}})  # 已删档的存量配置
+    assert eng.model_key == "asr_firered_aed"              # 未知值回落**当前**默认
     settings.update({"stt": {"local_model": "garbage"}})
-    assert eng.model_key == "asr_firered_ctc"              # 未知值回落**当前**默认
+    assert eng.model_key == "asr_firered_aed"
     settings.update({"stt": {"local_model": "sensevoice"}})
     assert eng.model_key == "asr_sensevoice_small"          # 存量显式档不得被换档吃掉
 
@@ -229,7 +231,7 @@ def test_www_local_model_selector_wired():
     assert 'local_model:$("#stt_local_model").value' in html, "保存体未带 local_model"
     assert '_STT_KINDS.includes(S.stt.local_model)' in html, \
         "loadSettings 未回填选择（须成员判断：二元式会把第三档显示成默认档）"
-    assert '"paraformer"' in html and "stt_kind" in html, "状态卡未显示在载引擎"
+    assert '"firered_ctc"' in html and "stt_kind" in html, "状态卡未显示在载引擎"
 
 
 # ── ④ 2026-09-30 数据集对账批：电动窗六表同步 + 帘字防吞 + 动态区域表 ──

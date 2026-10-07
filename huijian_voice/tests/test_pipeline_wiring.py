@@ -44,10 +44,13 @@ def test_config_flow_abort_signature_matches_core():
     assert "async def async_abort" not in cf, "abort 覆写不得是协程"
 
 
-def test_asr_tail_padding_present():
-    """v1.0.18：流式 Paraformer 收流前必须尾补静音（台架仿真实锤丢尾词）。"""
+def test_asr_streaming_tail_padding_stays_removed():
+    """2026-10-07：最后一条流式档（Paraformer）删除后，收流调用与 1s 尾补静音一并
+    移除，全部引擎为离线整句解码。若将来重新接流式档却忘了配尾补，2026-09-08
+    台架实锤的丢尾词事故（「打开办公室射灯」→「打开办公室射」）会回来——本钉直接红。"""
     asr = (Path(__file__).resolve().parents[1] / "core" / "asr.py").read_text(
         encoding="utf-8")
     body = asr.split("def _local_transcribe", 1)[1]
-    feed = body.index("stream.input_finished()")
-    assert "0.0] * const.SAMPLE_RATE" in body[:feed], "input_finished 前须补 ≥1s 静音"
+    for banned in ("stream.input_finished()", "rec.is_ready(", "rec.get_result_all("):
+        assert banned not in body, \
+            f"流式收流调用回魂：{banned}（接流式档必须一起做 1s 尾补静音）"

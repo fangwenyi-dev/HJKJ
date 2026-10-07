@@ -651,11 +651,11 @@ def test_readiness_exposes_fallback_that_old_green_light_hid():
     这是"面板看着一切正常、实际跑的不是所选嗓/引擎"的唯一机器可读出口。"""
     from core.ws_server import _readiness
     body = _readiness(_ready_ctx(
-        _ReadyASR(loaded="paraformer", stale=True),
-        {"asr_sensevoice_small": "pending", "asr_paraformer_bilingual": "ready"}))
+        _ReadyASR(key="asr_firered_aed", loaded="firered_ctc", stale=True),
+        {"asr_firered_aed": "pending", "asr_firered_ctc": "ready"}))
     assert body["asr_ready"] is True, "回落也算在载：watchdog 判据不回退"
     assert body["asr_fallback_in_use"] is True
-    assert body["asr_loaded_model"] == "paraformer"
+    assert body["asr_loaded_model"] == "firered_ctc"
     assert body["asr_model_state"] == "pending"
 
 
@@ -670,23 +670,23 @@ def test_readiness_unknown_engine_key_is_not_a_crash():
 def test_readiness_state_prefers_on_disk_over_download_ledger():
     """快照的 state 是**下载进度台账**，只有 `_loop_models` 真去 ensure() 过某个键才会
     写成 ready；而它对"已在盘"的键根本不进 pend ⇒ 引擎载得好好的、state 却永远停在
-    初值 "pending"。1.1.13 上线当天家里实测正是这个形状（paraformer 在载 + 全部 pending），
+    初值 "pending"。1.1.13 上线当天家里实测正是这个形状（引擎在载 + 全部 pending），
     只读 state 会把健康报成待取。判据：在盘＝ready，不在盘才谈进度。"""
     from core.ws_server import _readiness
     class _Store:
         def snapshot(self):
-            return {"asr_paraformer_bilingual":
+            return {"asr_sensevoice_small":
                     {"state": "pending", "ready": True, "pct": 0}}
-    ctx = AppContext(asr=_ReadyASR(key="asr_paraformer_bilingual", loaded="paraformer"),
+    ctx = AppContext(asr=_ReadyASR(key="asr_sensevoice_small", loaded="sensevoice"),
                      tts=_Tts(), store=_Store())
     body = _readiness(ctx)
     assert body["asr_model_state"] == "ready", "在盘必须判 ready，不许报 pending"
     # 对照：同一条台账把 ready 撤掉 ⇒ 必须立刻回到如实的 pending（钉不是恒答 ready）
     class _Store2:
         def snapshot(self):
-            return {"asr_paraformer_bilingual":
+            return {"asr_sensevoice_small":
                     {"state": "pending", "ready": False, "pct": 0}}
-    ctx2 = AppContext(asr=_ReadyASR(key="asr_paraformer_bilingual", loaded="paraformer"),
+    ctx2 = AppContext(asr=_ReadyASR(key="asr_sensevoice_small", loaded="sensevoice"),
                       tts=_Tts(), store=_Store2())
     assert _readiness(ctx2)["asr_model_state"] == "pending"
 
@@ -766,7 +766,7 @@ def test_healthz_models_field_prefers_on_disk_ready(server):
     class _Store:
         def snapshot(self):
             return {"tts_kokoro_multilang": {"state": "pending", "ready": True},
-                    "asr_paraformer_bilingual": {"state": "failed", "ready": False}}
+                    "asr_sensevoice_small": {"state": "failed", "ready": False}}
 
     ctx.store = _Store()
 
@@ -775,5 +775,5 @@ def test_healthz_models_field_prefers_on_disk_ready(server):
             async with sess.get(f"http://127.0.0.1:{port}/healthz") as r:
                 body = await r.json()
                 assert body["models"]["tts_kokoro_multilang"] == "ready", body["models"]
-                assert body["models"]["asr_paraformer_bilingual"] == "failed", body["models"]
+                assert body["models"]["asr_sensevoice_small"] == "failed", body["models"]
     _run(go())
