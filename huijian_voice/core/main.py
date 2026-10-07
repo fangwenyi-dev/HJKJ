@@ -87,9 +87,6 @@ class Service:
         self.klar = KlarClient(self.settings)
         self.pipeline = Pipeline(self.settings, self.ha, self.scenes, self.textcnn,
                                  self.executor, agent=self.agent, klar=self.klar)
-        # v1.2.3：吃热词的 STT 档（qwen3_asr/funasr_nano）与级联改写层共用同一份本家名。
-        # 懒取（构造 recognizer 时才读），装配顺序无碍；provider 为空/异常＝不喂热词。
-        self.asr.set_hotwords_provider(self.pipeline.prior_universe)
         self.host = local_ip()
         self.ctx = AppContext(settings=self.settings, ha=self.ha, asr=self.asr, tts=self.tts,
                               pipeline=self.pipeline, scenes=self.scenes, textcnn=self.textcnn,

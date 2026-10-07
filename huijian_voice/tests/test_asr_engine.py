@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import asr as asr_mod                      # noqa: E402
-from core.asr import AsrEngine, KEY_PF, KEY_SV       # noqa: E402
+from core.asr import AsrEngine, KEY_FR, KEY_PF, KEY_SV  # noqa: E402
 
 
 class S:
@@ -118,7 +118,8 @@ def make_engine(settings, store, fail_kinds=()):
     def fake_build(kind, d):
         if kind in fail_kinds:
             raise RuntimeError(f"boom {kind}")
-        rec = SvRec() if kind == "sensevoice" else PfRec()
+        # 离线档（SenseVoice / FireRed-CTC）用离线形态替身；Paraformer 用流式形态。
+        rec = PfRec() if kind == "paraformer" else SvRec()
         rec._hj_kind = kind
         return rec
 
@@ -131,25 +132,39 @@ PCM = b"\x01\x00" * 8000   # 0.5s s16le@16k
 
 def test_default_kind_and_model_key():
     eng = make_engine(S(), Store())
-    assert eng._primary_kind() == "sensevoice"
-    assert eng.model_key == KEY_SV
+    assert eng._primary_kind() == "firered_ctc", "v1.2.4 起默认档＝FireRedASR2-CTC"
+    assert eng.model_key == KEY_FR
     eng2 = make_engine(S(**{"stt.local_model": "paraformer"}), Store())
     assert eng2.model_key == KEY_PF
     eng3 = make_engine(S(**{"stt.local_model": "瞎写的值"}), Store())
-    assert eng3.model_key == KEY_SV, "未知值必须安全回默认 sensevoice"
+    assert eng3.model_key == KEY_FR, "未知值必须安全回**当前默认档**（回旧默认＝默认档换档时静默裂口）"
+    eng4 = make_engine(S(**{"stt.local_model": "sensevoice"}), Store())
+    assert eng4.model_key == KEY_SV, "存量 settings.json 显式存了 sensevoice 的用户不得被换档"
 
 
-def test_sv_loads_by_default():
-    store = Store(ready_keys={KEY_SV})
+def test_default_arm_loads_when_present():
+    store = Store(ready_keys={KEY_FR, KEY_SV})
     eng = make_engine(S(), store)
     assert eng.ensure_loaded() is True
-    assert eng.loaded_kind() == "sensevoice"
+    assert eng.loaded_kind() == "firered_ctc"
     assert store.ensure_calls == []
 
 
+def test_fallback_to_sensevoice_when_default_arm_broken():
+    """v1.2.4 回落链第一级：默认 FireRed 起不来 → SenseVoice（旧默认、盘上最可能在）。"""
+    store = Store(ready_keys={KEY_FR, KEY_SV, KEY_PF})
+    eng = make_engine(S(), store, fail_kinds=("firered_ctc",))
+    assert eng.ensure_loaded() is True, "主档坏了也必须能识别（fail-open）"
+    assert eng.loaded_kind() == "sensevoice"
+    assert eng.stale_kind() is True
+
+
 def test_fallback_to_paraformer_when_sv_broken():
+    """回落链第二级：用户显式留在 SenseVoice 而它起不来 → Paraformer（v4.2 兼容档，
+    存量用户行为逐值不变）。"""
     store = Store(ready_keys={KEY_SV, KEY_PF})
-    eng = make_engine(S(), store, fail_kinds=("sensevoice",))
+    eng = make_engine(S(**{"stt.local_model": "sensevoice"}), store,
+                      fail_kinds=("sensevoice",))
     assert eng.ensure_loaded() is True, "主档坏了也必须能识别（fail-open）"
     assert eng.loaded_kind() == "paraformer"
     assert eng.stale_kind() is True
@@ -160,11 +175,12 @@ def test_missing_primary_dir_defers_download_and_fails_open():
     executor 线程里跑分钟级跨境下载，设备侧 T_AWAITING=20s 先超时 ⇒ 无应答也无报错。
     现只查在盘，缺失转交后台补取（main._loop_models 本就在带退避重下），当轮快败。
     fail-open 到 Paraformer 的既有行为必须原样保住。"""
-    store = Store(ready_keys={KEY_PF})          # sv 目录缺
+    store = Store(ready_keys={KEY_PF})          # 默认档与回落档都不在盘
     eng = make_engine(S(), store)
     assert eng.ensure_loaded() is True, "主档缺失仍要能识别（fail-open 不回归）"
     assert store.ensure_calls == [], "热路径不得再触发同步下载（分钟级挂死的根因）"
-    assert store.async_calls == [KEY_SV], "缺失必须转交后台补取，否则永远没人下"
+    # v1.2.4 三级链：缺的档逐个转交后台补取（FireRed→SenseVoice→Paraformer，在盘即载）
+    assert store.async_calls == [KEY_FR, KEY_SV], "缺失必须转交后台补取，否则永远没人下"
     assert eng.loaded_kind() == "paraformer"
 
 
@@ -179,7 +195,7 @@ def test_hot_path_does_not_block_on_slow_download():
     assert eng.ensure_loaded() is False, "两档都不在盘＝本轮无结果"
     took = time.perf_counter() - t0
     assert took < 1.0, f"热路径被同步下载挂死（{took:.1f}s）——F3 回归"
-    assert store.async_calls == [KEY_SV, KEY_PF], "快败仍要把两档都推给后台补下"
+    assert store.async_calls == [KEY_FR, KEY_SV, KEY_PF], "快败仍要把链上每一档都推给后台补下"
 
 
 def test_both_dirs_missing_sets_named_reason():
@@ -187,19 +203,37 @@ def test_both_dirs_missing_sets_named_reason():
     store = Store(ready_keys=set())
     eng = make_engine(S(), store)
     assert eng.ensure_loaded() is False
-    assert "模型资产缺失" in eng.last_reason and KEY_SV in eng.last_reason
+    assert "模型资产缺失" in eng.last_reason and KEY_FR in eng.last_reason, eng.last_reason
 
 
 def test_rebind_primary_after_main_arrives():
+    """回落档在载 → 默认档到盘 → 换绑回默认档（v1.2.4 默认＝FireRed）。
+
+    中间那步"回落档先到盘也不换绑"是这条链的承重墙：rebind 只认**主档**在不在盘，
+    否则 SenseVoice 一下载就把默认档的下载成果挤掉，用户永远看不到 FireRed 在跑。
+    """
     store = Store(ready_keys={KEY_PF})
     eng = make_engine(S(), store)
     assert eng.ensure_loaded() and eng.loaded_kind() == "paraformer"
-    store.ready.add(KEY_SV)                     # 后台下载完成
+    store.ready.add(KEY_SV)                     # 回落档先到盘
+    eng._busy = 0
+    reason_before = eng.last_reason
+    queued_before = list(store.async_calls)     # 首载链已把缺失的 FireRed/SenseVoice 推过后台
+    assert eng.rebind_primary() is False, "默认档不在盘时不换绑（rebind 只认主档）"
+    assert eng.loaded_kind() == "paraformer"
+    # guard 真正守的是**副作用**：少了这道 guard，_load_one 会替缺失的主档再 ensure_async
+    # 一遍并把 last_reason 写成"模型资产缺失"——而此刻识别正在回落档上好好跑着，
+    # 面板/回执读到的分因就成了谎话（与"空结果与静音同形"同一类陷阱）。
+    assert store.async_calls == queued_before, \
+        f"rebind 失败不该再推下载：{queued_before} → {store.async_calls}"
+    assert eng.last_reason == reason_before, \
+        f"rebind 失败不该改写分因：{reason_before!r} → {eng.last_reason!r}"
+    store.ready.add(KEY_FR)                     # 默认档下载完成
     eng._busy = 1
     assert eng.rebind_primary() is False, "推理在飞不得换绑"
     eng._busy = 0
     assert eng.rebind_primary() is True
-    assert eng.loaded_kind() == "sensevoice"
+    assert eng.loaded_kind() == "firered_ctc"
     assert eng.stale_kind() is False
 
 
@@ -245,9 +279,25 @@ def test_lock_entry_pins_sensevoice_int8():
 
 
 def test_settings_defaults_local_model_present_for_merge():
-    """存量 settings.json 无 local_model 键——升级后必须靠 DEFAULTS 深合并拿到默认。"""
+    """存量 settings.json 无 local_model 键——升级后必须靠 DEFAULTS 深合并拿到默认。
+
+    v1.2.4 换默认档：这条钉同时是"面板/引擎/就绪门三处同链"的唯一锚点——
+    DEFAULTS 的字面值必须等于 `asr._DEFAULT_KIND`，且必须等于 lock 里
+    `default_provider:true` 的那个**主**档，否则会出现"引擎跑 A、门检 B"。
+    """
+    from core import asr as _a
     from core.settings import DEFAULTS
-    assert DEFAULTS["stt"]["local_model"] == "sensevoice"
+    assert DEFAULTS["stt"]["local_model"] == "firered_ctc"
+    assert DEFAULTS["stt"]["local_model"] == _a._DEFAULT_KIND, \
+        "DEFAULTS 与 asr._DEFAULT_KIND 分叉＝换默认时只改一处（回落判据会跟着失真）"
+    assert _a._FALLBACK_KIND in _a._KIND_KEY
+    lock = json.loads((Path(__file__).resolve().parents[1] / "models.lock.json")
+                      .read_text(encoding="utf-8"))
+    must_be_on_disk = {k for k, v in lock.items()
+                       if isinstance(v, dict) and v.get("default_provider")}
+    assert {m for m in must_be_on_disk if m.startswith("asr_")} == {
+        _a._KIND_KEY[_a._DEFAULT_KIND], _a._KIND_KEY[_a._FALLBACK_KIND]}, \
+        f"就绪门必检集必须＝{{默认档, 回落档}}（回落档不在盘则 fail-open 形虚）：{sorted(must_be_on_disk)}"
     assert DEFAULTS["stt"]["provider"] == "local_paraformer", "provider 值空间兼容 pin 不得改"
 
 
@@ -292,11 +342,12 @@ def test_e2e_need_is_derived_from_lock_not_hardcoded():
     lock = json.loads((root / "models.lock.json").read_text(encoding="utf-8"))
     want = {k for k, v in lock.items()
             if isinstance(v, dict) and v.get("default_provider")}
-    assert want == {KEY_SV, PROVIDER_MODEL_KEYS[DEFAULTS["tts"]["provider"]]}, want
+    assert want == {KEY_FR, KEY_SV, PROVIDER_MODEL_KEYS[DEFAULTS["tts"]["provider"]]}, \
+        f"就绪门必检集＝{{默认档, 回落档, 默认 TTS}}：{sorted(want)}"
     for rel in ("tests/e2e/run_e2e.sh", "tests/e2e/run_local.sh"):
         src = (root / rel).read_text(encoding="utf-8")
         assert "default_provider" in src, f"{rel}: need 集未从 lock 派生（写死的键会漂）"
-        for hard in (KEY_SV, "tts_melo_zh_en", "tts_kokoro_multilang"):
+        for hard in (KEY_SV, KEY_FR, "tts_melo_zh_en", "tts_kokoro_multilang"):
             assert hard not in src, f"{rel}: need 集仍写死 {hard}"
         # v1.1.36（2026-10-01）：就绪门必须看**引擎真装态**。
         # ⚠ 这条第一轮写成 `assert "asr_loaded" in src` —— 被我自己写的注释逐字

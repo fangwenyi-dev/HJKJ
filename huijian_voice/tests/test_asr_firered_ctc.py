@@ -6,14 +6,15 @@
   ② 该档是 **OfflineRecognizer**（CTC 非自回归），必须走离线单次解码路径；
      现役流式分支（补 1s 尾静音 + is_ready/get_result_all）是 Paraformer 形态，
      CTC recognizer 按那套调用就是空结果；
-  ③ 显式选它做主档而构建失败时**不得静默回落 Paraformer**——否则回落档的识别
-     结果会被当成 FireRed 的成绩，用户的对比实测直接失效（与"识别错、动作对、
-     话术报成功"同一类陷阱）；
+  ③ v1.2.4 起它是**默认档**：构建失败必须 fail-open，但只允许落 SenseVoice，
+     不得由 Paraformer 顶上来（当年它因"丢尾字"被降级，无声顶替＝把已知有病的档
+     塞回主链）；两级都坏时分因点的是**所选那档**；
   ④ 构造参数必须落在 sherpa-onnx v1.13.4 的真实签名内（该工厂函数**没有
      sample_rate 形参**，沿用 SenseVoice 那套传参＝TypeError→现场"模型加载失败"）；
-  ⑤ Web 下拉第三项 + loadSettings 如实回填（未知值仍按默认档显示，与引擎读侧
-     _primary_kind 的回落判据同形）。
+  ⑤ Web 下拉第一项 + loadSettings 如实回填（未知值仍按默认档显示，且面板的
+     "回落显示值"必须与引擎 `_DEFAULT_KIND` 同形——写死旧默认＝显示一个档、跑另一个档）。
 """
+import re
 import sys
 import types
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import asr as asr_mod                       # noqa: E402
-from core.asr import AsrEngine, KEY_PF, KEY_SV        # noqa: E402
+from core.asr import AsrEngine, KEY_FR, KEY_PF, KEY_SV  # noqa: E402
 
 PCM = b"\x01\x00" * 8000      # 0.5s s16le@16k → 8000 采样
 
@@ -74,15 +75,19 @@ class FrRec:
         pass
 
 
-def _engine(settings, store, kind_returned="firered_ctc", fail_kinds=()):
-    """_build_recognizer 打桩：返回**离线形态**的 CTC recognizer 替身。"""
+def _engine(settings, store, kind_returned=None, fail_kinds=()):
+    """_build_recognizer 打桩：返回**离线形态**的 CTC recognizer 替身。
+
+    `kind_returned=None` ⇒ 按实际被加载的那一档打标（测回落链必须用这个，
+    否则"落到 SenseVoice"会被记成"还是 FireRed 在载"，链走没走看不出来）。
+    """
     eng = AsrEngine(settings, store)
 
     def fake_build(kind, d):
         if kind in fail_kinds:
             raise RuntimeError(f"boom {kind}")
         rec = FrRec()
-        rec._hj_kind = kind_returned
+        rec._hj_kind = kind if kind_returned is None else kind_returned
         return rec
 
     eng._build_recognizer = fake_build
@@ -103,8 +108,8 @@ def test_firered_kind_resolves_to_its_own_lock_key():
     eng = AsrEngine(S(**{"stt.local_model": "firered_ctc"}), Store())
     assert eng._primary_kind() == "firered_ctc"
     assert eng.model_key == key
-    # 默认档不得被这次接线翻掉（存量 settings 无该键时仍 SenseVoice）
-    assert AsrEngine(S(), Store()).model_key == KEY_SV
+    # v1.2.4：FireRed **就是**默认档（这条从"不得翻默认"改成"默认就是它"）
+    assert AsrEngine(S(), Store()).model_key == KEY_FR
 
 
 def test_firered_decodes_offline_single_pass_no_tail_pad():
@@ -118,17 +123,38 @@ def test_firered_decodes_offline_single_pass_no_tail_pad():
     assert eng._rec.stream.n == 8000, "CTC 不得补尾静音（8000 采样即整句）"
 
 
-def test_firered_build_failure_does_not_silently_fall_back():
-    """对比档失败不得用 Paraformer 顶替：那会把回落成绩记成 FireRed 的。"""
+def test_firered_as_default_falls_back_to_sensevoice_only():
+    """v1.2.4 换默认档 ⇒ 旧判据「FireRed 失败不回落」随之作废：那是"显式对比档"的规矩，
+    留着它等于把"默认档挂了整条语音就没识别"写死成判据。
+
+    新链条（两级，每级只认当下主档的位置）：
+      默认 FireRed 坏 → **只允许**落 SenseVoice；Paraformer 不得顶上来（它是第三级，
+      且当年因"丢尾字"被降级，无声顶替＝把已知有病的档塞回主链）。
+    """
     key = _fr_key()
     store = Store(ready_keys={key, KEY_SV, KEY_PF})
     eng = _engine(S(**{"stt.local_model": "firered_ctc"}), store,
-                  kind_returned="firered_ctc", fail_kinds=("firered_ctc",))
-    assert eng.ensure_loaded() is False, "所选档起不来必须如实失败"
-    assert eng.loaded_kind() != "paraformer", "静默回落＝对比实测失效"
-    # 分因要说清是**所选那档**失败（现场口径与其他两档同形：报 kind，非 lock 键名）
+                  fail_kinds=("firered_ctc",))
+    assert eng.ensure_loaded() is True, "默认档起不来必须 fail-open，不能整轮哑"
+    assert eng.loaded_kind() == "sensevoice", f"回落落点不对：{eng.loaded_kind()}"
+    assert eng.stale_kind() is True, "回落档在载必须标记为待换绑（主档就绪即换回）"
+
+
+def test_firered_and_sensevoice_both_broken_reports_chosen_arm():
+    """整条链都起不来时报的是**所选那档**，不是回落尝试链的最后一条。
+
+    三级都要断：FireRed 与 SenseVoice 是"在盘但构建炸"，Paraformer 是"不在盘"
+    （它若在盘且能建，链就该成功——那是上一条钉的形状，不是这条的）。
+    """
+    key = _fr_key()
+    store = Store(ready_keys={key, KEY_SV})
+    eng = _engine(S(**{"stt.local_model": "firered_ctc"}), store,
+                  fail_kinds=("firered_ctc", "sensevoice"))
+    assert eng.ensure_loaded() is False
     assert "firered_ctc" in (eng.last_reason or "") and "加载失败" in eng.last_reason, \
         f"失败要带得出具名分因：{eng.last_reason!r}"
+    assert eng.loaded_kind() == "", "整条链都没起来时不得留下'已加载'的假象"
+    assert store.async_calls == [KEY_PF], "缺失的第三级仍要转交后台补取"
 
 
 def test_firered_build_passes_only_supported_kwargs():
@@ -167,13 +193,26 @@ def test_firered_build_passes_only_supported_kwargs():
 def test_www_firered_option_wired_and_roundtrip():
     html = (Path(__file__).resolve().parents[1] / "www" / "index.html").read_text(
         encoding="utf-8")
-    assert '<option value="firered_ctc">' in html, "下拉缺第三档"
+    assert '<option value="firered_ctc">' in html, "下拉缺 FireRed 档"
     assert "_STT_KINDS.includes(S.stt.local_model)" in html, \
         "loadSettings 仍是二选一三元式，回填会把 firered 显示成默认档"
+    # v1.2.4：回填失败时的"回落显示值"必须等于引擎的默认档。写死旧默认＝面板显示
+    # 一个档、引擎跑另一个档，且下一次保存会静默把 settings 改写成面板那个值。
+    m = re.search(r'_STT_KINDS\.includes\(S\.stt\.local_model\)[^\n]*:\s*"([a-z_]+)"', html)
+    assert m, "找不到 loadSettings 的回落显示值（回填形状变了，本钉失去对象）"
+    from core import asr as _a
+    assert m.group(1) == _a._DEFAULT_KIND, \
+        f"面板回落显示 {m.group(1)} ≠ 引擎默认档 {_a._DEFAULT_KIND}"
 
 
-def test_lock_entry_firered_ctc_is_measured_and_non_default():
-    """lock 条目必须落在**实测**字节上：sha256/实名来自 2026-09-28 gh-proxy 直下。"""
+def test_lock_entry_firered_ctc_is_measured_and_now_default():
+    """lock 条目必须落在**实测**字节上：sha256/实名来自 2026-09-28 gh-proxy 直下。
+
+    v1.2.4 换默认档：`default_provider` 由 false 转 true，于是"开机首启会下 776MB"
+    从"对比档才有的代价"变成**所有新装客户的默认代价**。这不是可以悄悄接受的细节——
+    回落档 SenseVoice 只有 239MB，所以本版的下载面从 239MB 抬到 776MB。
+    钉在这里是为了让下一次换默认时，这个数必须被人看见并改口。
+    """
     import json
     lock = json.loads((Path(__file__).resolve().parents[1] / "models.lock.json")
                       .read_text(encoding="utf-8"))
@@ -183,4 +222,5 @@ def test_lock_entry_firered_ctc_is_measured_and_non_default():
     assert e["top_dir"] == "sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25"
     assert e["urls"][0].startswith("https://gh-proxy.com/"), "第一源必须国内可达"
     assert len(e["urls"]) == 2, "hf-mirror 该包实测 404，不得挂死源（逃生门是 import/）"
-    assert e["default_provider"] is False, "对比档不得进默认集（否则开机就下 776MB）"
+    assert e["default_provider"] is True, "v1.2.4 起它是默认档，必须进 E2E 就绪门必检集"
+    assert e["size_mb"] == 520, "tar 实测 520,516,278B ⇒ 字节闸(_DL_ABS_MAX_BYTES×1.5)按它算"

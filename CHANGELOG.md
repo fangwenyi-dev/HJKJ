@@ -3226,6 +3226,44 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
 
+## [1.2.4] - 2026-10-07 · 删掉两档热词引擎，默认 STT 换成 FireRedASR2-CTC（同日回退 v1.2.3 的引擎接线）
+
+用户在 .91 真机升级后对比：FireRedASR2-CTC 识别更好、且明显快于 Qwen3-ASR / FunASR-nano。
+据此删两档、把默认档换过去。**v1.2.3 那两刀（别名进先验、近音档、先验单口）全部保留**，
+被撤的只有引擎接线那一半。
+
+- **删除** `asr_qwen3_asr_06b` / `asr_funasr_nano`：`core/asr.py` 的两条构造分支、
+  `set_hotwords_provider()`/`_hotwords_csv()` 取数口、`main.py` 的装配点、`models.lock.json`
+  两条条目（含各自 sha256/urls）、Web 下拉两项与 `_STT_KINDS` 白名单两项。
+  撤除依据（都是当天实测，不是推测）：① 0.6B 自回归解码在 4核8G 上峰值 RSS 1425–1645MB
+  （现役 SenseVoice 370MB），并联两路即超预算；② .91 首跑给出 `hotwords add 209 tokenizer
+  tokens`、`before_audio=218`、`max_total_len 512（model limit 512）` ⇒ 62 条热词吃掉 41% 的
+  KV 预算，随即出现 `Result is truncated. max_new_tokens 128 is too small`；③ 两包系第三方
+  导出件（ModelScope `zengshuishui/*`），官方 CER 榜单不适用，我们自己的同句 A/B 也没跑过。
+- **默认档 → `firered_ctc`**（`settings.DEFAULTS` 与 `asr._DEFAULT_KIND` 同链，钉住不许分叉）。
+  连带三处必须跟着改，缺一处就是"引擎跑 A、面板显示 B、就绪门检 C"：
+  `_primary_kind()` 的未知值回落目标、Web 的 `_STT_KINDS` 与"回落显示值"、
+  `models.lock.json` 的 `default_provider`。
+- **回落链从两级改成三级**：`FireRed → SenseVoice → Paraformer`（用户显式留在 SenseVoice 时
+  仍是 `SenseVoice → Paraformer`，存量行为逐值不变；显式选对比档一律不顶替）。
+  为什么留第三级：升版窗口里靶机常见"FireRed 还在下、SenseVoice 也被清过"，
+  两级链在这段窗口内每轮都无识别——少一级是**可用性回归**，不是简化。
+  `rebind_primary()` 只认主档在不在盘：回落档先到盘不换绑，默认档到盘才换回。
+- **代价（写在这里，不藏在注释里）**：① 新装首启下载面从 239MB（SenseVoice）抬到
+  **776MB**（FireRed tar 520,516,278B／解包 model.int8.onnx 775,861,420B），回落档 SenseVoice
+  同留 `default_provider=true`（回落档不在盘＝fail-open 形虚）；② 本加载项**再无任何档消费
+  解码期热词**——"清单当热词"退回成只有解码后的同音/近音改写层（零 token 成本、全档共用，
+  但救不到少字与声学丢音）；③ 存量 settings.json 里没写过 `local_model` 键的用户，
+  升版本即**静默换识别引擎**（显式存过 sensevoice 的不受影响）。
+- **换档依据的强度要标清**：这是"用户真机主观对比＋非自回归天然快"，**不是** CER 表。
+  FireRedASR2-CTC 至今无公开 CER（它是 AED 同权重只取 encoder+CTC 分支的导出，
+  attention decoder 被排除，官方 3.05% 那张表是 AED/LLM 口径），我们自己的同句 A/B 也还欠着。
+
+**量具**：语音全量 **2780 passed / 8 skipped / 0 failed**（collected 2788，含离线金标 83 零回退）；
+`compileall` 覆盖 core+tests+custom_components；改既有钉 9 条（默认档/回落链/就绪门必检集/
+e2e 派生集/rebind 语义/UI 三处同链），新增钉 3 条（三级链逐级、整链断掉点所选那档、
+DEFAULTS 与 _DEFAULT_KIND 同链＋就绪门＝{默认档,回落档}）；变异六臂各自只打中该打的钉。
+
 ## [1.2.3] - 2026-10-07 · 远场批第三刀：别名与近音档进先验 + 首次接入「解码期吃热词」的 STT
 
 四件事。前两件是识别侧收窄与补口，后两件把"热词"第一次做到解码期。

@@ -213,11 +213,13 @@ def test_bilingual_targets_idempotent_on_pure_cn():
 def test_asr_model_key_follows_local_model(settings):
     from core.asr import AsrEngine
     eng = AsrEngine(settings, None)
-    assert eng.model_key == "asr_sensevoice_small"          # 默认档
+    assert eng.model_key == "asr_firered_ctc"              # v1.2.4 默认档
     settings.update({"stt": {"local_model": "paraformer"}})  # Web 保存的写入形
     assert eng.model_key == "asr_paraformer_bilingual"
     settings.update({"stt": {"local_model": "garbage"}})
-    assert eng.model_key == "asr_sensevoice_small"          # 未知值回落默认
+    assert eng.model_key == "asr_firered_ctc"              # 未知值回落**当前**默认
+    settings.update({"stt": {"local_model": "sensevoice"}})
+    assert eng.model_key == "asr_sensevoice_small"          # 存量显式档不得被换档吃掉
 
 
 def test_www_local_model_selector_wired():
