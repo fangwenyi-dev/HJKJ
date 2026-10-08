@@ -374,6 +374,7 @@ def test_p1_tts_rebind_probes_target_before_unload():
         def __init__(self):
             self.probe_when_loaded = []
             self.ensure_calls = []
+            self.kicked = []
 
         def lock_entry(self, key):
             return {}
@@ -382,9 +383,12 @@ def test_p1_tts_rebind_probes_target_before_unload():
             self.probe_when_loaded.append(engine._tts is not None)
             return None          # 目标档未就绪（缺 vocos / 未下完 同形）
 
-        def ensure(self, key):
+        def ensure(self, key, force=False):
             self.ensure_calls.append(key)
             return False
+
+        def ensure_async(self, key, force=False):
+            self.kicked.append(key)
 
         def voices_count_for(self, key):
             return 0
@@ -404,7 +408,10 @@ def test_p1_tts_rebind_probes_target_before_unload():
         "目标档未就绪时不得卸掉在载旧嗓（旧序：卸完再验 ⇒ 两档皆无=彻底哑）"
     assert store.probe_when_loaded and store.probe_when_loaded[0] is True, \
         "就绪性探测必须发生在卸旧嗓之前（顺序钉）"
-    assert store.ensure_calls, "未就绪要走备料，否则下一轮等不到换绑"
+    assert store.kicked, "未就绪要走备料（交后台补取），否则下一轮等不到换绑"
+    assert not store.ensure_calls, \
+        "换绑备料不得在本线程做阻塞下载（tts.ensure_loaded 被 _loop_models 每轮 await，" \
+        "分钟级阻塞＝整条保障循环 parked，STT 预热/换绑一起停）"
     assert not engine.ready_for_current_provider()
 
 

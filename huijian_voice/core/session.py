@@ -179,6 +179,22 @@ class SttSession(BaseSession):
     # 正常语句远小于此；触顶即异常流（无 stop 狂发），丢最旧保顶不再无界涨。
     _MAX_PCM_BYTES = 32000 * 300
 
+    # P0-1（2026-10-07）：**识别**拒收闸，与上面那条**内存**兜底是两条不同的闸——
+    # 累积顶触发时音频照样进引擎，所以它护不住识别代价。默认档换成 FireRedASR2-AED
+    # 后整句解码代价曲线变了两个数量级（开发机 num_threads=2 实测，
+    # _bench/probe_aed_long_utterance.py）：30s→10.99s 解码/+1.88GB，60s→36.13s/
+    # +3.0GB，120s→76.52s/+5.9GB，181s→109.05s/+8.0GB，≥211s 直接 RuntimeError
+    # （ORT encoder 广播失败，该轮无结果）。而 const.STT_RESULT_BUDGET_S=52 那道
+    # wait_for **只截回执不截线程**：解码走 asr.py:321 run_in_executor(None, …)，
+    # 取消 awaitable 取消不掉已在飞的阻塞线程——于是超长轮会一边放客户端走人、
+    # 一边在后台跑满 109s 全程占 8GB；4核8G 靶机上内存先到顶，最坏形状是
+    # OOM→Supervisor 重启循环。取 30s：现网 403 句命令集中位 2.75s/最长 5.88s，
+    # 而那批是合成音（人念更慢更长），留 5 倍冗余，代价实测仍在预算与靶机内存内。
+    _MAX_UTTER_SEC = 30.0
+    # 16k mono s16le；由 const 派生，不写死（写死＝改采样率时秒数与字节数各说各话）
+    _PCM_BYTES_PER_SEC = const.SAMPLE_RATE * 2 * const.CHANNELS
+    _MAX_UTTER_BYTES = int(_PCM_BYTES_PER_SEC * _MAX_UTTER_SEC)
+
     def __init__(self, ws, ctx):
         super().__init__(ws, ctx)
         self._pcm = bytearray()
@@ -280,6 +296,15 @@ class SttSession(BaseSession):
         `_dec_err`（libopus 缺）轮既无 reason 也无兜底，与真静音逐字节同形。
         现在：静音轮不读任何槽位；引擎已就绪但本轮空结果时取**本轮**分因
         （transcribe_pcm_with_reason）；解码器缺失/丢帧各有具名因。"""
+        if len(pcm) > self._MAX_UTTER_BYTES:
+            # P0-1：超上限的整轮**不进引擎**（判据与代价账见 _MAX_UTTER_SEC 注释）。
+            # 拒收而不是截尾：截掉前段再喂＝引擎只听到后半句，"把空调打开不要…"
+            # 这类否定尾巴被留下时，是把"拒收"换成了"误执行"，方向更危险。
+            reason = (f"语音过长 {len(pcm) / self._PCM_BYTES_PER_SEC:.1f}s"
+                      f"（上限 {self._MAX_UTTER_SEC:.0f}s），整轮拒收未进引擎")
+            logger.warning("[STT] %s", reason)
+            await self._reply_stt("", rid, reason)
+            return
         text = ""
         reason = ""       # 本轮具名分因
         eng_reason = ""

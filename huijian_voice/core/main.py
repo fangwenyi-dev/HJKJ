@@ -50,6 +50,18 @@ def _setup_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+# ── 保障循环的两种节奏（2026-10-07，AED 换默认后必须分开）────────────
+#   看盘＝磁盘 stat，便宜，固定 60s；补下载触发＝跨境重活，按**每键**指数退避到 900s。
+# 旧形态把两者绑成同一个 sleep：pend 非空时 `backoff=min(backoff*2,900)` 直接决定下一轮
+# 隔多久 ⇒ 1.23GB 的 AED 慢滴会把整条循环 parked 到 15 分钟，而 `rebind_primary` 的唯一
+# 调用点就在 pend-空分支里 ⇒ 面板切档/首载最长 15 分钟没人执行（显示新档、跑旧档）；
+# 同迭代还要 await tts.ensure_loaded（TTS 侧曾是阻塞下载，见 tts.py 同批刀），
+# 两个停车因素相乘。做成模块级常量：它们是节律调参，不是实例态。
+_MODELS_CHECK_S = 60.0
+_POKE_COOLDOWN_S = 30.0
+_POKE_COOLDOWN_MAX_S = 900.0
+
+
 class Service:
     def __init__(self):
         self.settings = Settings()
@@ -144,40 +156,59 @@ class Service:
         self._runners = (ws_runner, admin_runner)
 
     # ── 后台循环 ────────────────────────────────────────────────
+    # 节奏分账见模块级 _MODELS_CHECK_S / _POKE_COOLDOWN_* 的注释。
+    async def _models_pass(self, st: dict, now: float | None = None) -> float:
+        """保障循环的一轮，返回下一轮等待秒数（恒 ≤ _MODELS_CHECK_S）。
+
+        st 是跨轮退避状态（每键最近触发时刻 + 当前冷却）。做成参数而不是实例字段，
+        是为了让这一轮可被逐轮驱动地测（循环体本身没法测 cadence）。
+        `now` 同理：测试注入假时钟，生产走 monotonic。
+        """
+        now = time.monotonic() if now is None else now
+        poke: dict = st.setdefault("poke", {})
+        cool: dict = st.setdefault("cool", {})
+        need_asr = str(self.settings.get("stt.provider", "")).startswith("local")
+        need_tts = str(self.settings.get("tts.provider", "")).startswith("local")
+        need = ([self.asr.model_key] if need_asr else []) + \
+               ([self.tts.model_key()] if need_tts else [])
+        pend = [k for k in need if not self.store.is_ready(k)]
+        for k in pend:
+            if now - poke.get(k, float("-inf")) >= cool.get(k, _POKE_COOLDOWN_S):
+                self.store.ensure_async(k)
+                poke[k] = now
+                cool[k] = min(cool.get(k, _POKE_COOLDOWN_S) * 2, _POKE_COOLDOWN_MAX_S)
+        # 已落盘/不再需要的键清掉记录：哪天资产被清（用户删档、换档）要从 30s 重新起算，
+        # 而不是继承上次下载的 900s 冷却。
+        for k in [k for k in poke if k not in pend]:
+            poke.pop(k, None)
+            cool.pop(k, None)
+        if not pend:
+            loop = asyncio.get_running_loop()
+            if need_asr and not self.asr.ready():
+                await loop.run_in_executor(None, self.asr.ensure_loaded)
+            elif need_asr and self.asr.stale_kind():
+                # v4.2：回落档在载/用户切了 local_model——主档就绪即原地换绑
+                # （推理在飞 rebind 返回 False，下一轮再看盘时再试，不断会话）
+                await loop.run_in_executor(None, self.asr.rebind_primary)
+            # v1.1.5：判据收紧为"当前档引擎在载"——web 切 TTS 引擎后
+            # 本循环负责换绑（在飞让位在 inner 内处理，不断会话）
+            if need_tts and not self.tts.ready_for_current_provider():
+                await loop.run_in_executor(None, self.tts.ensure_loaded)
+            # TextCNN 预热（小模型，镜像内置）
+            if self.settings.get("nlu.textcnn_enabled", True):
+                await loop.run_in_executor(None, self.textcnn._ensure)
+        return _MODELS_CHECK_S
+
     async def _loop_models(self) -> None:
-        """本地档模型保障：未就绪则 ensure（带网络的重试退避），就绪后预热加载。"""
-        backoff = 30
+        """本地档模型保障：缺则后台补取（每键退避），在盘即预热/换绑（固定 60s 看盘）。"""
+        st: dict = {}
         while True:
-            pend: list[str] = []      # F4 附带：预置，except 引用 pend 不再 NameError
-            need_asr = str(self.settings.get("stt.provider", "")).startswith("local")
-            need_tts = str(self.settings.get("tts.provider", "")).startswith("local")
-            need = ([self.asr.model_key] if need_asr else []) + \
-                   ([self.tts.model_key()] if need_tts else [])
             try:
-                pend = [k for k in need if not self.store.is_ready(k)]
-                if pend:
-                    for k in pend:
-                        self.store.ensure_async(k)
-                    backoff = min(backoff * 2, 900)
-                else:
-                    backoff = 30
-                    loop = asyncio.get_running_loop()
-                    if need_asr and not self.asr.ready():
-                        await loop.run_in_executor(None, self.asr.ensure_loaded)
-                    elif need_asr and self.asr.stale_kind():
-                        # v4.2：回落档在载/用户切了 local_model——主档就绪即原地换绑
-                        # （推理在飞 rebind 返回 False，60s 后下一轮再试，不断会话）
-                        await loop.run_in_executor(None, self.asr.rebind_primary)
-                    # v1.1.5：判据收紧为"当前档引擎在载"——web 切 TTS 引擎后
-                    # 本循环负责换绑（在飞让位在 inner 内处理，不断会话）
-                    if need_tts and not self.tts.ready_for_current_provider():
-                        await loop.run_in_executor(None, self.tts.ensure_loaded)
-                    # TextCNN 预热（小模型，镜像内置）
-                    if self.settings.get("nlu.textcnn_enabled", True):
-                        await loop.run_in_executor(None, self.textcnn._ensure)
-            except Exception:
+                delay = await self._models_pass(st)
+            except Exception:  # noqa: BLE001 循环不许被单轮异常打死
                 logger.exception("[模型] 保障循环异常")
-            await asyncio.sleep(backoff if pend else 60)
+                delay = _MODELS_CHECK_S
+            await asyncio.sleep(delay)
 
     async def _loop_status(self) -> None:
         while True:

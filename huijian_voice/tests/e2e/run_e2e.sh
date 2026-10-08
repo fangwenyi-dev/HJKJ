@@ -37,7 +37,7 @@ for i in $(seq 1 90); do
 done
 curl -sf http://127.0.0.1:8002/api/health >/dev/null || { diag "health 超时"; exit 1; }
 
-echo "==== 4. 等运行期所需模型真下载就绪（主档 ASR+Kokoro ≈1.4GB，给 25 分钟）===="
+echo "==== 4. 等运行期所需模型真下载就绪（默认集＝lock 里 default_provider 两档，tar 合计 ~1GB、解包 ~1.4GB，给 25 分钟）===="
 # v4.2 教训（run 34364440982 实红 25min 超时）：等值集合必须是「运行期 need」，
 # 不能是 lock 全清单——回落/对比档新装根本不会主动下载，
 # all(models_ready.values()) 恒 false。

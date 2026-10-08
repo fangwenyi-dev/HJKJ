@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gc
 import logging
 import re
 import threading
@@ -89,6 +90,20 @@ _KIND_LABEL = {"sensevoice": "SenseVoice-Small",
 # 三处都指它，不许再写死字面（写死＝换默认时只改一处，出现"默认档自己不落盘、回落档当主档跑"的裂口）。
 _DEFAULT_KIND = "firered_aed"
 _FALLBACK_KIND = "firered_ctc"
+# ── 进程级解码准入（2026-10-07，AED 换默认后新增）───────────────────
+# 根因：AED 的代价是**全局量**（并发 × 每轮），而本仓此前每一道闸都是**每会话量**
+# （session 的 30s 拒收、52s 预算都只管自己那一轮）。STT 走
+# `run_in_executor(None, …)`＝asyncio 默认池（4 核机 min(32, cpu+4)=8 worker），
+# 8 轮同 30s ⇒ 排队 8×10.99s 且瞬时 8×1.88GB≈15GB，靶机 8G 直接 OOM。
+# 开发机 403 句实测（num_threads=2）：AED RTF 0.320 / 峰值 RSS 1415MB，
+# CTC 0.167 / 864MB，SenseVoice 0.022 / 358MB。
+# 取 1：`num_threads=2` 是**每轮**的，N 轮并发＝2N 个 ORT 线程压 4 核 ⇒ RTF 随并发
+# 劣化（0.32 那个基准只在单轮成立）。串行后正常句（中位 2.75s）单轮约 0.9s，
+# 8 轮排队约 7s，仍在预算内；最坏 30s 轮串行排队由 _DECODE_QUEUE_WAIT_S 兜住。
+_DECODE_CONCURRENCY = 1
+# 排队上限：单轮上界 30s×RTF≈11s，等 30s + 解码 11s = 41s < const.STT_RESULT_BUDGET_S
+# 的 52s ⇒ 超上限那轮带具名分因失败，而不是让会话在客户端先判死后还占着准入位。
+_DECODE_QUEUE_WAIT_S = 30.0
 # （2026-10-07：全库引擎均为离线整句解码——最后一条流式档 Paraformer 删除后，
 #  收流分支与归错集合一并移除；若将来再接流式档，尾补静音必须一起做，
 #  否则 2026-09-08 台架实锤的丢尾事故会回来。）
@@ -103,7 +118,10 @@ class AsrEngine:
         self.store = model_store
         self._rec = None
         self._lock = threading.Lock()
-        self._busy = 0          # 在飞推理数（卸载避让；审查 F1）
+        self._busy = 0          # 在飞推理数（卸载避让；审查 F1）——含排队中的轮
+        # 进程级解码准入位（见上方 _DECODE_CONCURRENCY 的代价账）。BoundedSemaphore：
+        # 多一次 release 当场炸，而不是悄悄把上限放大（上限本身就是这条钉的对象）。
+        self._decode_gate = threading.BoundedSemaphore(_DECODE_CONCURRENCY)
         self._loading = False   # 冷启动双载闩（下载/构建期并发诉求直接 False，走礼貌话术）
         self.last_used = time.time()
         # 本轮拿不到结果的具名分因。空串与"用户没说话"在设备侧逐字节同形，
@@ -201,17 +219,53 @@ class AsrEngine:
             self._set_reason(
                 f"模型资产缺失({key})，已转后台补下载（本轮不等待）", sink)
             return False
+        # N2 先卸后载：换档时若不先把旧档从 self._rec 摘掉，构造新档的这几秒里两档
+        # 共驻——AED 1415MB + CTC 864MB ≈ 2.28GB 纯 STT（旧 SenseVoice↔CTC 才 1.2GB，
+        # 所以这条也是换默认后才变成问题的），靶机 4核8G 叠上在飞解码就是 OOM 入口。
+        # 只在"在载的是**另一个**档"时摘（首载/同档重载无对象可摘）；摘了就必须负责：
+        # 新档构建失败要把旧档装回去，不能把"切档失败"升级成"这台机没引擎"。
+        prev_kind = ""
+        with self._lock:
+            cur = getattr(self._rec, "_hj_kind", "") if self._rec is not None else ""
+            if cur and cur != kind:
+                prev_kind = cur
+                self._rec = None
+        if prev_kind:
+            logger.warning("[STT] 换绑 %s → %s：先卸旧档（避免两档共驻 ~2.3GB）",
+                           _KIND_LABEL.get(prev_kind, prev_kind), _KIND_LABEL.get(kind, kind))
+            # 让上一档的 ORT 权重真还给 OS，而不是等下一次分代回收；只在确实摘掉过
+            # 旧档时做——首载/同档重载没有对象要释放，没必要为它停一次全堆 GC。
+            gc.collect()
         try:
             rec = self._build_recognizer(kind, d)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error("[STT] 模型加载失败(%s): %s", kind, e)
-            self._set_reason(
-                f"模型加载失败({kind}): {type(e).__name__}: {e}", sink)
+            reason = f"模型加载失败({kind}): {type(e).__name__}: {e}"
+            if prev_kind and self._restore_prev(prev_kind):
+                reason += f"（已回滚到 {_KIND_LABEL.get(prev_kind, prev_kind)}，功能不中断）"
+            self._set_reason(reason, sink)
             return False
         with self._lock:
             self._rec = rec
         self.last_used = time.time()
         logger.warning("[STT] %s 已加载 @ %s", _KIND_LABEL.get(kind, kind), d)
+        return True
+
+    def _restore_prev(self, prev_kind: str) -> bool:
+        """换绑失败兜底：把刚才为省内存卸掉的旧档装回来（只回滚一层，不递归）。"""
+        d = self.store.model_dir_for(_KIND_KEY[prev_kind])
+        if d is None:
+            logger.error("[STT] 回滚旧档失败：资产已不在盘(%s)", prev_kind)
+            return False
+        try:
+            rec = self._build_recognizer(prev_kind, d)
+        except Exception:  # noqa: BLE001
+            logger.exception("[STT] 回滚旧档失败(%s)", prev_kind)
+            return False
+        with self._lock:
+            if self._rec is None:
+                self._rec = rec
+        logger.warning("[STT] 已回滚到旧档 %s", _KIND_LABEL.get(prev_kind, prev_kind))
         return True
 
     def ensure_loaded(self, sink: dict | None = None) -> bool:
@@ -345,20 +399,32 @@ class AsrEngine:
                 return ""
             self._busy += 1
         try:
-            samples = audio.pcm16_to_f32(pcm_s16)
-            # 2026-10-07：全部引擎均为离线整句解码（最后一条流式档已删，收流分支
-            # 与 1s 尾补静音一并移除）。若将来再接流式档，2026-09-08 那份丢尾事故
-            # （「打开办公室射灯」→「打开办公室射」）会回来，尾补静音必须一起做。
-            stream = rec.create_stream()
-            stream.accept_waveform(const.SAMPLE_RATE, samples)
-            rec.decode_stream(stream)
-            text = _STRIP_TAGS.sub("", stream.result.text or "")
+            if not self._decode_gate.acquire(timeout=_DECODE_QUEUE_WAIT_S):
+                # 准入位被占满：这条必须带具名分因——旧形是排队无上限，8 轮一起挤进
+                # ORT，客户端 20s 先判死而服务端还在解码（"说了没反应"的新造法）。
+                self._set_reason(
+                    f"引擎繁忙：解码排队超 {_DECODE_QUEUE_WAIT_S:.0f}s"
+                    f"（在飞解码上限 {_DECODE_CONCURRENCY}），本轮未进解码", reason_out)
+                logger.warning("[STT] 解码准入排队超 %ss，本轮放弃", _DECODE_QUEUE_WAIT_S)
+                return ""
             try:
-                rec.reset(stream)
-            except Exception:
-                pass
-            self.last_used = time.time()
-            return text.replace("　", "").strip()
+                samples = audio.pcm16_to_f32(pcm_s16)
+                # 2026-10-07：全部引擎均为离线整句解码（最后一条流式档已删，收流分支
+                # 与 1s 尾补静音一并移除）。若将来再接流式档，2026-09-08 那份丢尾事故
+                # （「打开办公室射灯」→「打开办公室射」）会回来，尾补静音必须一起做。
+                stream = rec.create_stream()
+                stream.accept_waveform(const.SAMPLE_RATE, samples)
+                rec.decode_stream(stream)
+                text = _STRIP_TAGS.sub("", stream.result.text or "")
+                # 复位？1.13.7 的 OfflineRecognizer 根本没有那个方法（实测 dir()），
+                # 旧形那一行每轮抛 AttributeError 被吞——它从未做任何复位，而且离线
+                # 形态本来就每轮新建 stream。
+                # 并发安全不靠它：真依据是 DecodeStream 全程 const＋decoder 无实例态
+                # ＋ORT Session::Run 线程安全，代价上限由上面的准入位管。
+                self.last_used = time.time()
+                return text.replace("　", "").strip()
+            finally:
+                self._decode_gate.release()
         except Exception:
             # 第四轮审计 P2：异常必须落**本轮分因**——旧形只写日志、返回 ""，
             # 回执与"真静音"逐字节同形（设备侧无从区分，只能靠人猜）。

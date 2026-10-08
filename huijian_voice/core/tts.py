@@ -1080,19 +1080,20 @@ class TtsEngine:
                     logger.info("[TTS] 引擎换绑 %s→%s 推迟（合成/整轮在飞），下一轮重试",
                                 self.loaded_provider(), prov)
                     return True
-            # 第四轮审计 P1：目标档**就绪性前置**（不持锁——ensure 可能跨境下载）。
+            # 第四轮审计 P1：目标档**就绪性前置**（不持锁——备料可能是跨境下载）。
             # 旧序先卸旧嗓再验新档：目标档缺声码器/未下完时两档皆无，播报从
             # "旧嗓能用"塌成彻底无声，违本函数"本轮保持旧嗓不断播"的口径。
-            # 未就绪=只备料不清旧嗓，下一轮 models 循环重试（退避由 store 管）。
+            # 未就绪=只备料不清旧嗓，下一轮 models 循环再看盘重试。
+            # 备料本身不陪等（与下方冷载路径同规格）：`store.ensure` 的阻塞等待会把
+            # `_loop_models` parked 成分钟级，STT 预热/换绑一起停。
             if not self.store.model_dir_for(key):
                 try:
-                    self.store.ensure(key)
-                except Exception as e:  # noqa: BLE001 备料异常按未就绪处理
-                    logger.error("[TTS] 换绑备料异常: %s", e)
-                if not self.store.model_dir_for(key):
-                    logger.warning("[TTS] 换绑推迟：目标档 %s 未就绪，本轮保持旧嗓 %s",
-                                   prov, self.loaded_provider())
-                    return True
+                    self.store.ensure_async(key)
+                except Exception as e:  # noqa: BLE001 触发异常按未就绪处理
+                    logger.error("[TTS] 换绑备料触发后台补取失败: %s", e)
+                logger.warning("[TTS] 换绑推迟：目标档 %s 未就绪，本轮保持旧嗓 %s",
+                               prov, self.loaded_provider())
+                return True
             with self._lock:
                 if self._tts is not None and (self._busy or self._round_busy):
                     # 备料（阻塞 IO）期间又起了新轮：让位，下一轮再换
@@ -1106,17 +1107,22 @@ class TtsEngine:
                            self.loaded_provider(), prov)
         d = self.store.model_dir_for(key)
         if not d:
+            # 快败而不是陪等（与 `asr._load_one` 2026-09-26 那一刀同规格）：
+            # `store.ensure` 是**阻塞等待**语义（per-key 锁，见本文件 R2 #6 自述），
+            # 冷下载分钟级窗口里 `_loop_models` 每轮 await 本函数 ⇒ 整条保障循环被
+            # parked，STT 预热/换绑一起停；请求路径（合成前 ensure_loaded）也会占死
+            # 一条专用池线程。改成交后台补取（ensure_async 是真 single-flight），
+            # 本轮按未就绪收束，下一次看盘（≤60s）再试。
             try:
-                if self.store.ensure(key):
-                    d = self.store.model_dir_for(key)
-            except Exception as e:  # noqa: BLE001 下载异常按未就绪上报，不穿锁
-                logger.error("[TTS] %s 模型下载异常: %s", key, e)
+                self.store.ensure_async(key)
+            except Exception as e:  # noqa: BLE001 触发失败按未就绪上报，不穿锁
+                logger.error("[TTS] %s 触发后台补下载失败: %s", key, e)
         if not d:
             # 现场 grep 口径（v1052 钉）：kokoro 行字面量不得改写，他档另起新行
             if prov == "local_kokoro":
                 logger.error("[TTS] kokoro 模型未就绪")
             else:
-                logger.error("[TTS] %s 模型未就绪", key)
+                logger.error("[TTS] %s 模型未就绪（已转后台补下载，本轮不等待）", key)
             return False
         with self._lock:
             if self._tts is not None and \

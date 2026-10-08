@@ -50,9 +50,6 @@ class SlowRec:
     def decode_stream(self, s):
         time.sleep(0.35)
 
-    def reset(self, s):
-        pass
-
 
 def test_asr_unload_defers_to_inflight():
     eng = AsrEngine(DSettings(), SimpleNamespace())

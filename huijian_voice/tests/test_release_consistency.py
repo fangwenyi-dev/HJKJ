@@ -448,3 +448,82 @@ def test_acr_endpoint_matches_image_in_every_ci_site():
     hosts = set(re.findall(r"^\s*ACR:\s*(\S+)\s*$", wf, re.M))
     assert hosts and hosts == {host}, (
         f"CI 里的 ACR 主机 {sorted(hosts)} 与 image 的 host {host} 不同源")
+
+
+# ── 对外文案语义钉（2026-10-08，v1.2.6 审计后新增）─────────────────
+# 起因：删掉 `asr_paraformer_bilingual` 并把默认档换成 AED 之后，translations 三份
+# 正文还写着「STT 双语流式包 + TTS 多语包」——一个是不存在的引擎、一个不是默认档，
+# 而 HA 配置页逐字展示。既有钉只断言每个 schema 键**有** name/description（存在性），
+# 内容说什么没人看 ⇒ 补这一类"文案语义"判据。
+
+_GONE_ENGINES = ("双语流式", "bilingual streaming", "asr_paraformer_bilingual")
+_COPY_FILES = ("translations/zh-Hans.yaml", "translations/zh-CN.yaml",
+               "translations/en.yaml", "DOCS.md", "www/index.html")
+
+
+def test_customer_facing_copy_does_not_sell_a_deleted_engine():
+    """反向判据：对外五份文案里不许出现"已删引擎"的卖点字面。
+
+    只钉精确串（"双语流式"/"bilingual streaming"/键名），不钉裸"流式"——
+    DOCS 里「卫星本体的流式播放」说的是 TTS 下行播放，与本类缺陷无关，
+    把判据放宽成子串会把无关文字一起杀掉（假阳）。
+    """
+    for rel in _COPY_FILES:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for gone in _GONE_ENGINES:
+            assert gone not in text, f"{rel} 仍在宣传已删引擎：{gone}"
+
+
+def test_customer_facing_copy_names_the_default_stt():
+    """正向判据（与上一条配成双向）：默认档名字必须出现在对外文案里。
+
+    单向"禁旧名"会漏掉另一种漂移——把那句直接删掉就绿了，客户却再也看不到
+    自己会下哪个包。这里要求每份文案都点得出**当前默认 STT**的名字。
+    """
+    aed = _config() and "FireRedASR2-AED"
+    for rel in _COPY_FILES:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert aed in text, f"{rel} 没写默认 STT 档名（{aed}）"
+
+
+def test_model_names_cover_every_lock_key_both_ways():
+    """面板 MODEL_NAMES 的键集合必须与 models.lock.json **逐键相等**。
+
+    现状纠偏：`statRow(MODEL_NAMES[k]||k, …)` 缺键时直接把英文键名甩给客户
+    （ Melo 是默认 TTS，漏了它=状态表最显眼那行显示 `tts_melo_zh_en`）。
+    双向判：少一个键=红；多一个键（已删档留在表里）=红。
+    """
+    import json as _json
+    lk = _json.loads((ROOT / "models.lock.json").read_text(encoding="utf-8"))
+    # 模型键宇宙＝值为 dict 的条目。`_comment` 之类说明键不是模型、面板根本不显示，
+    # 把它算进"必须登记"的对象会让本钉被一个无关东西挡红。
+    lock_keys = {k for k, v in lk.items() if isinstance(v, dict)}
+    www = (ROOT / "www" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"const MODEL_NAMES = \{([^}]*)\}", www)
+    assert m, "www 里找不到 MODEL_NAMES——本钉的解析式要随之重写"
+    panel_keys = set(re.findall(r"([a-z][a-z0-9_]+)\s*:", m.group(1)))
+    missing = sorted(lock_keys - panel_keys)
+    extra = sorted(panel_keys - lock_keys)
+    assert not missing, f"MODEL_NAMES 缺键（面板会显示英文键名）：{missing}"
+    assert not extra, f"MODEL_NAMES 有幽灵键（lock 里已不存在）：{extra}"
+
+
+def test_manual_import_example_names_the_default_top_dir():
+    """「手动投放」举例的顶层目录名必须＝默认档的 top_dir。
+
+    实发形状：例子给的是回落档 CTC 的目录名，离线主机照着放下去的是**回落档**，
+    主档 AED 仍 pending 且不报错——这类"照抄例子就错"的文案比缺文档更坏。
+    """
+    import json as _json
+    lk = _json.loads((ROOT / "models.lock.json").read_text(encoding="utf-8"))
+    defaults = [v for k, v in lk.items()
+                if isinstance(v, dict) and v.get("default_provider")
+                and k.startswith("asr_")]
+    assert len(defaults) == 1, f"默认 STT 档应恰有一个，实见 {len(defaults)}"
+    want = defaults[0]["top_dir"]
+    www = (ROOT / "www" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"import/&lt;顶层目录名&gt;/（([^）]*)）", www)
+    assert m, "www 手动投放示例句式变了，本钉要随之重写"
+    toks = re.findall(r"[A-Za-z0-9._-]{6,}", m.group(1))
+    assert want in toks, \
+        f"示例里的目录名 {toks} 不含默认档 {want}——照抄会投放错包"

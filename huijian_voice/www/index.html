@@ -81,7 +81,7 @@
       <div id="sttLocalBox"><label class="hj-field">本地模型（离线引擎切换）</label>
         <select id="stt_local_model">
           <option value="firered_ctc">FireRedASR2-CTC · 中英+20多种方言（回落档，离线整句，包 776MB）</option>
-          <option value="firered_aed">FireRedASR2-AED · 中英（默认，同权重带 attention decoder，中文同音段更稳，慢约 15×，包 1.23GB）</option>
+          <option value="firered_aed">FireRedASR2-AED · 中英（默认，同权重带 attention decoder，中文同音段更稳；开发机实测比 CTC 慢约 2×、比 SenseVoice 慢约 15×，包 1.23GB）</option>
           <option value="sensevoice">SenseVoice-Small · 中英粤（小体积可选，离线整句）</option>
         </select></div>
     </div>
@@ -203,7 +203,7 @@
   <div class="card"><h3>模型包</h3>
     <table id="modelTable"><thead><tr><th>模型</th><th>状态</th><th>大小/进度</th><th></th></tr></thead><tbody></tbody></table>
     <div class="hint">下载中断可直接点重试（断点校验 sha256）。手动投放：把<b>解包后</b>的模型目录放到
-      加载项 /data/models/import/&lt;顶层目录名&gt;/（如 sherpa-onnx-fire-red-asr2-ctc-zh_en-int8-2026-02-25/），重启即可识别，零网络。</div>
+      加载项 /data/models/import/&lt;顶层目录名&gt;/（默认档是 sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/），重启即可识别，零网络。</div>
   </div>
   <div class="card"><h3>热操作</h3>
     <button class="act gray" id="reloadBtn">释放/重载模型（改配置后想立即生效可点）</button>
@@ -365,7 +365,7 @@ const VOICE_HINTS = {
 };
 const TTS_SID_OWNER = "local_kokoro";   // tts.sid 的写权只属 Kokoro 档：单音色/云档保存时不提交
 let _kokoroSid = null;                  // Kokoro 档记住的选择（切档再切回不丢，含自定义音色主名）
-const MODEL_NAMES = {asr_sensevoice_small:"STT · SenseVoice-Small 中英粤", asr_firered_ctc:"STT · FireRedASR2-CTC 中英+方言", asr_firered_aed:"STT · FireRedASR2-AED 中英", tts_kokoro_multilang:"TTS · Kokoro 多语包"};
+const MODEL_NAMES = {asr_sensevoice_small:"STT · SenseVoice-Small 中英粤", asr_firered_ctc:"STT · FireRedASR2-CTC 中英+方言", asr_firered_aed:"STT · FireRedASR2-AED 中英（默认档）", tts_kokoro_multilang:"TTS · Kokoro 中英多音色", tts_melo_zh_en:"TTS · MeloTTS 中英（默认档）", tts_matcha_zh_en:"TTS · Matcha 中英"};
 const $ = s => document.querySelector(s);
 /* Ingress 适配（网关同款实证）：页面挂在 /api/hassio_ingress/<token>/ 下，
    根绝对路径 fetch 会打到 HA Core。由 location.pathname 推导前缀；

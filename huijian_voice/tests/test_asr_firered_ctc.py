@@ -70,9 +70,6 @@ class FrRec:
     def decode_stream(self, s):
         pass
 
-    def reset(self, s):
-        pass
-
 
 def _engine(settings, store, kind_returned=None, fail_kinds=()):
     """_build_recognizer 打桩：返回**离线形态**的 CTC recognizer 替身。

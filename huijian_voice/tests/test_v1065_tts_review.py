@@ -264,31 +264,45 @@ def test_tts_test_timeout_503():
         admin_api._TTS_TEST_TIMEOUT_S = orig
 
 
-def test_ensure_loaded_downloads_outside_engine_lock(tmp_path):
-    """行为钉：store.ensure（模拟冷下载）被调用时，引擎 `_lock` 必须可被他人
-    拿到——旧版持锁跨下载=并发合成/试听各占 executor 线程堵锁（池 8 线程堆满
-    连带 STT 饿死）。"""
+def test_ensure_loaded_never_blocks_the_caller_inside_engine_lock(tmp_path):
+    """行为钉（v1.0.65 F3 → 2026-10-08 N6 升级为更强形式）。
+
+    旧判据：`store.ensure`（模拟冷下载）被调用时引擎 `_lock` 必须可得——防"持锁跨下载"
+    把并发合成/试听各堵一条 executor 线程（默认池 8 线程堆满连带 STT 饿死）。
+    新判据两条：①冷载路径**不碰**阻塞 ensure（改交 ensure_async 后台补取，本轮快败）——
+    因为 `_loop_models` 每轮 await `tts.ensure_loaded`，分钟级阻塞＝整条保障循环 parked，
+    STT 预热/换绑一起停；②kick 出去那一下仍不得持 `_lock`。两条合起来封住整类
+    "下载把调用方陪死"，比旧的一条更严。
+    """
     from core.tts import TtsEngine
-    lock_holder = {}
+    calls = {"ensure": 0, "kick": 0, "free_at_kick": None, "lk": None}
 
     class _Store:
         def model_dir_for(self, key):
             return None
-        def ensure(self, key):
-            lk = lock_holder["lk"]
+
+        def ensure(self, key, force=False):
+            calls["ensure"] += 1
+            return False
+
+        def ensure_async(self, key, force=False):
+            calls["kick"] += 1
+            lk = calls["lk"]
             got = lk.acquire(blocking=False)
-            lock_holder["free_during_download"] = got
+            calls["free_at_kick"] = got
             if got:
                 lk.release()
-            return False        # 令下载后仍未就绪，走快速失败路径（不碰 sherpa）
+
         def lock_entry(self, key):
             return {}
 
     e = TtsEngine(_S({}), _Store())
-    lock_holder["lk"] = e._lock
+    calls["lk"] = e._lock
     assert e.ensure_loaded() is False
-    assert lock_holder.get("free_during_download") is True, \
-        "ensure 在 _lock 内被调用=回归"
+    assert calls["ensure"] == 0, \
+        "载入路径又出现阻塞 ensure（_loop_models 会被 parked 成分钟级，见 tts.py 同批注释）"
+    assert calls["kick"] == 1, f"缺资产必须交后台补取，本轮快败（kick={calls['kick']}）"
+    assert calls["free_at_kick"] is True, "kick 在引擎 _lock 内被调用=旧版持锁跨下载同族回归"
 
 
 def test_push_voice_fp_strong_ref():

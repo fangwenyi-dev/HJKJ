@@ -5,8 +5,9 @@ configuration:
   model_auto_download:
     name: 模型自动下载
     description: >-
-      开启后，首次启动自动从网络下载语音模型（约 1.3 GB，STT 双语流式包 + TTS
-      多语包；国内镜像优先，三级源自动回退）。下载期间即可试用已就绪的部分。
+      开启后，首次启动自动从网络下载语音模型：STT · FireRedASR2-AED（约 800 MB，
+      解包 1.23 GB）＋ TTS · MeloTTS 中英（约 160 MB）——下载面约 1 GB、占盘约
+      1.4 GB；国内镜像优先，三级源自动回退。下载期间即可试用已就绪的部分。
       关闭后需把解包好的模型目录放入 /data/models/import/ 并重启加载项——完全
       离线环境选这个。
   auto_install_integration:

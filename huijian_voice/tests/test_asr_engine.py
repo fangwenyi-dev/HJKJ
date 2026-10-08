@@ -69,9 +69,6 @@ class SvRec:
     def decode_stream(self, s):
         pass
 
-    def reset(self, s):
-        pass
-
 
 def make_engine(settings, store, fail_kinds=()):
     eng = AsrEngine(settings, store)

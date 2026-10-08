@@ -72,9 +72,6 @@ class OffRec:
     def decode_stream(self, s):
         pass
 
-    def reset(self, s):
-        pass
-
 
 def _fake_sherpa(calls):
     def _mk(name):
