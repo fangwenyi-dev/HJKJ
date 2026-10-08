@@ -705,8 +705,14 @@ jobs:
               if f"## [{ver}]" in log:
                   i = log.index(f"## [{ver}]")
                   rest = log[i + 1:]
-                  j = rest.index("## [", 3) if "## [" in rest[3:] else len(rest)
-                  body = log[i:i + 1 + j].strip()
+                  # 必须**行首锚定**找下一个版本头。旧形 `rest.index("## [", 3)` 是子串匹配，
+                  # 正文里只要有一句提到 `` `## [x.y.z]` ``（v1.2.7 发版实锤：本版正文讲
+                  # "四源一致性的 CHANGELOG 断言原来会被网关区旧 `## [1.2.6]` 满足"，就在
+                  # 那个反引号串处把 Release 正文截断，20 行/1127 字符静默丢失，
+                  # 而 job 全绿——GitHub 侧走 body_path 全文 4028 字符，两边 unequal 才发现）。
+                  nl = re.search(r"^## \[", rest[3:], re.M)
+                  j = (3 + nl.start()) if nl else len(rest)
+                  body = log[i:i + j].strip()
           if not body:
               # v1.7.12（审计 I-4）：缺段不再 ValueError 崩 job——优先复用
               # prepare 产物（含其 git-log 兜底），仍无则给最小说明
