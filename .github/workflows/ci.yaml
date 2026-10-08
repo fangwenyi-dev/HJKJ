@@ -289,10 +289,16 @@ jobs:
           
           if [ -f CHANGELOG.md ]; then
             awk -v ver="${{ steps.version.outputs.version }}" '
-              /^## \[/{ found=0 }
-              $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
-              /^## \[/{ if(found) exit }
-              found { print }
+              # 两条版本号线共用本文件（10-06 起），本链只认语音横幅**之前**的网关区。
+              # 没这道横幅门时它按 ver 全文匹配：`## [1.2.6]` 在文件里有两处（网关区
+              # L2993 / 语音区 L3229），今日靠"网关段在上"侥幸取对；而 ver=1.1.37 这类
+              # 网关没有、语音有的号会**静默**把语音那篇当网关 Release 正文发出去
+              # （10-08 用 Python 复刻两条链实测）。语音侧链早有横幅门，这次补齐。
+              /^# 慧尖HA语音插件 变更日志/{ if (found) exit; done=1; next }
+              !done && /^## \[/{ found=0 }
+              !done && $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
+              !done && /^## \[/{ if(found) exit }
+              !done && found { print }
             ' CHANGELOG.md | head -50 > "$CHANGELOG_FILE"
           fi
           

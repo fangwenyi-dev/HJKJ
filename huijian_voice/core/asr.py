@@ -97,19 +97,60 @@ _FALLBACK_KIND = "firered_ctc"
 # 8 轮同 30s ⇒ 排队 8×10.99s 且瞬时 8×1.88GB≈15GB，靶机 8G 直接 OOM。
 # 开发机 403 句实测（num_threads=2）：AED RTF 0.320 / 峰值 RSS 1415MB，
 # CTC 0.167 / 864MB，SenseVoice 0.022 / 358MB。
+# **靶机 .91（4核8G，线上 1.2.6）实测**（10-08，8 句 2.7s 真实命令、走 stt 通道、
+# 含 LAN+ws 往返故为上界）：RTF 均值 0.887、最差 1.190 ≈ 开发机 3 倍，且已越过 1.0
+# ——即"一条 2.7s 的句子要 2.1~3.3s 才出结果"。所以并发一抬就是 N×0.9 的墙钟，
+# 8 轮同 30s 在靶机是 8×26.6s≈3.5 分钟的排队 + 瞬时十余 GB，OOM 只是先后问题。
 # 取 1：`num_threads=2` 是**每轮**的，N 轮并发＝2N 个 ORT 线程压 4 核 ⇒ RTF 随并发
-# 劣化（0.32 那个基准只在单轮成立）。串行后正常句（中位 2.75s）单轮约 0.9s，
-# 8 轮排队约 7s，仍在预算内；最坏 30s 轮串行排队由 _DECODE_QUEUE_WAIT_S 兜住。
+# 再劣化（0.887 那个数也只在单轮成立）。串行后正常句在靶机约 2.4s，
+# 4 轮排队约 10s，仍在下面这条排队上限内。
 _DECODE_CONCURRENCY = 1
-# 排队上限：单轮上界 30s×RTF≈11s，等 30s + 解码 11s = 41s < const.STT_RESULT_BUDGET_S
-# 的 52s ⇒ 超上限那轮带具名分因失败，而不是让会话在客户端先判死后还占着准入位。
-_DECODE_QUEUE_WAIT_S = 30.0
+# 排队上限由**靶机实测**算式定死（10-08 .91 4核8G 实测 RTF 上界 1.190，含 LAN+ws 往返）：
+#   排队 + 整轮上限 30s×1.19 = 排队 + 35.7 ≤ 会话预算 52 − 余量 5 ⇒ 排队 ≤ 11.3 → 取 10。
+# 早先这里写 30s，用的是开发机 RTF 0.32 推出的"单轮 11s"——那格是假的（差 3 倍），
+# 会让超预算那轮的回执与在飞解码脱钩，正是本文件上面说的"墙钟闸被自己的读法架空"同族。
+# 判据钉在 tests/test_aed_admission.py::test_budget_arithmetic_holds_on_the_measured_target_rtf。
+_DECODE_QUEUE_WAIT_S = 10.0
 # （2026-10-07：全库引擎均为离线整句解码——最后一条流式档 Paraformer 删除后，
 #  收流分支与归错集合一并移除；若将来再接流式档，尾补静音必须一起做，
 #  否则 2026-09-08 台架实锤的丢尾事故会回来。）
 
 # SenseVoice 输出的语言/情感/事件标签：zh/yue/EN/NEUTRAL/Speech/woitn 等
 _STRIP_TAGS = re.compile(r"<\|[^<>|]*\|>")
+
+# ── 云 STT 整包超时（N8）────────────────────────────────────────
+_CLOUD_TIMEOUT_DEFAULT_S = 12.0
+_CLOUD_TIMEOUT_MIN_S = 3.0
+_CLOUD_TIMEOUT_MAX_S = 30.0
+
+
+def _cloud_timeout(cloud: dict) -> float:
+    """云档超时：钳在 3~30s，非数值按缺省处理并点名，不抛异常打死整轮。
+
+    两个方向都不是装饰：`stt.cloud` 是用户能手改的 settings.json——
+    · `timeout: 0` 让每次云调用**立刻**失败，现场形状是"云配了却永远在回落本地"，
+      一条日志都不点（旧形 `float(0)` 直接进 ClientTimeout）；
+    · `timeout: 10000` 把整轮拖过设备侧 20s 与会话 52s 预算——会话早已回别的话，
+      这条线程还在等云（与本轮 P0-1 同族：墙钟闸被自己的读法架空）。
+    上限取 30s 的理由是链式的：云失败还要**回落本地再解码一轮**（靶机 AED 实测
+    单轮 2.1~3.3s、30s 音频 26.6~35.7s），云侧留超过 30s 就挤不进 52s 预算。
+    """
+    raw = (cloud or {}).get("timeout", _CLOUD_TIMEOUT_DEFAULT_S)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("[STT] 云档 timeout=%r 非数值，按缺省 %.0fs 处理",
+                       raw, _CLOUD_TIMEOUT_DEFAULT_S)
+        return _CLOUD_TIMEOUT_DEFAULT_S
+    if val != val or val in (float("inf"), float("-inf")):      # NaN/inf 不进钳位比较
+        logger.warning("[STT] 云档 timeout=%r 非有限值，按缺省 %.0fs 处理",
+                       raw, _CLOUD_TIMEOUT_DEFAULT_S)
+        return _CLOUD_TIMEOUT_DEFAULT_S
+    clamped = min(max(val, _CLOUD_TIMEOUT_MIN_S), _CLOUD_TIMEOUT_MAX_S)
+    if clamped != val:
+        logger.warning("[STT] 云档 timeout=%.1fs 越界，钳位到 %.1fs（允许 %.0f~%.0fs）",
+                       val, clamped, _CLOUD_TIMEOUT_MIN_S, _CLOUD_TIMEOUT_MAX_S)
+    return clamped
 
 
 class AsrEngine:
@@ -148,6 +189,17 @@ class AsrEngine:
     def model_key(self) -> str:
         """主档 key（_loop_models 按此下载/预热；回落在载不改变主档诉求）。"""
         return _KIND_KEY[self._primary_kind()]
+
+    @property
+    def fallback_key(self) -> str:
+        """当前回落链的目标键；没有回落链时返回空串。
+
+        回落**只在默认档语境发生**（`ensure_loaded` 的链判据是 `primary == _DEFAULT_KIND`），
+        显式选了 CTC/SenseVoice 的用户起不来就是不回落（对比档被顶替＝实测作废）。
+        所以这里也按同一条规则回答，`_loop_models` 才不会给显式档白下 776MB。
+        键名由 `_FALLBACK_KIND` 派生，不写死——与 `_DEFAULT_KIND` 那对常量同规格。
+        """
+        return _KIND_KEY[_FALLBACK_KIND] if self._primary_kind() == _DEFAULT_KIND else ""
 
     def loaded_kind(self) -> str:
         with self._lock:
@@ -449,7 +501,7 @@ class AsrEngine:
         headers = {}
         if key := str(cloud.get("api_key") or ""):
             headers["Authorization"] = f"Bearer {key}"
-        timeout = aiohttp.ClientTimeout(total=float(cloud.get("timeout", 12)))
+        timeout = aiohttp.ClientTimeout(total=_cloud_timeout(cloud))
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(f"{base}/audio/transcriptions", data=form, headers=headers) as r:
                 if r.status != 200:

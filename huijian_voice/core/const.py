@@ -99,7 +99,11 @@ STT_RESULT_BUDGET_S = 52.0    # 客户端等 stt 帧 60s（stt.py:109）
 TTS_STREAM_BUDGET_S = 52.0    # 逐帧间隙窗（客户端逐帧窗 60s，tts_transport.stream timeout）
 TTS_STREAM_TOTAL_BUDGET_S = 660.0  # 整轮总闸（客户端整轮闸 720s，防永动僵尸流）
 LLM_TURN_BUDGET_S = 50.0      # 客户端外层 fail_after 60（conversation.py:73-80）
-CONNECT_GATE_S = 14.0         # 客户端 ensure_connected 15s 上限——upgrade 前禁止慢操作
+# （2026-10-08 删）CONNECT_GATE_S=14.0 全树零引用——它下面那段"upgrade 前禁止慢操作"
+#  的对账注释留着才有意义，常量本身是死码：真正的那道 15s 窗在集成侧
+#  custom_components/huijian_ai/ws_transport.py（ensure_connected 上限），不在加载项里。
+#  想在这里加"连接后禁止慢操作"的闸，必须先证明加载项侧真有那个调用点，别再留一个
+#  看着像承重墙的装饰。
 
 # 兜底话术（LLM 关且级联全 miss；可在 settings.dialog.fallback_text 覆盖）
 FALLBACK_TEXT = "这句话我还不会，可以说「打开客厅的灯」或「客厅多少度」试试。"

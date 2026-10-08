@@ -51,7 +51,7 @@
     "sha256": "43015b3f1643a5688b4821e8ed323473d38b798c4ec291471fe00df1bcfc4f1c",
     "top_dir": "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26",
     "required_files": ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"],
-    "size_mb": 800,
+    "size_mb": 839,
     "_file_note": "2026-10-07 本机 gh-proxy 直下实测 838,589,068B（与官方 gh release asset 字节数逐字相同）→ sha256 43015b3f…。解包 1.23GB：encoder.int8.onnx 817,286,833 + decoder.int8.onnx 417,291,928 + tokens.txt 79,172（现役 CTC 档 model.int8.onnx 775,861,420，这是 1.6×）。它是 FireRedASR2 的 **AED 分支**（encoder + attention decoder 都在），与 CTC 档同源权重但解码形状不同：官方 3.05% 那张中文 CER 表**就是 AED/LLM 口径**（CTC 导出丢了 attention decoder，无公开 CER）⇒ 这一档反而是家族里唯一有官方数字的。接入入口 from_fire_red_asr 实测 12 参：**没有 sample_rate**（照 SenseVoice 传参＝TypeError，与 CTC 档同坑）、**没有 hotwords**、有 hr_* 同音替换 FST 挂点。开发机实测（num_threads=2，非 4核8G 靶机）：加载 3.25s、RTF 0.31-0.38、峰值 RSS 1813MB；同 6 句 SenseVoice RTF 0.02/RSS 370MB ⇒ AED 慢约 15×（自回归 decoder），仍 <1 可用。中文同音段 AED 更稳（「一般现在时」vs SV「一般现代时」、「频繁」vs「平凡」），但那是**包自带 6 句厂商素材**，不是我们 307 句/真清单，不足以下结论。**2026-10-07 晚起为默认档**（default_provider=true，进 E2E 就绪门必检集；回落链 AED→CTC——本档起不来落 CTC，“显式档被顶替＝实测作废”的规矩不变）。",
     "urls": [
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2",

@@ -33,7 +33,7 @@ DEFAULTS: dict[str, Any] = {
         "language": "zh-CN",
         # 云档示例：{"provider":"cloud_openai_compat","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","api_key":"","model":"paraformer 或 whisper 兼容名"}
         # 云失败自动回落本地（v4.1-②）
-        "cloud": {"provider": "", "base_url": "", "api_key": "", "model": ""},
+        "cloud": {"provider": "", "base_url": "", "api_key": "", "model": "", "timeout": 12},
     },
     "tts": {
         "provider": "local_melo",            # local_kokoro | local_matcha | local_melo | cloud

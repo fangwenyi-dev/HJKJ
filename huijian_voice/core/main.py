@@ -171,7 +171,19 @@ class Service:
         need_tts = str(self.settings.get("tts.provider", "")).startswith("local")
         need = ([self.asr.model_key] if need_asr else []) + \
                ([self.tts.model_key()] if need_tts else [])
-        pend = [k for k in need if not self.store.is_ready(k)]
+        # 两条集合必须分开：**预热门**只看主档（need），**补取集合**（fetch）可以多一个
+        # 回落档。理由：AED 的 fail-open 目标是 CTC，而过去 need 只含主档 ⇒ 新装机盘上
+        # 根本没有 CTC，主档一坏就无路可落（10-08 取证：线上 .91 那份 CTC 是它"当过默认档"
+        # 时留下的，新机不会再有）。反过来，把回落档直接塞进 need 会让 `not pend` 这道
+        # 预热门在 776MB 下载期间一直关着——首装用户全程"模型未就绪"，那不是兜底是把能用
+        # 的功能换成兜底。所以：主档一落盘，才把回落档排进补取，且它不参与预热门判定。
+        fetch = list(need)
+        if need_asr and self.store.is_ready(self.asr.model_key):
+            fb = self.asr.fallback_key        # 直读：缺这个属性就是要炸，别用 getattr 宽容读
+            if fb and not self.store.is_ready(fb) and fb not in fetch:
+                fetch.append(fb)
+        pend = [k for k in fetch if not self.store.is_ready(k)]
+        pend_main = [k for k in need if not self.store.is_ready(k)]
         for k in pend:
             if now - poke.get(k, float("-inf")) >= cool.get(k, _POKE_COOLDOWN_S):
                 self.store.ensure_async(k)
@@ -182,7 +194,7 @@ class Service:
         for k in [k for k in poke if k not in pend]:
             poke.pop(k, None)
             cool.pop(k, None)
-        if not pend:
+        if not pend_main:
             loop = asyncio.get_running_loop()
             if need_asr and not self.asr.ready():
                 await loop.run_in_executor(None, self.asr.ensure_loaded)

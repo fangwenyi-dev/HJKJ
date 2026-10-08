@@ -183,7 +183,11 @@ def test_lock_entry_aed_measured_default_and_covers_opened_files():
         "sha256 是 2026-10-07 本机 gh-proxy 直下实测值，改它必须重新实测"
     assert e["tarball"] == f"{e['top_dir']}.tar.bz2"
     assert e["urls"][0].startswith("https://gh-proxy.com/")
-    assert e["size_mb"] == 800, "tar 实测 838,589,068B ⇒ 下载字节闸按它算"
+    assert e["size_mb"] == 839, (
+        "tar 实测 838,589,068B；本仓 size_mb 按**十进制 MB**用（`model_store` ×1e6，"
+        "CTC 那条 520↔520,516,278B 同口径）。曾写 800（MiB 心算）⇒ 下载进度冲到 104%、"
+        "字节上浮上限算小一档；10-08 与钳位一起修，判据见 "
+        "test_aed_admission::test_lock_declares_the_aed_package_size_in_decimal_mb")
     _, kw = _kwargs("firered_aed")
     opened = {p.name for p in _paths(kw)}
     assert opened <= set(e["required_files"]), \

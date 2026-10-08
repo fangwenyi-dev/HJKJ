@@ -47,8 +47,14 @@ def test_version_four_point_consistency():
                     .read_text(encoding="utf-8"))
     assert mf["version"] == ver, "vendored 集成 manifest 版本未与加载项同链（网关四源范式）"
     changelog = (ROOT.parent / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert re.search(rf"^## \[{re.escape(ver)}\]", changelog, re.M), \
-        "根 CHANGELOG 缺 `## [ver]` 段（Keep a Changelog 头，CI Release 正文/awk 提取依赖）"
+    # 必须**按语音横幅切区**再找本版段：本文件里 `## [1.2.6]` 有两处（网关区 L2993
+    # 的 2026-08-26 旧条目 / 语音区 L3229 的本版），旧写法全文 re.search 会被网关区
+    # 那一处满足——语音段整块被删掉它也绿（10-08 审计实测）。有判据力的是下面
+    # _extract_voice_section 那条，但这条也不该留成一个恒真半钉。
+    assert _extract_voice_section(ver), \
+        "根 CHANGELOG 的**语音区**缺 `## [ver]` 段（Keep a Changelog 头，CI Release 正文/awk 提取依赖）"
+    assert re.search(rf"^## \[{re.escape(ver)}\]", changelog, re.M), "兜底：全文找不到该版本头"
+
     constpy = (ROOT / "core" / "const.py").read_text(encoding="utf-8")
     # const 最终兜底字面量（毒值过滤后的 else 分支）必须与 config 同版本
     m2 = re.search(r'HUIJIAN_VERSION", ""\).*\nAPP_VERSION = .*else "([\d.]+)"', constpy)
@@ -527,3 +533,55 @@ def test_manual_import_example_names_the_default_top_dir():
     toks = re.findall(r"[A-Za-z0-9._-]{6,}", m.group(1))
     assert want in toks, \
         f"示例里的目录名 {toks} 不含默认档 {want}——照抄会投放错包"
+
+
+def test_both_release_chains_are_banner_bounded():
+    """两条号线共用一份 CHANGELOG ⇒ **两条**提取链都必须有自己的区界（10-08 补齐网关侧）。
+
+    实测过的漏网形状：语音链有 `/^# 慧尖HA语音插件 变更日志/{inv=1}`，网关链没有——
+    它按 `ver` 全文匹配，`ver=1.1.37`（网关区没有、语音区有）时取到语音区 L3819 的
+    28 行，会当成**网关** Release 正文发出去。今日不炸只因为"网关段整块在上"这个
+    布局约定；哪天有人把语音段插到上面或把两线按时间混排，就静默串正文，且没有任何
+    测试会红（CI 只用当期版本号跑）。判据做成两条：工作流里有横幅规则 ＋
+    复刻语义跑一个"语音独有号"必须取不到内容。
+    """
+    gw = (ROOT.parent / ".github" / "workflows" / "ci.yaml").read_text(encoding="utf-8")
+    m = re.search(r"awk -v ver=.*?\n(.*?)\n\s*' CHANGELOG\.md", gw, re.S)
+    assert m, "找不到网关链的 awk 程序体——提取形状变了，本钉要随之重写"
+    body = m.group(1)
+    assert "慧尖HA语音插件 变更日志" in body, \
+        "网关提取链没有语音横幅边界＝会跨线吃语音正文"
+    # 结构判据直接落在 awk 规则上：**每条**能推进/收集正文的规则都得带 `!done` 区界守卫。
+    # （先前只查"横幅字符串在不在 body 里"是半钉：把某条 `!done &&` 拆掉，横幅行还在、
+    # 串就漏回正文了，钉却绿着——变异臂 B6 实测如此。本机 awk 对这条动态正则不可信
+    # （同一份程序连 1.8.2 都取空），所以不能靠跑 awk，只能钉形状＋跑复刻语义双管。）
+    rules = [ln.strip() for ln in body.splitlines()
+             if ln.strip() and not ln.strip().startswith("#")]
+    unguarded = [ln for ln in rules if "## \\[" in ln and "!done" not in ln]
+    assert not unguarded, f"网关链存在无区界的推进规则（跨线吃正文的入口）：{unguarded}"
+
+    def gateway_chain(ver):
+        done = found = False
+        out: list[str] = []
+        for ln in (ROOT.parent / "CHANGELOG.md").read_text(encoding="utf-8").split("\n"):
+            ln = ln.rstrip("\r")
+            if ln.startswith(_VOICE_BANNER):
+                if found:
+                    break
+                done = True
+                continue
+            if done:
+                continue
+            if ln.startswith("## ["):
+                found = False
+                if ln == f"## [{ver}]" or ln.startswith(f"## [{ver}] "):
+                    found = True
+                    out.append(ln)
+                continue
+            if found:
+                out.append(ln)
+        return out
+
+    assert gateway_chain("1.8.2"), "本版网关段取不到＝链被改坏"
+    assert not gateway_chain("1.1.37"), \
+        "网关链仍从语音区取正文（1.1.37 是语音独有号）——横幅边界没生效"

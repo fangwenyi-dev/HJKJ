@@ -431,7 +431,7 @@ class ModelStore:
                                 f"下载超上限：已 {got} 字节，上限 {_cap or _DL_ABS_MAX_BYTES}")
                         f.write(chunk)
                         if size:
-                            pct = int(got / size * 100)
+                            pct = min(100, int(got / size * 100))
                             if pct != last_pct and pct % 5 == 0:
                                 last_pct = pct
                                 self._set_status(entry["_key"], state="downloading", pct=pct, detail=f"{got//1024//1024}MB / {int(size//1e6)}MB")
