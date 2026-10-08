@@ -277,6 +277,37 @@ def test_strong_negation_still_refused():
         assert is_refusal_imperative(t, ("客厅",)), f"{t} 被放行＝能做用户明说不要的动作"
 
 
+def test_curtain_guard_no_longer_kills_the_whole_sentence():
+    """形状钉：帘窗语序那道「不改写」分支里不许再 `_miss` 判死整句。
+
+    第五轮复查指控 4 成立——P1-7 第一版只改了拒执行闸那一道，帘窗这道仍用整句判据
+    `_miss`，等于同一病灶的第二处。修法＝只跳过改写、原话继续往下走。
+    """
+    src, fn = _fn_src(os.path.join(ROOT, "core", "nlu", "fast_path.py"), "match")
+    seg = ast.get_source_segment(src, fn) or ""
+    tail = seg.split("帘窗语序:否定句不改写", 1)[1].split("帘窗语序→", 1)[0]
+    assert "_miss" not in tail, (
+        "帘窗『不改写』分支又回到 return self._miss(...)——弱否定定语真命令被整句判死")
+
+
+def test_state_modifier_with_window_type_produces_plan():
+    """行为钉（能证的那一半）：带窗型的状态定语命令要出计划；强否定照旧不接管。
+
+    如实标注边界：`把没关严窗户拉上`（泛称"窗户"、无区域）修完**仍不出计划**——
+    那是"绝不猜房间/绝不冒按全区"的既有红线，不是本刀能宣称修好的东西；
+    本刀只保证它不再被当成"用户拒绝"来拒（理由换了，终态没变）。
+    """
+    from test_experience_batch import PSettings
+    T.sync_vocab({"cover.a": {"attributes": {"friendly_name": "客厅 平开窗"}},
+                  "light.d": {"attributes": {"friendly_name": "客厅灯"}}})
+    T.sync_areas(["客厅"])
+    fp = FastPath(_NoScenes(), None, PSettings(), areas_of=lambda: ("客厅",))
+    plan = asyncio.run(fp.match("把没关严平开窗关上"))
+    assert plan is not None and plan.intent == "ControlWindow", plan
+    for t in ("别把窗帘关上", "不要把窗关上"):
+        assert asyncio.run(fp.match(t)) is None, f"{t} 被放行＝做用户明说不要的动作"
+
+
 def test_bare_negation_weak_head_never_executes_alone():
     """裸「没」开头且整句就是拒绝（「没关灯」）时仍要否决——分档不是放宽。"""
     assert is_refusal_imperative("没关灯", ())

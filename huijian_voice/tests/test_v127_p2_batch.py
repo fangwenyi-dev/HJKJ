@@ -67,9 +67,16 @@ def test_cache_put_recompute_has_no_python_level_iteration():
     tree = ast.parse(body)
 
     def live_view(node):
-        """直接吃 OrderedDict 活视图（values/items/keys）＝迭代可被别的线程插队。"""
-        if isinstance(node, ast.Call):        # list(...) 已一次性拷贝，插不进来
-            return False
+        """迭代源是否**直接**吃 OrderedDict 活视图（values/items/keys）。
+
+        第五轮复查抓出我这条判据自己是假的：旧写法对 `ast.Call` 一律 return False，
+        而 `self._cache.values()` 本身就是个 Call ⇒ buggy 与 fixed 两版都放行，
+        主判据空转（真把 buggy 判红的只余那条不绑函数的全文文本臂）。现在：
+        `.values()` 这类调用＝活视图（可被插队），`list(...)` 包裹＝已拷贝（安全）。
+        """
+        if isinstance(node, ast.Call):
+            f = node.func
+            return isinstance(f, ast.Attribute) and f.attr in ("values", "items", "keys")
         return isinstance(node, ast.Attribute) and node.attr in ("values", "items", "keys")
 
     bad = []
@@ -230,10 +237,56 @@ def test_partial_failures_set_partial_error_key():
 
 
 # ── 【语法】云 STT 应答与云 TTS 英文句的两处判据形状 ───────────────────────
-def test_cloud_stt_response_is_capped():
+# ── 【行为】云 STT 应答：累计读到 EOF 且有上限（我上一版把这条改错了）────────
+class _Chunks:
+    """仿真分片应答：每次 read(n) 只回**下一片**（aiohttp StreamReader 的真实语义）。"""
+
+    def __init__(self, parts):
+        self.parts = list(parts)
+        self.i = 0
+
+    async def read(self, n):
+        if self.i >= len(self.parts):
+            return b""
+        p = self.parts[self.i]
+        self.i += 1
+        return p
+
+
+def _chunked(body, size=64):
+    return [body[i:i + size] for i in range(0, len(body), size)]
+
+
+def test_read_capped_reassembles_chunked_response():
+    import json as _json
+    from core.asr import _read_capped
+    body = _json.dumps({"text": "打开客厅的灯" * 40}, ensure_ascii=False).encode("utf-8")
+    got = asyncio.run(_read_capped(_Chunks(_chunked(body))))
+    assert got == body, f"累计读不完整：{len(got)}/{len(body)}"
+
+
+def test_single_read_n_is_a_half_packet_trap():
+    """钉住我上一版引入的错：`read(大 n)` **不是**"读到 n 或 EOF"，而是"有数据就回、
+    至多 n"。同一分片流上它只拿到第一段 ⇒ `json.loads` 必抛 ⇒ 每次正常云 STT 整轮失败。
+    谁把 `_read_capped` 换回一次 `read(n)`，这条就当众红。"""
+    body = b"x" * 1452
+    got = asyncio.run(_Chunks(_chunked(body)).read((1 << 20) + 1))
+    assert 0 < len(got) < len(body), "aiohttp 语义变了？这条要按新语义重写，不许删"
+
+
+def test_read_capped_rejects_oversize():
+    from core.asr import _read_capped
+    big = _chunked(b"z" * (70 << 20))          # 70MB
+    with pytest.raises(RuntimeError):
+        asyncio.run(_read_capped(_Chunks(big), limit=1 << 20))
+
+
+def test_cloud_stt_response_uses_capped_cumulative_read():
     _, fn, seg = _fn_seg(os.path.join(ROOT, "core", "asr.py"), "_cloud_transcribe")
-    assert "await r.json(" not in seg, "成功支整包进内存回魂（错误支已截 8192，同函数只修一半）"
-    assert "(1 << 20)" in seg and "json.loads" in seg, seg[:200]
+    assert "await r.json(" not in seg, (
+        "成功支回到整包/半包读：要么无上限进内存（v1.0.65 F12 原始病灶），"
+        "要么一次 read(n) 抽半包（本版刚踩的坑）——两条都不许")
+    assert "_read_capped(r.content)" in seg and "json.loads" in seg
 
 
 def test_cloud_truncation_gate_is_cjk_scoped():

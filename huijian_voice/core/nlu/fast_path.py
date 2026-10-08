@@ -726,19 +726,43 @@ _NEGATION_CMD_TAIL = re.compile(
 
 
 def _negation_area_tail(t: str, areas) -> bool:
-    """动词后那段「≤2 字 + 的」是本家真有的房间名 ⇒ 这是否定祈使，不是定语小句。
+    """动词后那段「≤2 字 + 的」是房间名 ⇒ 这是否定祈使，不是定语小句。
 
-    只判**逐字相等**：三字以上房间名（卫生间/办公室）本来就撞不进 `{0,2}的` 窗口，
-    主正则早已命中；放宽成包含会开始吃「没关**卫生**的」「别开**大部**的」这类。
-    永不抛（救援/守卫层不得冒泡到级联）。
+    `areas` 三档语义（2026-10-08 第五轮复查补的第二档是**必需**的）：
+      · `None`＝调用方没给判据入口 ⇒ 本臂整条不启用，逐值等于旧判据；
+      · `()`／空表＝这台 HA 还没注册任何区域（`_real_areas()` 拿不到、也没配
+        `spatial.satellite_areas`，全新装很常见）。**不能整条不启用**——那等于在
+        没建区域的家把「别开客厅的灯」原样放行（实测下发 1 步 + 播「好的，办好了」，
+        正是本刀要治的 P0）。此档回退到本仓既有的位置词**词形**判据
+        `targets._area_like`（与 pipeline"位置词豁免"表空档同一单源）。本臂方向是
+        "多否决一次"，而 v1.1.36 那条"豁免只认表"的红线管的是**别猜房间去执行**，
+        两者不同向。
+      · 非空表＝只认表里的名字（原口径）。
+    片段侧仍只判**逐字相等**：三字以上房间名本就撞不进 `{0,2}的` 窗口、主正则早已
+    命中；放宽成包含会开始吃「没关**卫生**的」这类。永不抛。
     """
-    if not areas:
+    if areas is None:
         return False
     try:
         tab = {str(a).strip() for a in areas if str(a or "").strip()}
-        if not tab:
+        if tab:
+            return any(m.group(1) in tab for m in _NEGATION_CMD_TAIL.finditer(t))
+        # 空表＝这台 HA 没注册任何区域（全新装很常见）。此时不能"整条不启用"——
+        # 那等于把「别开客厅的灯」在这半边家里原样放行（实测下发 1 步 + 播「好的，
+        # 办好了」，正是本刀要治的 P0）。回退到本仓既有的**位置词词形判据**
+        # `targets._area_like`（pipeline 的"位置词豁免"表空档用的也是它，同一单源）：
+        # 实测 客厅/卧室/书房/厨房/卫生间=True，而上锁/关严/紧/好/完/门/窗=False，
+        # 所以既补上没建区域的家，又不会把动补定语吃成否定。
+        like = getattr(T, "_area_like", None)
+        if not callable(like):
             return False
-        return any(m.group(1) in tab for m in _NEGATION_CMD_TAIL.finditer(t))
+        for m in _NEGATION_CMD_TAIL.finditer(t):
+            try:
+                if like(m.group(1)):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -773,7 +797,7 @@ def _noun_strip():
         return None
 
 
-def is_negation_imperative(text: str, areas=()) -> bool:
+def is_negation_imperative(text: str, areas=None) -> bool:
     """这句是**否定祈使**（「别开灯」「不要把窗关上」）——单点定义，两侧共用。
 
     v1.1.27 的 CHANGELOG 写的是"否定祈使**全局**拒执行"，实际判据只落在本模块的
@@ -791,7 +815,7 @@ def is_negation_imperative(text: str, areas=()) -> bool:
                 or _negation_area_tail(t, areas))
 
 
-def is_bare_negation_imperative(text: str, areas=()) -> bool:
+def is_bare_negation_imperative(text: str, areas=None) -> bool:
     """**整句就是一句否定命令**（句里没有别的肯定动作）——裁决面只用这条。
 
     为什么不能用全句判据 `is_negation_imperative`：一条 klar 计划只代表句子的
@@ -830,7 +854,7 @@ def is_bare_negation_imperative(text: str, areas=()) -> bool:
 _WEAK_NEG_HEADS = ("没", "未", "不")     # 裸形否定词：中文里高频当**状态定语**
 
 
-def is_refusal_imperative(text: str, areas=()) -> bool:
+def is_refusal_imperative(text: str, areas=None) -> bool:
     """字面表单发通路用的否决判据——比整句判据少一类误杀，比 bare 判据少一类放行。
 
     2026-10-08 P1（第五轮复查）：「把没关严窗户拉上」是**真命令**（"没关严"是窗户的
@@ -1082,10 +1106,17 @@ class FastPath:
         # 手工装配的测试替身/直呼方一概零漂移。
         self.areas_of = areas_of
 
-    def _areas(self) -> tuple:
-        """区域表取用永不抛：观测面故障不得把字面表弄成整句失配。"""
+    def _areas(self):
+        """区域表取用永不抛：观测面故障不得把字面表弄成整句失配。
+
+        `None`＝没装配 areas_of（手工替身/直呼方）⇒ 房间名臂整条不启用，逐值等于旧判据；
+        空表＝本台没注册区域 ⇒ 判据内部回退静态基准（见 `_negation_area_tail` 三档语义）；
+        取表抛错＝按"拿不到表"处理（同 None 与空之间偏安全的方向：宁可多否决一次）。
+        """
         try:
-            return tuple((self.areas_of or (lambda: ()))() or ())
+            if self.areas_of is None:
+                return None
+            return tuple(self.areas_of() or ())
         except Exception:  # noqa: BLE001
             return ()
 
@@ -1326,10 +1357,16 @@ class FastPath:
             # 收口=否定句一律不改写（不改写则原话继续走下面那道闸，落 MISS=零执行）；
             # 非否定句的 SOV/SVO 归一照旧，形态零漂移。
             if is_negation_imperative(text, self._areas()):
+                # 2026-10-08 P1-7 补全（第五轮复查）：这里原来直接 `_miss` 判死整句。
+                # "不改写"是对的（改写会把否定词从动词头上拆走、让下面的闸吃不到原话），
+                # 但**判死不是这道的活**——下面那道拒执行闸吃的才是分档判据。旧形等于
+                # 用整句判据多砍一刀：「把没关严窗户拉上」这类弱否定**定语真命令**
+                # 在这里被整句拒（"没关严"是窗户的状态，不是拒绝）。改为只跳过改写、
+                # 原话继续往下走，让该拒的拒、该执行的执行。
                 trace.append("帘窗语序:否定句不改写(闸要吃原话)")
-                return self._miss(trace, "否定句→不接管(拒执行)")
-            trace.append(f"帘窗语序→{cov}")
-            text = cov
+            else:
+                trace.append(f"帘窗语序→{cov}")
+                text = cov
 
         # 体验批 E2E 补洞：SOV 语序锁令「大门开锁/把门锁上(门+锁上)」动作前置归一。
         # 否定/疑问字（没不别谁哪）不参与——「还没上锁」是陈述不是命令。

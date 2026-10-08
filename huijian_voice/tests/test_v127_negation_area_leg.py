@@ -147,7 +147,7 @@ def test_verb_embedded_device_noun_is_still_a_refusal():
     assert not is_bare_negation_imperative("不用开灯，把窗帘拉上就行")
 
 
-# ── ③ 等价臂：不传表 ⇒ 逐值回落到旧判据（现网零漂移的证据，不是注释）────
+# ── ③ 等价臂：`areas=None` ⇒ 逐值回落到旧判据（现网零漂移的证据，不是注释）──
 def test_no_table_is_byte_identical_to_old_judge():
     corpus = list(NEGED) + list(COMPLEMENT) + [
         "别开灯", "不要关灯", "别开台灯", "把灯打开", "开一下客厅的灯",
@@ -155,8 +155,33 @@ def test_no_table_is_byte_identical_to_old_judge():
     for t in corpus:
         old = bool(_NEGATION_CMD.search(t) or _NEG_PREP_FLOW.search(t))
         assert is_negation_imperative(t) is old, f"默认参数漂移：{t}"
-        assert is_negation_imperative(t, ()) is old, f"空表漂移：{t}"
         assert is_negation_imperative(t, None) is old, f"None 表漂移：{t}"
+
+
+# ── ③b 空表（这台 HA 没注册任何区域）⇒ 回退位置词词形，不再放行 P0 ──────
+# 第五轮复查抓出的半截：旧写法"表空即整条不启用"＝只治注册了区域的那一半家，
+# 没建区域的家「别开客厅的灯」照样下发、照样播「好的，办好了」。
+def test_empty_table_falls_back_to_area_word_form():
+    for t in ("别开客厅的灯", "不要开卧室的空调", "别开书房的灯"):
+        assert is_negation_imperative(t, ()), f"空表下 {t} 仍不被认成否定祈使"
+        assert is_bare_negation_imperative(t, ()), f"空表下 {t} 整句判据没跟上"
+    # 反向：动补/定语在空表下也不许被吃（词形判据对它们是 False，实测过）
+    for t in COMPLEMENT + ("把没上锁的门打开", "没关严的窗关上"):
+        assert not is_negation_imperative(t, ()), f"空表下 {t} 被误判成否定祈使"
+
+
+def test_end_to_end_area_less_home_also_refuses():
+    """真入口、`ha._areas` 与 `spatial.satellite_areas` 都拿不到 ⇒ 仍须 0 下发。"""
+    T.sync_vocab(HOME)
+    T.sync_areas([])
+    kl_plan = Plan(intent="HassTurnOn",
+                   args={"target": [{"area": "客厅", "devices": [{"name": "灯"}]}]},
+                   source="klar", utterance="别开客厅的灯")
+    ha = HA(HOME)                       # 不给 _areas：模拟没注册区域的家
+    ex = RecExecutor()
+    p = _pipe(kl=Lane({"别开客厅的灯": kl_plan}), ex=ex, ha=ha)
+    asyncio.run(p.handle("别开客厅的灯", origin="o"))
+    assert ex.plans == [], f"没建区域的家仍下发：{ex.plans}"
 
 
 # ── ④ 字面表侧：fp 自己也要吃区域表（只修裁决面=半道闸）────────────────
@@ -166,7 +191,7 @@ def test_fast_path_self_veto_with_area_table():
         assert asyncio.run(fp.match(t)) is None, f"{t} 字面表仍出计划"
     # 对照臂：同一句、同一表，摘掉 areas_of ⇒ 旧行为（出计划或不接管由别的分支定）
     fp0 = FastPath(_NoScenes(), None, PSettings())
-    assert fp0._areas() == (), "默认必须无表"
+    assert fp0._areas() is None, "没装配 areas_of 必须回 None＝本臂不启用（逐值旧行为）"
     # 取表抛错不得把字面表弄崩（观测面故障不殃及判据）
     boom = FastPath(_NoScenes(), None, PSettings(), areas_of=lambda: (_ for _ in ()).throw(RuntimeError()))
     assert boom._areas() == ()

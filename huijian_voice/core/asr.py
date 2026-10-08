@@ -77,6 +77,29 @@ from . import audio, const
 
 logger = logging.getLogger("huijian.asr")
 
+_CLOUD_RESP_MAX = 1 << 20          # 云 STT 应答上限；正常应答 `{"text": "…"}` 只有几 KB
+
+
+async def _read_capped(stream, limit: int = _CLOUD_RESP_MAX) -> bytes:
+    """**累计**读到 EOF，超上限立即失败——既不整包进内存，也不读半包。
+
+    2026-10-08 自己给自己抓的回归：上一版把 `r.json()` 换成 `await r.content.read(上限)`
+    是**错的**——aiohttp 的 `read(n)` 语义是"至多 n、有数据就回"。本机回环实证：应答
+    1452B 按 64B 分片、片间 20ms ⇒ `read(1MiB+1)` 只拿到 **64 字节**，`json.loads` 当场
+    抛 ⇒ 每一次正常分片应答都被打成整轮云 STT 失败（比原来"整包进内存"严重得多：
+    那个要误配才炸，这个正常路径就炸）。同一测点累计读实测 1452/1452 完整。
+    """
+    buf = bytearray()
+    while True:
+        part = await stream.read(65536)
+        if not part:
+            break
+        buf += part
+        if len(buf) > limit:
+            raise RuntimeError(
+                f"云 STT 应答超过 {limit}B（已读 {len(buf)}B）——base_url 指向的不是转录端点？")
+    return bytes(buf)
+
 # 引擎键位（models.lock.json 的 key）
 KEY_SV = "asr_sensevoice_small"
 KEY_FR = "asr_firered_ctc"
@@ -515,10 +538,7 @@ class AsrEngine:
                 # `base_url` 被指到大文件服务/慢速滴流端点时，一轮 12s 超时窗内的
                 # 字节全落内存（同型洞只修一半，注释就在上一行）。
                 # 正常应答是 `{"text": "…"}`，量级几 KB ⇒ 1 MiB 上限足够且不可能误杀。
-                _raw = await r.content.read((1 << 20) + 1)
-                if len(_raw) > (1 << 20):
-                    raise RuntimeError(
-                        f"云 STT 应答超过 1MiB（共 {len(_raw)}B）——base_url 指向的不是转录端点？")
+                _raw = await _read_capped(r.content)
                 obj = json.loads(_raw.decode("utf-8", "replace"))
                 if not isinstance(obj, dict):
                     raise RuntimeError(f"云 STT 应答不是 JSON 对象：{type(obj).__name__}")
