@@ -232,8 +232,14 @@ def test_gitee_sha_wait_gate_fails_loudly_not_silently():
 def test_gitee_release_existence_judged_by_parsed_body():
     """Gitee 对**不存在的 Release** 回 `HTTP 200 + body null`（2026-10-06 真探针实测），
     而 `/commits/<sha>` 回真 404——两个端点行为不一样。所以「要不要创建」必须判解析
-    结果（`existing.get("id")`），不能判 HTTPError。谁把它「简化」成 try/except 404，
-    幂等分支就永远走创建（400/重复卡）。本条是字样级判据：行为级要真发 API，留给 CI。"""
+    结果（`existing.get("id")`），不能判 HTTP 状态或异常类型。
+
+    v1.8.4 换载体（urllib → curl）时更新本条：旧判据 `e.code != 404` 是 urllib 时代的
+    异常写法，换 curl 后它只活在注释里——**字样在、行为已被阉**正是本仓反复踩的假绿形态
+    （同 test_gitee_sha_wait_gate_fails_loudly_not_silently 的对抗复核实锤）。⇒ 判据改成
+    吃新载体的真实守卫，"非 404 不吞掉"这条不变量的**行为**由
+    tests/test_v184_gitee_leg_carrier.py 用假 curl 真跑整段脚本钉住（禁只删不补）。
+    """
     import yaml
 
     ci = (HERE.parent.parent / ".github" / "workflows" / "ci.yaml").read_text(encoding="utf-8")
@@ -241,5 +247,6 @@ def test_gitee_release_existence_judged_by_parsed_body():
     steps = wf["jobs"]["gitee-release"]["steps"]
     body = [s for s in steps if "Create or sync" in s.get("name", "")][0]["run"]
     assert 'if existing and existing.get("id"):' in body, \
-        "存在性判据必须吃解析后的 id（Gitee 不存在时回 200+null，判 HTTPError 会误判）"
-    assert "e.code != 404" in body, "非 404 的 HTTP 错误必须抛出去，不许一并吞掉"
+        "存在性判据必须吃解析后的 id（Gitee 不存在时回 200+null，判 HTTP 会误判）"
+    assert "code not in (200, 404)" in body, \
+        "非 200/404 的 HTTP 状态必须响亮失败（旧 urllib 写法 e.code != 404 的等价守卫）"

@@ -82,7 +82,15 @@ class _CtypeHandlersMixin:
         # 网关重发的同一条 002 被判新消息整批重跑（双倍设备编号消耗、双倍
         # ack）。此处只表达"已收到"，与处理结果无关（异常另有日志），
         # 与 _handle_ctype_001"先应答后更新状态"同构。
-        await self._send_ack("002", payload)
+        # v1.8.4（审计 B-3）：ack 仍排在最前（顺序契约不变），但**它的失败不得吃掉整帧**。
+        # _send_ack 会 await mqtt.async_publish——broker 未就绪/发布异常时旧写法直接把这
+        # 一帧的 update_gateway_status、全量 devices 批处理、属性更新全跳过，与上面那句
+        # "与处理结果无关（异常另有日志）"正好相反。ack 没送达的后果只是网关多重发一次，
+        # 而本帧状态已落；两者不可比，所以这里只记警告、继续处理。
+        try:
+            await self._send_ack("002", payload)
+        except Exception as e:  # noqa: BLE001 - ack 失败不得影响本帧处理
+            _LOGGER.warning("002 ack 发布失败（本帧照常处理，网关会重发）: %s", e)
         try:
             # 不使用 "unknown" 作为默认值，避免解绑确认的空 002 消息覆盖网关在线状态
             status = data.get("status")

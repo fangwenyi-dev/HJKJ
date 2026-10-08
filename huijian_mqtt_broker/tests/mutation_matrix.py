@@ -58,6 +58,12 @@ TUTILS = "tests/test_utils.py"
 T1760 = "tests/test_v1760_channel_guard.py"
 T1761AF = "tests/test_v1761_adversarial_followups.py"
 T1763H = "tests/test_v1763_healer_resident.py"
+# v1.8.4 批次（审计 B-2/B-3 + Gitee 发布腿换载体）的被改文件与判据文件
+CTYPES = "custom_components/window_controller_gateway/mqtt_handler/_ctypes.py"
+CIY = "../.github/workflows/ci.yaml"       # _copy() 把 .github 一起带进副本
+T184R = "tests/test_v184_ws_renewal.py"
+T184A = "tests/test_v184_ack_failure.py"
+T184G = "tests/test_v184_gitee_leg_carrier.py"
 T1763R = "tests/test_v1763_repairs_flow.py"
 T1763W = "tests/test_v1763_fast_e2e_wiring.py"
 T1763M = "tests/test_v1763_mdns_watchdog.py"
@@ -583,6 +589,56 @@ ARMS = [
      "N4b 原形：端点文件 port=1e999→inf 时 int() 抛 OverflowError 逃出判定面，"
      "被宽兜底折成 probe_error（判词不准：真坏的是端点文件）",
      T1765),
+
+    # ── v1.8.4（2026-10-08 审计 B 档 + Gitee 发布腿载体）──
+    # 这批臂原本是发版前的一次性脚本跑的；上一版复核点名过"本批臂未固化进矩阵"
+    # 的流程欠账（v1.7.64 报告 §五 N3）⇒ 这次直接并进仓内，以后每次整跑都重放。
+    ("v184_renewal_ignores_business_gate", WSGW,
+     "if business:\n                    # 续期点在分派判定",
+     "if True:\n                    # 续期点在分派判定",
+     "test_one_byte_text_does_not_renew", "red",
+     "B-2 原形：续期不看业务帧判据 ⇒ 任意 1 字节 TEXT 与当年 BINARY 等价，"
+     "同网段拿公开令牌即可永久占满 4 槽、把真小程序挤成 503",
+     T184R),
+    ("v184_renewal_outside_business_guard", WSGW,
+     "                business = frame_is_business(msg.data)\n",
+     "                business = frame_is_business(msg.data)\n"
+     "                deadline = loop.time() + WS_RECV_TIMEOUT_SECONDS\n",
+     "test_renewal_point_is_after_dispatch", "red",
+     "在分派前再补一处裸续期：受保护那处仍在，所以「存在性」式守卫会绿——"
+     "判据必须是「循环内所有续期点都受罩」（本臂就是为钉这个软判据而加的）",
+     T184R),
+    ("v184_business_table_dropped_ping", WSGW,
+     '"get_gateways", "get_devices", "control", "pair", "unbind", "ping", "set_token",\n',
+     '"get_gateways", "get_devices", "control", "pair", "unbind", "set_token",\n',
+     "test_business_cmd_table_matches_the_dispatch_chain", "red",
+     "命令表与分派链漂移（表里少一条）⇒ 该命令的客户端每 300s 被静默踢线",
+     T184R),
+    ("v184_ack_failure_kills_the_frame", CTYPES,
+     '        try:\n            await self._send_ack("002", payload)\n'
+     "        except Exception as e:  # noqa: BLE001 - ack 失败不得影响本帧处理\n"
+     '            _LOGGER.warning("002 ack 发布失败（本帧照常处理，网关会重发）: %s", e)\n',
+     '        await self._send_ack("002", payload)\n',
+     "test_ack_failure_does_not_skip_the_frame", "red",
+     "B-3 原形：ack 排在 try 之外，一次发布失败就把 002 的状态/批处理/属性整帧吃掉，"
+     "与紧邻注释承诺的「与处理结果无关」相反",
+     T184A),
+    ("v184_gitee_retry_bound_cut", CIY,
+     "for try_no in (1, 2, 3):", "for try_no in (1,):",
+     "test_transient_tls_error_then_success_is_visible", "red",
+     "有界重试被砍成一次 ⇒ v1.8.3 实发形态：一次 TLS 抖动打断整条 Gitee 腿",
+     T184G),
+    ("v184_gitee_token_not_redacted", CIY,
+     'last = redact("curl rc=%s %s" % (proc.returncode, proc.stderr))',
+     'last = "curl rc=%s %s" % (proc.returncode, proc.stderr)[:160]',
+     "test_token_never_reaches_the_log", "red",
+     "失败信息不脱敏 ⇒ curl 诊断里的完整 URL（含 access_token）进公开 job 日志",
+     T184G),
+    ("v184_gitee_existence_guard_gutted", CIY,
+     "if code not in (200, 404):", "if False:",
+     "test_non_retryable_status_blocks_creation", "red",
+     "存在性查询的非 200/404 守卫被阉 ⇒ 静默落到创建分支，两源正文分叉",
+     T184G),
 ]
 
 

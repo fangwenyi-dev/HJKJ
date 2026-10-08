@@ -621,21 +621,65 @@ jobs:
         run: |
           set -eu
           python3 - <<'PY'
-          import io, json, os, sys, urllib.error, urllib.request
+          import io, json, os, subprocess, sys, time
           ver, sha = os.environ["VERSION"], os.environ["COMMIT"]
           tok = os.environ["GITEE_TOKEN"].strip()
           if not tok.isascii():
               print("::error title=GITEE_TOKEN 非 ASCII::含 BOM 或不可见字符"); sys.exit(1)
           api = "https://gitee.com/api/v5/repos/" + os.environ["GITEE_REPO"]
           tag = "v" + ver
+          ATTEMPTS = 0
 
+          # 载体定案（v1.8.4，2026-10-08 发版实锤）：这条腿原先用 python urllib——同一个 runner、
+          # 同一个 job 里，前置的"等 sha 落 Gitee"步用 curl 打 gitee API **2.3 秒返回 200**，而
+          # urllib 连红三次全卡在 TLS 握手 30s 超时（attempt1 <stdin>:47、attempt2 :37、
+          # attempt3 :47；v1.8.3 那条 Release 最后是手工补的，id=1189310）。⇒ 不是 Gitee 拒连、
+          # 也不是某次改动引入，是**载体差异**。所以全部外呼改走 curl，并对瞬时失败（连接失败/
+          # 非 JSON/5xx）做**有界重试**——v1.8.2 起就自登记"缺有界重试，一超时打断整条腿"。
+          # 纪律：token 留在 URL 查询里，日志只打去掉查询串的路径，且失败信息先脱敏；
+          #       重试次数与最终原因必须可见。行为判据见 tests/test_v184_gitee_leg_carrier.py。
           def call(url, data=None, method=None):
-              req = urllib.request.Request(
-                  url,
-                  data=json.dumps(data).encode() if data else None,
-                  method=method or ("POST" if data else "GET"),
-                  headers={"Content-Type": "application/json"} if data else {})
-              return json.load(urllib.request.urlopen(req, timeout=30))
+              global ATTEMPTS
+              path = url.split("?", 1)[0]
+
+              def redact(text):
+                  # curl 的诊断行可能整条带 URL（含 access_token 查询串）。本 job 日志是公开的，
+                  # token 漏出去＝任何人都能写这个仓的 Release ⇒ 失败信息先脱敏再截。
+                  return (text or "").replace(tok, "‹token 已脱敏›")[:160]
+
+              last = "未执行"
+              for try_no in (1, 2, 3):
+                  ATTEMPTS += 1
+                  args = ["curl", "--silent", "--show-error", "--no-location",
+                          "--connect-timeout", "15", "--max-time", "60",
+                          "--write-out", "\n%{http_code}", url]
+                  if method:
+                      args += ["--request", method]
+                  if data is not None:
+                      args += ["--header", "Content-Type: application/json",
+                               "--data-binary", json.dumps(data)]
+                  proc = subprocess.run(args, capture_output=True, text=True)
+                  if proc.returncode != 0:
+                      last = redact("curl rc=%s %s" % (proc.returncode, proc.stderr))
+                  else:
+                      head, _, code = proc.stdout.rpartition("\n")
+                      code = code.strip()
+                      if not (code.isdigit() and code != "000"):
+                          last = "HTTP %s" % code
+                      elif code.startswith("5"):
+                          last = "HTTP %s（服务端瞬时）" % code
+                      else:
+                          try:
+                              return int(code), (json.loads(head) if head.strip() else None)
+                          except json.JSONDecodeError:
+                              last = redact("响应非 JSON（HTTP %s，前 80 字 %r）"
+                                           % (code, head[:80]))
+                  if try_no < 3:
+                      print("gitee %s 第 %d 次失败：%s ⇒ 退避重试" % (path, try_no, last))
+                      time.sleep(10 * try_no)
+              print("::error title=Gitee API 三次重试仍失败::%s %s（最后一次：%s）"
+                    % (method or "GET", path, last))
+              sys.exit(1)
 
           body = ""
           if os.path.exists("CHANGELOG.md"):
@@ -656,19 +700,30 @@ jobs:
                   body = "## v%s\n\n完整变更记录见 GitHub Release %s。" % (ver, tag)
           body = body + "\n\n---\n完整记录见 GitHub 仓库 CHANGELOG.md 与 Release %s。" % tag
 
-          try:
-              existing = call("%s/releases/tags/%s?access_token=%s" % (api, tag, tok))
-          except urllib.error.HTTPError as e:
-              if e.code != 404:
-                  raise
-              existing = None
+          # 存在性判据一个字不能动：Gitee 对**不存在的 Release** 回的是 `200 + body null`
+          # （2026-10-06 真探针），所以只认解析后的 id；而 200/404 之外的任何状态都必须响亮
+          # 失败——静默放行就是两源正文分叉。换载体前这条不变量由 HTTPError 抛出表达，现在由
+          # 下面的 code 判定表达；行为验证见 tests/test_v184_gitee_leg_carrier.py。
+          code, existing = call("%s/releases/tags/%s?access_token=%s" % (api, tag, tok))
+          if code not in (200, 404):
+              print("::error title=Gitee 存在性查询返回 HTTP %s::既不创建也不同步"
+                    "（宁可不发，也不要两源正文分叉）" % code)
+              sys.exit(1)
           if existing and existing.get("id"):
-              r = call("%s/releases/%s?access_token=%s" % (api, existing["id"], tok),
-                       {"body": body, "tag_name": tag, "name": tag}, method="PATCH")
-              print("Gitee Release 已同步正文: id=%s tag=%s" % (r.get("id", existing["id"]), tag))
+              code, r = call("%s/releases/%s?access_token=%s" % (api, existing["id"], tok),
+                             {"body": body, "tag_name": tag, "name": tag}, method="PATCH")
+              if code not in (200, 201):
+                  print("::error title=Gitee 正文同步失败::PATCH HTTP %s" % code)
+                  sys.exit(1)
+              print("Gitee Release 已同步正文: id=%s tag=%s（外呼尝试 %d 次）"
+                    % (r.get("id", existing["id"]), tag, ATTEMPTS))
               sys.exit(0)
-          r = call("%s/releases?access_token=%s" % (api, tok), {
+          code, r = call("%s/releases?access_token=%s" % (api, tok), {
               "tag_name": tag, "name": tag, "body": body,
               "target_commitish": sha, "prerelease": False})
-          print("Gitee Release 已创建: id=%s tag=%s" % (r["id"], r["tag_name"]))
+          if code not in (200, 201):
+              print("::error title=Gitee Release 创建失败::POST HTTP %s" % code)
+              sys.exit(1)
+          print("Gitee Release 已创建: id=%s tag=%s（外呼尝试 %d 次）"
+                % (r["id"], r["tag_name"], ATTEMPTS))
           PY

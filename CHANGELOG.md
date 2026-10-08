@@ -3,11 +3,62 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.8.4] - 2026-10-08 · 审计 B 档两条（WS 占槽面 / 002 ack）+ Gitee 发布腿换 curl 带重试
+
+⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件
+拷进 `/config/custom_components`，已加载的模块不换）。这是上线前审计的第二刀，两条代码修复 +
+一条发布链修复，**无功能变更**。诚实边界同上一版：静态 + 门禁 + 真栈 e2e，未做真机 HA 联调。
+
+### B-2 WS 空闲续期只认已识别的业务命令
+
+v1.7.33 那次"只认业务 TEXT"的修复**只堵了一半**：续期发生在解析与分派**之前**，所以任意 1 字节
+非空 TEXT（`"x"`）与当年的 BINARY 帧完全等价——默认令牌公开在本仓，同网段主机每 299s 发一帧
+就能永久占满 `WS_MAX_CLIENTS=4`，把真小程序挤成恒 503，且**不自愈**（要重启加载项才释放槽位）。
+既有夹具的续期正例用的是合法 JSON、还把 `handle_json_message` 桩成恒回 None ⇒ 这条路径从来没
+被任何测试看过。
+
+现在续期只由 `frame_is_business()`（JSON 对象 + `cmd` 命中 `BUSINESS_CMDS`）认账。**两条判据
+选择**都记在代码注释里：① 不用"能解析成对象"当判据，因为 `{"cmd":"x"}` 只有 12 字节、同样能
+永久占槽；② 不用运行时 cmd 白名单当判据，改用"命令表 + 与分派链 AST 双向对账"的钉——将来给
+分派链加命令而忘了加表，钉当场红（既不静默踢线，也不名单空转）。**协议面一字未变**：畸形与
+未知命令照旧回 `missing cmd` / `unknown command` 错误包，只是不再能续命。
+
+### B-3 002 的 ack 发布失败不再吃掉整帧处理
+
+`_send_ack` 里是 `await mqtt.async_publish(...)`，而 ack 排在处理器的 `try` **之外**——一次发布
+异常（broker 未就绪等）就让这一帧的 `update_gateway_status`、全量 devices 批处理、属性更新一行
+不做，紧邻注释承诺的"只表达已收到、与处理结果无关"恰好相反。现在 ack 单独兜底：失败记 WARNING、
+继续处理。顺序契约（ack 先于批处理）与"批处理异常也必须已 ack"的既有契约都不动，两向都有臂。
+
+### Gitee Release 腿：载体换 curl + 有界重试（v1.8.3 发版实锤）
+
+v1.8.3 发版时这条腿连红三次：python `urllib` 打 gitee API 的 TLS 握手 30s 超时，而**同一个 job**
+里前置的"等 sha 落 Gitee"步用 curl 2.3 秒返回 200 ⇒ 载体差异，不是 Gitee 拒连，最终那条 Release
+是手工补的（id=1189310）。本批把三次外呼全改 curl，并对瞬时失败做 3 次退避重试（v1.8.2 就自登记
+"缺有界重试，一超时打断整条腿"）；失败信息先去 query 再脱敏（curl 诊断可能整条带 URL，日志公开）。
+
+判据从字样级升级为**真跑**：抽出 CI 里那段 python，桩掉 `subprocess`/`time` 在假树上跑完整分支
+（不存在→创建 / 已存在→PATCH / PATCH 失败响亮 / 5xx 有界重试 / 4xx 不重试 / token 不入日志），
+并带一条"把守卫改成永假必须改变行为"的反向臂。7 条臂同时固化进仓内变异矩阵（53 → **76 臂**）。
+
+### 门禁（本机实测）
+
+`pytest huijian_mqtt_broker/tests` = **1716 passed / 0 failed / 0 skipped**（本批 +22 条新钉）；
+ruff `--select F,E9,B --ignore B008,B905` 全过；`compileall`、`bash -n`（11 个 shell）、
+`node --check` ×3、YAML 门 14 文件、JSON 门全树 0 失败；版本五源 = 1.8.4、徽章文案与链接同源。
+跨仓契约钉真跑臂 **113/0**（下限 110）、hub 生命周期真栈 **35/0**（下限 35）、WSL HA 真栈 e2e
+全断言通过（WS 常听段在本批改动后重跑）。
+
+
+
 ## [1.8.3] - 2026-10-08 · 上线前审计 A 档收口：四条纪律缺口 + 集成英文面 + 对外安全告知
 
 网关整树做了一次上线前只读审计（`docs/bug-audit-2026-10-08-gateway.md`）：**无 P0/P1 阻断项**，
 抓到的是"同一条纪律在个别点没贯彻到底"的自洽性缺口。本批收口四条代码项 + 一项本地化面 +
-一段对外告知，**无用户可见功能变更**。诚实边界：全程静态 + 门禁 + 真栈 e2e，**未做真机 HA
+一段对外告知，**无用户可见功能变更**。⚠️ **但本批改了集成 Python 代码：升级加载项后请再重启一次
+Home Assistant**——重启加载项只把新文件拷进 `/config/custom_components`，已加载的模块不换，
+于是 B-4（生命周期钩子链）与 B-9（英文面）两条修不落地，表现就是"升级了但什么都没变"。
+诚实边界：全程静态 + 门禁 + 真栈 e2e，**未做真机 HA
 联调**（没连 192.168.1.91）；审计里我判为"建议不照做"的三条见本节末。
 
 ### B-4 `gateway.py:136` 生命周期钩子断链
@@ -69,7 +120,7 @@ strings.json 回落**，取不到就原样回吐 translation key（`:458`）。�
 
 ### 门禁（本机实测，非引用）
 
-`pytest huijian_mqtt_broker/tests` = **1693 passed / 0 failed / 0 skipped**（新钉 +15）；ruff
+`pytest huijian_mqtt_broker/tests` = **1694 passed / 0 failed / 0 skipped**（新钉 +16）；ruff
 `--select F,E9,B --ignore B008,B905` 全过；`compileall`、`bash -n`（run.sh + 10 个 e2e shell）、
 `node --check` ×3、YAML 门 14 文件、JSON 门 84 文件全绿；版本五源 = 1.8.3、旧号零残留。
 跨仓契约钉走**真跑臂** 113 passed/0 failed（下限 110 已复核）；hub 生命周期真栈 35/0（下限 35）；

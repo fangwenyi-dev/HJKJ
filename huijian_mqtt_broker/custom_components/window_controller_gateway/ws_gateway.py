@@ -139,6 +139,28 @@ _MSG_TOO_LONG = "newToken too long"
 _MSG_BAD_CHARS = "newToken invalid chars (A-Za-z0-9_- only)"
 _MSG_OLD_MISMATCH = "old token mismatch"
 
+# 空闲续期只认这些**已识别的业务命令**（v1.8.4 审计 B-2）。判据不能是"能解析成对象"：
+# 默认令牌公开在本仓，同网段主机发 `{"cmd":"x"}` 这种 12 字节的未知命令也能永久占槽，
+# 挤掉真小程序（WS_MAX_CLIENTS=4 ⇒ 503）。这张表与 handle_json_message 的分派链
+# **必须一致**，由 tests/test_v184_ws_renewal.py 的 AST 双向对账钉住——只改分派链
+# 不改这里，那条钉当场红（既不"静默踢线"，也不"名单空转"）。
+BUSINESS_CMDS = frozenset({
+    "get_gateways", "get_devices", "control", "pair", "unbind", "ping", "set_token",
+})
+
+
+def frame_is_business(text: str) -> bool:
+    """这一帧算不算"有人在用"：JSON 对象 + `cmd` 命中 BUSINESS_CMDS。
+
+    与 handle_json_message 的判据故意分开：后者对未知 cmd 也要回错误包（协议面），
+    而续期只认已识别命令（资源面）。两者的**一致性靠 AST 对账钉**，不靠注释。
+    """
+    try:
+        msg = json.loads(text)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+    return isinstance(msg, dict) and msg.get("cmd") in BUSINESS_CMDS
+
 
 # ==================== 纯函数（握手/校验/视图——单测直接驱动） ====================
 
@@ -921,6 +943,12 @@ class WsGatewayServer:
         默认令牌公开在本仓，同网段主机握手后每 299s 发 1 字节二进制帧即可
         永久占槽（WS_MAX_CLIENTS=4 被占满，真小程序恒 503）。改为显式
         deadline：只在业务 TEXT 分支续期；`_stopping` 时主动退出。
+
+        v1.8.4（审计 B-2）：**那一版只堵了一半**——续期发生在解析与分派**之前**，
+        所以任意 1 字节非空 TEXT（`"x"`）与当年的 BINARY 帧效果完全相同。现在续期
+        只在 `frame_is_business()` 认账时发生（JSON 对象 + cmd 命中 BUSINESS_CMDS）；
+        错误包照旧回给客户端，协议面不变。判据用命令集而非"能解析成对象"，是因为
+        `{"cmd":"x"}` 这类 12 字节未知命令同样能永久占槽。
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + WS_RECV_TIMEOUT_SECONDS
@@ -952,12 +980,17 @@ class WsGatewayServer:
                     return
                 if not msg.data:
                     continue  # 空帧：固件忽略（不计业务活动）
-                deadline = loop.time() + WS_RECV_TIMEOUT_SECONDS  # 业务帧续期
+                business = frame_is_business(msg.data)
                 try:
                     resp = await self.handle_json_message(msg.data)
                 except Exception as e:  # noqa: BLE001 - 单条命令异常不断会话
                     _LOGGER.error("WS 命令处理异常: %s", e, exc_info=True)
                     continue
+                if business:
+                    # 续期点在分派判定**之后**（v1.8.4 审计 B-2）：旧实现先续期再解析，
+                    # 任意 1 字节 TEXT 就能与当年那条 BINARY 漏洞等价占槽。畸形/未知命令
+                    # 照旧回错误包（协议面一字不变），只是不再拿它续命。
+                    deadline = loop.time() + WS_RECV_TIMEOUT_SECONDS  # 业务帧续期
                 if resp is not None:
                     try:
                         await ws.send_str(
