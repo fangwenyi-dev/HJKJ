@@ -679,7 +679,10 @@ jobs:
             *[![:print:]]*|$'\xef'*) echo "::error title=GITEE_TOKEN 含异常字节::疑似复制进 BOM/换行，重新设置纯 token"; exit 1;;
           esac
           python3 - <<'PY'
-          import io, json, os, sys, urllib.request, urllib.error
+          # 2026-10-08 修：`ed641cf` 把正文提取器改成正则行首锚定（用了 re.M）却漏
+          # `import re` ⇒ 语音线 Gitee Release 腿自那笔起每次必 NameError。
+          # vo-1.2.8 发版实抓（job 失败：NameError: name 're' is not defined）。
+          import io, json, os, re, sys, urllib.request, urllib.error
           ver, sha = os.environ["VERSION"], os.environ["COMMIT"]
           tag = "vo-" + ver   # D2：与 GitHub 侧同前缀
           tok = os.environ["GITEE_TOKEN"].strip()
