@@ -832,3 +832,170 @@ def test_bulk_noop_never_reads_out_an_entity_id():
     for noise in ("light.", "_", "deng"):
         assert noise not in reply, (noise, reply)
     assert "2 台" in reply, reply
+
+
+# ══ F. 发版前对抗复核确证的四条（全量套件带着它们仍然是绿的）════════════
+# 这一节的来历必须写清楚：2026-10-08 夜派去的"尝试推翻"代理抓出 5 条，我逐条自己
+# 复现后确认 4 条（第 5 条见 CHANGELOG「未闭环」）。**修之前 2932 条测试全绿**——
+# 说明这批钉原本对这几条完全无牙，`_m("把展厅所有灯关掉")` 那种样本 group(0)==group(1)，
+# 等于给反向误执行背书。所以本节每条都要配一次变异（M35–M39），不许只靠"看着像修好了"。
+def test_trailing_verb_with_prefix_keeps_direction():
+    """尾动词带「都/全」前缀时方向不许取反（对抗复核 A1，实测最高危）。
+
+    `_WH_TRAIL_RE` 的 0 组含可选前缀，旧写法拿 `group(0)[0]` 判动词 ⇒
+    「展厅所有窗**都**关了」首字是「都」，不在动词表里 → 判成 TurnDeviceOn，
+    用户说"都关了"我们**真把三扇窗打开**；「所有灯都关掉／全关了」同样翻成开。
+    """
+    for sentence in ("展厅所有窗都关了", "展厅所有窗户都关了", "展厅所有窗全关了"):
+        p = _m(sentence)
+        assert p is not None and p.intent == "ControlWindow", (sentence, p)
+        assert p.args.get("action") == "close", (sentence, p.args)
+    for sentence in ("展厅所有灯都关掉", "展厅所有灯全关了", "展厅所有灯都关了"):
+        p = _m(sentence)
+        assert p is not None and p.intent == "TurnDeviceOff", (sentence, p)
+    # 反向臂：真要说"开"的句子必须还是开（判据不是"一律关"）
+    p = _m("展厅所有灯都开了")
+    assert p is not None and p.intent == "TurnDeviceOn", p
+
+
+def test_named_device_class_is_not_whole_room_bulk():
+    """「所有**监控**设备」不是「所有设备」（对抗复核 A2：子串判据漏闸）。
+
+    旧写法 `"设备" in cat` ⇒ 「关闭展厅所有监控设备」产出空名 + 9 域白名单，
+    用户要关摄像头，实际关的是空调、灯、音箱和**三扇开窗器**，而 `_turn_gate`
+    只扫原话里的"窗"字，这条原话里没有 ⇒ v1.0.90「不敢把整屋设备冒按」被新道绕过。
+    改精确词表后：具名"X设备"把用户说的词带下去（集成按名称包含回捞，捞不到就如实查无）。
+    """
+    wl = list(capability.BULK_TOGGLEABLE_DOMAINS)
+    devices = lambda p: (p.args["target"][0]["devices"][0]) if p else None  # noqa: E731
+    for sentence in ("关闭展厅所有监控设备", "关闭展厅所有灯具设备"):
+        p = _m(sentence)
+        d = devices(p)
+        assert d is not None and d.get("name"), (sentence, p)     # 必须带用户说的词
+        assert d["domains"] != wl, (sentence, d)                  # 绝不折成整屋白名单
+    assert _m("打开展厅所有摄像设备") is None or \
+        devices(_m("打开展厅所有摄像设备")).get("name")           # 要么不接管，要么带词
+    # 反向臂：真正的「所有设备」口径不许被这次收窄误伤
+    p = _m("关闭展厅所有设备")
+    assert devices(p) == {"name": "", "domains": wl}, p
+
+
+def test_single_domain_group_claims_no_idle_slots():
+    """整组同域时（集成侧不折叠）core 不许说「N 个功能位没跟着动」（对抗复核 A3）。
+
+    判据分家在两包：折叠发生在集成、数字算在 core。一台三路开关模块的三条通道
+    都在 switch 域 ⇒ 集成侧"单域不折叠"三条全动，而 core 旧写法无条件按
+    "每台只留一条"算 ⇒ 播「好的，机房 3 台都关了（另有 2 个功能位，都没动）」——
+    1 台设备、且那两条恰恰动了。
+    """
+    st = {"switch.module_a": _ent("switch.module_a", "on", "机房模块 一路"),
+          "switch.module_b": _ent("switch.module_b", "on", "机房模块 二路"),
+          "switch.module_c": _ent("switch.module_c", "on", "机房模块 三路")}
+    amap = {k: "机房" for k in st}
+    devs = {k: "dev_module" for k in st}
+    args = {"target": [{"area": "机房",
+                        "devices": [{"name": "", "domains": list(
+                            capability.BULK_TOGGLEABLE_DOMAINS)}]}]}
+    ctl = {"TurnDeviceOff": {"success": True, "control_targets": [
+        {"name": n, "area": "机房", "entity_id": eid, "success": True}
+        for eid, _s, n, _a in [("switch.module_a", "off", "机房模块 一路", "机房"),
+                               ("switch.module_b", "off", "机房模块 二路", "机房"),
+                               ("switch.module_c", "off", "机房模块 三路", "机房")]]}}
+
+    def go():
+        return _run(st, Plan(intent="TurnDeviceOff", args=args, source="t0",
+                             utterance="关闭机房所有设备"), ctl,
+                    areas=amap, devices=devs)[1]
+
+    got = go()
+    assert "功能位" not in got, got
+    # 台数按设备归并：三条通道＝1 台 ⇒ 不许念"3 台都关了"
+    assert "3 台" not in got, got
+    assert "机房模块 一路" in got, got                     # 一台就逐台点名
+    # 反向臂（同源判据的另一侧）：同一批实体跨到第二个域，折叠真发生 ⇒ 该报就报
+    # （这台模块名下 4 条可开关实体，折叠后只留优先级最高的一条 ⇒ 3 条没跟着动）
+    st["light.xian_shi_deng"] = _ent("light.xian_shi_deng", "on", "指示灯")
+    amap["light.xian_shi_deng"] = "机房"
+    devs["light.xian_shi_deng"] = "dev_module"
+    assert "3 个功能位" in go(), go()
+
+
+def test_satellite_never_double_counted_as_risky_device():
+    """卫星那台设备不许同时被算进「为防误动」（对抗复核 A4：多报一台客户没有的设备）。
+
+    旧判据按**实体域**归类：卫星的 `assist_satellite.*` 与音量 `number.*` 既不在
+    可开关白名单、也不在"不支持开关"里 ⇒ 落进 kept_devs，播出
+    「另有 1 个不支持开关、**1 台为防误动**、1 台是语音卫星自身」——同两台设备
+    进两个桶，而且 `_KEPT_RISKY_SAY` 没有 assist_satellite，括号例子落空，
+    听起来像"有道门锁没敢碰"。改判：卫星按**整台设备**（平台证据不看域）先摘干净。
+    """
+    st = snapshot()
+    amap = entity_area(st)
+    devs = {}
+    # 一号卫星：有可开关域实体（麦克风开关）——逐域判也能认出来
+    for eid in ("assist_satellite.huijian_1f04_assist_satellite",
+                "number.huijian_1f04_yin_liang",
+                "switch.huijian_1f04_mai_ke_feng_kai_guan"):
+        st[eid] = _ent(eid, "on", f"HUIJIAN-1F04 {eid.split('.')[0]}")
+        amap[eid] = "展厅"
+        devs[eid] = "dev_sat"
+    # 二号卫星：**一个可开关域实体都没有**（纯 assist_satellite+音量）——这条才是
+    # "按实体域判卫星"的判据失效形态，撤掉整台设备判据的突变必须在这里转红（M38）
+    for eid in ("assist_satellite.huijian_abcd_assist_satellite",
+                "number.huijian_abcd_yin_liang"):
+        st[eid] = _ent(eid, "on", f"HUIJIAN-ABCD {eid.split('.')[0]}")
+        amap[eid] = "展厅"
+        devs[eid] = "dev_sat2"
+    args = {"target": [{"area": "展厅",
+                        "devices": [{"name": "", "domains": list(
+                            capability.BULK_TOGGLEABLE_DOMAINS)}]}]}
+    ok, reply = _run(st, Plan(intent="TurnDeviceOff", args=args, source="t0",
+                               utterance="关闭展厅所有设备"),
+                     {"TurnDeviceOff": {"success": True, "control_targets": [
+                         {"name": "悬窗 开窗器", "area": "展厅", "success": True}]}},
+                     areas=amap, devices=devs)
+    assert ok is True, reply
+    assert "2 台是语音卫星自身" in reply, reply      # 两台卫星各算一台（不是逐条实体）
+    assert "为防误动" not in reply, reply
+
+
+def test_integration_receipt_row_carries_entity_id():
+    """跨包契约：回执行必须带 entity_id，否则 core 那句「N 台」只能按实体行数。
+
+    两包不能互相 import，契约靠钉：集成侧 `intent_turn` 往 control_targets 里加
+    entity_id，core 侧 `_bulk_dev_count` 读它。任何一侧单方面改形制（把键名改掉/
+    去掉）都会让播报悄悄退回"行数＝台数"，而这正是本批要消灭的假账。
+    """
+    import pathlib
+    import re as _re
+    turn = (pathlib.Path(__file__).resolve().parents[1]
+            / "custom_components" / "huijian_ai" / "intent_turn.py").read_text(encoding="utf-8")
+    hits = _re.findall(r'control_targets\.append\(\{([^)]*?)\}\)', turn, _re.S)
+    assert hits, "找不到 control_targets 的行构造——形状变了，本钉要随之重写"
+    assert any('"entity_id"' in h for h in hits), hits
+    ex = (pathlib.Path(__file__).resolve().parents[1] / "core" / "executor.py"
+          ).read_text(encoding="utf-8")
+    assert 't.get("entity_id")' in ex, "core 侧不再消费 entity_id ⇒ 台数口径已退回行数"
+
+
+def test_bulk_noop_label_counts_devices_not_channels():
+    """空操作那半句也一样：一台三路模块全在要求状态 ⇒ 说「1 台」不说「3 台」。
+
+    与 `test_single_domain_group_claims_no_idle_slots` 同族（那条判成功面，这条判
+    noop 面），两处台数必须同口径——旧写法 `len(cands)` 是候选**实体**条数。
+    """
+    st = {"switch.m_a": _ent("switch.m_a", "off", "模块 一路"),
+          "switch.m_b": _ent("switch.m_b", "off", "模块 二路"),
+          "switch.m_c": _ent("switch.m_c", "off", "模块 三路")}
+    args = {"target": [{"area": "机房",
+                        "devices": [{"name": "", "domains": list(
+                            capability.BULK_TOGGLEABLE_DOMAINS)}]}]}
+    ok, reply = _run(st, Plan(intent="TurnDeviceOff", args=args, source="t0",
+                              utterance="关闭机房所有设备"),
+                     {"TurnDeviceOff": {"success": True, "control_targets": []}},
+                     areas={k: "机房" for k in st},
+                     devices={k: "dev_module" for k in st})
+    assert ok is True, reply
+    assert "机房的 1 台" in reply, reply          # 一台设备（三条通道归并成一台）
+    assert "本来就在要求的状态上" in reply, reply   # 空操作这条真信号不能丢
+    assert "3 台" not in reply, reply

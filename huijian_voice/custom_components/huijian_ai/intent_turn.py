@@ -207,7 +207,11 @@ class TurnDeviceIntentBase(intent.IntentHandler):
             entity_key = f"{item.area_name}-{item.name}"
             if entity_key not in entity_key_map:
                 entity_key_map.add(entity_key)
-                control_targets.append({"name": item.name, "area": item.area_name})
+                # v1.2.10 带 entity_id：加载项播报那句「N 台都关了」要按**设备**数
+                # （`_entity_device` 归堆），只有 name 的话一台三路开关模块会被数成 3 台。
+                # 旧形只有 name/area 的两个消费面不受影响（additive 键）。
+                control_targets.append({"name": item.name, "area": item.area_name,
+                                        "entity_id": item.state.entity_id})
 
         if not control_targets and (unsupported or call_failed):
             # v1.1.27：窗侧失败并入主返回——旧版只在"窗成灯败"分支消费

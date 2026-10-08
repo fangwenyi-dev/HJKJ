@@ -762,7 +762,7 @@ class Executor:
                                 .get("friendly_name") or "").strip() for c in cands]
                     label = "、".join([r for r in real if r][:3]) or "、".join(names)
                 else:
-                    label = f"{_bulk_area_prefix(args)}{len(cands)} 台"
+                    label = f"{_bulk_area_prefix(args)}{self._cand_devices(cands)} 台"
                 return "noop", label
             return "", ""
         except Exception:  # noqa: BLE001 判不了就不判（话术退回既有口径）
@@ -853,6 +853,65 @@ class Executor:
             logger.exception("[执行] 别名候选还原异常（不判）")
             return []
 
+    def _bulk_area_view(self, states: dict, area: str) -> dict:
+        """本区域批量面的**同源**视图（同步读已缓存快照 ⇒ 零新增网络）。
+
+        为什么 core 也要有一份：折叠发生在集成侧，而播报的数字算在 core 侧——
+        两边判据不同源就会各说各话（本仓"同类洞只修一边""一条链两个时钟"的教训）：
+        · `collapse`：集成侧 `_build_entities_for_item` **只在整组跨 >1 域时**才按设备折叠；
+          core 若无条件按"每台只留一条"算功能位，就会把真动过的通道播成"没跟着动"。
+        · `sat_devices`：卫星＝本集成平台实体所在的**整台设备**（不是逐条域）。逐域判会漏：
+          卫星的 `assist_satellite.*`/音量 `number.*` 既不在可开关白名单、也不在
+          "不支持开关"里 ⇒ 被塞进"为防误动没碰的一台"，凭空给客户多报一台设备。
+        快照不可用（空表）⇒ `collapse=False`＋空表，调用方退回保守口径，绝不编数。
+        """
+        wl = set(capability.BULK_TOGGLEABLE_DOMAINS)
+        area_map = getattr(self.ha, "_entity_area", {}) or {}
+        plat = getattr(self.ha, "_entity_platform", {}) or {}
+        dev_map = getattr(self.ha, "_entity_device", {}) or {}
+        in_area = [e for e in (states or {}) if area_map.get(e) == area]
+        dev_of = {e: (dev_map.get(e) or f"@{e}") for e in in_area}
+        sat = {dev_of[e] for e in in_area
+               if plat.get(e) == capability.BULK_SELF_PLATFORM}
+        bulk = [e for e in in_area
+                if str(e).split(".", 1)[0] in wl and dev_of[e] not in sat]
+        doms = {str(e).split(".", 1)[0] for e in bulk}
+        groups: dict = {}
+        for e in bulk:
+            groups[dev_of[e]] = groups.get(dev_of[e], 0) + 1
+        return {"collapse": len(doms) > 1, "sat_devices": sat, "dev_of": dev_of,
+                "groups": groups}
+
+    def _bulk_dev_count(self, targets: list) -> int:
+        """回执行了台数（一台三路开关模块的三条通道＝1 台）。
+
+        行数≠台数：集成侧 `control_targets` 是按 area+name 去重的**实体**行。
+        拿不到 entity_id（旧集成/窗侧回执形制）或表里没这条 ⇒ 回 0，调用方退回
+        按行数（＝现版行为，绝不因为"数不出设备"而把 3 台念成 1 台）。
+        """
+        dev_map = getattr(self.ha, "_entity_device", {}) or {}
+        devs: set = set()
+        for t in targets or []:
+            eid = str(t.get("entity_id") or "") if isinstance(t, dict) else ""
+            if not eid:
+                return 0
+            devs.add(dev_map.get(eid) or (t.get("name") if isinstance(t, dict) else "")
+                     or eid)
+        return len(devs)
+
+    def _cand_devices(self, cands: list) -> int:
+        """core 侧候选（两种形制：HA state 行 dict 与 `(entity_id, …)` 元组）的台数。
+        任一条拿不到 entity_id ⇒ 退回条数＝现版行为，不猜。"""
+        rows = []
+        for c in cands or []:
+            if isinstance(c, dict):
+                rows.append({"entity_id": c.get("entity_id") or ""})
+            elif isinstance(c, (tuple, list)) and c:
+                rows.append({"entity_id": str(c[0] or "")})
+            else:
+                return len(cands or [])
+        return self._bulk_dev_count(rows) or len(cands or [])
+
     async def _bulk_skipped_note(self, args: dict) -> str:
         """「(区域)所有设备」没碰到的部分，分因如实报（v1.2.10 用户拍板口径）。
 
@@ -880,33 +939,30 @@ class Executor:
             states = await self.ha.states()
             if not states:
                 return ""
-            area_map = getattr(self.ha, "_entity_area", {}) or {}
+            view = self._bulk_area_view(states, area)
+            dev_of, sat = view["dev_of"], view["sat_devices"]
             wl = set(capability.BULK_TOGGLEABLE_DOMAINS)
-            plat = getattr(self.ha, "_entity_platform", {}) or {}
-            dev_map = getattr(self.ha, "_entity_device", {}) or {}
             unsupport = 0
             kept_devs: set = set()
-            own_devs: set = set()
             kept_domains = set()
-            groups: dict = {}          # 白名单实体按设备归堆（折叠后台数=摊数）
             for eid in states:
-                if area_map.get(eid) != area:
+                dev = dev_of.get(eid)
+                if dev is None or dev in sat:
+                    # 不在本区域 / 是语音卫星那台设备——卫星的 assist_satellite/音量 number
+                    # 既不在白名单也不在"不支持开关"里，逐域判会把整台卫星塞进
+                    # "为防误动没碰的一台"，凭空给客户多报一台设备（v1.2.10 对抗复核 A4）。
                     continue
                 dom = str(eid).split(".", 1)[0]
-                # 无 device_id 的实体自成一摊（与集成侧 _bulk_one_per_device 同口径：
-                # 表拉不到时最多少合并几条，绝不把两台并成一台）
-                dev = dev_map.get(eid) or f"@{eid}"
-                if plat.get(eid) == capability.BULK_SELF_PLATFORM and dom in wl:
-                    own_devs.add(dev)         # 卫星自己：集成侧已从批量面摘出去
-                    continue
                 if dom in capability.UNTOGGLEABLE_DOMAINS:
                     unsupport += 1
                 elif dom not in wl:
                     kept_devs.add(dev)
                     kept_domains.add(dom)
-                else:
-                    groups[dev] = groups.get(dev, 0) + 1
-            extras = sum(n - 1 for n in groups.values())
+            own_devs = sat
+            # 折叠判据与集成侧同源：**单域那一摊每条通道都会被真动**，此时按
+            # "每台只留一条"算 extras 就是把动过的说成"没跟着动"（对抗复核 A3）。
+            extras = (sum(n - 1 for n in view["groups"].values())
+                      if view["collapse"] else 0)
             segs = []
             if extras:
                 segs.append(f"{extras} 个功能位")
@@ -1629,17 +1685,22 @@ class Executor:
                 return f"好的，{head}{names}已解锁"
         # v1.2.10 区域批量（「关闭展厅所有设备」一次真动好几台）：逐台念名会播成
         # 半分钟（.91 展厅一个区就 31 个实体），改按台数收口。台数取**回执里确证
-        # 成功的行**而不是请求数——宁少报不多报（与 `_receipt` 同一口径）；≤2 台
-        # 仍逐台点名，两台设备靠名字分得清，念数反而丢信息。放在锁语义之后：
+        # 成功的那些行归并出的设备数**而不是请求数——宁少报不多报（与 `_receipt` 同一口径）；
+        # ≤2 台仍逐台点名，两台设备靠名字分得清，念数反而丢信息。放在锁语义之后：
         # 计数形没有名字可判，门锁批量得先按 D7 反转口径念出来。
-        if _area_bulk_slot(args) and len(targets) > 2:
+        if _area_bulk_slot(args):
+            # 按**设备**数，不按回执行数：集成侧 `control_targets` 是去重后的**实体**行，
+            # 一台三路开关模块会念成"3 台都关了"（v1.2.10 对抗复核 A3）。
+            # 拿不到 entity_id（旧集成/窗侧形制）时 `_bulk_dev_count` 回 0 ⇒ 退回行数，
+            # 与现版一致，绝不因为"数不出设备"就把 3 台念成 1 台。
+            n_bulk = self._bulk_dev_count(targets) or len(targets)
             _bulk_verb = {"TurnDeviceOn": "打开了", "TurnDeviceOff": "关了",
                           "PauseDevice": "暂停了"}.get(intent)
-            if _bulk_verb:
+            if n_bulk > 2 and _bulk_verb:
                 # 「展厅 5 台都关了」——不复用 head（head 是「展厅的」，接数字会念成
                 # "展厅的5 台"），区域名后带一个空格；无区域时不编区域。
                 who = f"{area} " if area else ""
-                return f"好的，{who}{len(targets)} 台都{_bulk_verb}"
+                return f"好的，{who}{n_bulk} 台都{_bulk_verb}"
         if intent == "TurnDeviceOn":
             return f"好的，{head}{names}打开了"
         if intent == "TurnDeviceOff":

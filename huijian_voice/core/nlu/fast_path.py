@@ -635,6 +635,9 @@ FLAG_ANAPHORA_STRIPPED = "anaphora_stripped"  # 句首回指副词已剥离成�
 FLAG_CHAIN_ANAPHORA = "chain_anaphora"        # 链内回指：同句先行分句供目标
 FLAG_AREA_BULK = "area_bulk"                  # 区域+「所有」+类别词的批量目标（v1.2.10）
 
+# 批量"整屋全部可开关设备"的三个**精确**词（不是子串！见 `_area_bulk_target`）。
+_BULK_DEVICE_WORDS = ("设备", "电器", "家电")
+
 _FLAG_TRACE_TOKENS: dict[str, tuple[str, ...]] = {
     FLAG_PRONOUN_TARGET: ("代词目标",),
     FLAG_ANAPHORA_STRIPPED: ("回指→",),
@@ -1268,7 +1271,10 @@ class FastPath:
                 return intent_type, action_val, text[m.end():].strip()
         mt = _WH_TRAIL_RE.search(text)
         if mt:
-            verb = mt.group(0)
+            # **取 group(1) 不是 group(0)**：0 组含可选前缀「都/全/全都」⇒ 拿 0 组判首字时，
+            # 「展厅所有窗都关了」的残串是「都关了」，首字「都」不在动词表里 → 判成 TurnDeviceOn，
+            # 用户说"都关了"我们真开窗（2026-10-08 发版前对抗复核实测，与全屋道 :1180 同判据）。
+            verb = mt.group(1)
             intent_type = ("TurnDeviceOff" if verb[0] in "关关停" else "TurnDeviceOn")
             return intent_type, None, text[:mt.start()].strip()
         return None, "", ""
@@ -1292,7 +1298,12 @@ class FastPath:
             pass
         elif _window_type(cat):
             return None, None, None               # 具名窗型归原车道（逐窗精确）
-        elif "设备" in cat or cat in ("电器", "家电"):
+        elif cat in _BULK_DEVICE_WORDS:
+            # **精确词，不是子串**：`"设备" in cat` 会把「监控设备/摄像设备/灯具设备」
+            # 也当成"整屋全部设备"⇒ 用户要关摄像头，实际关的是空调、灯、音箱和**三扇
+            # 开窗器**（2026-10-08 发版前对抗复核实测；v1.0.90「不敢把整屋设备冒按」
+            # 那道闸就是从这条子串判据漏出去的）。具名的"X 设备"归下面的类别道：
+            # 把用户说的词带下去，集成按同域+名称包含回捞，捞不到就如实查无。
             return ({"area": area,
                      "devices": [{"name": "",
                                   "domains": list(BULK_TOGGLEABLE_DOMAINS)}]},
