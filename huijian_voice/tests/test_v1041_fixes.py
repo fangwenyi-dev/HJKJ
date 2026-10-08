@@ -372,9 +372,16 @@ def test_f13_wholehouse_trailing_verb(text, intent):
 
 def test_f13_query_counterpins_stay_guarded():
     fp = _fp()
-    for t in ("所有灯现在什么状态", "家里灯都开着吗", "所有灯的开关在哪里",
-              "客厅所有灯都打开"):          # 区域句不放行成全屋（误开全家灯）
+    for t in ("所有灯现在什么状态", "家里灯都开着吗", "所有灯的开关在哪里"):
         assert asyncio.run(fp.match(t)) is None, t
+    # v1.2.10：「客厅所有灯都打开」是**区域命令**，本钉的不变量"区域句不放行成全屋"
+    # 仍然守住——它落的是 area=客厅 的窄目标（whole_house False），不是全家灯。
+    p = asyncio.run(fp.match("客厅所有灯都打开"))
+    assert p is not None and p.whole_house is False, p and p.trace
+    assert p.args["target"][0]["area"] == "客厅", p.args
+    # 不断 name 就看不见"只带域"的降级（对抗复核 B 条同族）：域不是类别
+    dev = p.args["target"][0]["devices"][0]
+    assert dev["name"] == "灯" and dev["domains"] == ["light"], p.args
     assert _is_complex_query("所有灯现在什么状态") is True
     assert _is_complex_query("所有灯都关啦") is False            # 都/啦 不豁免
     assert _is_complex_query("客厅所有灯都打开") is True         # 守卫与尾动同判据
@@ -394,8 +401,17 @@ def test_s12_verbfront_region_not_swallowed():
     assert p is not None and p.whole_house is False, p and p.trace
     assert p.args["target"][0]["area"] == "卧室", p.args
     assert p.args["target"][0]["devices"][0]["domains"] == ["cover"], p.args
-    for t in ("打开客厅所有灯", "关闭书房所有灯"):     # 灯区域句当前无 area 兜底 → None
-        assert asyncio.run(fp.match(t)) is None, t
+    for t, area in (("打开客厅所有灯", "客厅"), ("关闭书房所有灯", "书房")):
+        # v1.2.10 更新：本钉旧形断 None 是因为"灯区域句当前无 area 兜底"（原文注释），
+        # 而本钉的不变量是**不得 whole_house/不得扩大作用域**。区域批量道补上兜底后，
+        # 落的是本钉第一档许可的"正确 area 化"——区域逐字保留、whole_house 仍 False。
+        p = asyncio.run(fp.match(t))
+        assert p is not None and p.whole_house is False, (t, p and p.trace)
+        assert p.args["target"][0]["area"] == area, (t, p.args)
+        dev = p.args["target"][0]["devices"][0]
+        # name 也要断（对抗复核指出只断 area/domains 会看不见"名字被降级成空"
+        # 那一类降级——域不是类别，域展开会打到同域的别的设备）
+        assert dev["domains"] == ["light"] and dev["name"] == "灯", (t, dev)
     # 纯全屋句零漂移
     for t, intent in (("打开所有灯", "TurnDeviceOn"),
                       ("关闭全部窗帘", "TurnDeviceOff"),

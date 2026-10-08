@@ -356,6 +356,77 @@ async def _match_with_constraints(
     return found_states, all_expanded_domains
 
 
+OWN_INTEGRATION_DOMAIN = "huijian_ai"
+
+# v1.2.10「(区域)所有设备」＝一台设备只动它的电源位（2026-10-08 用户拍板："空调只需要
+# 关闭空调电源"）。本机注册表实测：办公室空调名下 16 条实体，7 条是功能位 switch
+# （ECO/上下摆风/左右摆风/辅热/干燥/睡眠/提示音/空调开关），且它们的 `entity_category`
+# 与 `capabilities` **都是 None** ⇒ 拿"类别/主实体"位判不了，只有**域**这一条判据在这批
+# 生态上可信。域优先级＝家电本体在前、`switch` 垫后（智能插座这类"本来就是一路开关"
+# 的设备仍会被留）。覆盖面必须与 core 的 `BULK_TOGGLEABLE_DOMAINS` 逐字相等（有钉）。
+_BULK_DOMAIN_PRIORITY = ("climate", "water_heater", "humidifier", "vacuum",
+                         "cover", "fan", "light", "media_player", "switch")
+# 配置/诊断实体（指示灯、信息按钮、配对键、升级位）不是"一台设备"，批量面一律不碰。
+_BULK_SKIP_CATEGORIES = frozenset({"config", "diagnostic"})
+
+
+def _is_bulk_auxiliary(entity_entry) -> bool:
+    """实体是否只是某台设备的"零件位"（指示灯、信息按钮、配对键、升级位）。
+
+    HA 的 `entity_category` 是 `str` 枚举，序列化后可能是裸串 ⇒ 先取 `.value`
+    再比。**取不到就算不是零件位**：这条只用来在批量展开里少按几个开关，
+    宁可多动一个指示灯，也不能凭空剔掉客户能点名的实体。永不抛。
+    """
+    try:
+        cat = getattr(entity_entry, "entity_category", None)
+        if cat is None:
+            return False
+        return str(getattr(cat, "value", cat)) in _BULK_SKIP_CATEGORIES
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def _bulk_one_per_device(entities: list[EntityInfo]) -> list[EntityInfo]:
+    """按 device 折叠：一台设备只留优先级最高的那条实体，其余都是它的"零件"。
+
+    同优先级按 entity_id 定序——结果必须与注册表遍历序无关（否则同一句话今天关这台、
+    明天关那台）。无 device_id 的实体各自成组（不参与折叠，宁多不少）。保持入参原序。
+    """
+    best: dict[str, tuple] = {}
+    for e in entities:
+        dom = str(e.state.entity_id).split(".", 1)[0]
+        rank = (_BULK_DOMAIN_PRIORITY.index(dom)
+                if dom in _BULK_DOMAIN_PRIORITY else len(_BULK_DOMAIN_PRIORITY))
+        dev = getattr(e.entity, "device_id", None) or f"@{e.state.entity_id}"
+        key = (rank, e.state.entity_id)
+        cur = best.get(dev)
+        if cur is None or key < cur[0]:
+            best[dev] = (key, e)
+    keep = {id(v[1]) for v in best.values()}
+    return [e for e in entities if id(e) in keep]
+
+
+def _is_own_integration(entity_entry, hass: HomeAssistant | None = None) -> bool:
+    """实体是否属于**本集成自己**（语音卫星：麦克风开关、媒体播放器、连续对话…）。
+
+    两条独立证据任一命中即真：注册表 `platform`、或 `config_entry_id` 落在本集成的
+    config entry 里（老 HA 无 platform 字段时仍判得准）。**判不了就算"不是自己人"**
+    ——这条只用来在批量展开里少带几台，宁可多带一台也不凭空剔客户的设备。永不抛。
+    """
+    try:
+        if entity_entry is None:
+            return False
+        if getattr(entity_entry, "platform", None) == OWN_INTEGRATION_DOMAIN:
+            return True
+        cid = getattr(entity_entry, "config_entry_id", None)
+        if not cid or hass is None or not hasattr(hass, "config_entries"):
+            return False
+        return cid in {e.entry_id
+                       for e in hass.config_entries.async_entries(OWN_INTEGRATION_DOMAIN)}
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def _build_entities_for_item(
     hass: HomeAssistant,
     item: StateWithAreaConstraint,
@@ -371,6 +442,19 @@ def _build_entities_for_item(
             continue
         entity_entry = entity_registry.async_get(state.entity_id)
         if not entity_entry:
+            continue
+        # v1.2.10「(区域)所有设备」绝不关语音卫星自己（用户明令：不要关 esp 相关）。
+        # 卫星的麦克风开关/媒体播放器天然落在可开关域里，客户把它登记在哪个房间，
+        # 那句「关闭客厅所有设备」就会把它自己关掉——下一句再没人听得见（自杀式静音）。
+        # 只挡**批量展开**（空名目标）；用户点名「关闭小智音箱」这类具名句照旧能动它。
+        if not item.requested_name and _is_own_integration(entity_entry, hass):
+            _LOGGER.info("Bulk target skips own-assistant entity: %s", state.entity_id)
+            continue
+        # v1.2.10「(区域)所有设备」不碰设备零件位（用户拍板"空调只需要关闭空调电源"）：
+        # 指示灯/信息按钮/配对键/升级位都是 config·diagnostic 类，它们不是一台设备。
+        # 只挡批量展开（空名目标）——点名「打开射灯指示灯」这类具名句照旧能动。
+        if not item.requested_name and _is_bulk_auxiliary(entity_entry):
+            _LOGGER.info("Bulk target skips auxiliary entity: %s", state.entity_id)
             continue
         entity_area = get_entity_area(hass, entity_entry)
         # v1.1.27：旧版此处 `if item.unset_area_constraint and entity_area: continue`
@@ -389,6 +473,15 @@ def _build_entities_for_item(
             )
         )
 
+    # v1.2.10 批量展开收到"一台设备一条"：办公室空调名下 8 条可开关实体（本体 +
+    # ECO/摆风/辅热/干燥/睡眠/提示音/电源开关），逐条按下去等于替客户把遥控器摸了一遍
+    # ——他只要"关闭空调"。具名目标（「灯」「射灯」）不折叠：那是用户自己圈的范围。
+    # **同域那一摊也不折叠**：整组只有一个域时（klar/LLM 给「开灯」传 name="" +
+    # domains=[light]），一台双路灯的两条 light 通道就是客户要的两盏，谁都不该被顶掉；
+    # 只有跨域混装（空调本体+功能位、插座+指示灯）才存在"这条是那台的零件"的判据。
+    if not item.requested_name and len({str(e.state.entity_id).split(".", 1)[0]
+                                        for e in candidate_entities}) > 1:
+        return _bulk_one_per_device(candidate_entities)
     return candidate_entities
 
 

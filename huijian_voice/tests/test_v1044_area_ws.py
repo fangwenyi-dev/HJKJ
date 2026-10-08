@@ -221,6 +221,31 @@ def test_device_registry_area_is_inherited(ha_base):
     assert "registry" not in err, err
 
 
+@pytest.mark.parametrize("ha_base", ["areadev"], indirect=True)
+def test_ws_channel_also_fills_the_entity_device_map(ha_base):
+    """生产接缝端到端：WS 拉完注册表，`_entity_device` 必须真被填上。
+
+    批量播报按"台"数数靠这张表（`executor._bulk_skipped_note`：一台设备名下的
+    功能位/零件不能用「台」混进设备数）。它若只在单测里由替身自己拼出来，WS 侧
+    少传一个字段就是**静默空表**——播报退化成按实体数，测试全绿（M16 同形教训）。
+    """
+    async def go():
+        c = HAClient()
+        c.base = ha_base
+        c.token = "test-token"
+        await c.start()
+        try:
+            await c._load_registries()
+            return dict(c._entity_device), c.last_error
+        finally:
+            await c.close()
+
+    devs, err = asyncio.run(go())
+    # sensor.t1/t4 无 device_id ⇒ 不进表（调用方按"自成一摊"处理，宁少合并不多）
+    assert devs == {"sensor.t2": "dev_bed", "sensor.t3": "dev_gone"}, devs
+    assert "registry" not in err, err
+
+
 @pytest.mark.parametrize("ha_base", ["devfail"], indirect=True)
 def test_device_registry_failure_never_downgrades_entity_registry(ha_base):
     """设备注册表拉取失败 ⇒ 降级为"只看实体自带"，实体/别名/device_class 不许丢。"""

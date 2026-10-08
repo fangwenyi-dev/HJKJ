@@ -23,8 +23,9 @@ from typing import Any, Optional
 
 from . import corrector, targets as T
 from . import creation
+from ..capability import BARE_WINDOW_NAMES, BULK_TOGGLEABLE_DOMAINS
 from .music import GENERIC_WORDS as _MUSIC_WORDS
-from .query import is_state_question, is_status_query, looks_local_query
+from .query import class_of, is_state_question, is_status_query, looks_local_query
 from .query import STATE_QUESTION_TAIL      # noqa: F401  变异靶：判据表在 query 单点定义
 
 logger = logging.getLogger("huijian.fastpath")
@@ -120,6 +121,24 @@ def resolve_absolute_lane(domains: list, raw_delta: str) -> Optional[tuple]:
     return None                           # 认不出族（switch/media_player/纯区域…）
 
 
+# ── 内倒近音族（单源）───────────────────────────────────────────
+# 2026-10-08 声学链实锤的**表间漂移**：头位动作表收了 9 档，尾位扫描
+# `_WINDOW_ACTION_SCAN` 只收 3 档 ⇒ 「关闭展厅所有窗户内道」尾位扫不到 内道，
+# 退到 `关` 字档折成 close——用户要内倒、窗整扇关（说的 A 做的 B，本仓同级红线）。
+# 现两档共用这一份词族；族内长词优先由 _alt 排序保证。
+_NEI_DAO_FAMILY = ("内倒", "内导", "内岛", "内到", "内道", "内达", "内藻",
+                   "内打", "内大")
+# 尾位**不吃** 内打/内大：句中这两个形态会咬住以它们起头的设备名
+# （「内大开窗器」剥掉窗型词后的残段"内大"被当成内倒动作＝反向误执行）。
+# 头位是整句起手的强意图位，才容得下这两档——不对称是有意的，别"顺手对齐"。
+_NEI_DAO_TAIL = tuple(w for w in _NEI_DAO_FAMILY if w not in ("内打", "内大"))
+
+
+def _alt(words) -> str:
+    """词族 → 正则交替式（长词在前，防短词截胡）。永不抛。"""
+    return "|".join(sorted(words, key=len, reverse=True))
+
+
 # ── 动作词匹配规则（v1.5 L207-255 逐字移植；(pattern, intent, action_val)）──
 _ACTION_PATTERNS: list[tuple[re.Pattern, str, Any]] = [
     # v1.0.40 修复（A1）：交替式必须**长词在前**——Python re 交替是"最左优先"而非
@@ -132,7 +151,7 @@ _ACTION_PATTERNS: list[tuple[re.Pattern, str, Any]] = [
     # 残出「器关闭」，(?!帘|器) 让整词进 ② 前缀剥离/窗族纠正车道。
     (re.compile(r"^(打开窗户|开窗户|打开窗(?!帘)|开窗(?!帘|器)|窗户打开)"), "ControlWindow", "open"),
     (re.compile(r"^(关闭窗户|关窗户|关闭窗(?!帘)|关窗(?!帘|器)|窗户关闭)"), "ControlWindow", "close"),
-    (re.compile(r"^(内倒|内导|内岛|内到|内道|内达|内打|内大|内藻)"), "ControlWindow", "A"),
+    (re.compile(rf"^({_alt(_NEI_DAO_FAMILY)})"), "ControlWindow", "A"),
     # 音乐带（2026-09-12）：后接音乐补语（播放/音乐/歌）时让位——"停止播放"
     # 是播控令不是窗帘暂停；裸"暂停/停"与"暂停窗帘"仍走窗户语义。
     (re.compile(r"^(暂停|停止|停)(?!(?:播放|音乐|歌|一?首))"), "ControlWindow", "pause"),
@@ -463,7 +482,7 @@ _ADJ_HEAD = re.compile(r"^(?:调高|调低|调亮|调暗|调大|调小|调到|�
                        r"提高|降低|提升|加大|减小|增加|减少)+")
 
 _WINDOW_ACTION_SCAN = [
-    (re.compile(r"内倒|内导|内岛"), "a"),
+    (re.compile(_alt(_NEI_DAO_TAIL)), "a"),
     (re.compile(r"暂停|停止|停"), "pause"),
     (re.compile(r"关|close"), "close"),
     (re.compile(r"开|open"), "open"),
@@ -614,11 +633,13 @@ class Plan:
 FLAG_PRONOUN_TARGET = "pronoun_target"        # 代词目标，待上下文注入
 FLAG_ANAPHORA_STRIPPED = "anaphora_stripped"  # 句首回指副词已剥离成具名短句
 FLAG_CHAIN_ANAPHORA = "chain_anaphora"        # 链内回指：同句先行分句供目标
+FLAG_AREA_BULK = "area_bulk"                  # 区域+「所有」+类别词的批量目标（v1.2.10）
 
 _FLAG_TRACE_TOKENS: dict[str, tuple[str, ...]] = {
     FLAG_PRONOUN_TARGET: ("代词目标",),
     FLAG_ANAPHORA_STRIPPED: ("回指→",),
     FLAG_CHAIN_ANAPHORA: ("链内回指",),
+    FLAG_AREA_BULK: ("区域批量",),
 }
 
 # T0 目标提取质量不足的 miss 原因名。生产者(:1411 附近)与消费者(T1 接管闸)
@@ -1169,6 +1190,129 @@ class FastPath:
                         source="t0", utterance=text, trace=trace, whole_house=True)
         return None
 
+    # ── v1.2.10：区域+「所有」+类别词的批量目标 ─────────────────────────
+    # 病灶（线上 v1.2.9 逐字，2026-10-08 17:20–17:21）：
+    #   「关闭展厅所有窗」→ t0 把区域名「展厅」当设备名、domains=[media_player]
+    #     （展厅那台音箱），靠 klar 兜住又被 _turn_gate 拒——窗一扇没动；
+    #   「关闭展厅所有灯」→ t0 整句未接管，交上层碰运气。
+    # _wholehouse_plan 只接**无区域**的全屋句（v1.0.41 S12 明令：动词+区域+全屋混形
+    # 是区域句，旧实现剥标记后直产 whole_house = 静默扩大作用域）。本道补的就是那半张
+    # 表：**区域是硬约束**，只在该区域内按类别展开，绝不全屋。
+    # 裁决次序与 _wholehouse_plan 同位次（场景等值/并列闸之后、复杂查询守卫之前），
+    # 两条支路共用同一批单源表：动词用 _ACTION_PATTERNS，全屋标记用 _WHOLEHOUSE_RE，
+    # 类别词→域用 query.class_of，尾动词用 _WH_TRAIL_RE。
+    _AB_STRIP = re.compile(r"(?:里的|里面的|内的|的|里|内|中)+$")
+
+    def _area_bulk_plan(self, text: str, trace: list) -> Optional[Plan]:
+        """「关闭客厅所有灯」/「把展厅所有窗户关掉」→ 区域内按类别批量。
+
+        认不出区域、认不出类别、句首即全屋标记、含否定字、连排/并列形态一律不接管
+        （宁交上层落空，绝不冒按——同 v1.0.90「不敢把整屋设备冒按」口径）。永不抛。
+        """
+        try:
+            t = (text or "").strip()
+            if not t or _WH_HEAD_RE.match(t):
+                return None                       # 全屋句归 _wholehouse_plan
+            if re.search(r"[别不没勿莫甭]", t):
+                return None                       # 否定字一律不接管（改写会把否定词从头上拆走）
+            if T.coord_refuse(t) or _SERIAL_RESIDUE.search(t):
+                return None                       # 并列/连排归链发，单发不猜
+            intent, action_val, body = self._area_bulk_split(t)
+            if intent is None:
+                return None
+            mk = _WHOLEHOUSE_RE.search(body)
+            if not mk:
+                return None                       # 没有显式"所有/全部"标记＝具名句，归原车道
+            area = self._AB_STRIP.sub("", body[:mk.start()]).strip()
+            cat = body[mk.end():].strip(" 的地得了吧啦").strip()
+            if not (1 <= len(area) <= 8) or not (1 <= len(cat) <= 6):
+                return None
+            if re.search(r"内倒|暂停|停止|调[大小高亮暗成到为]|设为|设置|度|[%％]|[0-9]",
+                         cat):
+                # 参数/档位/开度/编号句各有车道（_position_plan、_ACTION_PATTERNS 的
+                # 内倒项、_tail_window_action）——本道伸手会把动作吃掉：
+                # 「关闭展厅所有灯调到最亮」折成"关灯"是半执行（尾巴丢）。
+                # 只扫**类别段**且按词形匹配：扫整句会让「所有设备」的"设"、
+                # 「所有空调」的"调"自己把自己拦死（本轮实测踩过）。
+                return None
+            if "的" in cat:
+                return None                       # 「所有窗户的电源」：目标不是纯类别词
+            if T._area_of_prefix(area) != area:
+                return None                       # 区域必须逐字命中已知区域（绝不猜房间）
+            if _AREA_VERB_RESIDUE.search(area):
+                return None                       # 区域段带动词＝连排未切分
+            entry, intent_name, extra = self._area_bulk_target(
+                area, cat, intent, action_val)
+            if entry is None:
+                return None
+            trace.append(f"区域批量:{area}+{cat}")
+            return Plan(intent=intent_name, args={"target": [entry], **extra},
+                        source="t0", utterance=text, trace=trace).mark(FLAG_AREA_BULK)
+        except Exception:  # noqa: BLE001 判据故障=不接管（原车道逐字不变）
+            logger.exception("[fastpath] 区域批量预检异常（视为不接管）")
+            return None
+
+    @staticmethod
+    def _area_bulk_split(text: str):
+        """批量句拆成 (Turn* 意图, 动作值, 去掉动词后的残句)。
+
+        两种语序共用同一批动词表：动词前置（关闭展厅所有灯）走 _ACTION_PATTERNS，
+        动词后置（展厅所有灯关掉）走 _WH_TRAIL_RE——都不在本道手抄动词。
+        拆不出返回 (None, '', '')。
+        """
+        for pattern, intent_type, action_val in _ACTION_PATTERNS:
+            if intent_type not in ("TurnDeviceOn", "TurnDeviceOff"):
+                continue
+            m = pattern.match(text)
+            if m:
+                return intent_type, action_val, text[m.end():].strip()
+        mt = _WH_TRAIL_RE.search(text)
+        if mt:
+            verb = mt.group(0)
+            intent_type = ("TurnDeviceOff" if verb[0] in "关关停" else "TurnDeviceOn")
+            return intent_type, None, text[:mt.start()].strip()
+        return None, "", ""
+
+    @staticmethod
+    def _area_bulk_target(area: str, cat: str, intent: str, action_val):
+        """类别词 → (target 槽, 意图名, 额外 args)；认不出类别回 (None, None, None)。
+
+        **域不是类别**（对抗复核推翻的 P0）：这台 HA 的 cover 域全是开窗器、零台帘，
+        所以「关闭展厅所有窗帘」只带 `domains=["cover"]` 会真按三扇窗还报绿；
+        light 域同理含「办公室空调 Indicator Light」。故除两个例外，具名类别词一律
+        **把用户说的词一起带下去**（集成 `intent_helper._contains_name_states` 按
+        同域+名称包含回捞：既接得住真帘，又不碰开窗器）：
+        · 裸窗泛称（窗/窗户/窗子）→ ControlWindow，集成按窗型按钮表展开全窗，不 names；
+        · 设备/电器/家电 → 空名 + 可开关域白名单（这本来就是"全部可开关设备"的语义，
+          播报侧靠同一白名单如实报"没动的台数"）。
+        具名窗型（平开窗/推拉窗）不在这道接管——原车道逐窗更准。
+        """
+        bare_window = cat in BARE_WINDOW_NAMES
+        if bare_window:
+            pass
+        elif _window_type(cat):
+            return None, None, None               # 具名窗型归原车道（逐窗精确）
+        elif "设备" in cat or cat in ("电器", "家电"):
+            return ({"area": area,
+                     "devices": [{"name": "",
+                                  "domains": list(BULK_TOGGLEABLE_DOMAINS)}]},
+                    intent, {})
+        act = action_val or ("open" if intent == "TurnDeviceOn" else "close")
+        if bare_window:
+            # ControlWindow 的动作位在 args["action"]（集成 handler 直读它，
+            # 缺失即 "Could not determine action"），不进 devices 槽。
+            return ({"area": area,
+                     "devices": [{"name": "窗户", "domains": []}]},
+                    "ControlWindow", {"action": act})
+        _w, dd = class_of(cat)
+        doms = [str(d) for d in (dd or ())]
+        if not doms:
+            doms = [str(d) for d in (T.turn_domains(cat) or ())]
+        if not doms:
+            return None, None, None
+        return ({"area": area,
+                 "devices": [{"name": cat, "domains": doms}]}, intent, {})
+
     # ── v1.0.42 家电族：扫地机/吸尘器/拖地机 专有动作层 ─────────────────
     # 集成侧 TurnDeviceOn/Off 已有 vacuum 映射（on→vacuum.start 开扫、
     # off→vacuum.return_to_base 回充），本层只把字面表不认的形态（启动/
@@ -1337,6 +1481,12 @@ class FastPath:
         wh = self._wholehouse_plan(text, trace)
         if wh is not None:
             return wh
+        # v1.2.10：区域+「所有」+类别词（「关闭展厅所有窗户」）同位次裁决——
+        # 守卫同样会吞它，而落给上层的结果是 klar 产歧义目标或被 _turn_gate 拒，
+        # 现场那条「关闭展厅所有窗」甚至被 t0 自己错解成"关展厅那台音箱"。
+        ab = self._area_bulk_plan(text, trace)
+        if ab is not None:
+            return ab
         if _is_complex_query(text):
             trace.append("复杂查询守卫→交上层")
             # 等值触发词已在最前面裁决过（同 text 同 check），此处不再重复判定

@@ -58,6 +58,13 @@ class HAClient:
         self._states: dict[str, dict] = {}
         self._areas: dict[str, str] = {}          # area_id → 名称
         self._entity_area: dict[str, str] = {}    # entity_id → area 名
+        # entity_id → 所属集成（注册表 platform）。批量口令要把"语音卫星自己"
+        # 摘出去（见 core/capability.BULK_SELF_PLATFORM 与 executor._bulk_skipped_note）。
+        self._entity_platform: dict[str, str] = {}
+        # entity_id → 所属 device_id。批量播报要说"几台设备"，而注册表里一台设备
+        # 名下常挂十几条实体（办公室空调：本体 + 7 个功能位 + 指示灯 + 信息按钮）。
+        # 没有这张表就只能按实体数数，"2 台都关了，另有 16 台没动"会念成 18 台。
+        self._entity_device: dict[str, str] = {}
         self._cache_ts = 0.0
         self._CACHE_TTL = 5.0
         self._REG_TTL = 300.0
@@ -405,6 +412,46 @@ class HAClient:
                 dc_map[eid] = dcv
         return ent_map, alias_map, dc_map
 
+    @staticmethod
+    def _parse_platforms(rows) -> dict[str, str]:
+        """实体注册表行 → {entity_id: 所属集成(platform)}。
+
+        单独一张表、不改 `_parse_registry` 的三元组返回——那函数被 5 处测试直调，
+        加返回值等于把它们的解包全撞坏（ additive 才是这条链该有的改法）。
+        停用/隐藏实体照旧不进表（与 `_parse_registry` 同判据，否则词表与真机不一致）。
+        """
+        out: dict[str, str] = {}
+        for e in (rows or []):
+            if not isinstance(e, dict):
+                continue
+            eid = e.get("entity_id")
+            if not eid or e.get("disabled_by") or e.get("hidden_by"):
+                continue
+            plat = e.get("platform")
+            if isinstance(plat, str) and plat.strip():
+                out[eid] = plat.strip()
+        return out
+
+    @staticmethod
+    def _parse_devices(rows) -> dict[str, str]:
+        """实体注册表行 → {entity_id: device_id}（批量播报按"台"数数要用）。
+
+        与 `_parse_platforms` 同判据、同改法：单独一张表，不碰 `_parse_registry`
+        的三元组。**没有 device_id 的实体不进表**——调用方按"每台一条"归堆时，
+        查不到就各自成组（与集成侧 `_bulk_one_per_device` 同口径，宁多不少）。
+        """
+        out: dict[str, str] = {}
+        for e in (rows or []):
+            if not isinstance(e, dict):
+                continue
+            eid = e.get("entity_id")
+            if not eid or e.get("disabled_by") or e.get("hidden_by"):
+                continue
+            dev = e.get("device_id")
+            if isinstance(dev, str) and dev.strip():
+                out[eid] = dev.strip()
+        return out
+
     async def _load_registries(self) -> None:
         # v1.0.44 根治：现代 HA（2024.4 起）已**删除** /api/config/* REST——区域/
         # 实体注册表只剩 WebSocket 通道。旧实现 `if r.status == 200` 静默吞 404，
@@ -414,25 +461,33 @@ class HAClient:
         # auth_required 消息双形态）→ REST 兼容老 HA；双双失败不再静默：
         # WARN + last_error（状态页可见），杜绝"恒空但看似正常"。
         try:
-            areas, ent_map, alias_map, dc_map = await self._ws_registries()
-            self._apply_registries(areas, ent_map, alias_map, dc_map)
+            areas, ent_map, alias_map, dc_map, plat, devs = await self._ws_registries()
+            self._apply_registries(areas, ent_map, alias_map, dc_map, plat, devs)
             return
         except Exception as e:
             logger.warning("[HA] 注册表 WebSocket 拉取失败，回落 REST（老 HA 形态）: %s", e)
-        areas, ent_map, alias_map, dc_map, err = await self._rest_registries()
+        areas, ent_map, alias_map, dc_map, plat, devs, err = await self._rest_registries()
         if areas is None:
             self.last_error = f"registry: ws+rest 均失败（rest: {err}）"
             # v1.1.21：失败也推进窗口（退避）——旧式不写 _reg_ts ⇒ TTL 一到立刻重试，
             # 而整段注册表加载持 _lock（最坏 ~110s），每轮语音都会被拖过设备 20s 超时
             self._reg_ts = time.time()
             return
-        self._apply_registries(areas, ent_map, alias_map, dc_map)
+        self._apply_registries(areas, ent_map, alias_map, dc_map, plat, devs)
 
     def _apply_registries(self, areas: dict, ent_map: dict,
                           alias_map: dict | None = None,
-                          dc_map: dict | None = None) -> None:
+                          dc_map: dict | None = None,
+                          platform_map: dict | None = None,
+                          device_map: dict | None = None) -> None:
         self._areas = areas
         self._entity_area = ent_map
+        # v1.2.10：实体→所属集成表（批量口令据此把"语音卫星自己"摘出去；
+        # 老 HA/拉取失败时为空表 ⇒ 判据按"认不出＝不排除"放行，绝不瞎摘客户的设备）
+        self._entity_platform = platform_map or {}
+        # v1.2.10：实体→设备表（批量播报按"台"数数用；空表 ⇒ 每条实体自成一摊，
+        # 只会把"2 台"报成"2 摊"，绝不凭空少报客户能点名的设备）
+        self._entity_device = device_map or {}
         # v1.1.4 第 2 步补口：实体注册表里**已经在 HA 侧填好的语音别名**与
         # device_class 一并接住。别名是最省钱的覆盖面来源——用户自己在 HA
         # 「设备与服务→实体→别名」里写的叫法，过去我们完全没读，等于把已经
@@ -475,7 +530,7 @@ class HAClient:
                 raise RuntimeError(f"{mtype} → {str(m)[:200]}")
             # 其余帧为 event 推送（订阅制下不该出现），忽略继续等本命令结果
 
-    async def _ws_registries(self) -> tuple[dict, dict, dict, dict]:
+    async def _ws_registries(self) -> tuple[dict, dict, dict, dict, dict, dict]:
         """一次连接拉区域+实体注册表。auth 双形态：新版 HA 接受 ws 请求携带
         Authorization header（服务端静默不发首帧）；老式连接首帧 auth_required →
         消息认证。首帧 1s 探测区分两态。
@@ -516,18 +571,21 @@ class HAClient:
                                            "实体自带区域）: %s", de)
                     ent_map, alias_map, dc_map = self._parse_registry(
                         ent_rows, areas, dev_area)
-                    return areas, ent_map, alias_map, dc_map
+                    return (areas, ent_map, alias_map, dc_map,
+                            self._parse_platforms(ent_rows),
+                            self._parse_devices(ent_rows))
             except Exception as e:  # 端点形态差异：换下一个候选
                 last_err = e
                 continue
         raise last_err or RuntimeError("无可用 WS 端点")
 
-    async def _rest_registries(self) -> tuple[Optional[dict], Optional[dict], dict, dict, str]:
+    async def _rest_registries(self) -> tuple[Optional[dict], Optional[dict], dict,
+                                              dict, dict, dict, str]:
         """老 HA（<2024.4）REST 兼容通道。非 200 不再静默——回传原因入 last_error。"""
         try:
             async with self._session.get(self._url("/api/config/area_registry/list")) as r:
                 if r.status != 200:
-                    return None, None, {}, {}, f"areas {r.status}"
+                    return None, None, {}, {}, {}, {}, f"areas {r.status}"
                 areas = {a["area_id"]: a.get("name", a["area_id"]) for a in await r.json()}
             async with self._session.get(self._url("/api/config/entity_registry/list")) as r:
                 rows = await r.json() if r.status == 200 else []
@@ -542,9 +600,10 @@ class HAClient:
                 except Exception as de:
                     logger.debug("[HA] REST 设备注册表读取失败（区域继承降级）: %s", de)
             ent_map, alias_map, dc_map = self._parse_registry(rows or [], areas, dev_area)
-            return areas, ent_map, alias_map, dc_map, ""
+            return (areas, ent_map, alias_map, dc_map,
+                    self._parse_platforms(rows), self._parse_devices(rows), "")
         except Exception as e:
-            return None, None, {}, {}, str(e)
+            return None, None, {}, {}, {}, {}, str(e)
 
     async def states(self) -> dict[str, dict]:
         await self.refresh_states()

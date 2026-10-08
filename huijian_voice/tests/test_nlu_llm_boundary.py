@@ -506,7 +506,12 @@ def test_action_clause_with_own_area_is_not_overridden():
 
 
 def test_unknown_domain_whole_house_is_rejected():
-    """认不出域的全屋口径（"所有设备"）不冒然全屋全动（会带上门锁）→ 整单拒绝。"""
+    """认不出域的全屋口径（"所有设备"）不冒然全屋全动（会带上门锁）→ 整单拒绝。
+
+    v1.2.10 加了「(区域)所有设备」批量道后，本钉的理由**换了一半**：域现在认得出了
+    （可开关白名单），但创建子句里的区域是**推断**来的（触发条件带的"客厅"）——
+    把用户明说的全屋口径悄悄收窄成常驻规则，比当场拒收危险，故 `_retry_with_area`
+    对含全屋标记的子句一律不再继承区域。断言逐字不变，防的是新道从这条路溜进去。"""
     ex = Recorder()
     r = _casc(_pipe(executor=ex, ha=FakeHAWithAreas()),
               "当客厅温度超过28度就打开所有设备")

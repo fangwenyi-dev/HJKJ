@@ -225,6 +225,70 @@ _LEG_WINDOW_DESIRED = {"open": ("open",), "close": ("closed",), "closed": ("clos
 # HassToggle 在 lock 域都落 unlock（同文件 else 支）⇒ 不在此列。
 _LOCK_WANT_LOCKED = ("HassLock", "HassTurnOn", "TurnDeviceOn")
 
+# 「(区域)所有设备」白名单**之外**、但本身可开关的域——批量口令故意不碰、且必须在
+# 播报里点名是哪一类（见 Executor._bulk_skipped_note）。只收"用户会以为也一起动了
+# 就出事"的这几类；表外的域（遥控器、二进制传感器…）只报台数不举例，绝不编因果。
+_KEPT_RISKY_SAY = {"lock": "门锁", "alarm_control_panel": "报警面板",
+                   "camera": "摄像头", "scene": "场景", "script": "脚本",
+                   "todo": "清单", "input_button": "输入按钮"}
+
+
+def _area_bulk_slot(args: dict) -> bool:
+    """target 是否为「区域 + 空名 + 域过滤」的**区域内批量**形（v1.2.10）。
+
+    与 `pipeline._is_wholehouse_args` 同形判据，差别就在带区域：全屋形是
+    「打开所有灯」，区域批量形是「关闭展厅所有灯」。只看 args 不看旗标——
+    链里次腿的 flags 不随 extra_steps 传，判据必须对两条通道同形
+    （同 v1.1.39 把"点名查无"上提到 args 层的理由）。永不抛。
+    """
+    try:
+        for slot in ((args or {}).get("target") or []):
+            if not isinstance(slot, dict) or not str(slot.get("area") or "").strip():
+                continue
+            devs = slot.get("devices")
+            if not isinstance(devs, list) or not devs:
+                continue
+            if all(isinstance(d, dict) and not str(d.get("name") or "").strip()
+                   and (d.get("domains") or []) for d in devs):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _bulk_area_prefix(args) -> str:
+    """批量目标所属区域 → 播报前缀「办公室的 」（取第一个非空 area；都没有回空串）。
+
+    空串是**故意的**：无区域的批量形（全屋「所有灯」）没有可点的房间名，
+    播报退成「3 台本来就在要求的状态上」，绝不编一个区域出来。永不抛。
+    """
+    try:
+        for slot in ((args or {}).get("target") or []):
+            if isinstance(slot, dict):
+                a = str(slot.get("area") or "").strip()
+                if a:
+                    return f"{a}的 "
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _bulk_all_devices_slot(args: dict) -> bool:
+    """本次批量是否为"所有设备"口径（域集覆盖可开关白名单）。
+
+    只有它需要如实交代"还有哪些台不支持开关、没动"——用户点名「所有灯」时
+    不提空调是正解，提了反而是噪音。永不抛。
+    """
+    try:
+        wl = set(capability.BULK_TOGGLEABLE_DOMAINS)
+        for slot in ((args or {}).get("target") or []):
+            for d in ((slot or {}).get("devices") or []):
+                if set(str(x) for x in ((d or {}).get("domains") or [])) >= wl:
+                    return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def _lock_domain_target(args: dict) -> bool:
     """目标是否为 lock 域（v1.1.19：锁确证按域判，不看意图名）。永不抛。"""
@@ -668,7 +732,19 @@ class Executor:
                             for s in tgt if isinstance(s, dict)]
                 if capability.resolve_candidates(states, {}, anywhere):
                     return "", ""
-                return "missing", "、".join(names)
+                # v1.2.10（线上 v1.2.9 实锤 2026-10-08 17:21:01）：裸窗泛称不是设备名。
+                # 执行面（intent_window_control 的 `is_bare_window_name` 分支）把
+                # 「窗户/窗/窗子」刻意升级成"本区域全部窗"的**按钮按压**，从不按名字
+                # 匹配实体；判据面按 friendly_name 子串查证据必空（展厅那三扇叫
+                # 「悬窗 开窗器」）⇒ 真关了三扇窗却被播成「窗户」我没找到。判据对
+                # "执行面按类别展开"的词没有证伪权——剔除后无可点名的名字就不判。
+                # 具名窗型（推拉窗）与带修饰段的真名字（会飞的窗）不在豁免面内，
+                # 「点名查无」那条红线原样保留。
+                named = [n for n in names
+                         if not capability.is_generic_window_name(n)]
+                if not named:
+                    return "", ""
+                return "missing", "、".join(named)
             # 空操作判定只对"状态名就是 on/off"的域成立；cover/climate/media_player
             # 等状态词不同（open/closed、hvac_action…），一律不判，宁可不点名。
             if any(str(eid).split(".", 1)[0] not in _LEG_NOOP_DOMAINS
@@ -676,7 +752,17 @@ class Executor:
                 return "", ""
             cur = {str((e or {}).get("state")) for e in cands}
             if cur and cur.issubset(want):
-                label = "、".join(names) or str(cands[0].get("entity_id") or "")
+                # v1.2.10 点名材料三级取第一个能用的：**解析到的真体名 → 用户说的词 →
+                # 区域+N 台**。只念用户自己的词会播成「「灯」本来就在要求的状态上」
+                # （声学链实测），而真体名「射灯」才是这条命令实际涉及的那台；
+                # 纯批量形（「所有设备」，name=""）没有可比名字，按台数说——
+                # 绝不退到 entity_id（机器名进 TTS 是纯噪音，E1 对 entity_id 形同口径）。
+                if names:
+                    real = [str(((c or {}).get("attributes") or {})
+                                .get("friendly_name") or "").strip() for c in cands]
+                    label = "、".join([r for r in real if r][:3]) or "、".join(names)
+                else:
+                    label = f"{_bulk_area_prefix(args)}{len(cands)} 台"
                 return "noop", label
             return "", ""
         except Exception:  # noqa: BLE001 判不了就不判（话术退回既有口径）
@@ -767,6 +853,80 @@ class Executor:
             logger.exception("[执行] 别名候选还原异常（不判）")
             return []
 
+    async def _bulk_skipped_note(self, args: dict) -> str:
+        """「(区域)所有设备」没碰到的部分，分因如实报（v1.2.10 用户拍板口径）。
+
+        · **功能位**：同一台设备名下、被"只动电源位"折叠掉的那些条（空调的
+          ECO/上下摆风/辅热/干燥/睡眠/提示音…）——本体关了不等于它们也关了，
+          用户说的是"所有设备"，这些条没动就要认账；
+        · **不支持开关**：域在 `capability.UNTOGGLEABLE_DOMAINS`（传感器/按钮/数值/
+          选择器这类设备零件，HA 语义里根本没有 turn_on 动作）；
+        · **为防误动没碰**：域可开关但不在批量白名单里（门锁、报警面板、场景…）——
+          这一档必须说出来：一道口令悄悄跳过门锁不报，等于让他以为门也一起锁上了。
+        · **语音卫星自身**：集成侧已从批量面摘掉（防自杀式静音），注里也要认账。
+        单位口径：**「台」只用于设备**（后两档按 device_id 归堆再数），零件与功能位
+        用「个」——集成侧折叠后回执那句"2 台"是**设备**，这里若继续按实体数，
+        办公室会念成"2 台都关了，另有 16 台没动"（真机 2 台设备挂 27 条实体），
+        等于凭空多出 14 台客户没有的设备。
+        快照走 TTL 缓存、本轮判据已经读过 ⇒ 零新增网络。数不出来 ⇒ 空串（绝不编数）。
+        """
+        try:
+            slot = next((s for s in ((args or {}).get("target") or [])
+                         if isinstance(s, dict) and str(s.get("area") or "").strip()),
+                        None)
+            if slot is None:
+                return ""
+            area = str(slot.get("area") or "").strip()
+            states = await self.ha.states()
+            if not states:
+                return ""
+            area_map = getattr(self.ha, "_entity_area", {}) or {}
+            wl = set(capability.BULK_TOGGLEABLE_DOMAINS)
+            plat = getattr(self.ha, "_entity_platform", {}) or {}
+            dev_map = getattr(self.ha, "_entity_device", {}) or {}
+            unsupport = 0
+            kept_devs: set = set()
+            own_devs: set = set()
+            kept_domains = set()
+            groups: dict = {}          # 白名单实体按设备归堆（折叠后台数=摊数）
+            for eid in states:
+                if area_map.get(eid) != area:
+                    continue
+                dom = str(eid).split(".", 1)[0]
+                # 无 device_id 的实体自成一摊（与集成侧 _bulk_one_per_device 同口径：
+                # 表拉不到时最多少合并几条，绝不把两台并成一台）
+                dev = dev_map.get(eid) or f"@{eid}"
+                if plat.get(eid) == capability.BULK_SELF_PLATFORM and dom in wl:
+                    own_devs.add(dev)         # 卫星自己：集成侧已从批量面摘出去
+                    continue
+                if dom in capability.UNTOGGLEABLE_DOMAINS:
+                    unsupport += 1
+                elif dom not in wl:
+                    kept_devs.add(dev)
+                    kept_domains.add(dom)
+                else:
+                    groups[dev] = groups.get(dev, 0) + 1
+            extras = sum(n - 1 for n in groups.values())
+            segs = []
+            if extras:
+                segs.append(f"{extras} 个功能位")
+            if unsupport:
+                segs.append(f"{unsupport} 个不支持开关")
+            if kept_devs:
+                # 「（门锁这类）」只在**真是那几个域**时才写——写死一个例子会在
+                # "其实是一台遥控器"的家里播成"门锁没动"，那是编出来的因果。
+                say = "、".join(_KEPT_RISKY_SAY[d] for d in sorted(kept_domains)
+                                if d in _KEPT_RISKY_SAY)
+                segs.append(f"{len(kept_devs)} 台"
+                            + (f"（{say}这类）" if say else "") + "为防误动")
+            if own_devs:
+                # 防自杀式静音：卫星的麦克风开关/媒体播放器都在可开关域里，客户把它
+                # 登记在房间里的话，「所有设备」就会把它自己关掉——下一句再没人听得见。
+                segs.append(f"{len(own_devs)} 台是语音卫星自身")
+            return ("另有 " + "、".join(segs) + "，都没动") if segs else ""
+        except Exception:  # noqa: BLE001 数不出来就不说，绝不编
+            return ""
+
     async def run(self, plan: Plan) -> tuple[bool, str]:
         """执行 Plan（klar 多分句/复合链逐步顺序执行）。返回 (success, 中文播报)。永不抛。"""
         # 每一步带**自己的**来源（src）：一条链由 select_primary_plan 逐分句裁决，
@@ -786,6 +946,7 @@ class Executor:
         offline: list[str] = []              # 标的确证离线（部分离线时点名，见 _offline_names）
         lock_notes: list[str] = []           # 锁后置确证未过（见 _lock_unconfirmed）
         anon_missing = 0                     # entity_id 形分句查无此台（E1，无名可点）
+        skip_note = ""                       # 区域批量"没碰到的台"如实注（v1.2.10）
         for idx, (name, args, src) in enumerate(steps):
             # v1.1.21：本步用**副本**——改指（_repoint_offline_twin）会就地写 args，
             # 旧实现把调用方 plan.args/extra_steps 里的同一份引用改掉（同轮二次 run
@@ -811,7 +972,8 @@ class Executor:
                             name, args)
                 return self._named(False, self._step_say(idx, steps, gate)
                                  + self._accum_notes(missing, noops, no_receipt,
-                                                     offline, lock_notes, anon_missing))
+                                                     offline, lock_notes, anon_missing,
+                                                     skip_note))
             cap = await self._capability_refuse(name, args)
             if cap is not None:
                 # v1.1.3：网关侧按本家实体真实能力当场如实回话（带可选档位），
@@ -821,7 +983,8 @@ class Executor:
                 logger.info("[执行] %s %s → 能力预裁拦下 | %s", name, args, cap)
                 return self._named(False, self._step_say(idx, steps, cap)
                                  + self._accum_notes(missing, noops, no_receipt,
-                                                     offline, lock_notes, anon_missing))
+                                                     offline, lock_notes, anon_missing,
+                                                     skip_note))
             await self._repoint_offline_twin(args)
             avail = await self._availability_refuse(name, args)
             if avail is not None:
@@ -832,7 +995,8 @@ class Executor:
                             name, args, avail)
                 return self._named(False, self._step_say(idx, steps, avail)
                                  + self._accum_notes(missing, noops, no_receipt,
-                                                     offline, lock_notes, anon_missing))
+                                                     offline, lock_notes, anon_missing,
+                                                     skip_note))
             # v1.1.15(收口批)：单步计划同样逐台证伪——旧的 `len(steps) > 1` 栅栏
             # 让"电视声被听成单步 HassTurnOff 打在已关的灯上"永远回"关了"（审计实证：
             # 17:02/17:03 两轮）。判据本身早就对单步成立（resolve_candidates 与
@@ -903,6 +1067,10 @@ class Executor:
             for nm in await self._unanswered(args, result):
                 if nm not in no_receipt:
                     no_receipt.append(nm)
+            # v1.2.10「(区域)所有设备」：只数**没碰**的台数，成功支与后继腿早退支
+            # 共用同一条注（走 _accum_notes），不得因后面一腿被闸拦下而蒸发。
+            if not skip_note and _area_bulk_slot(args) and _bulk_all_devices_slot(args):
+                skip_note = await self._bulk_skipped_note(args)
             if len(steps) > 1:
                 # 逐腿留痕（D2 旧病：整链只印首步的 intent/args，第二腿在账上不存在，
                 # 现场无法对账"到底动了几台"）；通道名一并印——D6 的病灶正是"走了
@@ -991,11 +1159,18 @@ class Executor:
                 # （逐实体行）是**两种事实**，不许互吞——旧式这里把 partial 置空，实测
                 # 「另有 1 台没成功」静默消失（链里一腿查无此名 + 一腿部分失败）。
                 bits.append(partial.strip("（）"))
+            if skip_note:
+                bits.append(skip_note)
+                skip_note = ""
             reply = "好的，" + "；".join(bits)
             partial = ""
         tag = f"(+%d步)" % (len(steps) - 1) if len(steps) > 1 else ""
         if partial and not reply.endswith(partial):
             reply = reply.rstrip("。") + partial      # 部分失败点名，不静默全绿
+        if skip_note and skip_note not in reply:
+            # 区域批量"没碰的台"注：与部分失败点名同一并入位（bits 支已消费掉时
+            # skip_note 已置空，这里不会重复）。
+            reply = reply.rstrip("。") + "（" + skip_note + "）"
         # v1.1.27-r2（金标复测）：集成侧把窗侧失败折进 `partial_error` 返回；core
         # 旧无消费者 ⇒ 用户只听「好的，…关了」（金标复测 V1-项3 实锤）。按"部分
         # 失败点名"同口径并入话术：去重、不改成功口径（顶层仍如实 True）。
@@ -1015,7 +1190,7 @@ class Executor:
 
     @staticmethod
     def _accum_notes(missing, noops, no_receipt, offline, lock_notes,
-                     anon_missing: int = 0) -> str:
+                     anon_missing: int = 0, skip_note: str = "") -> str:
         """早退路径的“已攒判据”尾注（第四轮审计 ①）。
 
         前几腿已证伪的事实（查无此名/空操作/离线/无回执/锁确证未过）不得因
@@ -1026,6 +1201,8 @@ class Executor:
                [f"「{n}」现在离线、这条没执行" for n in offline] + list(lock_notes)
         if anon_missing:
             bits.append(f"另有 {anon_missing} 条找不到对应的设备")
+        if skip_note:
+            bits.append(skip_note)
         return ("（" + "；".join(bits) + "）") if bits else ""
     @staticmethod
     def _step_say(idx: int, steps: list, reason: str) -> str:
@@ -1450,6 +1627,19 @@ class Executor:
                 return f"好的，{head}{names}已上锁"
             if intent == "TurnDeviceOff":
                 return f"好的，{head}{names}已解锁"
+        # v1.2.10 区域批量（「关闭展厅所有设备」一次真动好几台）：逐台念名会播成
+        # 半分钟（.91 展厅一个区就 31 个实体），改按台数收口。台数取**回执里确证
+        # 成功的行**而不是请求数——宁少报不多报（与 `_receipt` 同一口径）；≤2 台
+        # 仍逐台点名，两台设备靠名字分得清，念数反而丢信息。放在锁语义之后：
+        # 计数形没有名字可判，门锁批量得先按 D7 反转口径念出来。
+        if _area_bulk_slot(args) and len(targets) > 2:
+            _bulk_verb = {"TurnDeviceOn": "打开了", "TurnDeviceOff": "关了",
+                          "PauseDevice": "暂停了"}.get(intent)
+            if _bulk_verb:
+                # 「展厅 5 台都关了」——不复用 head（head 是「展厅的」，接数字会念成
+                # "展厅的5 台"），区域名后带一个空格；无区域时不编区域。
+                who = f"{area} " if area else ""
+                return f"好的，{who}{len(targets)} 台都{_bulk_verb}"
         if intent == "TurnDeviceOn":
             return f"好的，{head}{names}打开了"
         if intent == "TurnDeviceOff":

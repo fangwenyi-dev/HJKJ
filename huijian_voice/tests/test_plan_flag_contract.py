@@ -18,7 +18,8 @@ trace 是给人看的诊断串。改一句日志措辞（或顺手给前缀加�
 import ast
 import pathlib
 
-from core.nlu.fast_path import (FLAG_ANAPHORA_STRIPPED, FLAG_CHAIN_ANAPHORA,
+from core.nlu.fast_path import (FLAG_ANAPHORA_STRIPPED, FLAG_AREA_BULK,
+                                FLAG_CHAIN_ANAPHORA,
                                 FLAG_PRONOUN_TARGET, MISS_LOW_EXTRACT_QUALITY,
                                 Plan, TRACE_TAG_CHAIN, TRACE_TAG_CONTEXT,
                                 _FLAG_TRACE_TOKENS)
@@ -109,7 +110,8 @@ def test_flag_vocabulary_and_derivation_table_agree():
     """元钉：旗标常量与派生表一一对应——加了旗标忘了配 token，旗标永远不亮
     （比没有旗标更坏：读代码的人以为它有）。"""
     assert set(_FLAG_TRACE_TOKENS) == {FLAG_PRONOUN_TARGET,
-                                       FLAG_ANAPHORA_STRIPPED, FLAG_CHAIN_ANAPHORA}
+                                       FLAG_ANAPHORA_STRIPPED,
+                                       FLAG_CHAIN_ANAPHORA, FLAG_AREA_BULK}
     for flag, tokens in _FLAG_TRACE_TOKENS.items():
         assert tokens and all(tokens), f"{flag} 派生 token 为空=永不可达"
 
@@ -121,6 +123,7 @@ def test_trace_tokens_still_derive_flags():
         "TurnDeviceOn", {}, trace=["代词目标:它→待上下文注入"]).flags
     assert FLAG_ANAPHORA_STRIPPED in Plan("X", {}, trace=["回指→亮一点"]).flags
     assert FLAG_CHAIN_ANAPHORA in Plan("X", {}, trace=["链内回指:继承目标 a"]).flags
+    assert FLAG_AREA_BULK in Plan("X", {}, trace=["区域批量:展厅+灯"]).flags
     assert Plan("X", {}, trace=["无匹配动作"]).flags == set()
 
 

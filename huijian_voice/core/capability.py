@@ -54,6 +54,53 @@ UNTOGGLEABLE_DOMAINS = frozenset(READ_ONLY_DOMAINS | {
     "number", "select", "text", "button", "datetime", "date", "time", "event",
 })
 
+# ── 「类别选择器」词表：泛称不是设备名（v1.2.10 现场实锤）────────────────
+# 病灶（线上 v1.2.9，2026-10-08 17:21:01）：「关闭展厅所有窗户」真的关了展厅三扇窗
+# ——集成侧 `intent_window_control` 对裸窗字名（`is_bare_window_name` 分支）刻意升级成
+# "本区域全部窗"；而 `Executor._leg_truth` 按 friendly_name **子串**查证据，展厅没有一
+# 台名字里含「窗户」（它们叫「悬窗 开窗器」）⇒ 成功回执被改写成「窗户」我没找到。
+# 判据面对"执行面本来就打算按类别展开、不按名字匹配"的词没有证伪权。
+# ⚠ 下面两张表与集成侧 `intent_window_const._BARE_WINDOW_NAMES` / `GENERIC_WINDOW_NAMES`
+# 必须逐字相等：core 跑在加载项容器、集成跑在 HA 进程内，两边不能互相 import，
+# 漂移由 tests/test_v1210_area_bulk.py 的 AST 钉判红（v1.1.27 两表手抄各半张的教训）。
+BARE_WINDOW_NAMES = ("窗户", "窗", "窗子")
+GENERIC_WINDOW_NAMES = ("所有窗户", "所有窗", "全部窗户", "全部窗",
+                        "每个窗户", "每扇窗户", "全部窗子", "所有窗子")
+
+
+def is_generic_window_name(name) -> bool:
+    """名字是否为"本区域全部窗"的类别选择器（与集成侧同名谓词同一裁决）。
+
+    空名也算：集成侧对"只有区域没有窗型"（「打开办公室的窗」）同样升级全窗。
+    具名窗型（推拉窗/内开窗）与"类别词前有修饰段"的真名字（会飞的窗）**不在**此列
+    ——那些仍可被点名查无判据证伪，一并豁免等于拆掉 v1.1.35 那道闸。永不抛。
+    """
+    try:
+        n = str(name or "").strip().lower()
+        if not n:
+            return True
+        if n in BARE_WINDOW_NAMES:
+            return True
+        return any(g in n for g in GENERIC_WINDOW_NAMES)
+    except Exception:  # noqa: BLE001 判不了＝不当类别词（维持原判据）
+        return False
+
+
+# 「(区域)所有设备」批量车道只驱动这些域（2026-10-08 用户拍板：只动可开关域）。
+# 刻意用**白名单**而不是 UNTOGGLEABLE_DOMAINS 的补集：补集会带进 lock/alarm_control_panel/
+# scene/script——批量解锁与批量触发场景都不可逆，而 v1.0.90「不敢把整屋设备冒按」正是
+# 为此设的闸。lock 明确排除：「关闭所有设备」折成 unlock 等于一次口令拔完好几道门。
+BULK_TOGGLEABLE_DOMAINS = ("climate", "cover", "fan", "humidifier", "light",
+                           "media_player", "switch", "vacuum", "water_heater")
+
+# 「(区域)所有设备」还有一类**必须**排除的：本集成自己的语音卫星实体（麦克风开关 switch、
+# 媒体播放器 media_player、连续对话 switch…都在上面的白名单域里）。不挡就是
+# 一句「关闭客厅所有设备」把自己静音，下一句再没人听得见（2026-10-08 用户明令：
+# 不要关 esp 相关）。core 与集成两个包都要认这个域名，谁都不能 import 谁
+# （集成侧 const.py 引 awesomeversion，加载项容器里没有），故两侧各复刻一份字面量，
+# 等值由 tests/test_v1210_area_bulk.py 的 AST 钉守（与上面两张窗名表同一纪律）。
+BULK_SELF_PLATFORM = "huijian_ai"
+
 # 特殊档位禁忌表来自契约单点（core.nlu.schema），不在这里二次手抄。
 from .nlu.schema import NEVER_SPECIALS as _NEVER_SPECIALS
 

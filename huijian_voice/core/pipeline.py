@@ -2083,6 +2083,12 @@ class Pipeline:
             c.get("area_hint") or "")
         if not area:
             return None
+        if is_whole_house(clause):
+            # v1.2.10：用户自己写了全屋口径（「打开所有设备」）而全屋道认不出域时，
+            # 不许拿**推断**来的区域去收窄它。创建是常驻规则、无人值守时才执行，
+            # 把"所有设备"悄悄改成"客厅的所有可开关设备"入库，比当场拒收危险得多；
+            # 与 `_scope_action_area` 的"只有明说全屋才保留全屋语义"同一条裁决。
+            return None
         merged = await self._match_fp(f"{area}{clause}")
         if merged is not None and (merged.intent not in creation.ACTIONABLE_INTENTS
                                    or _area_as_name(merged, area)):
