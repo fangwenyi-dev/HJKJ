@@ -147,6 +147,63 @@ _CLOUD_TIMEOUT_DEFAULT_S = 12.0
 _CLOUD_TIMEOUT_MIN_S = 3.0
 _CLOUD_TIMEOUT_MAX_S = 30.0
 
+# ── v1.2.9 云 STT 采样率：表是仓内唯一源（面板只给覆盖字段，不抄第二份表）──
+# 只放**有厂商文档出处**的规则，见 `_cloud_rate` docstring。判据：
+# tests/test_v129_cloud_stt_rate.py（含"面板不得抄第二份"同源钉）。
+CLOUD_MODEL_RATES = (("-8k", 8000), ("8k-", 8000))
+_RATE_MIN = 8000        # 电话链路下限（低于此没有语音产品）
+_RATE_MAX = 192000      # 域外（含 1、负数、999999）一律消毒——写坏不许进重采样实参
+
+
+def _cloud_rate(cloud: dict) -> int:
+    """云 STT 该产出什么率的音频：**用户显式值 > 内置表 > 16k（不转）**。
+
+    2026-10-09 立案（厂商口径已核，不抄博客）：
+    · 阿里云百炼非实时 ASR 逐字「**支持任意采样率**，兼容 aac、wav、mp3 等多种主流
+      音视频格式」，生产建议就是 16kHz/16bit/单声道——我们上行天然合规 ⇒ 默认**不转**；
+      且 OpenAI 兼容 `/audio/transcriptions` 示例里**没有** `sample_rate` 参数（它只在
+      DashScope 原生 `parameters.sample_rate`）⇒ 本函数只管音频产出率，**不把率当 form
+      字段发**（发一个端点未定义的字段=可能被拒，那是"为了配置而配置"）。
+    · 阿里云 ISI 一句话/实时/录音文件识别极速版逐字「采样率：8000 Hz 或 16000 Hz」、
+      「模型类型：8000（电话）和 16000（非电话）」⇒ 只容这两档，电话链路必须真降采样。
+    脏值纪律与 `tts._cloud_rate`/本文件 `_cloud_timeout` 同型：不抛（抛=打死本轮识别）、
+    消毒回表驱动、并**点名是哪个配置项**——`stt.cloud` 是用户能手改的 settings.json，
+    静默兜底会让"配了却像没配"永远查不到。
+    """
+    model = str((cloud or {}).get("model") or "")
+    raw = (cloud or {}).get("sample_rate")
+    if raw is None or raw == "" or raw == 0:
+        return _model_rate(model)
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("[STT] stt.cloud.sample_rate=%r 非整数，按未配置处理"
+                       "（改走模型表；模型 %r → %d Hz）", raw, model, _model_rate(model))
+        return _model_rate(model)
+    if not _RATE_MIN <= v <= _RATE_MAX:
+        logger.warning("[STT] stt.cloud.sample_rate=%d 超出合理域 [%d,%d]，按未配置处理"
+                       "（改走模型表；模型 %r → %d Hz）",
+                       v, _RATE_MIN, _RATE_MAX, model, _model_rate(model))
+        return _model_rate(model)
+    return v
+
+
+def _model_rate(model: str) -> int:
+    """内置表的落点：命中片段→该率，未命中→16k（＝不转，逐值等于现版）。
+
+    命中且真的改了发出去的音频率时**必须留痕**（v1.2.9 对抗复核：旧写法静默无日志
+    ⇒ 现场"没人配过它，率却变了"无从对账，与 `tts` 那条"引擎名必上日志"同纪律）。
+    未命中/命中到 16k 不打，免得每轮一条 INFO 把日志淹掉。
+    """
+    m = (model or "").lower()
+    for frag, rate in CLOUD_MODEL_RATES:
+        if frag in m:
+            if rate != const.SAMPLE_RATE:
+                logger.info("[STT] 云 STT 按模型表带率：%r → %dHz（发送前真重采样）",
+                            model, rate)
+            return rate
+    return const.SAMPLE_RATE
+
 
 def _cloud_timeout(cloud: dict) -> float:
     """云档超时：钳在 3~30s，非数值按缺省处理并点名，不抛异常打死整轮。
@@ -516,7 +573,13 @@ class AsrEngine:
         base = str(cloud.get("base_url", "")).rstrip("/")
         if not base:
             raise RuntimeError("云 STT 未配置 base_url")
-        wav = audio.pcm_to_wav(pcm_s16)
+        # v1.2.9：按目标率**真重采样**，头随实际产出率。旧写法恒 `pcm_to_wav(pcm_s16)`
+        # = 只能发 16k——不是标错率（那是诚实的），是**没能力喂只容 8k 的电话档端点**。
+        # 率==16k 时 resample 走 `src==dst` 直通支，产出与旧版逐字节一致（等价臂有钉）。
+        rate = _cloud_rate(cloud)
+        pcm = (pcm_s16 if rate == const.SAMPLE_RATE
+               else audio.resample_pcm16(pcm_s16, const.SAMPLE_RATE, rate))
+        wav = audio.pcm_to_wav(pcm, rate)
         form = aiohttp.FormData()
         form.add_field("file", wav, filename="utterance.wav", content_type="audio/wav")
         form.add_field("model", str(cloud.get("model") or "whisper-1"))

@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.2.8">
-<link rel="stylesheet" href="css/voice.css?v=1.2.8">
+<link rel="stylesheet" href="css/huijian.css?v=1.2.9">
+<link rel="stylesheet" href="css/voice.css?v=1.2.9">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -91,7 +91,9 @@
       <div class="hj-row">
         <div><label class="hj-field">Base URL</label><input id="stt_cloud_base" placeholder="https://api.example.com/v1"></div>
         <div><label class="hj-field">模型名</label><input id="stt_cloud_model" placeholder="whisper-1"></div>
+        <div><label class="hj-field">输入采样率 Hz（0＝自动）</label><input id="stt_cloud_rate" type="number" min="0" step="1000" placeholder="0"></div>
       </div>
+      <div class="hint" id="stt_cloud_rate_hint">0＝按后端模型表自动带率（只容 8k 的电话档模型自动降到 8000，其余保持 16000 不转）；填非 0 值＝显式覆盖。此处只改**送出去的音频率**（真重采样），不会把该值当字段发给端点——百炼/OpenAI 兼容的 `/audio/transcriptions` 没有这个参数。</div>
       <label class="hj-field">API Key（显示为 **** 即未变更；输入新值才覆盖）</label><input id="stt_cloud_key" type="password">
     </div>
     <div class="hint">默认引擎本地优先；云端失败自动回落本地（日志可见）。本地模型切换保存后自动生效（未装的模型自动下载，约 1 分钟内换绑，进行中的会话不受影响；进度见「模型」页）。</div>
@@ -315,7 +317,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.2.8";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.2.9";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -536,6 +538,8 @@ async function loadSettings(){
   if (S.tts.provider && !["local_kokoro","local_matcha","local_melo","cloud","cloud_openai_compat"].includes(S.tts.provider))
     toast("tts.provider 值 "+S.tts.provider+" 未知，已按默认档 local_melo 显示（与后端回落一致）；保存将写入下拉框选项");
   $("#stt_cloud_base").value = S.stt.cloud?.base_url||""; $("#stt_cloud_model").value = S.stt.cloud?.model||"";
+  // v1.2.9：0/未配置＝后端按模型表自动带率（表唯一源，面板不抄第二份）
+  $("#stt_cloud_rate").value = S.stt.cloud?.sample_rate||0;
   $("#tts_cloud_base").value = S.tts.cloud?.base_url||""; $("#tts_cloud_voice").value = S.tts.cloud?.voice||"";
   $("#tts_cloud_model").value = S.tts.cloud?.model||""; ttsFmt = S.tts.cloud?.response_format||""; ttsRate = S.tts.cloud?.sample_rate||0;
   $("#stt_cloud_key").value = ""; $("#stt_cloud_key").placeholder = S.stt.cloud?.api_key||"";
@@ -749,7 +753,7 @@ $("#saveBtn").onclick = async ()=>{
   const _ma = _maCollect();          // 区域映射行编辑器 → {区域: entity}；半配行已 toast 拦下
   if (_ma === undefined) return; const _spd = parseFloat($("#tts_speed").value); if (!Number.isFinite(_spd) || _spd < 0.6 || _spd > 2) { const _cur = (S && S.tts && S.tts.speed != null) ? S.tts.speed : 1.25; $("#tts_speed").value = _cur; toast("语速需填 0.6–2.0（已回填当前生效值 " + _cur + "），确认后请再点保存"); return; }   // v1.1.27：留空不得静默改写 1.0（旧写法 parseFloat("")||1）
   const body = {
-    stt:{ provider:$("#stt_provider").value, local_model:$("#stt_local_model").value, cloud:{ base_url:$("#stt_cloud_base").value, model:$("#stt_cloud_model").value, ...( $("#stt_cloud_key").value?{api_key:$("#stt_cloud_key").value}:{}) } },
+    stt:{ provider:$("#stt_provider").value, local_model:$("#stt_local_model").value, cloud:{ base_url:$("#stt_cloud_base").value, model:$("#stt_cloud_model").value, sample_rate:(parseInt($("#stt_cloud_rate").value,10)||0), ...( $("#stt_cloud_key").value?{api_key:$("#stt_cloud_key").value}:{}) } },
     tts:{ provider:$("#tts_provider").value, ...ttsSidPatch(), speed:_spd,
           cloud:{ base_url:$("#tts_cloud_base").value, model:$("#tts_cloud_model").value, voice:$("#tts_cloud_voice").value, ...(ttsFmt?{response_format:ttsFmt}:{}), ...(ttsRate?{sample_rate:ttsRate}:{}), ...( $("#tts_cloud_key").value?{api_key:$("#tts_cloud_key").value}:{}) } },
     nlu:{ enabled:$("#nlu_enabled").checked, textcnn_enabled:$("#nlu_textcnn").checked, query_local:$("#nlu_query").checked, creation_enabled:$("#nlu_creation").checked, corrections_extra: safeJson($("#nlu_corr").value, {}) },
@@ -1113,6 +1117,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.2.8"></script>
+<script src="js/starsky.js?v=1.2.9"></script>
 </body>
 </html>

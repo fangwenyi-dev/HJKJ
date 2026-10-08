@@ -119,8 +119,16 @@ def f32_to_pcm16(samples: np.ndarray) -> bytes:
 
 def resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     """多相窗口 sinc 重采样（int16 单声道）。
-    24k→16k（kokoro）与任意云采样率→16k 统一走这里；线性插值会留混叠，
-    语音可懂度影响小但音色明显——用 Hamming 窗 sinc，半带 24 taps（4 相位）。
+    24k→16k（kokoro）、44.1k→16k（melo，v1.1.10 起的默认档）与任意云采样率→16k
+    统一走这里；线性插值会留混叠，语音可懂度影响小但音色明显——用 Hamming 窗 sinc。
+
+    v1.2.9：抽头跨度必须随抽取比放大。sinc 的自变量是 `t=(frac-m)*gain`（gain=
+    min(1,ratio)），窗的支撑域 |t|≤half 折算回**源样本**是 half/gain 个；旧写法把
+    m 固定成 ±12 个源样本，于是 2.756× 抽取（44.1k→16k）时窗只走到 |t|≈8.4 就被
+    硬截断——Hamming 旁瓣地板从 ≈−42dB 抬到实测 −22dB，8–12kHz 的能量折进 1–7kHz
+    人声存在度频段。跨度按 1/gain 放大后窗收到尾（纯音阻带判据见
+    tests/test_v129_resampler_stops_band.py；流式孺 `_StreamResampler` 同式同跨度，
+    只改一侧会让两者分叉）。
     """
     if src_rate == dst_rate or not pcm:
         return pcm
@@ -128,14 +136,15 @@ def resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     ratio = dst_rate / src_rate
     n_out = int(math.ceil(len(x) * ratio))
     half = 12
-    taps_per_phase = 4
     # 简化实现：对每个输出点做源域窗口插值（向量化版按整数步长批处理）
     out = np.zeros(n_out, dtype=np.float32)
     gain = min(1.0, ratio)
+    span_lo = int(math.ceil((half - 1) / gain))   # 负侧 m∈[-span_lo, span_hi]
+    span_hi = int(math.ceil(half / gain))
     idx = np.arange(n_out, dtype=np.float64) / ratio
     base = np.floor(idx).astype(np.int64)
     frac = idx - base
-    for m in range(-half + 1, half + 1):
+    for m in range(-span_lo, span_hi + 1):
         pos = base + m
         valid = (pos >= 0) & (pos < len(x))
         t = (frac - m) * gain
@@ -145,7 +154,6 @@ def resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
             sinc = np.where(np.abs(t) < 1e-6, 1.0, np.sin(np.where(valid, st, 0.0)) / np.where(valid & (np.abs(st) > 1e-6), st, 1.0))
         w = sinc * (0.54 + 0.46 * np.cos(np.pi * np.clip(t / (half * 2), -1, 1) * 2)) * gain
         out += np.where(valid, x[np.clip(pos, 0, len(x) - 1)], 0.0) * w
-    del taps_per_phase
     return f32_to_pcm16(out)
 
 

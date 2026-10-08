@@ -61,6 +61,7 @@
   "tts_kokoro_multilang": {
     "display_name": "TTS · Kokoro 中英多音色 v1.1 (103 音色，默认 sid28)",
     "default_provider": false,
+    "sample_rate": 24000,
     "tarball": "kokoro-multi-lang-v1_1.tar.bz2",
     "sha256": "a3f4c73d043860e3fd2e5b06f36795eb81de0fc8e8de6df703245edddd87dbad",
     "top_dir": "kokoro-multi-lang-v1_1",
@@ -76,6 +77,7 @@
   "tts_matcha_zh_en": {
     "display_name": "TTS · Matcha 中英（单女声，台架 RTF 0.022 最快档）",
     "default_provider": false,
+    "sample_rate": 16000,
     "tarball": "matcha-icefall-zh-en.tar.bz2",
     "sha256": "271b804af570400d3bcdcb53bf6e53cc9f75180ee763b9f13eb5eaf2b0d086ef",
     "top_dir": "matcha-icefall-zh-en",
@@ -101,6 +103,7 @@
   "tts_melo_zh_en": {
     "display_name": "TTS · MeloTTS 中英（单女声，RTF 0.197）",
     "default_provider": true,
+    "sample_rate": 44100,
     "tarball": "vits-melo-tts-zh_en.tar.bz2",
     "sha256": "e58351ed7149f290a54534538badd4077cdbe6fddc964b24d0bee870415d1514",
     "top_dir": "vits-melo-tts-zh_en",

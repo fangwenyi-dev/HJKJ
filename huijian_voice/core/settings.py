@@ -33,7 +33,11 @@ DEFAULTS: dict[str, Any] = {
         "language": "zh-CN",
         # 云档示例：{"provider":"cloud_openai_compat","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","api_key":"","model":"paraformer 或 whisper 兼容名"}
         # 云失败自动回落本地（v4.1-②）
-        "cloud": {"provider": "", "base_url": "", "api_key": "", "model": "", "timeout": 12},
+        "cloud": {"provider": "", "base_url": "", "api_key": "", "model": "",
+                  "timeout": 12,
+                  # v1.2.9：0＝按 asr.CLOUD_MODEL_RATES 自动带率（未命中=16k 不转，
+                  # 与旧版逐字节一致）；非 0＝显式覆盖。表是唯一源，面板不抄第二份。
+                  "sample_rate": 0},
     },
     "tts": {
         "provider": "local_melo",            # local_kokoro | local_matcha | local_melo | cloud

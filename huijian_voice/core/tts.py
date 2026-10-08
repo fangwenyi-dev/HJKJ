@@ -375,6 +375,11 @@ class _StreamResampler:
         self.passthrough = self.src_rate == self.dst_rate
         self.ratio = self.dst_rate / self.src_rate
         self.gain = min(1.0, self.ratio)
+        # v1.2.9：与 audio.resample_pcm16 同跨度——窗支撑域 |t|≤_HALF 折算回源样本
+        # 是 _HALF/gain 个，抽头数不随抽取比放大就会硬截断窗、把旁瓣地板抬到 −22dB
+        # （判据 tests/test_v129_resampler_stops_band.py，整包/流式两臂同测）。
+        self._span_lo = int(math.ceil((self._HALF - 1) / self.gain))
+        self._span_hi = int(math.ceil(self._HALF / self.gain))
         self._buf = np.zeros(0, dtype=np.float32)   # 未消费输入（含滤波历史）
         self._buf_start = 0     # self._buf[0] 对应的全局样本下标
         self._n_in = 0          # 已喂入的全局样本数
@@ -423,8 +428,8 @@ class _StreamResampler:
     def _emit(self, ready_only: bool) -> bytes:
         total_out = int(math.ceil(self._n_in * self.ratio))
         if ready_only:
-            # 抽头全在已到样本内的输出点（floor(i/ratio)+HALF ≤ n_in-1）
-            t_max = self._n_in - 1 - self._HALF
+            # 抽头全在已到样本内的输出点（floor(i/ratio)+span_hi ≤ n_in-1）
+            t_max = self._n_in - 1 - self._span_hi
             if t_max < 0:
                 return b""
             i_hint = int(np.floor((t_max + 1) * self.ratio)) + 1
@@ -433,7 +438,7 @@ class _StreamResampler:
                 return b""
             i = np.arange(self._n_out, i_hint, dtype=np.float64)
             base = np.floor(i / self.ratio).astype(np.int64)
-            keep = int(np.count_nonzero(base + self._HALF <= t_max))
+            keep = int(np.count_nonzero(base + self._span_hi <= t_max))
             if keep <= 0:
                 return b""
             i, base = i[:keep], base[:keep]
@@ -452,7 +457,7 @@ class _StreamResampler:
         frac = i / self.ratio - base
         out = np.zeros(i.shape[0], dtype=np.float32)
         buf_len = self._buf.shape[0]
-        for m in range(-self._HALF + 1, self._HALF + 1):
+        for m in range(-self._span_lo, self._span_hi + 1):
             pos = base + m
             valid = (pos >= 0) & (pos < self._n_in)
             t = (frac - m) * self.gain
@@ -473,7 +478,7 @@ class _StreamResampler:
 
     def _trim(self) -> None:
         """丢弃后续输出点再也用不到的输入（含滤波历史）。"""
-        keep_from = max(0, int(np.floor(self._n_out / self.ratio)) - self._HALF + 1)
+        keep_from = max(0, int(np.floor(self._n_out / self.ratio)) - self._span_lo)
         drop = keep_from - self._buf_start
         if drop > 0:
             self._buf = self._buf[drop:]
