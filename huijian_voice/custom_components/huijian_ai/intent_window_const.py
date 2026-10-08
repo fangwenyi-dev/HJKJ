@@ -72,6 +72,13 @@ def normalize_text(text: str) -> str:
 _CN_DIGITS = {
     "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    # 2026-10-08 P2：补「两」。`_CN_NUM_PATTERN` 的字符类和 `_CN_PURE_NUM_RE` 都收了
+    # 「两」，唯独这张取值表没有 ⇒ `_parse_chinese_number("两")` 取不到值折成 **0**：
+    # 实测「两号测试窗」在本侧被折成「0号测试窗」，而加载项侧
+    # （targets.CN_MAP，v1.0.40 就补过并写明理由）给的是「2号测试窗」——
+    # 本文件 docstring 自称"与加载项 targets.normalize_name 同源同闸"，两侧折出
+    # 两个名字，按名匹配必 miss。补一行即与加载项逐值一致。
+    "两": 2,
 }
 _CN_UNITS = {"十": 10, "百": 100, "千": 1000}
 _CN_NUM_PATTERN = None

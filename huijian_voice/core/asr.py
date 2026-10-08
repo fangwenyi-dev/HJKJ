@@ -67,6 +67,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import gc
+import json
 import logging
 import re
 import threading
@@ -509,5 +510,16 @@ class AsrEngine:
                     # 大文件/滴流端点时每轮 12s 内的字节全落内存）；与 tts.py F12 同口径。
                     _err_body = (await r.content.read(8192))[:160].decode("utf-8", "replace")
                     raise RuntimeError(f"HTTP {r.status}: {_err_body}")
-                obj = await r.json(content_type=None)
+                # 2026-10-08 P2：成功支同样**截读**。同函数错误支在 v1.0.65 F12 已按
+                # tts.py 同口径截 8192，唯独 200 支留 `r.json()` 整包进内存——
+                # `base_url` 被指到大文件服务/慢速滴流端点时，一轮 12s 超时窗内的
+                # 字节全落内存（同型洞只修一半，注释就在上一行）。
+                # 正常应答是 `{"text": "…"}`，量级几 KB ⇒ 1 MiB 上限足够且不可能误杀。
+                _raw = await r.content.read((1 << 20) + 1)
+                if len(_raw) > (1 << 20):
+                    raise RuntimeError(
+                        f"云 STT 应答超过 1MiB（共 {len(_raw)}B）——base_url 指向的不是转录端点？")
+                obj = json.loads(_raw.decode("utf-8", "replace"))
+                if not isinstance(obj, dict):
+                    raise RuntimeError(f"云 STT 应答不是 JSON 对象：{type(obj).__name__}")
                 return str(obj.get("text", "")).strip()

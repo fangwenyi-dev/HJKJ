@@ -96,8 +96,18 @@ class HuijianSetupView(HuijianHttpView):
                 _LOGGER.warning("Setup request with invalid signature for uuid=%s", uuid)
                 return self.json_message("invalid signature", 401)
 
+        # 2026-10-08 P2：这是 setup_data 进 INFO 日志的**最后一个未脱敏入库口**——
+        # 旧形只剔 `noise_psk`，而 setup_data 里的 llm/stt/tts/mcp_endpoint 按本仓约定
+        # 可以内嵌 `?token=<加载项令牌>`（同包 config_flow.py:120-143 专门做了
+        # `_redact_url_for_log`/`_redact_setup_for_log`，ws_transport/tts_transport/
+        # diagnostics 三处都用它，`test_v1127_r2_verify.py:226` 把这条写成铁律），
+        # 原文落 INFO 即凭据外流到 HA 日志（可被任何有日志读权限的加项/备份拿走）。
+        # 判据单源复用 config_flow 那份脱敏器——**延迟导入**：config_flow 在模块级
+        # import 了本模块（config_flow.py:55），反向模块级导入会成环。
+        from ..config_flow import _redact_setup_for_log
+
         _LOGGER.info("Setup qrcode from miniprogram: %s",
-                     {k: v for k, v in setup_data.items() if k != "noise_psk"})
+                     _redact_setup_for_log(setup_data))
 
         this_data[uuid] = setup_data
         # OTA 设备台账（v1.0.65 审查批·契约 F-02 断链修复）：固件 CMD20 入驻 POST

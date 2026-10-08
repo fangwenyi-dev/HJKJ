@@ -798,6 +798,13 @@ class AutomationDeleteView(HomeAssistantView):
             success, message = await store.delete_automation(automation_id)
 
             if success:
+                # 2026-10-08 P1（同 put）：删除后必须重算跟踪实体集，否则该条独占的
+                # 传感器一直留在 `_tracked_entity_ids` 里被白听——面板说"已删除"而
+                # 监听面与它不同源。重算失败不得把已删成的事实报成失败。
+                try:
+                    await get_automation_manager(hass).async_refresh_tracked_entities()
+                except Exception as e:  # noqa: BLE001
+                    _LOGGER.warning("自动化删除后重算跟踪实体失败（下次语音改动会自愈）: %s", e)
                 return self.json({"success": True, "message": message})
             else:
                 return self.json({"success": False, "error": message}, 404)
@@ -845,6 +852,20 @@ class AutomationDeleteView(HomeAssistantView):
                 automation_id, trigger, actions
             )
             _LOGGER.info("Update automation result: success=%s, message=%s", success, message)
+            # 2026-10-08 P1：面板这条路必须跟着刷新**跟踪实体集**。状态监听按
+            # `_tracked_entity_ids` 过滤（intent_automation.py:547），而该集合此前只在
+            # 语音侧 CRUD（:883/:943/:1080）后重算 ⇒ 在管理面板把触发传感器从 A 改成 B
+            # 之后，B 永不被跟踪：这条自动化**再也不触发**，而面板回「已更新」＝假成功，
+            # 只有下次语音改动或重启 HA 才自愈。删除同理（留下的旧集合会一直白听）。
+            if success:
+                try:
+                    manager = get_automation_manager(hass)
+                    await manager.async_refresh_tracked_entities()
+                except Exception as re_:  # noqa: BLE001
+                    # 刷新失败**不许把已改成的自动化报成失败**（那会让人以为没改上）；
+                    # 如实留痕，监听缺口退回到本轮修复前的形态，下一次语音改动会自愈。
+                    _LOGGER.warning("自动化已更新但跟踪实体刷新失败（该条可能暂不触发，"
+                                    "下次语音改动或重载条目自愈）: %s", re_)
             return self.json(
                 {
                     "success": success,

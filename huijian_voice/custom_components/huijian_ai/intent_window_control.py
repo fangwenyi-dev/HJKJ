@@ -174,6 +174,11 @@ async def _apply_window_position(
                 f"已将{len(ok_names)}扇窗开到{position}%，"
                 f"但{len(bad_msgs)}扇未成功：{'；'.join(bad_msgs[:3])}"
             ),
+            # 2026-10-08 P2：部分失败必须同时置 `partial_error`——v1.1.38 已把该字段
+            # 定为下游**唯一**口径（intent_voice_scene.py:462 与 intent_result.py:60-63
+            # 只读 success/partial_error，不读 message）。只写 message 的话，场景回放
+            # 含「平开窗开到50%」且两台败一台时播「已执行场景：X」＝把半失败折成全绿。
+            "partial_error": f"{len(bad_msgs)}扇窗开到{position}%未成功",
             "covers": [eid for _, eid in covers],
         }
     return {
@@ -251,6 +256,8 @@ async def _apply_window_param(
                 f"已将{len(ok_names)}扇窗{cn}设为{value}%，"
                 f"但{len(bad_msgs)}扇未成功：{'；'.join(bad_msgs[:3])}"
             ),
+            # 同上（partial_error 是下游唯一口径）：开度那条支已补，这条同族支不能只修一半。
+            "partial_error": f"{len(bad_msgs)}扇窗{cn}设为{value}%未成功",
             "numbers": [eid for _, eid in numbers],
         }
     return {
@@ -364,7 +371,15 @@ class ControlWindowIntent(intent.IntentHandler):
             # 携带时走同设备 number.set_value，不改窗位。
             vol.Optional("speed"): vol.Any(int, float, str),
             vol.Optional("strength"): vol.Any(int, float, str),
-            vol.Required("target"): target_parameter_type(),
+            # 2026-10-08 P1：`target` 从 Required 改 Optional。加载项的字面表对**裸窗句**
+            # （「关窗」「开窗」「打开所有窗户」）产出的就是无 target 的 ControlWindow，
+            # 旧形在 `async_validate_slots` 阶段就抛 voluptuous 英文串
+            # （required key not provided @ data['target']），本函数下面那条
+            # 「No target specified」友好支**永远走不到**——用户听到泛化道歉、
+            # 拿不到"带上房间名和窗型"的正确引导。与 v1.1.24 的"不适用就跳过、
+            # 绝不炸 500"同一条口径；缺 target 仍旧如实失败（success False），
+            # 只是把失败原因交回加载项话术层。
+            vol.Optional("target"): target_parameter_type(),
         }
 
     async def async_handle(self, intent_obj: intent.Intent) -> JsonObjectType:

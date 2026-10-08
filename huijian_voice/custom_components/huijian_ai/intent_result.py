@@ -26,7 +26,7 @@ def _err_text(value) -> str:
             return ""
         text = str(value).strip()
         return "" if ("bound method" in text or "<function" in text) else text
-    except Exception:  # noqa: BLE01 —— 折算永不抛
+    except Exception:  # noqa: BLE001 —— 折算永不抛
         return ""
 
 

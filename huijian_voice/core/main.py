@@ -244,8 +244,20 @@ class Service:
                 _atomic_write(const.MODELS_STATUS_FILE,
                               json.dumps({"updated": time.time(), "models": self.store.snapshot()},
                                          ensure_ascii=False))
-            except Exception:
-                logger.debug("[状态] 回写失败", exc_info=True)
+            except Exception as e:
+                # 2026-10-08 P2：这条旧形只有 `logger.debug`，生产日志档是 info ⇒
+                # **永远看不见**。而事实文件写不出去＝面板状态灯与 models_status 全瞎，
+                # 加上 nginx `try_files … /index.html` 把缺文件兜成 200 HTML，现场看到的
+                # 是「前端/核心版本不一致」这种把根因藏起来的结论（同批修的
+                # www/index.html `api()` 只解决了显示，来源仍得有人点名）。
+                # 闩锁一条 WARN、成功即重新武装——与 ha_client `_states_warned` 同型。
+                if not getattr(self, "_facts_warned", False):
+                    self._facts_warned = True
+                    logger.warning("[状态] 事实文件回写失败（面板状态/模型进度将停更）: %s", e)
+                else:
+                    logger.debug("[状态] 事实文件回写失败: %s", e)
+            else:
+                self._facts_warned = False
             await asyncio.sleep(5)
 
     async def _loop_reaper(self) -> None:

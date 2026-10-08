@@ -780,9 +780,24 @@ class EsphomeAssistSatellite(
                 # on_audio 播 16k PCM，只是不报 SPEAKER）→旧门控下播报永静默
                 # （台架×固件协议审计实锤）。两 flag 同报时 port 仍 0（AS:501
                 # 条件含 not API_AUDIO），UDP 语义不变。
-                if feature_flags & (
+                _push_capable = bool(feature_flags & (
                     VoiceAssistantFeature.SPEAKER | VoiceAssistantFeature.API_AUDIO
-                ) and (stream := tts.async_get_stream(self.hass, tts_output["token"])):
+                ))
+                stream = (tts.async_get_stream(self.hass, tts_output["token"])
+                          if _push_capable else None)
+                if _push_capable and not stream and bool(
+                        feature_flags & VoiceAssistantFeature.API_AUDIO):
+                    # 2026-10-08 P2：`and (stream := …)` 的短路把"取不到流"和"不是
+                    # 推流型设备"混成同一侧 ⇒ 取不到流（令牌过期/HA 刚重启窗口）时
+                    # 既不建流、`suppress_event` 也留在 False，于是把 TTS_END{url}
+                    # 原样发给**没有 media 自取能力**的 API 音频板——正是 :727 那条
+                    # v1.0.27 注释里"抢跑会把固件刚起的会话拆掉"的形态。本轮静音
+                    # 远好于把会话拆了。
+                    _LOGGER.warning(
+                        "[TTS] 取不到推流（token 过期/Core 刚重启？）——"
+                        "抑制 TTS_END{url}，本轮静音而非抢跑拆轮")
+                    suppress_event = True
+                if _push_capable and stream:
                     if self._zombie_tts_guard_active():
                         # v1.0.86：僵尸轮（drain 超时实锤）晚到的 TTS 不建流——
                         # 带上一轮音频的 STREAM_START 灌进当前轮正是"半句播报/
@@ -1059,13 +1074,25 @@ class EsphomeAssistSatellite(
                     "[Announce] 域内无 %s 的 TTS 引擎（加载项未运行/条目未启用"
                     "）——API 音频播报无源可推，回旧形态", DOMAIN)
 
-        await req_task
-        # v1.0.100（本修的收口点）：本 await 在设备回 AnnounceFinished（含 barge-in
-        # 提前收口，固件 v2.1.55 起该事件也覆盖打断轮）或超时后才返回。返回即意味着
-        # "这条播报在设备侧已经结束"——此刻任何仍在推的播报流都是孤儿，当场掐掉。
-        # 放在这里而不是 handle_announcement_finished：后者与会话 TTS 共用
-        # （同一事件也代表会话应答播完），在那儿吊销会牵动会话腿收口，风险不对等。
-        self._revoke_announce_stream("播报已收口")
+        try:
+            await req_task
+        finally:
+            # v1.0.100（本修的收口点）：本 await 在设备回 AnnounceFinished（含 barge-in
+            # 提前收口，固件 v2.1.55 起该事件也覆盖打断轮）或超时后才返回。返回即意味着
+            # "这条播报在设备侧已经结束"——此刻任何仍在推的播报流都是孤儿，当场掐掉。
+            # 放在这里而不是 handle_announcement_finished：后者与会话 TTS 共用
+            # （同一事件也代表会话应答播完），在那儿吊销会牵动会话腿收口，风险不对等。
+            #
+            # 2026-10-08 P2：这条收口原来**只在正常返回支**执行。`await req_task` 抛出
+            # （播报中途设备重启→APIConnectionError、announce 超时、对端关流）时
+            # 整行被跳过 ⇒ 播报腿推流任务继续按 28.8ms/帧把剩余音频灌完，并占着
+            # `_dl_seq` 归属权——`_abort_pipeline`/`_handle_pipeline_start_impl` 只
+            # cancel `_tts_streaming_task`，够不着 `_announce_stream_task`；下一个
+            # 吊销点要等**下一条下行流**才被触发（正是 v1.0.100 立案时量化的
+            # 6~9s 孤儿流形态）。现有钉 test_announce_orphan_stream.py 判的是
+            # "吊销排在 await 之后"的语句顺序，钉不出异常支——同一条竞态第二落点。
+            # finally 把三条路径（正常/抛错/取消）一起收；吊销本身幂等。
+            self._revoke_announce_stream("播报已收口")
 
     def _pick_wake_word_pipeline_index(self, wake_word_phrase: str | None) -> int:
         """按唤醒词挑激活的 pipeline 索引（0=默认）。

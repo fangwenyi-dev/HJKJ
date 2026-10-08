@@ -636,14 +636,31 @@ def test_p1_entry_setup_rearms_automation_listeners():
     """async_unload_entry 会 reset_automation_globals()（真注销状态监听+整点 tick），
     而重武装只在 get_automation_manager 懒建时发生——条目 reload 后若没人再调它，
     全屋传感器/时间自动化静默停摆到下次重启 HA。钩子必须在 async_setup_entry 内、
-    且**无条件**（对抗复核 A3：放在 !=assist 分支里 ⇒ assist 条目 reload 不补挂）。"""
+    且**无条件**（对抗复核 A3：放在 !=assist 分支里 ⇒ assist 条目 reload 不补挂）。
+
+    2026-10-08 第五轮复查：本钉原来是**假绿**。它按 AST 查"函数体顶层有没有这句
+    调用"，而实际病灶是这句调用被写在 `if config_type == "assist": ... return True`
+    **之后**——assist 条目（面板改引擎端点/保存 options/reauth 唯一会 reload 的那条）
+    根本到不了这一行。"有没有这句"看不见"走不走得到"，所以缺陷带绿存活数个版本。
+    不变量升级为机器可验证的**可达性**：重挂句之前不得有任何早退（Return/Raise，
+    含嵌在 if/try/with 里的）。这条判据同时挡住"把钩子挪回分支后面"的复发。
+    """
     src, fn = _entry_setup_fn("async_setup_entry")
-    direct = [n for n in fn.body
-              if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
-              and isinstance(n.value.func, ast.Name)
-              and n.value.func.id == "get_automation_manager"]
-    assert direct, ("async_setup_entry 顶层（非 if 内）必须调 get_automation_manager "
-                    "重新武装（reload 后静默停摆；assist 条目也要补挂）")
+    direct_idx = [i for i, n in enumerate(fn.body)
+                  if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                  and isinstance(n.value.func, ast.Name)
+                  and n.value.func.id == "get_automation_manager"]
+    assert direct_idx, ("async_setup_entry 顶层（非 if 内）必须调 get_automation_manager "
+                        "重新武装（reload 后静默停摆；assist 条目也要补挂）")
+    first = direct_idx[0]
+    early_exits = []
+    for i, stmt in enumerate(fn.body[:first]):
+        for node in ast.walk(stmt):
+            if isinstance(node, (ast.Return, ast.Raise)):
+                early_exits.append((i, type(node).__name__, node.lineno))
+    assert not early_exits, (
+        f"重挂句在 async_setup_entry 第 {fn.body[first].lineno} 行，但它之前已有早退 "
+        f"{early_exits} ⇒ 某类条目走不到这一行（assist reload 停摆病灶复发形状）")
 
 
 def test_p1_remove_entry_rearms_automation_listeners():

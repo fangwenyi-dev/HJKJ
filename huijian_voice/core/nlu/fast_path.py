@@ -451,7 +451,7 @@ _T0_ATTR_WORD = {"亮度": "brightness", "色温": "color_temperature",
                  "湿度": "humidity", "开合度": "position", "位置": "position"}
 _T0_ATTR_TAIL = re.compile(
     r"^(?P<dev>[\u4e00-\u9fffA-Za-z0-9]{0,6}?)"
-    r"(?P<attr>亮度|色温|温度|风量|风速|开合度|位置)"
+    r"(?P<attr>" + "|".join(sorted(_T0_ATTR_WORD, key=len, reverse=True)) + r")"
     r"\s*(?:调到|设为|设到|改成|改为|调高到|调低到|到|至|为|成)?\s*"
     r"(?P<val>\d{1,5}\s*[%％Kk]?|(?:百分之)?[零一二三四五六七八九十百]{1,6}\s*[%％度Kk]?"
     r"|一半|半数"
@@ -708,9 +708,72 @@ _NEG_PREP_FLOW = re.compile(
     r"(?:打开|开启|关掉|关闭|关上|调到|调成|调亮|调暗|设为|拉上|拉下|上锁|解锁|"
     r"开|关|调|设|拉|锁)")
 _OTHER_ACTION_VERB = re.compile(r"(?:" + _NEG_VERB_ALT + r")")
+# 2026-10-08 P0：尾闸豁免吃掉的那一段单独拿出来可判（动词后 1~2 字 + 「的」）。
+# 尾闸从"紧邻的"放宽到"0~2 字内的"（v1.1.27-r2，救「没关紧的窗关上」6 例补语形）
+# 的代价：**两字房间名恰好全落进这个窗口**——「别开客厅的灯」「不要开卧室的空调」
+# 「不要关阳台的灯」被当定语小句放行，全链探针实得=真下发 + 播「好的，办好了」
+# （用户说"别开"，灯开了）。当时写在 :1238 那句判词"真否定祈使无「的」，不受影响"
+# 是错的：中文里带房间名的否定祈使天然带「的」。
+# 补语（紧/好/完/严…）与房间名的分界不在字面上，在**本家有没有这间房**，所以这条
+# 判据必须拿区域表当输入——与 pipeline「位置词豁免只认表」（v1.1.36 复核⑥）同一条
+# 纪律。**不拿静态 BASE_AREAS 当表**：那等于凭空给"家里没这间房"的尾巴发否决权。
+# 表为空 ⇒ 本臂整条不启用，现网逐值不变（同 `real_areas=None` 的三档定式）。
+_NEGATION_CMD_TAIL = re.compile(
+    r"(?<![开关调设拉停顿放锁解])(?:别|不要|不用|不必|不许|不准|甭|勿|莫|没|不|未)"
+    r"(?:要|再|又|去|能|会|可以|给我|帮我|把|将)?"
+    r"(?:" + _NEG_VERB_ALT + r")"
+    r"([^，。！？,、]{1,2})的")
 
 
-def is_negation_imperative(text: str) -> bool:
+def _negation_area_tail(t: str, areas) -> bool:
+    """动词后那段「≤2 字 + 的」是本家真有的房间名 ⇒ 这是否定祈使，不是定语小句。
+
+    只判**逐字相等**：三字以上房间名（卫生间/办公室）本来就撞不进 `{0,2}的` 窗口，
+    主正则早已命中；放宽成包含会开始吃「没关**卫生**的」「别开**大部**的」这类。
+    永不抛（救援/守卫层不得冒泡到级联）。
+    """
+    if not areas:
+        return False
+    try:
+        tab = {str(a).strip() for a in areas if str(a or "").strip()}
+        if not tab:
+            return False
+        return any(m.group(1) in tab for m in _NEGATION_CMD_TAIL.finditer(t))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_NOUN_STRIP_CACHE: tuple = (None, None)      # (ALL_DEVICES 对象, 编译好的长串式)
+
+
+def _noun_strip():
+    """设备名词长串的一次性剥取器——让"剩余还有动词"这条判**真动词**。
+
+    单源取 `targets.ALL_DEVICES`（静态基准 ∪ 在装设备），不另抄一份"名字里嵌动作字"
+    的黑名单：空调/落地扇/新风机 这类名字里带 调/扇/风 的单字动词，抄表必漂移
+    （同文件 `_NEG_VERB_ALT` 单源是同一条理由）。永不抛：拿不到表就当没名词可剥。
+
+    缓存按**对象身份**成立：`targets` 每次换绑都整体赋值 `ALL_DEVICES = tuple(...)`
+    （`targets.py:365/:423`），身份变⇒内容必变。与 `homophone._INDEX_CACHE` 那个
+    "恒 miss 死码"的区别在于本处吃的就是那个长命全局对象，不是调用方现造的
+    新 tuple——同型写法不同结论，别照抄注释。
+    """
+    global _NOUN_STRIP_CACHE
+    try:
+        names = T.ALL_DEVICES
+        if _NOUN_STRIP_CACHE[0] is names:
+            return _NOUN_STRIP_CACHE[1]
+        words = [re.escape(str(n)) for n in (names or ())
+                 if n is not None and len(str(n)) >= 2]
+        pat = (re.compile("|".join(sorted(set(words), key=len, reverse=True)))
+               if words else None)
+        _NOUN_STRIP_CACHE = (names, pat)
+        return pat
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def is_negation_imperative(text: str, areas=()) -> bool:
     """这句是**否定祈使**（「别开灯」「不要把窗关上」）——单点定义，两侧共用。
 
     v1.1.27 的 CHANGELOG 写的是"否定祈使**全局**拒执行"，实际判据只落在本模块的
@@ -719,12 +782,16 @@ def is_negation_imperative(text: str) -> bool:
     现役树上「别开台灯」真把灯打开、还播「好的，办好了」（2026-10-01 本机干净
     checkout 全链探针实得）。裁决侧要的正是这个判据，故导出供 pipeline 复用——
     与 `is_query_like`「疑问句两档都不得执行」同一条纪律（同文件 :490/:499 的教训）。
+
+    `areas`（2026-10-08 P0）= 本家真注册的区域名。不传 ⇒ 逐字等于旧判据；
+    传了 ⇒ 额外认「否定+动词+房间名+的」这一形（见 `_NEGATION_CMD_TAIL` 上方根因）。
     """
     t = text or ""
-    return bool(_NEGATION_CMD.search(t) or _NEG_PREP_FLOW.search(t))
+    return bool(_NEGATION_CMD.search(t) or _NEG_PREP_FLOW.search(t)
+                or _negation_area_tail(t, areas))
 
 
-def is_bare_negation_imperative(text: str) -> bool:
+def is_bare_negation_imperative(text: str, areas=()) -> bool:
     """**整句就是一句否定命令**（句里没有别的肯定动作）——裁决面只用这条。
 
     为什么不能用全句判据 `is_negation_imperative`：一条 klar 计划只代表句子的
@@ -738,15 +805,60 @@ def is_bare_negation_imperative(text: str) -> bool:
     （`_NEG_VERB_ALT`），不抄第二份。
     「窗帘不要拉到底」这类剩余无动词的仍否决（宁可不执行，也不做用户明说不要的
     完全动作）——与「别开台灯」同向。
+
+    `areas` 同 `is_negation_imperative`；剥段时把房间名尾形一并剥掉，否则「客厅的」
+    残在剩余段里不改变判据（剩余只到「灯」这种名词），但口径必须与命中同源，
+    不另写一份。
     """
     t = (text or "").strip()
-    if not (is_negation_imperative(t)):
+    if not (is_negation_imperative(t, areas)):
         return False
-    m = _NEGATION_CMD.search(t) or _NEG_PREP_FLOW.search(t)
+    m = (_NEGATION_CMD.search(t) or _NEG_PREP_FLOW.search(t)
+         or _NEGATION_CMD_TAIL.search(t))
     if m is None:
         return False
     rest = t[:m.start()] + t[m.end():]
+    # 2026-10-08：剩余段先剥掉设备名词再数动词。空调/落地扇这类名字里**嵌着单字
+    # 动词**（调/扇），旧形把「别开空调」的剩余判成"还有肯定动作"⇒ 整条不否决
+    # ⇒ 用户说别开，空调真开。名词表单源取 targets（见 `_noun_strip`）。
+    pat = _noun_strip()
+    if pat is not None:
+        rest = pat.sub("", rest)
     return not bool(_OTHER_ACTION_VERB.search(rest))
+
+
+_WEAK_NEG_HEADS = ("没", "未", "不")     # 裸形否定词：中文里高频当**状态定语**
+
+
+def is_refusal_imperative(text: str, areas=()) -> bool:
+    """字面表单发通路用的否决判据——比整句判据少一类误杀，比 bare 判据少一类放行。
+
+    2026-10-08 P1（第五轮复查）：「把没关严窗户拉上」是**真命令**（"没关严"是窗户的
+    状态定语），但整句判据 `_NEGATION_CMD` 搜索到「没…关」就把整句拒了，用户听
+    "还不会"，窗没动。本仓 docstring（`is_bare_negation_imperative` 上方）自己列了
+    这条必须放行的形态，而字面表一直没接这条判据=同一病灶第二处。
+
+    也不能直接把 :1302 换成 `is_bare_negation_imperative`：bare 的定义是"整句里没有
+    别的肯定动作"，「别开灯，把电视关了」在链发失配回退单发时 bare=False ⇒ 会被放行
+    去执行**用户明确拒绝的那条**。分档判据：
+      · 强否定词（别/不要/不用/不必/不许/不准/甭/勿/莫）——语义只可能是拒绝 ⇒ 一律否决；
+      · 裸 没/未/不——高频当定语（没关严/没开完/没锁上）⇒ 只在"整句就是拒绝"时才否决。
+    实测两侧：不要把窗关上/别开灯/不要关窗/窗帘不要拉到底=否决；
+    把没关严窗户拉上/把没开完的窗继续开=放行。永不抛（判据故障不得拦正常句）。
+    """
+    try:
+        t = (text or "").strip()
+        if not is_negation_imperative(t, areas):
+            return False
+        m = (_NEGATION_CMD.search(t) or _NEG_PREP_FLOW.search(t)
+             or _NEGATION_CMD_TAIL.search(t))
+        if m is None:
+            return False
+        if not m.group(0).startswith(_WEAK_NEG_HEADS):
+            return True                                   # 强否定词：整句否决
+        return is_bare_negation_imperative(t, areas)      # 裸形：定语让路
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def is_pronoun(text: str) -> bool:
@@ -961,10 +1073,21 @@ def _cover_wordorder(text: str) -> Optional[str]:
 
 
 class FastPath:
-    def __init__(self, scenes, textcnn, settings):
+    def __init__(self, scenes, textcnn, settings, areas_of=None):
         self.scenes = scenes
         self.textcnn = textcnn
         self.settings = settings
+        # 2026-10-08 P0：否定闸要吃"本家真有的房间名"表。装配根传 `Pipeline._real_areas`
+        # （每轮现取，HA 区域表漂移不用重启）；不传 ⇒ 判据逐字等于旧形，
+        # 手工装配的测试替身/直呼方一概零漂移。
+        self.areas_of = areas_of
+
+    def _areas(self) -> tuple:
+        """区域表取用永不抛：观测面故障不得把字面表弄成整句失配。"""
+        try:
+            return tuple((self.areas_of or (lambda: ()))() or ())
+        except Exception:  # noqa: BLE001
+            return ()
 
     def _wholehouse_plan(self, text: str, trace: list[str]) -> Optional[Plan]:
         """显式全屋动作句（动词在前："打开所有灯/关掉全部窗帘"）→ Plan。
@@ -1202,7 +1325,7 @@ class FastPath:
             # 同文件的锁具倒装归一（:1190）早就带 `[没不别谁哪怎]` 护栏，唯独这处没有。
             # 收口=否定句一律不改写（不改写则原话继续走下面那道闸，落 MISS=零执行）；
             # 非否定句的 SOV/SVO 归一照旧，形态零漂移。
-            if is_negation_imperative(text):
+            if is_negation_imperative(text, self._areas()):
                 trace.append("帘窗语序:否定句不改写(闸要吃原话)")
                 return self._miss(trace, "否定句→不接管(拒执行)")
             trace.append(f"帘窗语序→{cov}")
@@ -1246,7 +1369,7 @@ class FastPath:
         # 内倒族动词（倒/内倒）**不入表**：本仓 STT 近音把「内倒」听成「别倒」
         # 是既有救援形态（targets._generic_rescue 按 bie/nei 一音节之差救回），
         # 收进来会把「打开书房别倒窗」这条真命令误杀。
-        if is_negation_imperative(text):
+        if is_refusal_imperative(text, self._areas()):
             return self._miss(trace, "否定句→不接管(拒执行)")
 
         # 连排句绝不在单发通路里执行（2026-09-10 真机实锤）：无连接词的动词连排

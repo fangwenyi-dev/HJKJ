@@ -320,7 +320,7 @@ def _phrase_is_not_a_name(seg: str, nouns=()) -> bool:
             return True
         return (seg[0] in _NAMELESS_HEAD_VERBS
                 and seg.endswith(_NAMELESS_TAIL_COMPS))
-    except Exception:  # noqa: BLE01 —— 守卫自身故障不得拦正常句
+    except Exception:  # noqa: BLE001 —— 守卫自身故障不得拦正常句
         return False
 
 
@@ -455,8 +455,11 @@ def _unknown_spoken_device_name(text: str, words, device_names,
             # 别开台灯」的第二腿被这里拼成"点名了一台叫『别开台灯』的设备"⇒ 家里查无 ⇒
             # 整链判死、该动的灯没动（2026-10-05 live_check_1137 N5）。与上面回指豁免
             # 同一条纪律：「别开/不要关」表达的是**拒绝这个动作**，不是"要哪一台"。
-            # 状态定语不受影响（「没关紧的」在 `_NEGATION_CMD` 的 `…的` 负向预查里）。
-            if is_negation_imperative(pre) or is_negation_imperative(said):
+            # 状态定语不受影响：补语（紧/好/严…）不是本家房间名 ⇒ `_NEGATION_CMD_TAIL`
+            # 那条臂不认它（2026-10-08 补：旧注释说"在 `…的` 负向预查里"，那道预查
+            # 正是被房间名撞穿的同一处，不能拿来给这条豁免背书）。
+            if is_negation_imperative(pre, real_areas or ()) or \
+                    is_negation_imperative(said, real_areas or ()):
                 continue                            # 拒绝腿：无裁决权，宁放行
             # v1.1.36 复核⑥：位置词豁免必须问"**这间房家里真有吗**"。
             # 旧形两道都吃 `known_areas`/`_area_like`，而 `_known_areas()` 把静态
@@ -492,7 +495,7 @@ def _unknown_spoken_device_name(text: str, words, device_names,
             unknown = unknown or spoken
             unknown_said = unknown_said or (said + g if said else spoken)
         return unknown_said or unknown              # 一个可判修饰段都没有=空串
-    except Exception:  # noqa: BLE01 —— 守卫自身故障不得拦正常句
+    except Exception:  # noqa: BLE001 —— 守卫自身故障不得拦正常句
         return ""
 
 
@@ -522,7 +525,7 @@ def _near_homophone_in_home(spoken: str, names) -> bool:
             if sum(1 for a, b in zip(s, pd) if a != b) <= 1:
                 return True
         return False
-    except Exception:  # noqa: BLE01
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -547,7 +550,7 @@ def _plan_target_domain(plan) -> str:
                 for dev in (slot.get("devices") or []):
                     if isinstance(dev, dict) and (dev.get("domains") or []):
                         return str(dev["domains"][0] or "")
-    except Exception:  # noqa: BLE01
+    except Exception:  # noqa: BLE001
         return ""
     return ""
 
@@ -582,12 +585,12 @@ def _plan_named_absent_target(plan, device_names, known_areas=(),
         t = plan.utterance or getattr(plan, "first_utterance", "") or ""
         if not t or any(a in t for a in _ANAPHORA_WORDS):
             return ""
-        if is_bare_negation_imperative(t) or is_query_like(t):
+        if is_bare_negation_imperative(t, real_areas or ()) or is_query_like(t):
             return ""
         return _unknown_spoken_device_name(t, _category_nouns(dom), device_names,
                                            known_areas=known_areas,
                                            real_areas=real_areas)
-    except Exception:  # noqa: BLE01
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -620,7 +623,7 @@ def _klar_named_absent_target(kl: Optional[Plan], device_names,
         # 用的。否定腿经 `is_bare_negation_imperative` 已被裁决弃用（:650/:679），
         # 但这条查无闸不吃同一判据 ⇒「打开办公室的射灯，别开台灯」的第二腿被当成
         # 点名查无，整链判死、该动的灯没动（同 :642 疑问闸"判据只落一侧"的老病根）。
-        if is_bare_negation_imperative(t):
+        if is_bare_negation_imperative(t, real_areas or ()):
             return ""
         # v1.1.38：问句不是"点名要哪一台"。裁决面早已让路（`is_query_like`，:645/:636），
         # 但闸在这里不看同一条判据 ⇒「哪个灯开着」被回成"没有找到对应的设备『哪个灯』"
@@ -631,7 +634,7 @@ def _klar_named_absent_target(kl: Optional[Plan], device_names,
                                            device_names,
                                            known_areas=known_areas,
                                            real_areas=real_areas)
-    except Exception:  # noqa: BLE01
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -711,7 +714,7 @@ def _klar_write_without_target_evidence(kl: Optional[Plan],
         if any(a in t for a in _ANAPHORA_WORDS):
             return False
         return True
-    except Exception:  # noqa: BLE01 —— 守卫自身故障不得拦正常句
+    except Exception:  # noqa: BLE001 —— 守卫自身故障不得拦正常句
         return False
 
 
@@ -746,7 +749,7 @@ def select_primary_plan(fp: Optional[Plan], kl: Optional[Plan],
         # 修②（2026-10-01）：**否定祈使两档都不得执行**——与上面疑问闸同一条纪律。
         # v1.1.27 的"全局拒执行"只落在字面表 `FastPath.match` 里（拒接管=不出计划），
         # klar 支不经该判据 ⇒ 现役树上「别开台灯」真把灯打开并播「好的，办好了」。
-        if is_bare_negation_imperative(kl.utterance or ""):
+        if is_bare_negation_imperative(kl.utterance or "", real_areas or ()):
             return None
         # v1.0.55：见 _klar_window_lamp_conflict——句在说窗、klar 却指向
         # 灯/开关时**整条弃用**（返回 None 落级联下层，宁可不执行）。
@@ -775,7 +778,7 @@ def select_fallback_plan(primary: Optional[Plan], fp: Optional[Plan],
             return None
         # v1.0.92：降级支同样过目标证据闸——v1.0.90 假成功案根因就是
         # 「主路被拦、降级通道不再复检」；只闸主裁决=半道闸。
-        if is_bare_negation_imperative(kl.utterance or ""):
+        if is_bare_negation_imperative(kl.utterance or "", real_areas or ()):
             return None                                   # 修②：降级支同闸
         if _klar_write_without_target_evidence(kl, known_areas, device_names,
                                                real_areas) or \
@@ -941,7 +944,7 @@ class Pipeline:
     def __init__(self, settings, ha, scenes, textcnn, executor, agent=None, klar=None):
         self.settings = settings
         self.ha = ha
-        self.fast_path = FastPath(scenes, textcnn, settings)
+        self.fast_path = FastPath(scenes, textcnn, settings, areas_of=self._real_areas)
         self.scenes = scenes
         self.executor = executor
         self.agent = agent
@@ -1352,7 +1355,12 @@ class Pipeline:
             if llm:
                 return llm
         # ⑦ 固定兜底
-        return Reply(self.settings.get("dialog.fallback_text", const.FALLBACK_TEXT), "fallback")
+        # 2026-10-08 P2：`ok=False`。同类兜底在 :1168（NLU 已关）、:989/:1002、:1103
+        # 四处都显式置否，唯独这条用了 Reply 的默认 `ok=True` ⇒ 漏斗成功率
+        # （telemetry.snapshot 的 ok_pct）与旁路事件 `huijian_voice_utterance` 的
+        # ok 字段把"听不懂"记成成功，下游据此判断"语音可用"的自动化被喂假信号。
+        return Reply(self.settings.get("dialog.fallback_text", const.FALLBACK_TEXT),
+                     "fallback", ok=False)
 
     _MUSIC_SVC = {"pause": "media_pause", "resume": "media_play",
                   "stop": "media_stop", "next": "media_next_track",
@@ -2148,7 +2156,7 @@ class Pipeline:
         plans: list[Plan] = []
         chain_spec: Optional[dict] = None       # 链内回指：同句先行分句的具名目标
         for (fpp, klp), clause in zip(pairs, clauses):
-            if is_bare_negation_imperative(clause):
+            if is_bare_negation_imperative(clause, self._real_areas()):
                 # v1.1.37 现网实锤（办公 .91）：「打开办公室的射灯，别开台灯」里
                 # 「别开台灯」是**拒绝腿**——它天然不该有计划，也就不能按"分句不中
                 # → 整句回退单发"或"点名查无 → 整链判死"处理。用户红线：半句否定
@@ -2472,6 +2480,15 @@ class Pipeline:
             victims = sorted(self._origin_ts.items(), key=lambda kv: kv[1])
             for k, _ in victims[:max(1, len(table) - 64)]:
                 table.pop(k, None)
+        # 2026-10-08 P2：`_origin_ts` **自己**也必须有界。上面这张循环只裁
+        # `_turns/_last_target/_confirm/_last_list` 四张表，键源表一条不删：
+        # origin 来自客户端每帧可自报的 `device` 串（且 :8000 默认 require_token=False），
+        # 每见新串加一键、永不回收 ⇒ docstring 里"origin 桶有界（64 台封顶）"是假的；
+        # 更实际的是任一表超 64 后每轮都拿**整表**排序，排序成本随污染一起涨。
+        ts = getattr(self, "_origin_ts", None)
+        if isinstance(ts, dict) and len(ts) > 64:
+            for k, _v in sorted(ts.items(), key=lambda kv: kv[1])[:len(ts) - 64]:
+                ts.pop(k, None)
 
     def _history_snapshot(self, origin: str) -> list[dict]:
         """P2-10：LLM 跨轮记忆（会话级环形缓冲，TTL 内的 user/assistant 对）。"""
@@ -2662,7 +2679,7 @@ class Pipeline:
                 if fn:
                     out.append(fn)
             return tuple(out)
-        except Exception:  # noqa: BLE01
+        except Exception:  # noqa: BLE001
             return ()
 
     def _alias_names(self) -> tuple:
@@ -2688,7 +2705,7 @@ class Pipeline:
                     if a and a != fn:
                         out.append(a)
             return tuple(out)
-        except Exception:  # noqa: BLE01 —— 覆盖面扩充不得把级联打挂
+        except Exception:  # noqa: BLE001 —— 覆盖面扩充不得把级联打挂
             return ()
 
     def _real_areas(self) -> tuple:
@@ -2711,7 +2728,7 @@ class Pipeline:
                 if name and name not in out:
                     out.append(name)
             return tuple(out)
-        except Exception:  # noqa: BLE01
+        except Exception:  # noqa: BLE001
             return ()
 
     def prior_universe(self) -> tuple:

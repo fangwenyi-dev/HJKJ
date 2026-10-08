@@ -80,3 +80,15 @@ venv/
 /_*
 # 旧仓还有一条 `/*.md`（内部文档禁发）**故意未采纳**：它会顺带忽略本网关仓将来新增
 # 的仓根 .md（AGENTS.md/SECURITY.md 之类），超出本次合并的必要范围。
+
+# 2026-10-08 第五轮复查：会话工件的真正忽略面补口。
+# 姊妹仓(-yy)的 .gitignore 里写着"docs/internal/ 同样被忽略"，**实测不成立**：
+# `/*.md` 是根锚定的，管不到 docs/ 之下，`git check-ignore` 对 docs/internal/*.md
+# 与 docs/bug-audit-*.md 都回 rc=1，`.workbuddy/`（工具落的会话日志）同样没覆盖。
+# 本仓 ci 是 push main 即构建发版——一次 `git add -A` 就把审计工单与会话纪要
+# 发进公开仓（CLAUDE.md 铁律"内部文档禁发"）。
+# 已入库的 docs/internal/MODIFICATION_RECORD.md 与 docs/superpowers/* 不受影响
+# （gitignore 从不追改已跟踪文件）；确实要新增长期内档时用 `git add -f`。
+/.workbuddy/
+/docs/*.md
+/docs/internal/

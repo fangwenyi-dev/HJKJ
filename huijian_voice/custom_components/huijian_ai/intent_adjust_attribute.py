@@ -366,6 +366,19 @@ def adjust_light_color(ctx: AdjustmentContext, target: AdjustmentTarget):
     target.attributes = {}
 
     hex_color = ctx.delta.str_value
+    # 2026-10-08 P2：形态闸。这里原来直接拿 `str_value` 去 `int(...,16)`——
+    # delta 形态（「把灯颜色调亮一点」）或非色值串（`max`/`+10`/`None`）进来时抛
+    # ValueError/TypeError，而 handler(:781) 只捕 `IntentHandleError`/
+    # `ServiceValidationError` ⇒ 异常穿出视图 = REST 500 + 播报表述"集成还没生效"
+    # （HA 侧 components/intent/__init__.py 同样只捕那两类）。本包的 LLM 工具描述
+    # (custom_llm_api.py:561) 同时把 color 与 max/min 教给模型且不交叉校验，
+    # 这条道现实可达；字面表有色名闸(:1755)，所以只有 LLM/直呼道踩得到。
+    if not isinstance(hex_color, str) or not re.fullmatch(r"[0-9a-fA-F]{3}|[0-9a-fA-F]{6}",
+                                                          hex_color.strip()):
+        raise intent.IntentHandleError(
+            f"Colour value {hex_color!r} is not a hex colour")
+
+    hex_color = hex_color.strip()
     if len(hex_color) == 3:
         hex_color = "".join([c * 2 for c in hex_color])
 
@@ -390,6 +403,13 @@ def adjust_light_temperature(ctx: AdjustmentContext, target: AdjustmentTarget):
         light.ATTR_MAX_COLOR_TEMP_KELVIN, 6500
     )
     color_temperature_step = 500
+    # 2026-10-08 P2 改口（只改宣称，不改行为）：v1.1.36 那条注释写"设备实际只会就近
+    # 吸到 500K 网格"，把**本仓选的吸附网格**说成了设备保证——HA 的 light 域没有
+    # 设备侧色温步进属性（已核 components/light），500K 只是常见 mired 网格的近似。
+    # 真实限制：设备网格与 500K 不同时（如按 mired 370K 步进），它会把我们算出的
+    # 目标再吸一次，播报说的 3417K 不等于设备落点。吸附本身保留（传 1 会落到 1K
+    # 这种谁都不存在的档位，那是更坏的假精确）；话术这里不做设备回读，故
+    # `supported_adjust_step` 的 500K 只是"我们按这个粒度调"，不是"设备只支持这个"。
 
     if ctx.delta.unit == "%":
         # Convert percentage to Kelvin

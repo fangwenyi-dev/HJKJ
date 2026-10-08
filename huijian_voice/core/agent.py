@@ -164,7 +164,7 @@ def _actions_target_lock(node) -> bool:
                              if isinstance(v, (dict, list, tuple)))
             elif isinstance(cur, (list, tuple)):
                 stack.extend(cur)
-    except Exception:  # noqa: BLE01
+    except Exception:  # noqa: BLE001
         return False
     return False
 
@@ -404,14 +404,14 @@ class Agent:
                     args = json.loads(fn.get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                ok, speech = await self._tool(name, args)
+                ok, speech = await self._tool(name, args, text)
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
                                  "content": json.dumps({"success": ok, "speech": speech}, ensure_ascii=False)})
             # 工具回喂后继续（末轮不再给 tools → 强制出文本）
             max_rounds -= 1
         yield const.FALLBACK_TEXT
 
-    async def _tool(self, name: str, args: dict) -> tuple[bool, str]:
+    async def _tool(self, name: str, args: dict, utterance: str = "") -> tuple[bool, str]:
         from .nlu.fast_path import Plan
         from .nlu.targets import args_target_lock
         # v1.0.41 安全（审查 S2 第一层）：白名单外的工具名直接拒（含一切路径形态），
@@ -477,7 +477,19 @@ class Agent:
                     if bad:
                         return False, (f"「{bad}」这个房间在 Home Assistant 里不存在，"
                                        f"动作没执行——请核对房间名后重试")
-        plan = Plan(intent=name, args=args, source="llm")
+        # 2026-10-08 P1：原话必须随计划下行。执行侧有几道闸**只吃原话**——
+        # `_turn_gate`（窗/开关族兄弟实体不得被喂 turn_on，executor.py:1305 的判据
+        # 就是 utterance 里的窗型词）、目标证据闸、点名查无闸。旧形这里不传
+        # ⇒ `plan.utterance` 恒空、executor.py:788 `_utt = plan.utterance or ""`
+        # 拿到空串 ⇒ **LLM 通道整条绕过 v1.0.69 那道开关族闸**：同一条
+        # TurnDeviceOn{target:[{name:"平开窗"}]} 走 t0 被拦「不敢把整屋设备冒按」，
+        # 走本通道直发并对 button/sensor/number 实体投 turn_on + 播「办好了」。
+        # CHANGELOG:2337 早就写明"LLM 工具通道根本不过级联闸"，v1.1.27 只给区域闸
+        # 补了这条道（:687），开关族闸一直漏着。
+        # 取舍：混合句（「打开客厅的灯然后关上推拉窗」）里 LLM 的灯腿现在可能被保守
+        # 拒一次——与执行侧既有红线同向（"宁可当场如实失败，绝不 area 扇出+谎报成功"），
+        # 宁多拒不误执行。逐腿原话要 LLM 侧带槽位，属另一刀，不在这里夹带。
+        plan = Plan(intent=name, args=args, source="llm", utterance=utterance or "")
         return await self.executor.run(plan)
 
 

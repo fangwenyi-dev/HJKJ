@@ -234,6 +234,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ESPHomeConfigEntry) -> b
         "Setup entry: %s",
         [entry.title, entry.entry_id, _safe_entry_fields(entry)],
     )
+    # 2026-10-08 P1（第五轮复查）：语音自动化监听的重新武装**必须落在 assist 早退之前**。
+    # 这一行此前写在下面 `if config_type == "assist": ... return True` 之后 —— assist
+    # 分支根本到不了它，而 async_unload_entry 对**任何**条目都调
+    # reset_automation_globals()（真注销 EVENT_STATE_CHANGED + 整点 tick）⇒
+    # 在面板编辑语音引擎端点/保存 options/reauth（config_flow.py:510/673
+    # async_update_reload_and_abort，只 reload assist 条目）之后，全屋传感器阈值与
+    # 每日定时的语音自动化**静默停摆**到下次重启 HA，无 WARN、面板触发日志恒空。
+    # 既有钉 test_audit4_fixes::test_p1_entry_setup_rearms_automation_listeners 按
+    # AST 查"函数体顶层有没有这句调用"——看得见语句、看不见上面的早退，故长期假绿；
+    # 本轮把它升级成可达性判据，不是弱化。幂等：实例已活时只 return。
+    get_automation_manager(hass)
     config_type = entry.data.get("config_type")
     if config_type == "assist":
         PLATFORMS = set()
@@ -284,15 +295,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ESPHomeConfigEntry) -> b
     await manager.async_start()
 
     await mcp_transport.async_setup_entry(hass, entry)
-    # 第四轮审计 P1：语音自动化监听**重新武装**。async_unload_entry 里
-    # reset_automation_globals() 已真注销 EVENT_STATE_CHANGED 与整点 tick，
-    # 而重新武装此前只在 get_automation_manager 懒建时发生——条目 reload
-    # （保存选项/重配/删设备）后无人再调它 ⇒ 全屋传感器/时间自动化**静默停摆**
-    # （管理页触发日志也恒空），只有重启 HA 才复活。
-    # 对抗复核 A3 修：**无条件**（此前放在 !=assist 分支内 ⇒ assist 引擎条目
-    # reload/重配不补挂）；get_automation_manager 实例已活只 return（幂等），
-    # 真正补挂在 reset 之后的首调——删除路径见 async_remove_entry。
-    get_automation_manager(hass)
+    # 第四轮审计 P1 的自动化监听重挂（`get_automation_manager`）已上移到
+    # `async_setup_entry` 分支头之前——写在这里时 assist 条目被早退绕过，等于没挂。
+    # 删除路径的补挂见 async_remove_entry（也不在下移后的这一行管）。
     # 语音卫星入驻后自动补建 assist 引擎条目（若 HA 尚无）：三平台实体
     # (conversation/stt/tts) 随慧尖设备安装自动注册、端点默认本机加载项 :8000。
     # 不 await——补建走独立 config flow(SOURCE_IMPORT)，失败 fail-open。

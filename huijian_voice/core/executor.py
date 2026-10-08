@@ -58,6 +58,16 @@ MODE_CN = {"heat": "制热", "cool": "制冷", "dry": "除湿", "fan_only": "送
 _EN_ERR_MAP = [
     ("could not extract window name", "没找到要控制的窗户，试试说「客厅的窗户内倒」"),
     ("window control failed", "窗户控制没成功，可能窗户没在 HA 里配好"),
+    # 2026-10-08 P1：裸窗句（「关窗」「开窗」）在加载项字面表里就是**无 target** 的
+    # ControlWindow。集成旧形在 slot 校验阶段抛 voluptuous 英文串，这条友好支到不了；
+    # 现在 target 改 Optional 后回的是这个短语——话术必须给**正确的句式引导**，
+    # 不能落进末行的「这一步没有执行成功（No target specified）」把英文念出来。
+    # 与用户红线一致：宁如实引导，绝不猜房间、绝不冒按全区窗钮。
+    ("no target specified", "要说哪扇窗——请带上房间名和窗型（如「打开办公室的平开窗」），"
+                            "或直接用窗名（如「关掉悬窗」）"),
+    # 2026-10-08 P2：颜色形态闸（集成 intent_adjust_attribute.adjust_light_color）抛的
+    # 正规失败句。不落进末行「这一步没有执行成功（Colour value …）」把英文念出来。
+    ("not a hex colour", "这个颜色我调不了——请说颜色名（如「把灯调成暖光」）或六位色号"),
     # v1.0.71（开错房间事故）：集成如实失败句「Could not find open button for X
     # in Y」旧表不认，播报被截成英文残句「（Could not find op」——现场实锤。
     ("could not find", "没找到要操作的窗户——请确认房间名和窗型叫法（如「办公室平开窗」）"),

@@ -4,6 +4,9 @@
 组件 + 真 config flow，见发布记录）；本文件只钉"接线代码不得被改回
 只建引擎不建管道"的半截状态。
 """
+from __future__ import annotations
+
+import ast
 from pathlib import Path
 
 CC = Path(__file__).resolve().parents[1] / "custom_components" / "huijian_ai"
@@ -19,11 +22,34 @@ def test_pipeline_wiring_present_and_called():
     assert "async_create_default_pipeline" in init
     assert "async_set_preferred_item" in init
     # assist 分支必须在平台 forward 之后调用接线（顺序错误=引擎未注册先接线）
-    seg = init.split('config_type == "assist"', 1)[1]
-    seg = seg.split("return True", 1)[0]
-    assert seg.index("async_forward_entry_setups") < seg.index(
-        "_async_ensure_huijian_pipeline"
-    )
+    #
+    # 2026-10-08 把这条从**文本切片**改成判 AST。旧形是
+    # `split('config_type == "assist"')` 再 `split("return True")` 取第一段——
+    # 本轮把自动化重挂钩子上移到 assist 早退之前时，我写的说明注释里引用了
+    # `return True` 这个字面量，切片切在注释上 ⇒ 钉以 ValueError 红。**红的是钉，
+    # 不是代码**，但根因是判据用文本而非语法：注释里出现这些串就能满足或破坏它
+    # （本仓记过的同型坑："治假绿的钉会被它描述的那个 bug 的注释满足"）。
+    # 现在判据读 assist 分支体的实际语句顺序，注释怎么写都不影响它。
+    tree = ast.parse(init)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+               and n.name == "async_setup_entry"), None)
+    assert fn, "async_setup_entry 不见了"
+    branch = next((s for s in fn.body
+                   if isinstance(s, ast.If) and "assist" in ast.unparse(s.test)), None)
+    assert branch, "assist 分支不见了——接线判据要跟着改，不许留旧形状自证通过"
+    seen = []
+    for stmt in branch.body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call):
+                nm = (getattr(node.func, "attr", None)
+                      or getattr(node.func, "id", None))
+                if nm in ("async_forward_entry_setups", "_async_ensure_huijian_pipeline"):
+                    seen.append((nm, node.lineno))
+    assert [n for n, _ in seen] == ["async_forward_entry_setups",
+                                    "_async_ensure_huijian_pipeline"], (
+        f"assist 分支里两次接线的顺序/存在性不对：{seen}"
+        "（必须先 forward 平台，固定 entity_id 才在注册表可见，再解管道名）")
 
 
 def test_pipeline_takeover_guarded():

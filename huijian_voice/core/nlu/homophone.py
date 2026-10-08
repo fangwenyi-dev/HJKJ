@@ -113,10 +113,14 @@ def homophone_index(names):
 
     歧义档（同音两个以上写法）**留在返回值里**由调用方丢弃——钉要钉在"这里确实存在
     两个同音写法"上，而不是钉在"改写函数没动文本"这种间接表征上。
-    ALL_DEVICES 每次换绑都是整体赋值（`targets.py:365`），故按对象身份缓存倒排。
+    缓存按**内容**判、不按对象身份：本层从不读 `ALL_DEVICES`，调用方每句现造新 tuple
+    （`pipeline.prior_universe()` = `prior_names(...) + _real_areas()`），按 `is` 判必
+    恒 miss＝死码 + 每句重建音节表（旧注释引 `targets.py:365` 的整体赋值规矩，
+    那个前提在这里不成立）。内容比较 O(n)，仍远省于每句重跑 `lazy_pinyin`。
     """
     global _INDEX_CACHE
-    if _INDEX_CACHE[0] is names:
+    key = tuple(names or ())
+    if _INDEX_CACHE[0] == key:
         return _INDEX_CACHE[1]
     idx: dict[tuple, set] = {}
     for w in names or ():
@@ -127,7 +131,7 @@ def homophone_index(names):
         if s is None:
             continue
         idx.setdefault(s, set()).add(w)
-    _INDEX_CACHE = (names, idx)
+    _INDEX_CACHE = (key, idx)
     return idx
 
 
@@ -170,10 +174,11 @@ def near_index(names):
     """可参与近音档比对的**本家音节向量**表：纯汉字、2~8 字、一字一音节。
 
     与第一档同源同闸（`_HAN`＋`_syl`），只是这里留的是逐词向量而非拼音串键——
-    第二档要逐位置比，键相等那条判据用不上。按对象身份缓存（同 `_INDEX_CACHE` 规矩）。
+    第二档要逐位置比，键相等那条判据用不上。缓存同 `_INDEX_CACHE`：按**内容**判。
     """
     global _VEC_CACHE
-    if _VEC_CACHE[0] is names:
+    key = tuple(names or ())
+    if _VEC_CACHE[0] == key:
         return _VEC_CACHE[1]
     vecs = []
     for w in names or ():
@@ -183,7 +188,7 @@ def near_index(names):
         s = _syl(w)
         if s is not None:
             vecs.append((w, s))
-    _VEC_CACHE = (names, vecs)
+    _VEC_CACHE = (key, vecs)
     return vecs
 
 

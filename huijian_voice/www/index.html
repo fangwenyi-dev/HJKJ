@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.2.7">
-<link rel="stylesheet" href="css/voice.css?v=1.2.7">
+<link rel="stylesheet" href="css/huijian.css?v=1.2.8">
+<link rel="stylesheet" href="css/voice.css?v=1.2.8">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -315,7 +315,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.2.7";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.2.8";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -375,6 +375,15 @@ const U = p => INGRESS_BASE + String(p).replace(/^\//, '');
 const toast = m => { const t=$("#toast"); t.textContent=m; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2600); };
 async function api(path, opt) {
   const r = await fetch(U(path), opt);
+  /* 2026-10-08 P2：200 但返回的不是 JSON 也算失败。事实文件（status.json /
+     models_status.json）由核心每 5s 回写，容器刚起/核心已退/写失败时**文件不在**，
+     而 nginx `location /` 的 `try_files … /index.html` 会把缺文件请求兜成 **200 + HTML**
+     ——`r.json()` 抛错被 `.catch` 吞成 `{message:"响应解析失败"}`，`r.ok` 又是真，
+     于是 refreshStatus 走不到 catch 支，页头显示「前端/核心版本不一致」（v1.1.27
+     那条"拉不到即置灰"被这条 200 支整条绕过），写失败本身还只 logger.debug 看不见。 */
+  const ct = (r.headers.get("content-type") || "").toLowerCase();
+  if (r.ok && ct.indexOf("json") < 0)
+    throw new Error("返回的不是 JSON（核心未就绪或事实文件尚未写出）");
   const j = await r.json().catch(()=>({message:"响应解析失败"}));
   if (!r.ok) throw new Error(j.message || ("HTTP "+r.status));
   return j;
@@ -634,11 +643,15 @@ $("#tv_upload").onclick = async () => {
     const r = await fetch(U("/api/tts/voices/upload?name=" + encodeURIComponent(name)), { method: "POST", body: f });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.message || ("HTTP " + r.status));
-    await post("/api/system/reload_models", {});
+    const rl = await post("/api/system/reload_models", {});
     await refreshVoicesPanel();
     _kokoroSid = name;                        // 上传成功即选中新嗓（保存后播报生效）
     $("#tts_sid").value = name;
-    toast(`「${name}」已投递并重载`);
+    // 2026-10-08 P2：`reload_models` 的返回里带着**如实说明**（"STT 推理中，跳过
+    // （稍后再点或空闲自动重载）"/"TTS 合成中，跳过"，admin_api.py:681-696），
+    // 旧写法把它丢掉直接播「已投递并重载」＝重载被跳过仍报成功。同文件 :645 的
+    // 「重新扫描」按钮就如实显示 r.note，两条支路口径不一致。
+    toast(`「${name}」已投递；` + ((rl && rl.note) ? rl.note : "重载无返回说明"));
   } catch (e) { toast("上传失败：" + e.message); }
 };
 $("#tv_scan").onclick = async () => {
@@ -1100,6 +1113,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.2.7"></script>
+<script src="js/starsky.js?v=1.2.8"></script>
 </body>
 </html>

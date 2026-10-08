@@ -1346,7 +1346,15 @@ class TtsEngine:
                     # <60 字豁免（英文/符号/URL 文本预期虚高，防误杀正常轮）。
                     audio_s = cloud_frames * const.FRAME_MS / 1000.0
                     exp_s = len(text) / (4.5 * max(self._speed(), _SPEED_MIN))
-                    if len(text) >= 60 and audio_s < 0.35 * exp_s:
+                    # 2026-10-08 P2：这条比值账只对**中文主导**的句子成立。4.5 字/s 是
+                    # 汉字语速（同固件 v2.1.44 那条账），英文按字符数算实际语速远高于它
+                    # ⇒ ≥60 字的正常英文整句 audio_s/exp_s 轻松掉到 0.35 以下，被误判成
+                    # "云端限长缺尾"：记 truncated + 开钉扎 ⇒ 英文回复偶发被本地兜底嗓换掉。
+                    # 60 字那条豁免当年只挡住了短句，长英文句正好落在闸门里。
+                    # 判据换成句子文字构成（CJK 是否过半），不给英文另猜语速常数。
+                    _cjk = sum(1 for c in text if "一" <= c <= "鿿")
+                    if (len(text) >= 60 and _cjk * 2 >= len(text)
+                            and audio_s < 0.35 * exp_s):
                         logger.warning(
                             "[TTS] 云产出时长/文本比异常（%.1fs vs 预期≈%.0fs，"
                             "%d 字）→ 按云端限长缺尾收口（truncated+钉扎）: %r",
@@ -1522,7 +1530,15 @@ class TtsEngine:
         # 都自动收敛，也不靠猜哪一步被打断。
         self._cache.pop(key, None)
         self._cache[key] = (packets, size)
-        self._cache_bytes = sum(int(sz) for _pkts, sz in self._cache.values())
+        # v1.1.36 复核批二 的"从表重算"把竞态**搬了家**而不是消掉了：`sum(... for ...
+        # in self._cache.values())` 是**活视图迭代**，worker 线程（换代 `clear()`
+        # :1242、换绑 :1103）插在迭代中间 ⇒ `RuntimeError: OrderedDict mutated during
+        # iteration`。读侧(:1410/:1444)有 `except KeyError`、popitem(:1528)有兜底，
+        # 唯独这一行没有；而调用点 :1480 在**发声协程**里裸调 ⇒ 异常穿到
+        # session.py:532 的 `except Exception` ⇒ 本轮播报以 truncated 收束（缺尾）。
+        # `list(...)` 是一次 C 级拷贝、对 GIL 原子 ⇒ 要么看到旧全集要么新全集，
+        # 不会"迭代到一半被改"，重算语义与 v1.1.36 的初衷逐值一致。
+        self._cache_bytes = sum(int(sz) for _pkts, sz in list(self._cache.values()))
         # v1.1.36 复核⑦：读侧今天护了，写侧是同一条竞态的另一个落点且更狠——
         # `len()` 判过之后、`popitem()` 取之前被 worker 线程的 `clear()` 插队
         # （换绑/换代，见 :1091/:1230/:1489 三处），OrderedDict.popitem 在空表上

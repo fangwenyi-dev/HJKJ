@@ -467,7 +467,12 @@ class TurnDeviceIntentBase(intent.IntentHandler):
                     f"Water heater entity {state.entity_id} does not support set_operation_mode"
                 )
             if service == SERVICE_TURN_ON:
-                modes = state.attributes.get("operation_modes", [])
+                # 2026-10-08 P1：属性名写错 ⇒ 「打开热水器」100% 失败。HA 侧真名是
+                # `operation_list`（home-assistant/core water_heater/__init__.py:70
+                # `ATTR_OPERATION_LIST = "operation_list"`，2026-10-08 取上游核对）；
+                # 旧的 "operation_modes" 在这台 HA 上永不存在 ⇒ modes 恒空 →
+                # 下一行 raise，用户听到"没找到符合条件的设备"。
+                modes = state.attributes.get("operation_list", [])
                 target_mode = next((m for m in modes if m != "off"), None)
                 if not target_mode:
                     raise intent.IntentHandleError(

@@ -273,6 +273,15 @@ class HAClient:
                         # 可达判据不动（401/403=URL 对而鉴权失败，仍算可达，
                         # 见 test_ha_client_urls 的 404 事故定案）：可达≠快照可用。
                         self._states_ok = False
+                        # 2026-10-08 P2：失败也推进重试窗口（退避）。`_cache_ts` 此前
+                        # 只在 200 支写 ⇒ TTL 一到每个调用点都重新打网络，而整段刷新
+                        # 持 `_lock`。一轮语音有 6-8 个取快照点（能力预检/可用性/离线名/
+                        # 逐腿真值/未应答 + capability.registry_areas + agent._device_brief），
+                        # HA"连着但不回包"时每点最坏 15s 串行累加 ⇒ 越过设备 20s 与
+                        # LLM_TURN_BUDGET，整轮无响应且同机其他卫星一起堵。
+                        # 与同文件 v1.1.21 注册表侧 `_reg_ts` 那条**完全同型**的修法对齐；
+                        # `_states_ts` 不动（陈旧度证据必须留在真上一次成功那刻）。
+                        self._cache_ts = time.time()
                         if not self._states_warned:
                             self._states_warned = True
                             logger.warning("[HA] states 返回非 200（status=%s），状态快照"
@@ -284,6 +293,7 @@ class HAClient:
                 # "由通转不通"的下降沿判据：_reachable 初值 False，全新安装把
                 # URL 配错会一次都不触发——那条恰恰最需要日志。
                 self._states_ok = False
+                self._cache_ts = time.time()   # 退避同非 200 支（一轮 6-8 个点各打一次网络）
                 if not self._states_warned:
                     self._states_warned = True
                     logger.warning("[HA] states 刷新失败，此后能力预检失效、状态查询"
