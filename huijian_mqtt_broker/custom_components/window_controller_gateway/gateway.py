@@ -137,6 +137,8 @@ class GatewayOnlineSensor(BinarySensorEntity):
         """当实体从HA中移除时调用"""
         # 移除状态更新回调
         self.mqtt_handler.remove_status_callback(self._on_status_change)
+        # base_entity v1.6.9 同款纪律：断链会静默跳过 MRO 上挂在钩子处的 mixin
+        await super().async_will_remove_from_hass()
 
 class GatewayPairingButton(ButtonEntity):
     """网关配对按键"""

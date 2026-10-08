@@ -129,6 +129,31 @@ def get_local_ip():
     return None
 
 
+def reregister_service(zeroconf, old_info, new_ip, mqtt_port):
+    """IP 变化：注销旧广播 → 按新地址重注册 → **回写状态文件**。
+
+    回写是 2026-10-08 审计 B-6 补的：旧实现在此分支只 print，状态文件永远停在
+    首次注册的 IP 上，而集成侧提示卡读的正是文件里的 local_ip ⇒ DHCP 续租/换网
+    后卡片显示的是失联前的旧地址。注册失败照原样向上抛（由 main 归因撞名/退出码），
+    所以新 IP 只在注册成功后才落地。
+    """
+    try:
+        zeroconf.unregister_service(old_info)
+    except Exception:  # noqa: BLE001 — 注销失败不能挡住按新地址重注册
+        pass
+    info = ServiceInfo(
+        type_="_mqtt._tcp.local.",
+        name="huijian-mqtt._mqtt._tcp.local.",
+        addresses=[socket.inet_aton(new_ip)],
+        port=mqtt_port,
+        properties={},
+        server="huijian.local.",
+    )
+    zeroconf.register_service(info)
+    write_status("ok", new_ip, mqtt_port)
+    return info
+
+
 def main():
     mqtt_port = int(sys.argv[1]) if len(sys.argv) > 1 else 2022
 
@@ -180,19 +205,8 @@ def main():
             current = get_local_ip()
             if current and current != local_ip:
                 print(f"[mDNS] 本机 IP 变化: {local_ip} → {current}，重新注册")
-                try:
-                    zeroconf.unregister_service(service_info)
-                except Exception:
-                    pass
-                service_info = ServiceInfo(
-                    type_="_mqtt._tcp.local.",
-                    name="huijian-mqtt._mqtt._tcp.local.",
-                    addresses=[socket.inet_aton(current)],
-                    port=mqtt_port,
-                    properties={},
-                    server="huijian.local.",
-                )
-                zeroconf.register_service(service_info)
+                service_info = reregister_service(zeroconf, service_info,
+                                                  current, mqtt_port)
                 local_ip = current
                 print(f"[mDNS] huijian.local → {local_ip}（已更新）")
 

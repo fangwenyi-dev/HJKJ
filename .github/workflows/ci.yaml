@@ -52,10 +52,25 @@ jobs:
         run: |
           pip install -q pyyaml
           python3 -c '
-          import yaml, sys, glob
-          for f in glob.glob("**/*.yaml", recursive=True):
+          import yaml, sys, glob, os
+          # 2026-10-08 审计 B-8：Python glob 的 `*` 不匹配以点开头的目录，旧写法
+          # **从未**校验过本仓自己的 workflow（本机实证：12 个文件、0 个来自 .github）。
+          # 显式补点目录一路，再加反向自校验——门一旦重新变窄必须当场响亮失败，
+          # 不许再用"12 个 ✅ 全绿"给人假安全感（下方 JSON 门走 find，本就覆盖 .github）。
+          # 分隔符先归一：glob 在 Windows 上混返 os.sep 与模式里的 /，直接比字符串
+          # 会让这道自校验在开发机上假红（本机实测踩到）。
+          def norm(p):
+              return p.replace(os.sep, "/")
+          files = sorted({norm(p) for pat in ("**/*.yaml", ".github/**/*.yaml")
+                          for p in glob.glob(pat, recursive=True)})
+          claimed = sorted(norm(p) for p in glob.glob(".github/workflows/*.yaml"))
+          missing = [f for f in claimed if f not in files]
+          if missing:
+              print("❌ YAML 门自身漏校验: " + ", ".join(missing))
+              sys.exit(1)
+          for f in files:
               try:
-                  yaml.safe_load(open(f))
+                  yaml.safe_load(open(f, encoding="utf-8"))
                   print(f"✅ {f}")
               except Exception as e:
                   print(f"❌ {f}: {e}")

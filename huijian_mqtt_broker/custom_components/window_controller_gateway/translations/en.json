@@ -1,0 +1,165 @@
+{
+  "title": "Huijian window opener gateway",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure window opener gateway",
+        "description": "Enter the gateway serial number and name",
+        "data": {
+          "gateway_sn": "Gateway serial number",
+          "gateway_name": "Gateway name (optional)"
+        }
+      },
+      "replace": {
+        "title": "Replace gateway",
+        "description": "Pick the gateway to replace. Its devices will be migrated to the new gateway {gateway_name} (SN: {new_gateway_sn})",
+        "data": {
+          "old_gateway_sn": "Old gateway",
+          "new_gateway_sn": "New gateway serial number"
+        }
+      },
+      "confirm_migration": {
+        "title": "Confirm device migration",
+        "description": "Devices are about to move from the old gateway {old_gateway} to the new gateway {new_gateway} ({device_count} devices in total)",
+        "data": {
+          "confirm": "Confirm migration",
+          "remove_old": "Remove the old gateway after migration"
+        }
+      },
+      "confirm_add": {
+        "title": "Gateway did not respond",
+        "description": "No report arrived within the test window (SN: {gateway_sn}).\nThe gateway may be unpowered, not connected to MQTT, or reporting on a longer interval.\nAdd it anyway? Once the gateway comes online and reports, its devices are discovered automatically.",
+        "data": {
+          "confirm": "Add anyway"
+        }
+      }
+    },
+    "error": {
+      "invalid_sn_format": "Invalid serial number format: at least 10 alphanumeric characters required",
+      "mqtt_not_available": "The MQTT integration is not enabled. Enable MQTT in Home Assistant first",
+      "broker_not_ready": "MQTT broker not ready: an MQTT config entry exists, but its client is not connected yet. With the Huijian all-in-one add-on, confirm the add-on is running (built-in broker port 2022); with a broker you set up yourself, check its reachability and credentials. The connection is retried automatically - wait about a minute and try again.",
+      "cannot_connect": "Failed to connect to the gateway",
+      "invalid_ws_token": "The token must be 8-62 chars of [A-Za-z0-9_-] (spaces/commas break the WebSocket subprotocol handshake and lock you out)",
+      "ws_port_reserved": "This port is used by the add-on itself (2022=MQTT broker / 10998=Web UI / 8123=Home Assistant / 1883=common external broker); pick another",
+      "required": "This field is required",
+      "already_configured": "This gateway is already configured"
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured",
+      "invalid_input": "Invalid input, go back and configure again",
+      "updated_existing_gateway": "Existing gateway configuration updated, starting device migration",
+      "ignored": "This gateway has been ignored",
+      "invalid_sn_format": "Invalid gateway SN format (at least 10 alphanumeric characters)",
+      "migration_not_supported": "Device migration is not enabled yet: delete the old gateway manually and add it again"
+    }
+  },
+  "issues": {
+    "mdns_name_conflict": {
+      "title": "Gateway auto-discovery is held by another Home Assistant (second Huijian add-on on this LAN)",
+      "description": "mDNS broadcast registration failed on this host ({local_ip}): huijian.local is already claimed by another device on the LAN (owner: {owner}). LoRa gateways that discover through mDNS will only reach that HA, so this host never sees their reports. Two ways out: (1) stop the Huijian add-on on one of the two hosts - keep one per home; (2) point the gateway's MQTT server address at {local_ip}:2022, this host's broker keeps working. Restart the affected add-on afterwards so the status refreshes."
+    },
+    "mqtt_channel_broken": {
+      "title": "Huijian gateway unreachable: HA's MQTT client is not on the built-in broker",
+      "description": "The gateway keeps reporting, but Home Assistant's MQTT client is not connected to the Huijian built-in broker (127.0.0.1:2022), so no gateway message arrives: bind requests (001) go unanswered (the firmware retransmits every 5 seconds without recovering), and no device or gateway card appears. Diagnostic code: {verdict}. Fix: open Settings - Devices & Services - MQTT and check the entry: address 127.0.0.1, port 2022, username ha_mqtt (default password huijian2022, matching the add-on configuration). To let Huijian rewrite the entry back to the built-in endpoint: restart the Huijian LoRa gateway add-on first (a restart rewrites the bootstrap marker), then come back and press Submit to retry one round. Huijian rechecks every 30 minutes and this card disappears by itself once the channel recovers.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Retry one channel check",
+            "description": "The bootstrap runs one more round and HA's MQTT client is checked against the built-in broker (127.0.0.1:2022). Success closes this card; if it still fails the error is shown - verify the address and credentials of the entry under Settings - Devices & Services - MQTT."
+          }
+        },
+        "error": {
+          "still_broken": "Still not fixed: the MQTT client is not connected to the built-in broker. Check that the entry points at 127.0.0.1:2022 with the same username and password as the add-on configuration; if another add-on owns that entry, change it back or remove it and retry."
+        }
+      }
+    },
+    "mqtt_bootstrap_pending": {
+      "title": "Huijian MQTT auto-configuration incomplete",
+      "description": "The Huijian add-on declared that HA's MQTT integration should use the built-in broker (127.0.0.1:2022), but has not succeeded yet - LoRa gateway reports cannot reach HA. The system retries automatically (from 5 minutes, exponential, capped at 1 hour); you can also press Submit to run one retry immediately. If it keeps failing: confirm the Huijian add-on is running and look for mqtt_bootstrap lines in the HA log to locate the cause (common: the MQTT entry is disabled, the original broker is still Supervisor-managed, credentials rejected).",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Retry one MQTT auto-configuration",
+            "description": "The bootstrap runs one more round: the built-in broker (127.0.0.1:2022) is configured as HA's MQTT integration. Success closes this card; if it still fails you stay on this page and the error is shown - confirm the Huijian add-on is running and the built-in broker is not taken by another MQTT entry."
+          }
+        },
+        "error": {
+          "still_broken": "Still not fixed: the bootstrap has not landed. Confirm the Huijian add-on is started (built-in broker 127.0.0.1:2022 reachable); restart the add-on if needed and press again."
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Huijian gateway settings",
+        "menu_options": {
+          "add_gateway": "Add LoRa gateway (bind a gateway serial number)",
+          "options": "Advanced options (miniprogram direct-connect token/port, discovery interval, debug logging)"
+        }
+      },
+      "options": {
+        "title": "Configuration options",
+        "description": "Advanced options for the gateway",
+        "data": {
+          "discovery_interval": "Device discovery interval (seconds)",
+          "auto_discovery": "Discover devices automatically",
+          "debug_logging": "Debug logging",
+          "ws_gateway_enabled": "Allow the Huijian miniprogram to connect directly over the LAN (listens on ws://0.0.0.0:port/ws)",
+          "ws_gateway_port": "Miniprogram WS gateway port (default 9001; the miniprogram and firmware always dial 9001, so changing this breaks LAN direct access)",
+          "ws_gateway_token": "Miniprogram handshake token (8-62 chars of [A-Za-z0-9_-]; empty = no authentication)",
+          "expose_cover_as_curtain": "Expose window openers as curtains (only use this when bridging to third-party ecosystems like vivo HomeBridge, whose device enumeration only accepts the curtain class; after saving, the entry auto-reloads and takes effect in seconds)"
+        }
+      },
+      "add_gateway": {
+        "title": "Add gateway",
+        "description": "Enter the gateway serial number to bind to this entry (example: {example_sn})",
+        "data": {
+          "gateway_sn": "Gateway serial number",
+          "gateway_name": "Gateway name (optional)"
+        }
+      }
+    },
+    "error": {
+      "required": "The gateway serial number is required",
+      "invalid_sn_format": "Invalid serial number format: at least 10 alphanumeric characters required",
+      "already_configured": "This gateway is already used by another config entry",
+      "invalid_ws_token": "Invalid token: 8-62 characters of letters/digits/underscore/hyphen (empty means no authentication)",
+      "ws_port_reserved": "This port is used by the add-on itself (2022=MQTT broker / 10998=Web UI / 8123=Home Assistant / 1883=common external broker); pick another"
+    }
+  },
+  "services": {
+    "start_pairing": {
+      "name": "Start pairing",
+      "description": "Put the gateway into pairing mode"
+    },
+    "refresh_devices": {
+      "name": "Refresh devices",
+      "description": "Trigger device rediscovery"
+    },
+    "set_position": {
+      "name": "Set position",
+      "description": "Set the cover position"
+    },
+    "check_gateway_status": {
+      "name": "Check gateway status",
+      "description": "Check whether the gateway is online and how it is connected"
+    },
+    "rename_device": {
+      "name": "Rename device",
+      "description": "Rename a sub-device, including custom room/area names"
+    },
+    "migrate_devices": {
+      "name": "Migrate devices",
+      "description": "Move sub-devices from the old gateway to a new one (currently unavailable)"
+    },
+    "transfer_device": {
+      "name": "Transfer device",
+      "description": "Move a single device from one gateway to another"
+    },
+    "unignore_gateway": {
+      "name": "Un-ignore gateway",
+      "description": "Remove the ignore record of a gateway that was accidentally ignored on the discovery card (since v1.7.12 ignores persist across restarts, so an accidental click keeps that card away permanently). Once removed, the discovery card returns on that gateway's next report"
+    }
+  }
+}

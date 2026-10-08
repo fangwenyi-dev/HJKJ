@@ -54,8 +54,6 @@ class WindowControllerDeviceManager:
         self._status_listeners = []
         self._device_registry_cache = None
         self._entity_registry_cache = None
-        self._is_migrating = False
-        self._migration_lock = asyncio.Lock()
         self._manually_removed_devices = self._load_manually_removed_devices()
         self._background_tasks = []
         # 设备显示编号计数器（用于 "开窗器 XX-XX (#NN)" 的 NN）。
