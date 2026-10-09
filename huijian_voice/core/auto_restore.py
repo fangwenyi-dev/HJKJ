@@ -94,6 +94,17 @@ _CLOSE_SERVICE = {
 }
 
 DEFAULT_MIN = 10
+# 纠正性重开用（与 _CLOSE_SERVICE 同表同口径，域不支持时退回 homeassistant.turn_on）
+_OPEN_SERVICE = {
+    "cover": ("cover", "open_cover"),
+    "light": ("light", "turn_on"),
+    "switch": ("switch", "turn_on"),
+    "fan": ("fan", "turn_on"),
+    "media_player": ("media_player", "turn_on"),
+    "humidifier": ("humidifier", "turn_on"),
+}
+# 抹掉用户的开之后，隔这么久**重新归位一次**（不是忘掉这条规则，也不是马上又关）
+_REFIRE_AFTER_CLOSE_S = 60.0
 # 10-10 对抗复核：默认域**只留 light**。原先带上 cover 的理由是"开合类语义上操作完就该闭合"，
 # 但这条被我自己的现场证据推翻：`light.ban_gong_shi_she_deng` 所在办公室的那扇平开窗，
 # 整夜由一条 YAML 自动化每 ~10 分钟开→7~11 分钟关（见模块头撤回记录）⇒ 10 分钟归位计时
@@ -149,6 +160,10 @@ class AutoRestore:
         self._loops: dict[str, asyncio.Task] = {}
         # 登记那一刻算出的绝对终点（monotonic），让 pending() 不依赖事件循环
         self._deadline: dict[str, float] = {}
+        # 「这台最后一次被语音打开」的时刻：用来抓评审 #4 那个 0–15s 撤回盲区——
+        # 收尾任务已经起飞（读状态→发关服务不是原子的），期间用户又说了一次"打开"，
+        # 那一次会被我们的关服务抹掉。发出后拿这两个时刻一比，就知道该不该补一次重开。
+        self._last_open: dict[str, float] = {}
 
     # ── 配置面（settings 缺失时走保守默认）───────────────────────────
     def _cfg(self) -> tuple[bool, float, tuple[str, ...], list[str]]:
@@ -218,6 +233,9 @@ class AutoRestore:
                             "⇒ 不登记，不动用户的东西", eids)
                 return
             for eid in eids:
+                # 「最后一次被语音打开」的时刻——即使这台不在策略内（不登记）也要记：
+                # #4 的自检要拿它跟收尾动作的读状态时刻比，判断是否抹掉了用户的开。
+                self._last_open[eid] = time.monotonic()
                 if self._wanted(eid, domains, exclude):
                     self._arm(eid, delay)
         except Exception:                                   # noqa: BLE001
@@ -267,6 +285,7 @@ class AutoRestore:
             if not enabled or not self._wanted(eid, domains, exclude):
                 logger.info("[归位] %s 到点，但策略已关/该设备已豁免 ⇒ 不动手", eid)
                 return
+            read_ts = time.monotonic()          # 「动手前」的基准时刻（#4 的锚）
             st = await self.ha.get_state(eid) if hasattr(self.ha, "get_state") else None
             cur = None
             if isinstance(st, dict):
@@ -292,6 +311,19 @@ class AutoRestore:
             if not ok:
                 # 失败不静默：再等一个周期重试一次，仍失败就放弃并留痕（不无限重试）
                 logger.warning("[归位] %s 收尾未成功，不再自动重试（避免与故障设备死循环）", eid)
+                return
+            # 评审 #4（0–15s 撤回盲区）：读状态与发服务**不是原子的**。若在这次收尾
+            # "动手之前"的读态之后，用户又用语音开过这台（_last_open 更新在 read_ts 之后），
+            # 我们刚发的那条关服务就把他的开抹掉了 ⇒ 立刻补一次**纠正性重开**，
+            # 让设备停在使用者要的状态上。做不到静默预防，就做到当场自愈 + 留痕。
+            opened_after = self._last_open.get(eid, 0.0)
+            if opened_after > read_ts:
+                o_domain, o_svc = _OPEN_SERVICE.get(dom, ("homeassistant", "turn_on"))
+                back = await self.ha.call_service(o_domain, o_svc, {"entity_id": eid})
+                logger.warning("[归位] %s 收尾发出后发现在 %.2fs 内用户又开过一次 ⇒ 已补发 %s.%s 纠正：%s",
+                               eid, opened_after - read_ts, o_domain, o_svc,
+                               "成功" if (isinstance(back, dict) and back.get("success")) else back)
+                self._arm(eid, _REFIRE_AFTER_CLOSE_S)   # 归位重来一次，不算"忘掉"
         except asyncio.CancelledError:
             raise
         except Exception:                                   # noqa: BLE001
@@ -313,6 +345,7 @@ class AutoRestore:
             h.cancel()
         self._tasks.clear()
         self._deadline.clear()
+        self._last_open.clear()
         for t in self._loops.values():
             t.cancel()
         self._loops.clear()

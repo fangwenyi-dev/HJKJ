@@ -454,6 +454,47 @@ def test_回执说没人被改动_changed_False_等同_noop_不登记():
     ar.cancel_all()
 
 
+def test_收尾发出后才发现用户刚开过_必须当场纠正性重开():
+    """评审 #4（0–15s 撤回盲区）：读状态→发关服务**不是原子的**。用户在这两步之间说
+    "打开灯"，我们刚发的 turn_off 就把他的开抹掉了。做不到预防，就必须**当场自愈**：
+    补一次 turn_on，并重新归位一次（不是从此不管）。"""
+    class SlowHA(HA):
+        """get_state 慢 0.3s——模拟 TTL 过期 / HA 响应慢（真实可达 0–15s）。"""
+
+        async def get_state(self, entity_id):
+            await asyncio.sleep(0.3)
+            return await super().get_state(entity_id)
+
+    ha = SlowHA(state="on")
+    ar = AutoRestore(ha, Set(**{"dialog.auto_restore": True,
+                                "dialog.auto_restore_domains": ["light"]}))
+
+    async def go():
+        fire = asyncio.get_running_loop().create_task(ar._fire("light.desk"))
+        await asyncio.sleep(0.05)                                    # 它已读态、还没发完
+        ar.note("TurnDeviceOn", {"entity_id": "light.desk"}, True)   # 用户此刻说"打开灯"
+        await fire
+
+    asyncio.run(go())
+    seq = [(d, s) for d, s, _ in ha.calls]
+    assert seq == [("light", "turn_off"), ("light", "turn_on")], \
+        "关完没补重开＝用户刚下的开被抹掉了：%s" % (seq,)
+    assert "light.desk" in ar.pending(), "纠正性重开后必须重新归位，不能直接放行不管"
+    ar.cancel_all()
+
+
+def test_用户开在收尾窗口之外_不得多发明细():
+    """反向对照（防把纠正当万能钥匙到处发）：只有"开"发生在本次收尾动手之后才补发。"""
+    ha = HA(state="on")
+    ar = AutoRestore(ha, Set(**{"dialog.auto_restore": True,
+                                "dialog.auto_restore_domains": ["light"]}))
+    # 必须在事件循环里登记（循环外 note() 会按规矩拒绝，不假装已安排）
+    assert "light.a" in _note(ar, "TurnDeviceOn", {"entity_id": "light.a"})
+    asyncio.run(ar._fire("light.a"))
+    assert [(d, s) for d, s, _ in ha.calls] == [("light", "turn_off")], ha.calls
+    ar.cancel_all()
+
+
 def test_pending_在事件循环外也必须可读_现场排查靠它():
     """评审 #7：旧实现在 _tasks 非空时取 running loop ⇒ 循环外调用直接 RuntimeError，
     而模块头承诺"在 pending 快照里可见，便于现场排查"。"""
