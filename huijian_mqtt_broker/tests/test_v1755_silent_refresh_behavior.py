@@ -168,6 +168,9 @@ const GATEWAY_SN_BY_ENTRY = {};
 // 抽函数跑的假 DOM 必须把模块作用域的依赖一起补上，否则 ReferenceError——
 // 这不是被测代码的错，是桩缺面（本仓纪律：桩不得窄于真实现）。
 const DISABLED_ENTRIES = {};
+// v1.8.5（审计 G-4）：同款模块级全局——降级渲染登记、无感刷新消费的整建标记。
+// 漏补即 ReferenceError 被 catch 吞掉，场景 A/B/C 会集体假红（桩缺面，不是缺陷）。
+const PENDING_REBUILD = {};
 """
 
 HARNESS_TAIL = """

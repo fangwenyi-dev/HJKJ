@@ -3,6 +3,107 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.8.5] - 2026-10-09 · 全量审计真 bug 收口：G-2/G-3/G-4/G-5/G-7/G-8 六条 + G-1/G-6 两条纪律缺口
+
+⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件
+拷进 `/config/custom_components`，已加载的模块不换）。两轮独立全仓审计（17 域只读深审）后逐条
+复现定案，本批**只修真 bug，不掺重构**；判为"故意设计/不可达/后果≈0"的 G-9/G-10/G-12 一律不动
+代码，如实标注在报告里。诚实边界：静态 + 门禁 + 真栈 e2e + **真机 HA 金标复测**（192.168.1.91，
+dry 与 real 两轮，PASS 14 / FAIL 2，两条 FAIL 与修复前同一对且为用例期望过期，**新 FAIL = 0**）。
+
+### G-2 hub 权威快照把"reload 窗口"当权威，云端真删用户设备（最高档）
+
+`hub/src/server.js:477` 用 `Array.isArray(msg.items)` 判"这是快照"，`hub/src/store.js:755-772` 在
+`opts.snapshot` 下做 `it.states = merged`——**没出现在本批的 sn 一律淘汰**。而本地只防了"零个
+manager"一种空集形态：条目 reload/启动未完成时，聚合到的 manager 从 N 掉到 N-1，上行的残缺快照
+被 hub 当全量权威 ⇒ **真实删除用户设备，且不自愈**。现在 HubClient 接一个期望数回调
+（`_hub_expected_manager_count`：启用的、`entry.data` 带 `CONF_GATEWAY_SN` 的条目数），
+`expected > len(self._managers)` 即判非权威、不上行并 WARNING 留痕；真删条目时期望数同步下降，
+故 v1.7.59 的"删网关要连带清设备"语义完好——这条既修新漏又保老修，两向都有臂（含反向臂
+`test_entry_truly_removed_shrinks_expectation_and_stays_authoritative`）。
+
+### G-3 诊断卡清理出口唯一化（僵尸卡）
+
+`_clear_takeover_issue` 全仓唯一调用点在 `mqtt_bootstrap.py:951`，而收尾分支与
+`_interruptible_sleep` 的两个 sleep 出口直接 `return`——**三张卡（takeover/channel/mdns）一张都
+不清**。口径同时修正：HA `issue_registry` 的 `is_persistent` 默认 False，残留只到下次重启，不是
+跨重启永久。现统一为 `_clear_huijian_issues(hass)` 单出口，配合结构钉"出口函数体之外不得再出现
+手写两张卡清单"。
+
+### G-4 无能力机型常态并排"不支持百分比定位"＋"位置: 65%"，且永不自愈
+
+两条路径：① `cover.py:317` 无条件写 `attrs["position"]`，而 `cover.py:78-82` 按 SN 前四位判
+`_position_capable`、`current_cover_position`（`:267`）已按能力恒返 None ⇒ 口径分裂；②
+`www/js/huijian.js` 的降级路径把"读不到"渲染成能力判词「不支持百分比定位」**并删掉滑块**，
+整建判据只比 id 串 ⇒ 永不自愈。现服务端只在 `self._position_capable` 时才写 `position`
+（`r_travel_raw` 仍无条件持久化，v1.6.26 B-2 语义不变）；前端分流"读不到（读取中…）/ 有能力
+（滑块）/ 真不支持"，并加 `PENDING_REBUILD` 登记-消费-清标记三件套让降级轮次能在下一轮自愈。
+顺带订正注释与 CHANGELOG 旧说：`loadDeviceState(dev, [])` 是**同步**调用，git `59c25af` 引入
+当日即同步，"异步补拉"不实。
+
+### G-8 超长数字串让 MQTT 命令通道整条断连
+
+`validate_control_command` 的 `int()` 排在 `try` **外**：Python ≥3.11 对超长十进制串抛
+`ValueError`（本机 3.13.12 实测上限 4300 位），一个 `>4300` 位的数字 `value` 就能把异常抛出校验
+函数；调用点与接收循环同样在 `try` 外裸调 ⇒ 整条 MQTT 会话断。现校验内先 `str()` 包裹、加
+`len > 16` 拒绝闸、`int()` 包 `except (ValueError, TypeError, OverflowError)`；接收循环把处理器
+异常收敛为 `{"ok": false, "err": "handler_error"}` 并保持连接。协议面未变（合法值照旧放行，
+`w_travel` 域 0..100 照旧拒绝越界）。
+
+### G-7 幽灵设备入库：`sn=0` 漏网（本轮新发现）
+
+002/003/005 三条入站路径都是"先 `str()` 再判空"，固件异常回包 `sn=0` 归一成 `"0"` 后非空，被当
+合法设备注册并写状态（复现：`002 devices[].sn='0' -> [('add_device','0'),('update_device_status','0')]`，
+003/005 两形态同样漏）。现以共享谓词 `is_valid_device_sn`（`^[a-zA-Z0-9]{10,}$`）五处入站闸统一
+拦截，且**三处均在类型归一之后**，JSON 数字形态 SN 照常通过。闸宽经真机取证：设备注册表反解
+unique_id 得网关 SN 2 个、设备 SN 4 个**全部 12 位**，与产品既有规则同串
+（`device_manager.py:1669` 的 `len(device_sn) < 10`、`config_flow.py:49`、`gateway_discovery_proxy.py:40`）
+⇒ 非新发明，是既有纪律下推到 ctype 层，**零误伤**。
+
+### G-5 mosquitto `autosave_on_changes true` 方向读反
+
+v1.7.33 注释写"状态变化即落盘、最坏丢 30 分钟"，实际相反：mosquitto 2.0.x `src/loop.c` 与
+`man mosquitto.conf(5)` 同口径——`on_changes=true` 时 `autosave_interval` 变成**变更条数阈值**，
+秒级定时落盘彻底停走；慧尖上报多为非 retained，计数涨得极慢，实际可能数小时~数天才落一次。
+丢的不是"整份 retained"而是**离线 QoS 队列与订阅**。现改回 `false` + `interval 1800`，并加防回潮臂。
+
+### G-1 `run.sh` errexit 区 7 处裸命令族（失败即整套下线）
+
+`set -e` 生效区内 7 处顶层裸写（`:148` chmod passwd、`:322` ACL 组重定向、`:323` chmod acl、
+`:328/:329` /data/mosquitto、`:335` /run/nginx、`:386` ingress heredoc、`:510` 循环 rm、`:820` 集成目录
+mkdir）任一失败都在 broker 启动（`:1173`）**之前**终止 run.sh ⇒ mosquitto + mDNS + Web UI + 集成
+整套不启动、加载项重启循环。现逐条"降级但发声"（绝不静默吞、绝不阻断启动）；`:817-820` 备份段语义
+一并修正为**仅 `cp` 真成功才置 `BACKUP_PERSIST=true`**（旧写法 cp 失败仍置真，后续"恢复"支会拿
+不存在/半截的 /tmp 备份覆盖用户真数据）。`_bridge_on`/`_bridge_off` 函数体内两条**故意不改**：
+全部调用点均 `|| true`，失败只杀后台对账子壳。同时修掉**门禁盲区**——`test_v182_runsh_swap_rollback.py`
+的 `_block()` 起点锚在 `:828`，结构性看不见 `:796/:819`，现重写为覆盖整个 errexit 区的宽扫描器
+（建模注释 / heredoc 体 / `( … ) &` 子壳 / 顶层函数体 / 带 `||` 的组）。
+
+### G-6 等待条目（awaiting）对 `entry.options` 零读，选项页保存静默无效
+
+`__init__.py` 的 awaiting 分支（`:388-684`）从不读 `entry.options`：`debug_logging` 与
+`auto_discovery` 只被完整分支消费，而 awaiting 条目没有 `device_manager` —— 用户在"网关未被发现"
+这个**最需要 DEBUG 的时刻**打开调试日志零效果且无声，取消勾选自动发现"发现卡"照弹。现 awaiting
+分支共用 `_apply_debug_logging`（引用计数语义不变）并让发现卡按 `auto_discovery` 门控（代答 001
+**不受门控**，风暴止血优先）。诚实边界：`discovery_interval` 在 awaiting 态**确无消费者**
+（唯一节拍源 `mqtt_handler.check_connection()` 要等转正），在不增删表单键的前提下无法真生效，
+已写成诚实钉而非假接线。
+
+### 配套与自查
+
+新增钉 `tests/test_v185_g6_awaiting_options.py`（14 条）与 `tests/test_v186_g7_sn_format_gate.py`
+（65 条）；变异矩阵 37 → **82 臂**，G-7 六臂经 `_goldtest/g7_mutation_selfcheck.py` 全部达成
+"变异红 + 未变异绿"且产品代码字节级未变。**自查发现并修复执行体未报告的 CRLF 污染**（`utils.py`
+831 处 / `mosquitto.conf` 68 处 / `tests/test_v1731_field_fixes.py` 647 处；成因是 PowerShell 文本
+API 改写，已用字节级 `b.replace(b"\r\n", b"\n")` 还原，全仓复扫 NONE）。
+
+### 门禁（本机实测）
+
+`pytest huijian_mqtt_broker/tests` = **1790 passed / 17 failed**，17 条与改动前**逐条同名同批**且
+全为 Windows 环境因（WSL bash 吃 Windows 路径 rc=127、`/proc` 缺失、同机三仓不可见 rc=3、CRLF）；
+`compileall` exit 0、`wsl bash -n run.sh` exit 0、`node --check www/js/huijian.js` exit 0、
+`config.yaml` YAML OK。语音侧离线金标集 **83 passed**（确认本批未污染语音 NLU 基线）。
+
 ## [1.8.4] - 2026-10-08 · 审计 B 档两条（WS 占槽面 / 002 ack）+ Gitee 发布腿换 curl 带重试
 
 ⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件

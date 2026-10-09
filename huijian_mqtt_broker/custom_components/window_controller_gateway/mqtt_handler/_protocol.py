@@ -19,7 +19,7 @@ from ..const import (
     PROTOCOL_HEAD,
     TOPIC_GATEWAY_REQ_FORMAT,
 )
-from ..utils import inbound_payload_ok, log_throttled
+from ..utils import inbound_payload_ok, is_valid_device_sn, log_throttled
 
 # logger 名钉死为拆分前模块 __name__ 值——日志输出零差异（回归要求）
 _LOGGER = logging.getLogger("custom_components.window_controller_gateway.mqtt_handler")
@@ -353,6 +353,11 @@ class _ProtocolMixin:
                         device_sn = str(raw_sn)
                         if not device_sn:
                             continue
+                        # v1.8.5（审计 G-7）：与 ctype 层同一格式闸——str() 归一
+                        # 之后 "0" 非空，旧判空拦不住固件异常回包 sn=0 的幽灵设备。
+                        if not is_valid_device_sn(device_sn):
+                            _LOGGER.warning("legacy 发现设备 SN 格式非法，跳过: %r", device_sn)
+                            continue
                         # 审计 2026-09-30 A-5：上方对 raw_sn 有逐条守卫，name 是
                         # 同一纪律的漏项。`device_info.get(ATTR_DEVICE_NAME, 默认)`
                         # 在"键存在但值为 null"时返回的是 **None 而不是默认值**，
@@ -387,6 +392,11 @@ class _ProtocolMixin:
                         return
                     if not isinstance(device_sn, str):
                         device_sn = str(device_sn)
+                    # v1.8.5（审计 G-7）：同款格式闸，堵住 sn=0 → "0" 经
+                    # update_device_status 自动入库的幽灵设备面。
+                    if not is_valid_device_sn(device_sn):
+                        _LOGGER.warning("legacy 设备状态 SN 格式非法，忽略: %r", device_sn)
+                        return
                     if (self.device_manager.get_device(device_sn) is None
                             and not self._auto_discovery_enabled()):
                         return

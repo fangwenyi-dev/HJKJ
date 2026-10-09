@@ -314,9 +314,15 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
             if r_travel is not None:
                 try:
                     raw = int(r_travel)
-                    attrs["position"] = max(0, min(100, raw))
-                    # v1.6.26（第八轮审计 B-2）：一并持久化原始值，
-                    # 恢复路径据此区分"真 100%"与"未校准 255 被钳成 100"
+                    # v1.8.5（审计 G-4）：**只在机型支持百分比定位时**才写 position。
+                    # 旧实现无条件写，而 Web 面板按 position_capable 渲染——无能力机型
+                    # （5002 等）于是常态并排显示「不支持百分比定位」＋「位置: 65%」，
+                    # 自相矛盾且与 current_cover_position（:267 已按能力恒返 None）口径分裂。
+                    # r_travel_raw 仍无条件持久化（v1.6.26 B-2：恢复路径据此区分
+                    # "真 100%"与"未校准 255 被钳成 100"，与能力无关）。
+                    if self._position_capable:
+                        attrs["position"] = max(0, min(100, raw))
+                    # v1.6.26（第八轮审计 B-2）：一并持久化原始值，代码见上
                     attrs["r_travel_raw"] = raw
                 except (ValueError, TypeError, OverflowError):
                     # v1.7.64（#3 同类）：属性字典在 HA 状态机里被逐轮构造，这里

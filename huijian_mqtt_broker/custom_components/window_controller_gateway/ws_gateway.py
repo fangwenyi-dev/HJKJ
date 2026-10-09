@@ -107,6 +107,12 @@ def validate_control_command(attribute: Any, value: Any) -> Optional[str]:
          COMMAND_VALUE_* 全整数，number 实体 step=1——小数只出现在上报侧）。
       5. 不在该属性值域内 → 拒。范围此前**只有小程序一侧在夹**（pctParam 0..100），
          任何绕开小程序直连 WS 的调用方送 speed=150 会一路发布出去。
+      6. 数值超出 Python 十进制串转换上限 → 拒（v1.8.5 审计 G-8）。两道正则都放行
+         5000 位数字串，而 `int()` 在 Python≥3.11 对超过 4300 位的十进制串抛
+         ValueError——本函数 docstring 承诺"不合格返回 None"，抛出去就违约。LAN 侧
+         有 1024B 帧闸挡着，**云通道没有**（hub_client.ws_connect 未设 max_msg_size，
+         默认 4MiB）⇒ 一条畸形 value 会让整条云长连抛出断开、cmd_result 永不回。
+         这里先按长度拒绝，再给 int() 兜底（双保险：长度闸挡绝大多数，try 挡其形态）。
     """
     if not isinstance(attribute, str) or attribute not in CONTROL_ATTR_DOMAINS:
         return None
@@ -114,11 +120,21 @@ def validate_control_command(attribute: Any, value: Any) -> Optional[str]:
         return None
     if not isinstance(value, (str, int, float)):
         return None
-    value_s = str(value)
+    try:
+        value_s = str(value)
+    except Exception:  # noqa: BLE001 - 极端对象 __str__ 异常不得冒泡断连
+        return None
     if not _VALUE_RE.fullmatch(value_s) or not _INT_VALUE_RE.fullmatch(value_s):
         return None
+    # 四个属性的合法线值最多三位数＋符号；16 位已远超，留足余量又不给转换上限机会
+    if len(value_s) > 16:
+        return None
     lo, hi, extra = CONTROL_ATTR_DOMAINS[attribute]
-    n = int(value_s)
+    try:
+        n = int(value_s)
+    except (ValueError, TypeError, OverflowError):
+        # sys.set_int_max_str_digits 被调小/形态异常等：一律按"不合格"处理（契约）
+        return None
     if n in extra or lo <= n <= hi:
         return value_s
     return None

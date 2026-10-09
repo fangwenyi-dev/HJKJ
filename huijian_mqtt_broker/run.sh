@@ -145,7 +145,12 @@ if [ "${HA_MQTT_USER_CREATED}" = "true" ]; then
     BOOTSTRAP_USERNAME="${HA_MQTT_USERNAME}"
 fi
 
-chmod 600 "${PASSWD_FILE}"
+# v1.8.5 G-1：本条曾在 set -e 区裸写——chmod 失败（只读挂载/属主异常）会直接
+# 杀死 run.sh，broker、mDNS、Web UI、集成一起下线。降级为"告警但继续"：
+# 权限没设上时 mosquitto 会拒绝读取并给出自己的报错，比整套加载项消失可诊断得多。
+if ! chmod 600 "${PASSWD_FILE}" 2>/dev/null; then
+    echo "[警告] 密码文件权限设置失败（mosquitto 可能拒绝读取，认证将不可用）: ${PASSWD_FILE}" >&2
+fi
 chown mosquitto:mosquitto "${PASSWD_FILE}" 2>/dev/null || true
 echo "[OK] 密码文件权限已设置 (600, mosquitto:mosquitto)"
 
@@ -319,20 +324,31 @@ topic readwrite zigbee2mqtt/#
 topic readwrite homeassistant/#
 topic read \$SYS/#
 EOF
-} > "${ACL_FILE}"
-chmod 600 "${ACL_FILE}"
+} > "${ACL_FILE}" || echo "[警告] ACL 文件写入失败（mosquitto 将以无 ACL 或旧 ACL 启动，主题权限可能全开）: ${ACL_FILE}" >&2
+# v1.8.5 G-1：chmod 曾裸写在 set -e 区，失败即整套加载项下线；降级为告警继续。
+if ! chmod 600 "${ACL_FILE}" 2>/dev/null; then
+    echo "[警告] ACL 文件权限收紧失败（600 未生效）: ${ACL_FILE}" >&2
+fi
 chown mosquitto:mosquitto "${ACL_FILE}" 2>/dev/null || true
 echo "[OK] ACL 文件已生成 (用户: ${USERNAME} + ${HA_MQTT_USERNAME})"
 
 # ---------- 2. 创建持久化目录 ----------
-mkdir -p /data/mosquitto
-chmod 755 /data/mosquitto
+# v1.8.5 G-1：mkdir/chmod 曾裸写在 set -e 区，失败即整套加载项下线。降级为告警继续。
+if ! mkdir -p /data/mosquitto 2>/dev/null; then
+    echo "[警告] 持久化目录创建失败（离线 QoS 队列与订阅将无法落盘，重启后丢失）: /data/mosquitto" >&2
+fi
+if ! chmod 755 /data/mosquitto 2>/dev/null; then
+    echo "[警告] 持久化目录权限设置失败（755 未生效）: /data/mosquitto" >&2
+fi
 chown mosquitto:mosquitto /data/mosquitto 2>/dev/null || true
 echo "[OK] 持久化目录已创建"
 
 # ---------- 3. 配置并启动 nginx（Ingress Web UI） ----------
 echo "[Ingress] 配置 nginx Web UI..."
-mkdir -p /run/nginx
+# v1.8.5 G-1：mkdir 曾裸写在 set -e 区，失败即整套加载项下线。降级为告警继续。
+if ! mkdir -p /run/nginx 2>/dev/null; then
+    echo "[Ingress] 警告: /run/nginx 创建失败，nginx 可能无法启动（侧边栏 Web UI 不可用）" >&2
+fi
 
 # SUPERVISOR_TOKEN 由 shebang 的 with-contenv 注入环境（s6-overlay v3 的
 # /run/s6/container_environment 是"每变量一文件"的目录，不存在可 source 的
@@ -383,7 +399,10 @@ if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
          "（Dockerfile 已显式列装，命中这条说明基础镜像换了）" >&2
 fi
 
-cat > /etc/nginx/http.d/ingress.conf <<NGINXEOF
+# v1.8.5 G-1：本行重定向曾在 set -e 区裸写——/etc/nginx/http.d 不可写（只读挂载、
+# 目录被换）时 cat 失败即整套加载项下线。降级为告警继续：nginx 无 conf 起不来，
+# 但 §3 的启动分支与存活看门狗本就按"非致命"处理，不该连 broker/mDNS 一起死。
+if ! cat > /etc/nginx/http.d/ingress.conf <<NGINXEOF
 server {
     listen 10998;
 
@@ -488,6 +507,9 @@ server {
     }
 }
 NGINXEOF
+then
+    echo "[Ingress] 警告: ingress.conf 写入失败（nginx 起不来，侧边栏 Web UI 不可用）——其余功能继续" >&2
+fi
 
 # v1.6.26（第八轮审计 W-1）：本文件含 nginx 注入用的明文 SUPERVISOR_TOKEN
 # ——与 passwd/acl 的 600/700 同口径收紧（同族"静默失防面"：passwd/acl 都
@@ -507,7 +529,9 @@ for f in /etc/nginx/http.d/*.conf; do
     [ "$f" = "/etc/nginx/http.d/ingress.conf" ] && continue
     if grep -Eq '^[[:space:]]*listen[[:space:]]+(\[::\]:)?80([[:space:];]|$)' "$f"; then
         echo "[Ingress] 移除杂散默认站 conf: $f"
-        rm -f "$f"
+        # v1.8.5 G-1：rm 曾裸写在 set -e 区（循环内首个失败即整套加载项下线）。
+        # 删不掉只是白占 80 的旧问题留待人工处理，不该拿 broker/mDNS 陪葬。
+        rm -f "$f" 2>/dev/null || echo "[Ingress] 警告: 杂散 conf 删除失败（可能在宿主 80 上继续抢绑）: $f" >&2
     fi
 done
 
@@ -793,7 +817,11 @@ if [ "${INSTALL_INTEGRATION}" = "true" ]; then
 
         if [ -n "${INTEGRATION_SRC}" ]; then
             INTEGRATION_DST="${HA_CONFIG_DIR}/custom_components/window_controller_gateway"
-            mkdir -p "${HA_CONFIG_DIR}/custom_components"
+            # v1.8.5 G-1：mkdir 曾裸写在 set -e 区，失败即整套加载项下线。
+            # 建不出目录只是"集成装不上"（HA 里少一个自定义集成），不该连 broker 一起死。
+            if ! mkdir -p "${HA_CONFIG_DIR}/custom_components" 2>/dev/null; then
+                echo "[集成] 警告: custom_components 目录创建失败，跳过本次集成安装（网关其余功能继续）: ${HA_CONFIG_DIR}/custom_components" >&2
+            fi
 
             NEED_UPDATE=false
             if [ -f "${INTEGRATION_DST}/manifest.json" ]; then
@@ -816,8 +844,14 @@ if [ "${INSTALL_INTEGRATION}" = "true" ]; then
                 PERSIST_FILE="${HA_CONFIG_DIR}/window_controller_gateway_data.json"
                 BACKUP_PERSIST=false
                 if [ -f "${PERSIST_FILE}" ]; then
-                    cp "${PERSIST_FILE}" "/tmp/window_controller_gateway_data.json.bak"
-                    BACKUP_PERSIST=true
+                    # v1.8.5 G-1：旧写法在此一行后无条件 BACKUP_PERSIST=true——
+                    # cp 失败（盘满/只读）时标记仍为真，§下面的"恢复"支会拿一个
+                    # 不存在/半截的 /tmp 备份去覆盖用户真数据。改为只在真成功时置位。
+                    if cp "${PERSIST_FILE}" "/tmp/window_controller_gateway_data.json.bak" 2>/dev/null; then
+                        BACKUP_PERSIST=true
+                    else
+                        echo "[集成] 警告: 持久化数据备份失败（磁盘/权限？）——本次不做恢复，设备清单按当前文件走" >&2
+                    fi
                 fi
 
                 # v1.7.33（全量审计）：原子换防。旧序 rm -rf + cp -r 两步非原子，

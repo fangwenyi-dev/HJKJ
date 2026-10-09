@@ -622,5 +622,26 @@ class TestConstAndWebuiPins:
     def test_degraded_rebuild_loads_state(self):
         js = (_WWW_DIR / "js" / "huijian.js").read_text(
             encoding="utf-8")
+        # v1.8.5（审计 G-4）：旧钉只断字面量 `loadDeviceState(dev, []);`——而那句
+        # 是**同步**调用（注释宣称的"异步补拉"不实），光有它降级态永不自愈。
+        # 判据升级为三件套：降级登记整建标记、恢复路径消费标记、成功整建清标记。
         assert "loadDeviceState(dev, []);" in js, \
-            "D-2：/states 失败降级分支必须补异步单实体回填"
+            "D-2：/states 失败降级分支仍要回填既有元素"
+        assert "PENDING_REBUILD[entryId] = true;" in js, \
+            "G-4：降级渲染必须登记整建标记，否则假能力声明与滑块丢失永不自愈"
+        assert "PENDING_REBUILD[entryId]" in js.split("async function updateGatewayDevices")[1], \
+            "G-4：silentRefresh 必须消费整建标记（id 集合未变也要重建）"
+        assert "delete PENDING_REBUILD[entryId];" in js, \
+            "G-4：整建成功必须清标记，否则每轮都重建（性能回退）"
+
+    def test_position_rendering_distinguishes_unreadable_from_unsupported(self):
+        """G-4 第二条：\"读不到\"不得渲染成能力判词（旧实现两者同形）。"""
+        js = (_WWW_DIR / "js" / "huijian.js").read_text(encoding="utf-8")
+        assert "const statesEmpty = !states || states.length === 0;" in js, \
+            "G-4：必须显式区分空 states（读不到）与 position_capable=false（不支持）"
+        assert "读取中…" in js, "G-4：读不到时应给占位文案而非能力判词"
+        # 反向臂：状态文本那半行必须带 posCapable 前置（否则无能力机型并排矛盾）
+        idx = js.index("statusText += ' | 位置: '")
+        head = js[max(0, idx - 200):idx]
+        assert "if (posCapable &&" in head, \
+            "G-4 回潮：『不支持百分比定位』＋『位置: N%』并排矛盾又回来了"

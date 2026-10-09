@@ -18,6 +18,7 @@ from ..const import (
     DEVICE_TO_GATEWAY_MAPPING,
     get_device_display_name,
 )
+from ..utils import is_valid_device_sn
 
 # logger 名钉死为拆分前模块 __name__ 值——日志输出零差异（回归要求）
 _LOGGER = logging.getLogger("custom_components.window_controller_gateway.mqtt_handler")
@@ -131,7 +132,14 @@ class _CtypeHandlersMixin:
                             _LOGGER.warning("002 设备 SN 类型非法，跳过: %r", device_sn)
                             continue
                         device_sn = str(device_sn)
-                        
+
+                        # v1.8.5（审计 G-7）：格式闸。本轮之前的判空在 str() 之前，
+                        # 固件回 sn=0 时归一成 "0" 非空 → 幽灵设备入库。
+                        # 与顶层发现分支（_protocol.py 的异网关 SN 闸）同一口径。
+                        if not is_valid_device_sn(device_sn):
+                            _LOGGER.warning("002 设备 SN 格式非法，跳过: %r", device_sn)
+                            continue
+
                         # 跳过已处理的设备
                         if device_sn in processed_sns:
                             continue
@@ -283,6 +291,13 @@ class _CtypeHandlersMixin:
             device_sn = None
         elif device_sn is not None:
             device_sn = str(device_sn)
+        # v1.8.5（审计 G-7）：格式闸。与 002/005 同口径——固件异常回包
+        # sn=0/"0" 归一成非空串后被当作合法设备 SN，最终 add_device 出幽灵设备。
+        # 置 None 后下方 `if errcode == 0 and device_sn:` 不成立，自然落进
+        # 「设备操作成功但未返回设备SN」的既有无 SN 路径（不新增分支语义）。
+        if device_sn is not None and not is_valid_device_sn(device_sn):
+            _LOGGER.warning("003 设备 SN 格式非法，按无 SN 处理: %r", device_sn)
+            device_sn = None
         bind_value = data.get("bind", None)
         # 按命令 id 匹配最近发出的 003 方向（发送端已记录 _bind_ops；
         # 记录为 (方向, 设备SN) 元组）。id 先经 _norm_cmd_id 归一：网关以
@@ -428,6 +443,12 @@ class _CtypeHandlersMixin:
             return
         if device_sn is not None:
             device_sn = str(device_sn)
+        # v1.8.5（审计 G-7）：格式闸。`if device_sn:` 挡不住 sn=0 → "0"，
+        # 未知设备会经 update_device_status 的"不存在则自动添加"分支入库。
+        # 直接 return：ack 由外层 _handle_ctype_005 的 finally 保证照发。
+        if device_sn is not None and not is_valid_device_sn(device_sn):
+            _LOGGER.warning("005 设备 SN 格式非法，忽略本条: %r", device_sn)
+            return
         if device_sn:
             # v1.7.12（第 6 轮审计 B-6）：auto_discovery 门禁补齐——002 路径
             # 有门（:135），但未知设备的首条 005 经 update_device_status 的

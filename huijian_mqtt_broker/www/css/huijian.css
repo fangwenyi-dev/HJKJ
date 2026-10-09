@@ -505,6 +505,12 @@ body {
 .slider-value.position-na {
     color: var(--text-secondary); font-weight: 600; font-size: 10px;
 }
+/* v1.8.5（审计 G-4）：/states 未取到时的位置占位——"读不到"不是"不支持"，
+   样式上也要与 position-na 区分（能力判词 vs 加载态）。 */
+.slider-value.position-unknown {
+    color: var(--text-secondary); font-weight: 600; font-size: 10px;
+    opacity: .75; font-style: italic;
+}
 input[type="range"] {
     -webkit-appearance: none; appearance: none;
     width: 100%; height: 6px; border-radius: 99px; cursor: pointer;

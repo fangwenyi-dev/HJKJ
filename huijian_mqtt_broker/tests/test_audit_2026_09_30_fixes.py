@@ -2076,6 +2076,9 @@ def test_e2_single_source_of_truth_convention_is_not_widening():
 # 要回答的问题，而不是一次性的人工结论。
 _E2_VALID_SITES = {
     ("__init__.py", "_hub_option"): "hub 地址/密钥只能取自生效条目",
+    ("__init__.py", "_hub_expected_manager_count"):
+        "v1.8.5 G-2 期望集：只数生效且带 SN 的条目（禁用条目不进期望数，"
+        "与 _hub_option 同过滤口径）",
     ("api.py", "WindowGatewaySecurityView.get"): "凭据告警只对在册监听的网关成立",
     ("mqtt_bootstrap.py", "_enabled_huijian_entry_count"): "healer 计数按生效条目",
     ("utils.py", "entry_state_for_sn"): "单一真源本身",
@@ -3190,7 +3193,7 @@ def test_mutation_matrix_cannot_silently_shrink_or_point_at_nothing():
     """
     arms = _matrix_arms()
     ids = [a[0] for a in arms]
-    assert len(ids) >= 37, "变异矩阵臂数缩到 %d（有人删臂？）" % len(ids)
+    assert len(ids) >= 82, "变异矩阵臂数缩到 %d（有人删臂？）" % len(ids)
     assert len(set(ids)) == len(ids), "臂 id 重复：同一条被数了两次 ⇒ 计数虚高"
     cache = {}
     bad = []

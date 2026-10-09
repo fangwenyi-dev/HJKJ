@@ -148,7 +148,15 @@ class TestMosquittoQueueSettings:
     def test_queue_and_autosave(self):
         conf = (ROOT / "mosquitto.conf").read_text(encoding="utf-8")
         assert "max_queued_messages 1000" in conf, "QoS1 离线窗口 100 条即静默丢弃"
-        assert "autosave_on_changes true" in conf, "仅 1800s 间隔最坏丢 30 分钟 retained 状态"
+        # v1.8.5（审计 G-5 纠偏）：v1.7.33 误把 on_changes=true 当"变化即落盘"，
+        # 实为 mosquitto 语义反面——true 使 interval 变变更计数阈值并**停掉**
+        # 秒级定时落盘（man mosquitto.conf(5) 与 src/loop.c 同口径）。正确形态
+        # 是 false + 定时 1800s。反向臂防回潮：true 复活即红（正是当初钉住错值的形态）。
+        assert "autosave_on_changes false" in conf, "定时落盘被 on_changes=true 停走（G-5）"
+        assert "autosave_on_changes true" not in conf, (
+            "G-5 回潮：true 会让 autosave_interval 变计数阈值、崩溃窗口重开"
+        )
+        assert "autosave_interval 1800" in conf, "落盘周期不得无声漂移"
 
 
 class TestDiscoveryProxyStderr:

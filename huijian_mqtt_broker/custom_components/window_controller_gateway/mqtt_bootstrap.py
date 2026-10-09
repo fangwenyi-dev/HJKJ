@@ -769,6 +769,11 @@ async def _interruptible_sleep(hass: HomeAssistant, delay: float) -> bool:
         remaining -= step
         if getattr(hass, "is_stopping", False) or \
                 _enabled_huijian_entry_count(hass) == 0:
+            # v1.8.5（审计 G-3）：两个 sleep 出口原先直接 return ⇒ 循环顶部的
+            # 清卡分支被绕开，**三张卡一张都不清**（连 C-10 修的那两张也漏）。
+            # 这里是"条目全卸/停机"的真正收尾点，必须与顶部同口径清卡。
+            if not getattr(hass, "is_stopping", False):
+                _clear_huijian_issues(hass)
             return False
     return True
 
@@ -810,6 +815,22 @@ def _clear_takeover_issue(hass: HomeAssistant) -> None:
     except Exception as err:  # noqa: BLE001
         # v1.7.31（C-1 同族）：清除失败=修复卡片滞留不消失，必须可见
         _LOGGER.warning("清除 MQTT 引导修复条目失败（卡片可能滞留）: %s", err)
+
+
+def _clear_huijian_issues(hass: HomeAssistant) -> None:
+    """**域级诊断卡的唯一清理出口**（v1.8.5 审计 G-3）。
+
+    为什么要有这个函数：三张卡（takeover / channel / mdns）此前是各调用点**手写
+    清单**——healer 收尾只写了两张（漏 takeover）、`__init__` 全删分支也只写了两张
+    （同样漏 takeover），而 C-10 那次修复自己就把"漏抄一张"写进了注释。清单式清理
+    的失败形态是**静默**的：卡留在"设置→系统→问题"里，卡面还写着"系统自动重试"，
+    而 healer 已经退出、无人再清（用户只能重启 HA）。
+
+    收口成一个出口后，将来新增第四张卡只需改这里一处；调用点不再各自维护清单。
+    """
+    _clear_takeover_issue(hass)
+    _clear_channel_issue(hass)
+    _clear_mdns_issue(hass)
 
 
 def _report_channel_issue(hass: HomeAssistant, verdict: str) -> None:
@@ -919,9 +940,11 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                     # v1.7.63（C-10）：收尾前清卡——否则"通道坏 → 出卡 → 用户
                     # 禁用慧尖条目"后 healer 不再运行，僵尸卡永留（即便 MQTT 被
                     # 改回内置端点也无人清）。停机路径不清（避免关机刷屏）。
+                    # v1.8.5（审计 G-3）：改走**域级唯一清理出口**——此前这里手写
+                    # 两张卡清单、漏了 takeover（卡面还承诺"系统自动重试"，而 healer
+                    # 已退出），正是"漏抄一张"的老形态。
                     if not getattr(hass, "is_stopping", False):
-                        _clear_channel_issue(hass)
-                        _clear_mdns_issue(hass)
+                        _clear_huijian_issues(hass)
                     return  # 宿主停机 / 启用条目已清空（v1.7.31 A-3：
                             # 禁用不再把 healer 骗成永续巡查——BUG-5 同口径）
                 if not await has_bootstrap_marker(hass):

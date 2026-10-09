@@ -351,8 +351,13 @@ class HubClient:
         view_builder: Optional[Callable[[str, str, Dict[str, Any]], Dict[str, Any]]] = None,
         session: Optional[aiohttp.ClientSession] = None,
         logger: Optional[logging.Logger] = None,
+        expected_managers_fn: Optional[Callable[[], int]] = None,
     ) -> None:
         self._managers: List[Any] = list(managers or [])
+        # v1.8.5（审计 G-2）：期望 manager 数回调。见 build_state_snapshot 的判据说明——
+        # 没有它时"manager 集合缩水"（条目 reload 中／冷启动分步 setup）会被当成
+        # "该网关已不存在"权威上行，hub 侧按键集淘汰 ⇒ 真删用户设备。
+        self._expected_managers_fn = expected_managers_fn
         # 上一轮成功构造的设备视图，键 (gwSn, sn)。hub 侧要靠"这一批是全量"淘汰已删
         # sn，所以单台设备视图构造失败不能让它从快照里消失＝从"状态不更新"升级成
         # "小程序里设备没了"。这里留一份回退位。
@@ -455,20 +460,45 @@ class HubClient:
     def managers(self) -> List[Any]:
         return list(self._managers)
 
+    def _expected_manager_count(self) -> int:
+        """"本该挂上几个 manager"（v1.8.5 审计 G-2）。
+
+        由 __init__.py 注入的回调给出（启用的、带网关 SN 的条目数）；拿不到一律回 0
+        ＝"无缺口"，退回旧行为——宁可少一层保护，也不能因取不到期望数而永不上行。
+        """
+        if self._expected_managers_fn is None:
+            return 0
+        try:
+            return max(0, int(self._expected_managers_fn() or 0))
+        except Exception as e:  # noqa: BLE001 - 期望集取不到不得阻断上行
+            self._logger.debug("hub 期望 manager 数取不到（按无缺口处理）：%s", type(e).__name__)
+            return 0
+
     def attach_managers(self, managers: List[Any]) -> None:
         """把状态监听挂到**当前全部** device_manager 上，并摘掉已不存在的。
 
         幂等：重复 ensure（条目 reload、多处调用点）只会得到"每个 manager 一个回调"。
         照抄 ws_gateway._attach_listeners 的语义——漏摘会让回调继续持有已卸载条目的
         manager（死对象），漏挂则第二台网关的状态变化永远不上行。
+
+        v1.8.5（审计 G-2）：集合**收缩**时额外告警一次。缩水有两种来历，判据是期望数：
+        条目真被删除 ⇒ 期望数同步下降（不告警）；条目 reload 中／冷启动分步 setup
+        ⇒ 期望数不变（告警，说明接下来这批快照不权威、云端暂时停在上一批）。
         """
         incoming = list(managers or [])
-        for gone in [m for m in self._managers if m not in incoming]:
+        gone = [m for m in self._managers if m not in incoming]
+        for m in gone:
             try:
-                gone.remove_status_listener(self._on_device_status)
+                m.remove_status_listener(self._on_device_status)
             except Exception:  # noqa: BLE001
                 pass
         self._managers = incoming
+        if gone and self._expected_manager_count() > len(self._managers):
+            self._logger.warning(
+                "hub 聚合到的网关条目变少（%d→%d，仍有 %d 个未挂上）——"
+                "多为条目 reload/启动未完成；期间不上行权威快照，云端设备列表停在上一批",
+                len(gone) + len(self._managers), len(self._managers),
+                self._expected_manager_count())
         self.mark_state_dirty()
         for m in self._managers:
             try:
@@ -1119,14 +1149,32 @@ class HubClient:
                         continue
                     if not isinstance(data, dict) or data.get("t") != "cmd":
                         continue
-                    result = await self._handle_cmd(data)
-                    await self._send_json(ws, {
-                        "t": "cmd_result",
-                        "cmdsn": data.get("cmdsn"),
-                        "ok": bool(result.get("ok")),
-                        "data": result.get("data"),
-                        "err": result.get("err"),
-                    })
+                    # v1.8.5（审计 G-8 后半）：**单条命令异常不得打掉整条云长连**。
+                    # 旧写法 `result = await self._handle_cmd(data)` 裸调：任何未预期
+                    # 异常都会冒泡出本协程 ⇒ 外层按"连接异常"整条断开重连，而
+                    # cmd_result 永不回 ⇒ 小程序侧表现为"控制无响应"且反复重连。
+                    # 判据与 LAN 侧 handle_json_message 的 per-message try 对齐
+                    # （两条通道同判据是本仓纪律）；回包仍走 cmd_result，语义不变。
+                    try:
+                        result = await self._handle_cmd(data)
+                    except Exception as e:  # noqa: BLE001 - 单条异常只降级本命令
+                        self._logger.warning(
+                            "hub 命令处理异常（已回 ok:false，连接保持）: %s",
+                            type(e).__name__, exc_info=True)
+                        result = {"ok": False, "err": "handler_error"}
+                    if not isinstance(result, dict):
+                        result = {"ok": False, "err": "handler_error"}
+                    try:
+                        await self._send_json(ws, {
+                            "t": "cmd_result",
+                            "cmdsn": data.get("cmdsn"),
+                            "ok": bool(result.get("ok")),
+                            "data": result.get("data"),
+                            "err": result.get("err"),
+                        })
+                    except Exception as e:  # noqa: BLE001 - 发送失败＝连接已坏，交外层重连
+                        self._logger.debug("hub 回执发送失败：%s", type(e).__name__)
+                        return
             finally:
                 for task in (flush, keepalive):
                     task.cancel()
@@ -1194,10 +1242,18 @@ class HubClient:
           那台网关 ⇒ 不权威；
         · 一个 manager 都没挂上（条目全在卸载中／启动没完成）：此时的"空"不代表"没有
           设备" ⇒ 不权威。零设备但 manager 在（真把最后一台删了）⇒ 权威空快照，必须上行。
+        · **挂了 manager 但没挂齐**（v1.8.5 审计 G-2）：条目 reload 的 unload 尾巴、
+          冷启动分步 setup 都会让这一批只看得见部分网关。此时"没看见"≠"已删除"，
+          同样不权威；判据由 `expected_managers_fn` 给出"应该有几个"，拿不到回调
+          时退回旧行为（零 manager 才不权威），避免把上行永久锁死。
         """
         builder = self._resolve_builder()
         if builder is None:
             return [], False
+        # v1.8.5（G-2）：期望集判据。hub 的淘汰语义是"本批键集权威"（store.js:755-772），
+        # 所以"我只挂上了 N 个 manager"不能推出"世上只有 N 台网关"。期望数由
+        # _expected_manager_count() 单一真源给出，取不到一律按 0＝无缺口。
+        expected = self._expected_manager_count()
         items: List[Dict[str, Any]] = []
         fresh: Dict[Any, Dict[str, Any]] = {}
         authoritative = True
@@ -1230,6 +1286,11 @@ class HubClient:
                 items.append(view)
                 fresh[(gateway_sn, dev_sn)] = view
         if not self._managers:
+            authoritative = False
+        # v1.8.5（G-2）：挂上了 manager 但比"该有的"少 ⇒ 这批缺了整台网关，
+        # 不得当权威全量交出去（hub 会按本批键集淘汰，把那些设备真删掉）。
+        # 条目真被删除时期望数同步下降，故不会把"该淘汰"误判成"缺一批"。
+        elif expected > len(self._managers):
             authoritative = False
         self._last_views = fresh
         return items, authoritative

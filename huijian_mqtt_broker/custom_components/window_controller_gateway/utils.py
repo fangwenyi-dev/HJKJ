@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Dict, Any, Optional, Tuple
@@ -215,6 +216,35 @@ EAR_ACK_CLAIM_MAX = 256
 EAR_INBOUND_MAX_BYTES = 64 * 1024
 EAR_PROMOTION_WATCH_SECONDS = 30.0
 EAR_PROMOTION_WATCH_LOG_TTL = 600.0
+
+# ==================== v1.8.5（审计 G-7）：设备 SN 格式闸 ====================
+#
+# 台架实锤（_goldtest/repro_g7_sn_zero.py）：002/003/005 三条入站路径都是
+# "先 str() 再判空"，于是固件异常回包的 sn=0 归一成 "0" 后**非空**，被当作
+# 合法设备 SN 一路走到 add_device/update_device_status，在设备表里注册出
+# 幽灵设备（002 只拦住数字 0、"0" 漏网；003/005 两形态全漏）。
+#
+# 判据取本仓**既有唯一口径**（三处同串先例，非新发明）：
+#   gateway_discovery_proxy.py:40 SN_RE = ^[a-zA-Z0-9]{10,}$
+#   __init__.py:493（心跳耳）、mqtt_handler/_protocol.py:156（他网关分支）
+# 顶层发现分支早已按此拒收 9 位 SN（tests/test_audit_round8.py
+# ::test_malformed_foreign_sn_rejected），此处只是把同一纪律下推到 ctype 层。
+#
+# 这是**格式**闸不是长度闸：device_manager 允许 5 位 SN 的消息源标识
+# （tests/test_audit_2026_09_30_fixes.py::test_a5_add_device_survives_non_str_name
+# 钉死），故判据只用于"入站报文里的设备 SN 像不像真 SN"，不用于内部标识。
+# 全部入站路径夹具的 SN 均为 10~12 位纯字母数字，闸零误伤。
+DEVICE_SN_RE = re.compile(r"^[a-zA-Z0-9]{10,}$")
+
+
+def is_valid_device_sn(value: Any) -> bool:
+    """入站设备 SN 格式判据（v1.8.5 审计 G-7）：非 str/过短/含非法字符 → False。
+
+    调用点一律在"已归一为 str"之后，因此 JSON 数字形态（如 500534380262）
+    照常通过；`0` / `"0"` / `" -"` / `""` / `None` 全判 False。
+    只判格式，不判归属与在线态——那些由各自的设备表/门禁分支负责。
+    """
+    return isinstance(value, str) and bool(DEVICE_SN_RE.match(value))
 
 
 def ear_ack_release(hass: HomeAssistant, gateway_sn: str, msg_id: Any) -> None:

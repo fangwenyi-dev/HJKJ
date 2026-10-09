@@ -94,7 +94,7 @@ def test_healer_detects_takeover_after_healthy(tmp_path, monkeypatch):
 
 
 def test_healer_clears_cards_when_entries_all_disabled(tmp_path, monkeypatch):
-    """C-10：启用条目清零 ⇒ 收尾前清卡（防僵尸卡）。"""
+    """C-10 + v1.8.5 G-3：启用条目清零 ⇒ 收尾前**三张卡全清**（防僵尸卡）。"""
     ir.ISSUES_DELETED.clear()
     hass = _Hass(tmp_path)
     # config_entries 对本域返回空 ⇒ 计数为 0
@@ -112,6 +112,59 @@ def test_healer_clears_cards_when_entries_all_disabled(tmp_path, monkeypatch):
     asyncio.run(go())
     assert (mb.DOMAIN, mb.CHANNEL_ISSUE_ID) in ir.ISSUES_DELETED
     assert (mb.DOMAIN, mb.MDNS_ISSUE_ID) in ir.ISSUES_DELETED
+    # v1.8.5（审计 G-3）：takeover 卡此前漏清——healer 已退出，卡片还写着
+    # "系统自动重试"，用户只能重启 HA 才消失。
+    assert (mb.DOMAIN, mb.TAKEOVER_ISSUE_ID) in ir.ISSUES_DELETED, (
+        "收尾不清 takeover 卡＝僵尸卡（G-3 原缺陷）"
+    )
+
+
+def test_clear_huijian_issues_is_the_single_cleanup_exit():
+    """G-3 结构钉：域级清卡只有一个出口，且出口必须列全三张卡。
+
+    为什么钉结构而不是只钉行为：原缺陷的形态就是"各调用点手写清单、漏抄一张"，
+    C-10 那次修复自己还把这个形态写进了注释。只要还有人手写两张卡的清单，
+    下次新增第四张卡就会再漏一次——所以判据是"出口唯一 + 清单完整"。
+    """
+    from pathlib import Path as _Path
+    src = (_Path(__file__).resolve().parents[1] / "custom_components"
+           / "window_controller_gateway" / "mqtt_bootstrap.py").read_text(encoding="utf-8")
+    assert "def _clear_huijian_issues(" in src, "域级清卡出口必须存在（唯一出口）"
+    fn_start = src.index("def _clear_huijian_issues(")
+    fn_body = src[fn_start:fn_start + 700]
+    for name in ("_clear_takeover_issue", "_clear_channel_issue", "_clear_mdns_issue"):
+        assert name + "(hass)" in fn_body, f"唯一出口漏了 {name}＝僵尸卡会重现"
+    # 反向臂：**出口函数体之外**再手写"两张卡清单"都算回潮（那份清单只能有一处）。
+    # 判据要排除出口自身——否则钉红的是合法实现（首版就踩了这个坑）。
+    import re as _re
+    fn_end = fn_start + 700
+    outside = src[:fn_start] + src[fn_end:]
+    handwritten = _re.findall(
+        r"_clear_channel_issue\(hass\)\s*\n\s*_clear_mdns_issue\(hass\)", outside)
+    assert not handwritten, (
+        "又出现手写的两张卡清单＝第 N 次漏抄的温床，请改走 _clear_huijian_issues"
+    )
+
+
+def test_sleep_exit_also_clears_cards(tmp_path, monkeypatch):
+    """G-3 第二处：`_interruptible_sleep` 的退出支也必须清卡。
+
+    旧写法在 sleep 里直接 `return False` ⇒ 循环顶部的清卡分支被绕开，三张卡
+    一张都不清（比 C-10 修的还漏得多）。本条钉 sleep 出口自身的行为。
+    """
+    ir.ISSUES_DELETED.clear()
+    hass = _Hass(tmp_path)
+    hass.config_entries.async_entries = lambda dom: []      # 条目清零
+    monkeypatch.setattr(mb, "HEALER_SLEEP_CHUNK", 0.01)
+
+    async def go():
+        return await mb._interruptible_sleep(hass, 60)
+
+    assert asyncio.run(go()) is False, "条目清零时 sleep 必须即刻收束"
+    for iid in (mb.TAKEOVER_ISSUE_ID, mb.CHANNEL_ISSUE_ID, mb.MDNS_ISSUE_ID):
+        assert (mb.DOMAIN, iid) in ir.ISSUES_DELETED, (
+            f"sleep 出口漏清 {iid}＝healer 已退出而卡片永留（G-3）"
+        )
 
 
 def test_healer_survives_verify_exception(tmp_path, monkeypatch):

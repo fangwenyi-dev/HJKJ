@@ -64,6 +64,9 @@ CIY = "../.github/workflows/ci.yaml"       # _copy() 把 .github 一起带进副
 T184R = "tests/test_v184_ws_renewal.py"
 T184A = "tests/test_v184_ack_failure.py"
 T184G = "tests/test_v184_gitee_leg_carrier.py"
+# v1.8.5 批次（审计 G-5/G-6/G-7/G-8）的被改文件与判据文件
+PROTO = "custom_components/window_controller_gateway/mqtt_handler/_protocol.py"
+T186G = "tests/test_v186_g7_sn_format_gate.py"
 T1763R = "tests/test_v1763_repairs_flow.py"
 T1763W = "tests/test_v1763_fast_e2e_wiring.py"
 T1763M = "tests/test_v1763_mdns_watchdog.py"
@@ -639,6 +642,58 @@ ARMS = [
      "test_non_retryable_status_blocks_creation", "red",
      "存在性查询的非 200/404 守卫被阉 ⇒ 静默落到创建分支，两源正文分叉",
      T184G),
+    # ==================== v1.8.5 审计 G-7：入站设备 SN 格式闸 ====================
+    # 缺陷形态：判空排在 str() 归一**之前**，固件异常回包 sn=0 归一成 "0" 后非空，
+    # 被当作合法 SN 一路走到 add_device/update_device_status（后者未知 SN 会自动
+    # 添加）⇒ 设备表里长出幽灵设备。002 只拦数字 0、字符串 "0" 漏网；003/005 两
+    # 形态全漏。台架实锤：_goldtest/repro_g7_sn_zero.py。
+    ("v185_g7_002_ghost_sn_registered", CTYPES,
+     "                        if not is_valid_device_sn(device_sn):\n"
+     '                            _LOGGER.warning("002 设备 SN 格式非法，跳过: %r", device_sn)\n'
+     "                            continue\n",
+     "",
+     "test_002_zero_forms_never_enter_device_table", "red",
+     "G-7 原形（002）：格式闸被摘 ⇒ sn=0 及其字符串形态的幽灵设备重新入库",
+     T186G),
+    ("v185_g7_003_ghost_sn_registered", CTYPES,
+     "        if device_sn is not None and not is_valid_device_sn(device_sn):\n"
+     '            _LOGGER.warning("003 设备 SN 格式非法，按无 SN 处理: %r", device_sn)\n'
+     "            device_sn = None\n",
+     "",
+     "test_003_zero_forms_never_enter_device_table", "red",
+     "G-7 原形（003）：绑定回复里的 sn=0 会注册幽灵设备，且吃掉「未返回设备SN」路径",
+     T186G),
+    ("v185_g7_005_ghost_sn_registered", CTYPES,
+     "        if device_sn is not None and not is_valid_device_sn(device_sn):\n"
+     '            _LOGGER.warning("005 设备 SN 格式非法，忽略本条: %r", device_sn)\n'
+     "            return\n",
+     "",
+     "test_005_zero_forms_never_enter_device_table", "red",
+     "G-7 原形（005）：状态上报 sn=0 经 update_device_status 自动添加出幽灵设备",
+     T186G),
+    ("v185_g7_ack_eaten_by_gate", CTYPES,
+     "        try:\n            await self._handle_ctype_005_inner(payload, ctype, data)\n",
+     "        if (data.get(\"sn\") is not None\n"
+     "                and not is_valid_device_sn(str(data.get(\"sn\")))):\n"
+     "            return\n"
+     "        try:\n            await self._handle_ctype_005_inner(payload, ctype, data)\n",
+     "test_005_ack_still_exactly_once", "red",
+     "闸被错放到 try/finally 之外并直接 return ⇒ 非法帧吞掉 ack，网关按未确认无限重传",
+     T186G),
+    ("v185_g7_legacy_discovery_ghost", PROTO,
+     "                        if not is_valid_device_sn(device_sn):\n"
+     '                            _LOGGER.warning("legacy 发现设备 SN 格式非法，跳过: %r", device_sn)\n'
+     "                            continue\n",
+     "",
+     "test_legacy_discovery_zero_forms_rejected", "red",
+     "G-7 原形（legacy 发现）：旧固件通道漏接同款闸 ⇒ 幽灵设备从兼容分支回流",
+     T186G),
+    ("v185_g7_predicate_too_loose", UTILS,
+     'DEVICE_SN_RE = re.compile(r"^[a-zA-Z0-9]{10,}$")',
+     'DEVICE_SN_RE = re.compile(r"^[a-zA-Z0-9]+$")',
+     "test_format_gate_is_not_a_length_gate", "red",
+     "谓词退化成无长度下限的字符集判据 ⇒ \"0\" 合法，全部五处闸一起失效",
+     T186G),
 ]
 
 

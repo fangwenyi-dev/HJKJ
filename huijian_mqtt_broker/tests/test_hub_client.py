@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 
 from custom_components.window_controller_gateway import hub_client as hc
 
@@ -919,3 +920,144 @@ def test_no_manager_means_empty_items_and_no_crash(tmp_path):
     assert items == []
     assert authoritative is False, "零 manager 的空快照不得当全量承诺交出去"
     assert client.status_view()["gateways"] == []
+
+
+# ── 期望集：残缺集合不得当权威上行（v1.8.5 审计 G-2）──────────────
+# 背景（hub 侧一手）：server.js:477 以 Array.isArray(msg.items) 判"全量快照"，
+# store.js:755-772 的 opts.snapshot 分支 `it.states = merged` 逐字写着"没出现在
+# 本批的 sn 一律淘汰"。⇒ 加载项把缺了整台网关的集合当权威交出去，云端会**真删**
+# 那台网关的全部设备（所有已绑定家人的小程序里一起消失）。触发面是 reload 的
+# unload 尾巴与冷启动分步 setup——两条都是 `_setup_complete` 尚未落地的正常时序。
+def test_partial_manager_set_is_not_authoritative(tmp_path):
+    """该挂 2 个、只挂上 1 个 ⇒ 不权威（否则云端把那台网关的设备整片删掉）。"""
+    m1 = FakeManager(gateway_sn="GW1", devices={"A1B2": {"attributes": {"r_travel": 30}}})
+    m2 = FakeManager(gateway_sn="GW2", devices={"C3D4": {"attributes": {"r_travel": 70}}})
+    client, _, _ = make_client(tmp_path, managers=[m1], expected_managers_fn=lambda: 2)
+    items, authoritative = client.build_state_snapshot()
+    assert [i["sn"] for i in items] == ["A1B2"], "可见的那台仍要构造出来（供恢复后比对）"
+    assert authoritative is False, (
+        "只挂上 1/2 个条目却判权威＝hub 按本批键集淘汰，把 GW2 的设备真删掉"
+    )
+
+
+def test_full_manager_set_stays_authoritative(tmp_path):
+    """挂齐了就必须权威——否则已删设备永远淘汰不掉（回到幽灵设备）。"""
+    m1 = FakeManager(gateway_sn="GW1", devices={"A1B2": {"attributes": {"r_travel": 30}}})
+    m2 = FakeManager(gateway_sn="GW2", devices={"C3D4": {"attributes": {"r_travel": 70}}})
+    client, _, _ = make_client(tmp_path, managers=[m1, m2], expected_managers_fn=lambda: 2)
+    items, authoritative = client.build_state_snapshot()
+    assert sorted(i["sn"] for i in items) == ["A1B2", "C3D4"]
+    assert authoritative is True, "挂齐了还不权威＝v1.7.59 幽灵设备修复被推翻"
+
+
+def test_entry_truly_removed_shrinks_expectation_and_stays_authoritative(tmp_path):
+    """条目**真被删除**时期望数同步下降 ⇒ 仍须权威（该淘汰的要淘汰得掉）。
+
+    这是反向臂：修复不能做成"只要 manager 变少就不推"——那样云端永远收不到
+    "最后一台已删除"，幽灵设备回归。
+    """
+    m1 = FakeManager(gateway_sn="GW1", devices={})
+    seen = {"n": 2}
+    client, _, _ = make_client(tmp_path, managers=[m1], expected_managers_fn=lambda: seen["n"])
+    _, authoritative = client.build_state_snapshot()
+    assert authoritative is False, "2 个条目只挂上 1 个（reload 中）——不权威"
+    seen["n"] = 1                      # 用户真把第二台删了：期望数随之降为 1
+    items, authoritative = client.build_state_snapshot()
+    assert items == []
+    assert authoritative is True, (
+        "真删条目后必须回到权威空快照，否则云端永远淘汰不掉已删网关（幽灵设备）"
+    )
+
+
+def test_partial_set_warns_once_on_shrink(tmp_path, caplog):
+    """收缩告警必须能区分 reload 与真删（真删不吵；reload 留痕一次）。"""
+    m1 = FakeManager(gateway_sn="GW1")
+    m2 = FakeManager(gateway_sn="GW2")
+    client, _, _ = make_client(tmp_path, managers=[m1, m2], expected_managers_fn=lambda: 2)
+    client.attach_managers([m1])       # 期望数仍 2 ⇒ reload 形态，必须留痕
+    logs = " ".join(r.getMessage() for r in caplog.records)
+    assert "变少" in logs or "未挂上" in logs, (
+        "reload 形态的残缺聚合必须留痕，否则现场无从归因'云端设备少了'"
+    )
+    caplog.clear()
+    client2, _, _ = make_client(tmp_path, managers=[m1, m2], expected_managers_fn=lambda: 1)
+    client2.attach_managers([m1])      # 期望数已降到 1 ⇒ 真删形态，不告警
+    logs2 = " ".join(r.getMessage() for r in caplog.records)
+    assert "变少" not in logs2, "真删条目还刷告警＝把正常淘汰当故障报"
+
+
+def test_expected_manager_fn_failure_falls_back_to_old_behavior(tmp_path):
+    """期望集取不到时按"无缺口"退回旧行为——不许把上行永久锁死。"""
+    def boom():
+        raise RuntimeError("stub 没接好")
+
+    m1 = FakeManager(gateway_sn="GW1")
+    client, _, _ = make_client(tmp_path, managers=[m1], expected_managers_fn=boom)
+    items, authoritative = client.build_state_snapshot()
+    assert items and authoritative is True, (
+        "期望数取不到就永不上行＝远程控制通道整条哑掉（比原缺陷更重）"
+    )
+
+
+def test_lan_and_cloud_count_manager_criteria_are_aligned(tmp_path):
+    """云侧期望数口径必须与 __init__ 的聚合口径同源（本仓"两条通道判据一致"纪律）。
+
+    源码级判据：ensure 构造 HubClient 时必须注入 expected_managers_fn，且该回调
+    指向 _hub_expected_manager_count（同一处定义"该有几个"）。
+    """
+    src = (Path(__file__).resolve().parents[1] / "custom_components"
+           / "window_controller_gateway" / "__init__.py").read_text(encoding="utf-8")
+    assert "expected_managers_fn=" in src, "少了期望集注入＝reload 窗口又把残缺集合当全量"
+    assert "_hub_expected_manager_count(hass)" in src, "注入的不是聚合口径同一真源"
+    assert "def _hub_expected_manager_count(" in src, "期望数判据必须与 _hub_managers 同处定义"
+
+
+# ── 畸形帧不得打掉整条云长连（v1.8.5 审计 G-8）─────────────────────
+def test_oversized_numeric_value_is_rejected_not_raised():
+    """5000 位数字串必须被**拒绝**（回 None），不得让 int() 抛 ValueError。
+
+    Python≥3.11 的十进制转换上限是 4300 位；两道正则都放行超长串，LAN 侧有
+    1024B 帧闸兜着，云通道没有（ws_connect 未设 max_msg_size）⇒ 抛出去就是
+    整条云长连断开、cmd_result 永不回。
+    """
+    huge = "9" * 5000
+    assert hc.validate_control_params("w_travel", huge) is None, (
+        "超长数字串必须被拒（int() 抛 ValueError 会冒泡断连）"
+    )
+    assert hc.validate_control_params("w_travel", "-" + huge) is None
+    # 边界：合法线值不得被误伤
+    assert hc.validate_control_params("w_travel", "100") == "100"
+    assert hc.validate_control_params("w_travel", 0) == "0"
+    assert hc.validate_control_params("w_travel", "101") == "101"
+    # 值域闸仍在（超长串不是被"长度"单独放行的旁路）
+    assert hc.validate_control_params("w_travel", "150") is None
+
+
+def test_session_once_contains_handler_exception_and_still_replies(tmp_path, monkeypatch):
+    """**真驱动**：一条命令处理抛异常 ⇒ 回 ok:false 且 `_session_once` 正常返回。
+
+    这是 G-8 后半的行为臂——旧写法异常冒泡出本协程，外层按"连接异常"整条断开；
+    钉源码字面量防不住"try 写了但包错语句"，所以这里让它真跑一遍。
+    """
+    cmd = {"t": "cmd", "cmdsn": "c1", "action": "control",
+           "sn": "A1B2", "params": {"attribute": "w_travel", "value": "30"}}
+
+    class Msg:
+        type = 1  # aiohttp.WSMsgType.TEXT
+
+        def __init__(self, data):
+            self.data = json.dumps(data)
+
+    ws = FakeWS(incoming=[Msg(cmd)])
+    client, _, session = make_client(tmp_path, managers=[FakeManager()], session=FakeSession(ws=ws))
+
+    async def boom(_msg):
+        raise ValueError("stub 内部炸了")
+
+    monkeypatch.setattr(client, "_handle_cmd", boom)
+    ok = asyncio.run(client._session_once())
+    assert ok is True, "单条命令异常不得被外层当成连接异常（会让整条长连重连）"
+    replies = [p for p in ws.sent if p.get("t") == "cmd_result"]
+    assert replies and replies[0]["ok"] is False and replies[0]["err"] == "handler_error", (
+        "异常必须折成 ok:false 回执，否则小程序干等"
+    )

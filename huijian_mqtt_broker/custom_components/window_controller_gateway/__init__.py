@@ -23,6 +23,8 @@ from .const import (
     GLOBAL_IGNORED_GATEWAYS,
     DEVICE_SETPOINTS,
     RESTART_DELAY,
+    CONF_AUTO_DISCOVERY,
+    CONF_DEBUG_LOGGING,
 )
 from .persist import load_persistent_data, save_persistent_data
 from .services import register_services
@@ -110,6 +112,42 @@ def _clamp_discovery_interval(raw) -> int:
     return seconds
 
 
+def _apply_debug_logging(entry_id: str, enabled: bool) -> None:
+    """按引用计数设置/恢复模块 logger 级别（v1.8.5 G-6 抽出的共用出口）。
+
+    完整设置分支与 awaiting 分支共用本函数。抽出的直接原因：awaiting 分支原先
+    对 entry.options 零读取，而"网关还没被发现"恰是最需要 DEBUG 的时刻——选项页
+    对等待条目可达，保存 debug_logging 却零效果且无声。
+
+    引用计数语义不变：只有集合清空才把级别恢复为 NOTSET（继续继承 HA logger
+    配置），避免多条目互相覆盖、卸载后不恢复（P1 修复的原始动机）。
+    """
+    if enabled:
+        _debug_logging_entries.add(entry_id)
+        _LOGGER.setLevel(logging.DEBUG)
+        _LOGGER.info("调试日志已启用")
+    else:
+        _debug_logging_entries.discard(entry_id)
+        if not _debug_logging_entries:
+            _LOGGER.setLevel(logging.NOTSET)  # 恢复为继承 HA logger 配置
+            _LOGGER.info("调试日志已关闭（模块日志级别恢复为继承设置）")
+
+
+def _auto_discovery_enabled(entry) -> bool:
+    """awaiting 分支的 auto_discovery 门控（v1.8.5 G-6）。
+
+    与 mqtt_handler._lifecycle._auto_discovery_enabled 同语义、同默认值：字段缺失、
+    取不到配置、任何异常都保持 True（历史行为，绝不能把用户已有网关的自动发现
+    因为一次读取失败而静默关掉）。awaiting 条目没有 device_manager，那条路径的
+    消费方触不到，故此处按 entry.options 直读。
+    """
+    try:
+        options = getattr(entry, "options", None) or {}
+        return bool(options.get(CONF_AUTO_DISCOVERY, True))
+    except Exception:
+        return True
+
+
 def _make_hub_control(hass: HomeAssistant):
     """hub 下行命令 → 本仓 004 控制路径。
 
@@ -149,6 +187,34 @@ def _hub_managers(hass: HomeAssistant) -> List[Any]:
         if manager is not None:
             out.append(manager)
     return out
+
+
+def _hub_expected_manager_count(hass: HomeAssistant) -> int:
+    """**本该**挂上几个 manager（v1.8.5 审计 G-2）。
+
+    判据＝当前启用的、带网关 SN 的条目数（与 _hub_managers 的聚合口径同源）：
+    · 条目**真被删除** ⇒ 它已不在 async_entries 里 ⇒ 期望数同步下降
+      ⇒ 缺的那台本就该被 hub 淘汰，快照仍可权威（保住 v1.7.59 幽灵设备修复）；
+    · 条目 **reload 中／冷启动分步 setup** ⇒ 条目还在，只是 `_setup_complete`
+      尚未落地 ⇒ 期望数 > 已挂数 ⇒ 快照判不权威、本轮不上行。
+
+    awaiting（等待态）条目 `data={}` 无 SN，天然不计入——它本来也没有设备。
+    取不到 config_entries（测试桩/极早期）时回 0＝无缺口，退回旧行为。
+    """
+    try:
+        entries = list(hass.config_entries.async_entries(DOMAIN))
+    except Exception:  # noqa: BLE001 - 无 config_entries（测试桩）时按无缺口
+        return 0
+    n = 0
+    for ent in entries:
+        if getattr(ent, "disabled_by", None):
+            continue
+        try:
+            if (ent.data or {}).get(CONF_GATEWAY_SN):
+                n += 1
+        except Exception:  # noqa: BLE001 - 单条目异常不影响计数口径
+            continue
+    return n
 
 
 def _hub_option(hass: HomeAssistant, key: str) -> str:
@@ -214,6 +280,9 @@ async def async_ensure_hub_client(hass: HomeAssistant) -> None:
             base=base,
             install_key=_hub_option(hass, "hub_install_key") or HUB_DEFAULT_INSTALL_KEY,
             control_fn=_make_hub_control(hass),
+            # v1.8.5（审计 G-2）：把"该有几个 manager"的判据注入长连。缺了回调时
+            # build_state_snapshot 退回旧行为（只防零 manager）——见该方法 docstring。
+            expected_managers_fn=lambda: _hub_expected_manager_count(hass),
         )
         domain_data[HUB_DATA_KEY] = client
         try:
@@ -359,6 +428,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].setdefault(entry.entry_id, {})
         hass.data[DOMAIN][entry.entry_id]["gateway_sn"] = ""
         hass.data[DOMAIN][entry.entry_id]["_awaiting_gateway"] = True
+        # v1.8.5 G-6：本分支此前对 entry.options 零读取。选项页对等待条目是可达的
+        # （config_flow async_step_init 的 E-1 菜单），但等待条目既没有 mqtt_handler
+        # 也没有 device_manager——debug_logging 与 auto_discovery 那两个消费方一个
+        # 都触不到，用户保存后零效果、且无声。而"网关还没被发现"恰是最需要 DEBUG
+        # 的时刻（发现链断裂、心跳耳异常都只在这段可见）。
+        #
+        # 此处消费 debug_logging，与完整设置分支共用同一引用计数出口
+        # （_apply_debug_logging）。只在本次要开启、或本条目已登记在案时才调用：
+        # 默认 False 且未登记时保持不动，避免每条 awaiting 条目 setup 都白打一行
+        # "调试日志已关闭"。auto_discovery 的消费点在心跳耳内（发现卡调用前）。
+        _awaiting_debug = bool((entry.options or {}).get(CONF_DEBUG_LOGGING, False))
+        if _awaiting_debug or entry.entry_id in _debug_logging_entries:
+            _apply_debug_logging(entry.entry_id, _awaiting_debug)
+        # discovery_interval 在本分支无消费方（它的唯一节拍源 mqtt_handler.
+        # check_connection() 要等网关配置后才存在），故此处不读；用户在此页改它
+        # 会在条目转正后的完整分支生效。
         # 无网关 SN：不 forward 任何平台实体。
         # 历史实现 forward 了 4 个空平台，但各平台 async_setup_entry 在
         # device_manager 缺失时会打 error 日志（"设备管理器未找到"），
@@ -462,6 +547,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         # （async_discover_gateway 第 3 步命中同 SN 条目本就早退）。
                         return
                     gateway_name = f"慧尖网关 {response_sn[-4:]}"
+                    # v1.8.5 G-6：本调用此前不看 options 的 auto_discovery。选项页
+                    # 对 awaiting 条目可达（config_flow E-1 菜单），但等待条目没有
+                    # mqtt_handler，`_auto_discovery_enabled` 那个唯一消费方触不到
+                    # ——用户取消勾选后发现卡照弹。门控加在调用侧。
+                    if not _auto_discovery_enabled(entry):
+                        _LOGGER.info(
+                            "心跳监听器发现新网关 %s，但 auto_discovery 已关闭"
+                            "——不弹发现卡（可在选项页重新开启）", response_sn)
+                        return
                     _LOGGER.info("心跳监听器发现新网关: %s (SN: %s)", gateway_name, response_sn)
                     await async_discover_gateway(hass, response_sn, gateway_name)
                 except Exception as e:
@@ -727,15 +821,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         # P1 修复：启用/禁用调试日志时使用引用计数控制模块 logger 级别。
         # 不再无条件 setLevel，避免多网关互相覆盖、卸载后不恢复。
-        if debug_logging:
-            _debug_logging_entries.add(entry.entry_id)
-            _LOGGER.setLevel(logging.DEBUG)
-            _LOGGER.info("调试日志已启用")
-        else:
-            _debug_logging_entries.discard(entry.entry_id)
-            if not _debug_logging_entries:
-                _LOGGER.setLevel(logging.NOTSET)  # 恢复为继承 HA logger 配置
-                _LOGGER.info("调试日志已关闭（模块日志级别恢复为继承设置）")
+        # v1.8.5 G-6：逻辑抽到 _apply_debug_logging，与 awaiting 分支共用。
+        _apply_debug_logging(entry.entry_id, bool(debug_logging))
 
         # 设置状态定期更新（取消定时设备发现，只保留连接检查）
         async def periodic_update(_now):
@@ -1085,12 +1172,13 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
                     _LOGGER.debug("注销服务 %s 失败（可能未注册）: %s",
                                   _svc_name, _svc_err)
             _LOGGER.info("全部条目已删除，域级服务已注销")
-            # v1.7.63（C-10）：全部条目被删 ⇒ 两张诊断卡一并清掉（healer 此后
-            # 不再运行，僵尸卡无人清）
+            # v1.7.63（C-10）：全部条目被删 ⇒ 诊断卡一并清掉（healer 此后不再
+            # 运行，僵尸卡无人清）。v1.8.5（审计 G-3）：改走域级唯一清理出口——
+            # 此前手写清单只列了 channel+mdns，漏掉 takeover（第三张卡），
+            # 卡面"系统自动重试"的承诺在 healer 退出后无人执行。
             try:
-                from .mqtt_bootstrap import _clear_channel_issue, _clear_mdns_issue
-                _clear_channel_issue(hass)
-                _clear_mdns_issue(hass)
+                from .mqtt_bootstrap import _clear_huijian_issues
+                _clear_huijian_issues(hass)
             except Exception as _ir_err:  # noqa: BLE001 — 可见性面失败不影响删除
                 _LOGGER.debug("清理诊断卡失败（不影响删除结果）: %s", _ir_err)
     except Exception as e:  # noqa: BLE001

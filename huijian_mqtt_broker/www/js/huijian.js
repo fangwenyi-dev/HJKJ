@@ -22,6 +22,13 @@
         // 的那份判据覆盖不到它们——卡片是 renderGatewayDisabled 建的，后续刷新并不知道
         // 它是禁用条目，于是照样长出一排点下去恒 4xx 的按钮。渲染与刷新共用这一份。
         const DISABLED_ENTRIES = {};
+        // v1.8.5（审计 G-4）：entryId → "本轮是降级渲染，需整建一次"标记。
+        // /states 取失败时设备瓷砖只能用空 states 渲染（拿不到 cover 能力属性），
+        // 旧实现把这个"读不到"直接当成"机型不支持百分比定位"：瓷砖写死
+        // 「不支持百分比定位」并删掉位置滑块，而恢复路径只更新既有元素、
+        // 不重建 DOM ⇒ 假声明与滑块丢失**永不自愈**（只能手动 F5）。
+        // 现在降级即登记，下一轮 silentRefresh 见到标记就升级为完整重建。
+        const PENDING_REBUILD = {};
         // 审计 2026-09-30 B-7 的**失效条件**（本批复核补口）：上面那份集合只在
         // loadGateways 整建时清，而 silentRefresh 的重建判据此前只比 entry_id 集合——
         // "禁用→重新启用"和"启动期 setup_retry→loaded"都不改变 id 集合，于是卡片
@@ -928,6 +935,8 @@
                     for (const dev of subDevices) html += renderDevice(dev, entryId, states);
                     deviceListEl.innerHTML = html;
                     for (const dev of subDevices) loadDeviceState(dev, states);
+                    // v1.8.5（审计 G-4）：整建成功 ⇒ 清降级标记（否则每轮都整建）。
+                    delete PENDING_REBUILD[entryId];
                 } catch (e) {
                     // 状态获取失败：仍用 API 的 gateway_online（若有）显示网关在线状态
                     if (gwDevice && typeof gwDevice.gateway_online === 'boolean') {
@@ -946,6 +955,12 @@
                     // 瓷砖冻结在"状态: 加载中"最长 30s（同 catch 网关徽标却有
                     // 降级处理，设备侧是漏网半边）。loadDeviceState 内部对
                     // 缺失实体有兜底，空 states 安全。
+                    // v1.8.5（G-4）：`loadDeviceState(dev, [])` 是**同步**调用，
+                    // 不是"异步补拉"（注释与 CHANGELOG 的旧表述不实，见 git
+                    // 59c25af）——它只更新既有元素，不会把缺失的能力属性补回来。
+                    // 所以这里额外登记整建标记，下一轮 silentRefresh 完整重建，
+                    // 让"不支持百分比定位"与滑块状态回到真值。
+                    PENDING_REBUILD[entryId] = true;
                     for (const dev of subDevices) loadDeviceState(dev, []);
                 }
             } catch (e) {
@@ -1006,7 +1021,10 @@
                 // 与服务端 d.id 直接可比
                 const renderedIds = Array.from(deviceListEl.querySelectorAll('.device-item'))
                     .map(el => el.id.slice('dev-'.length)).sort().join(',');
-                if (serverIds !== renderedIds) {
+                // v1.8.5（审计 G-4）：上一轮是 /states 失败的降级渲染 ⇒ 即使 id
+                // 集合未变也必须整建一次。否则"不支持百分比定位"的假声明与丢失的
+                // 位置滑块永远回不来（只更新既有元素，不会重建能力判据）。
+                if (serverIds !== renderedIds || PENDING_REBUILD[entryId]) {
                     await loadGatewayDevices(entryId, gwSn || gatewaySn);
                     return;
                 }
@@ -1117,10 +1135,17 @@
             // ——无百分比能力机型（如 5002）上滑块可拖、指令打到 LoRa 空口、
             // 服务回 200 而设备不动（假成功）。服务侧同批已补能力闸，此处
             // 消掉"可拖的假滑块"，能力属性成为唯一判据。
+            // v1.8.5（审计 G-4）：`states` 为空是"读不到"，不是"不支持"。
+            // 降级路径（/states 失败）传的是 []，旧实现照样按 posCapable=false
+            // 渲染成能力判词「不支持百分比定位」并删掉滑块——假声明且不自愈。
+            const statesEmpty = !states || states.length === 0;
             const posCapable = !!(coverEntity && coverEntity.attributes
                 && coverEntity.attributes.position_capable);
             html += '<div class="slider-group">';
-            if (posCapable) {
+            if (statesEmpty) {
+                html += '<div class="slider-row"><span class="slider-label">位置</span>' +
+                    '<span class="slider-value position-unknown" title="状态读取中：本轮未取到 /states，下一轮自动重建">读取中…</span></div>';
+            } else if (posCapable) {
                 html += '<div class="slider-row"><span class="slider-label">位置</span>' +
                     '<input type="range" class="position-slider" min="0" max="100" value="' + (currentPos === '--' ? 0 : escapeHtml(currentPos)) + '"' +
                     ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value+\'%\'"' +
@@ -1162,6 +1187,10 @@
             try {
                 // 2026-08-28 修复：用 API 返回的精确实体列表按 unique_id 锚点查找
                 const coverEntity = findEntityState(dev, 'cover', 'cover', states);
+                // v1.8.5（审计 G-4）：机型百分比能力（服务端 cover.py 暴露）。
+                // 缺失视为"无能力"——只有显式 true 才渲染位置数值/滑块。
+                const posCapable = !!(coverEntity && coverEntity.attributes
+                    && coverEntity.attributes.position_capable);
                 // 在线状态点: binary_sensor.*online*
                 const onlineEntity = findEntityState(dev, 'binary_sensor', 'online', states);
                 const dot = document.querySelector('#dev-' + dev.id + ' .dev-dot');
@@ -1235,7 +1264,14 @@
                     // 可为 null）旧判只挡 undefined，会渲染成"位置: null%"并把
                     // slider.value 置成 "null"（数字输入被浏览器钳成 0）——同族
                     // 判空补齐 null/''（与上方 :565 推导分支同口径）
-                    if (pos !== undefined && pos !== null && pos !== '') statusText += ' | 位置: ' + pos + '%';
+                    // v1.8.5（审计 G-4）：**只在机型有百分比能力时**才拼接这半行。
+                    // 旧实现无条件拼，而瓷砖区按 position_capable 渲染 ⇒ 无能力机型
+                    // 常态并排显示「不支持百分比定位」＋「位置: 65%」自相矛盾
+                    //（服务侧同批已让 cover.py 不再给无能力机型写 position，这里
+                    // 是前端侧的同判据收口——两层都判，防任一侧回潮）。
+                    if (posCapable && pos !== undefined && pos !== null && pos !== '') {
+                        statusText += ' | 位置: ' + pos + '%';
+                    }
                     const slider = document.querySelector('#dev-' + dev.id + ' .position-slider');
                     if (slider && pos !== undefined && pos !== null && pos !== ''
                             && !userInteracting(slider)) {
