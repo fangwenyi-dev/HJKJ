@@ -104,6 +104,22 @@ DEFAULTS: dict[str, Any] = {
         "chain_enabled": True,                 # 体验批 P2-12：复合句分句链发（全命中才链）
         "confirm_risky": True,                 # 体验批 P2-13：解锁/删场景先问「确认」再办
         "confirm_ttl_s": 30.0,                 # 确认问句存活：超过 30s 不回即作废
+        # ── ②「操作完成一定要关闭对应设备」（用户 2026-10-09 立规，现场＝办公室射灯）──
+        # 判据与保守边界见 core/auto_restore.py 模块头（只登记已 grounded 且执行成功的那台）。
+        # ⚠ **默认关**——2026-10-10 复核后的判断，不是漏配：真链路里最常见的那条形
+        #   `TurnDeviceOn {target:[{area:'办公室',devices:[{name:'灯'}]}]}` 由**集成侧**解析实体，
+        #   回给加载项的 `control_targets` 行只有 {name, area}、**没有 entity_id**
+        #   （custom_components/huijian_ai/intent_turn.py:121-126 实证）。在这种形上靠
+        #   area+name 反查实体去关＝猜目标；猜错会关掉用户根本没开过的设备，比"忘关"更坏。
+        #   ⇒ 先以 opt-in 出包；正解是集成把解析出的 entity_id 放回回执行（那边本就有
+        #   item.state.entity_id），上线并真机复验覆盖后，再把本默认翻成 True。
+        #   手动打开后＝只在能确证 entity_id 的设备上生效（目标未 grounded 一律不登记）。
+        "auto_restore": False,                 # 总开关：默认关＝行为逐值回到本批之前
+        "auto_restore_min": 10,                # 语音打开后多少分钟自动收尾（钳位 0.5–1440）
+        "auto_restore_domains": ["cover", "light"],
+                                               # 默认只管"开合类＋灯"：switch/fan 多为模式类
+                                               # （摆风、提示音）自动关会改别的语义，不默认纳入
+        "auto_restore_exclude": [],            # 点名不参与（支持 fnmatch，如 "light.bed_*"）
     },
     "spatial": {
         # 体验批 P2-11：卫星 IP → 区域名映射（"192.168.1.31": "卧室"）。

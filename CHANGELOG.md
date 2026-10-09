@@ -3552,6 +3552,71 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
      ═══════════════════════════════════════════════════════════════════════ -->
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
+## [1.4.0] - 2026-10-10 · **归位守卫**：语音打开的设备到点自动关（现场实锤＝办公室射灯）；并修掉一条会把"没执行"洗成"办好了"的假成功
+
+**为什么有这版**（用户 10-09 明令："各种语音控制用来操作 HA 中设备，操作完成一定要关闭对应设备"）：
+台架当晚我自己撞出这个形态——激励 `_live_cmdB`（"把办公室的灯打开"）每轮都**真的点亮**
+`light.ban_gong_shi_she_deng`，跑完没人关；HA 历史里该灯当天多次"亮 10–33 分钟无人关"。
+设备侧不会自己发生"操作完成"，收尾必须有一方负责，这一版把责任放进执行层。
+
+### 1 新功能：归位守卫 `core/auto_restore.py`（**本版默认关，opt-in**）
+- 语音**成功打开**且目标已 grounded 成 `entity_id` 的设备 → 登记归位计时；到点**先读当前状态**，
+  仍开着才发关服务（`cover.close_cover` / `light.turn_off` / 其余域走 `homeassistant.turn_off`）。
+- 默认域 `["cover","light"]`：开合类语义上"操作完就该闭合"；灯按用户点名纳入。
+  **switch/fan/media_player 默认不归位**——它们多被当"模式开关"（摆风、提示音、播放），自动关会改别的语义。
+- 语义细节：**重复打开同一台 = 续期**（不叠两枚计时）；**语音关闭 = 取消**（人已关，不再补刀）；
+  归位动作本身不再登记（否则关一次又开一次计时，永远循环）。
+- 配置面（Web「对话」区两控件，亦可 `settings.json`）：`dialog.auto_restore`（总开关，
+  **默认 false**，勾选才生效）、`dialog.auto_restore_min`（默认 10 分钟，钳位 0.5–1440）、
+  `dialog.auto_restore_domains`、`dialog.auto_restore_exclude`（支持 fnmatch 点名豁免）。
+  PATCH 走 `_deep_merge` ⇒ 老存档升级不掉键；UI 读值同向改成 `=== true`
+  （旧写法 `!== false` 会把"没有这个键"显示成"已开"，面板骗人）。
+- **为什么默认关**（这是本版最重要的实话）：真链路里最常见的一条形是
+  `TurnDeviceOn {target:[{area:'办公室',devices:[{name:'灯'}]}]}`，实体解析发生在**集成侧**，
+  回给加载项的 `control_targets` 行只有 `{name, area}`、**没有 `entity_id`**
+  （`custom_components/huijian_ai/intent_turn.py:121-126` 实证）。在这种形上加载项无法确证
+  "刚才开的是哪一台"，靠 area+name 反查再去关＝**猜目标**——猜错会关掉用户根本没开过的设备，
+  比"忘关"更坏。所以本版只在**能确证 entity_id** 的形上生效（klar 直调 / args 带 entity_id /
+  回执 states 行含 entity_id），并把默认留给下一步：集成把 `entity_id` 放回回执行
+  （那边本就有 `item.state.entity_id`），上线真机复验覆盖后再翻默认。
+- 顺带改掉我自己的一处**假绿**：第一版 `_ON_INTENTS` 只认 `HassTurnOn`，而慧尖生产主车道
+  产的是自有名 `TurnDeviceOn/TurnDeviceOff`（`fast_path.py:295/327`、`executor.py:210` 注释实锤）
+  ⇒ 真链路一帧都不登记，而当时 21 条钉全绿（它们喂的就是 Hass*）。现在两族都认，
+  且新钉**必须喂生产真名并走 `Executor.run`**；`ControlWindow` 按 `args["action"]` 判方向，
+  `stop/tilt/position` 这类终态不唯一的**一律不登记**。
+- 故意保守的两条：**只给区域的指令不登记**（area 扇出由 HA 自己解析，猜目标去关设备比忘关更糟）；
+  **延时不落盘**（重启后未到期任务丢失，不假装持久化）。
+- 真机端到端已过（生产 `HAClient`+`Executor` 直连 `.91`）：说"打开办公室射灯"→播"办公室射灯开了"、
+  HA 实测 `on`，**60 秒后设备自己变 `off`**，脚本终态复原 `off`。⚠ 这条走的是
+  **args 带 `entity_id` 的形**（klar 直调同形）；`target` 形（area+name）因上面所述拿不到 id
+  ⇒ 未覆盖，不作已验声明。
+
+### 2 缺陷修复：意图通道的假成功（会**掩盖**上面这件事）
+探针在真机拿到原样回执：`HassTurnOn` 走 `/api/intent/handle` 时 HA 回
+`{"response_type":"error","data":{"code":"failed_to_handle"},"speech":{…"Service handler cannot target all devices"}}`
+且 **HTTP 200**。旧 `HAClient._normalize_result` 的兜底是 `success = status < 300` ⇒ 归一化成成功，
+执行器播「好的」而 HA 侧**零状态变化**（v1.0.21 / v1.0.34 / v1.0.39 假成功家族再来一枚）。
+现按真回执判：`response_type=error` 或 `data.code ∈ {failed_to_handle, no_intent_match, not_supported, not_found}`
+⇒ `success=False` 并把 HA 原话带给话术层。真机复测：同一条现在回 `success=False`＋原因，灯确实没亮。
+
+### 3 测试
+`tests/test_auto_restore.py` 21 条（含**从生产入口 `Executor.run` 验登记**、执行失败不登记、区域不登记、
+续期不叠加、取消、到点按状态决定是否发服务、UI 提交键必须存在于服务端 DEFAULTS）+
+`tests/test_intent_false_success.py` 7 条（含真机原样回执、正向对照防过杀、"顶层 success 与
+`response_type=error` 同现不得绕过这道闸"的反漏杀钉、"未知 `data.code` 不误杀"的方向钉）。
+判据位置也一并加固：这道闸放在**所有早退出口之前**（原来挂在兜底分支里，若哪天顶层同时带
+`success` 与 `response_type=error` 就会被 `if "success" in obj` 绕过——那是我自己提出来
+并补上的漏杀面）。全量回归 **3022 passed / 8 skipped**，ruff（F,E9,B）干净。
+
+### 4 未做与未验（不冒充）
+- **`target` 形（area+name，真链路最常见）未覆盖**：集成回执不带 `entity_id`，加载项不猜目标 ⇒
+  该形不登记、不归位。这是本版默认关的直接原因；要覆盖需先改集成回执行并真机复验。
+- 打开开关后的 10 分钟默认时长只做了一次 **60 秒延时**的真机验证（`entity_id` 形），
+  10 分钟长时未观察。
+- 归位不落盘：加载项重启后未到期任务丢失（已知限制）。
+- 固件侧（另仓 0513gujian）v2.2.6 已单独发布：远场端点闸 `STOP_CAP=130` 转正，与本版无耦合。
+- HA 播报期卫星唤不醒属固件检测/状态路径，本仓不处理（另案）。
+
 ## [1.3.0] - 2026-10-10 · 现场「(办公室)所有设备只动灯」根修：批量面改用**区域证据**；同批收第七轮审计 A2/A3/A7/B2 与三条句形
 
 **为什么有这版**：用户报「打开/关闭办公室所有窗户」正常，「…所有设备」只动灯，空调与开窗器不动。

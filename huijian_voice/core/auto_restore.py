@@ -1,0 +1,247 @@
+"""语音操作后的"归位"守卫（用户 2026-10-09 立规：语音操作 HA 设备，操作完成一定要关闭对应设备，
+点名例子＝办公室射灯）。
+
+为什么需要它（现场证据，不是假想）
+    2026-10-09 现场证据（**其中一条当晚已被我自己的复查推翻，改在此留痕**）：
+      ✔ 成立：办公室射灯 `light.ban_gong_shi_she_deng` 会被"打开办公室的灯"这类口令**真点亮**
+         且没人关——本仓台架激励 `_live_cmdB` 整晚就在制造这个形态，23:50 我自己发现灯开着、
+         手工关回。当天历史记录里它也有多次"亮 10–33 分钟无人关"。
+      ✘ 撤回：傍晚我拿"平开窗 17:22 被语音打开后一直 open"当第二条证据，并按
+         `/api/config` 的 automations 为空断言"HA 里没有自动化引用这些实体"。
+         后来用 `/api/history/period` 查明：该窗整夜每 ~10 分钟自动 open、7~11 分钟后
+         自动 closed、`context.user_id` 为空 ⇒ 有 **YAML 自动化**在驱动它，
+         而 `/api/config` **只列 UI 建的自动化**、看不到 YAML 那套。
+         ⇒ 窗这条不是"操作后没人关"的证据；本模块的立论只建立在射灯那一类上。
+    ⇒ 但结论不变：**"操作完成"设备侧不会自己发生**，UI 自动化覆盖不到的设备（灯、插座、
+      非循环执行器）仍没人收尾，所以归位放在加载项执行层，且**默认只管明确点名的域**。
+
+★ 覆盖面实况与**默认关**的原因（10-10 复核；别把这条读成"已经做好了"）
+  真链路里最常见的一条形是
+      `TurnDeviceOn {target:[{area:'办公室', devices:[{name:'灯'}]}]}`
+  ——实体解析发生在**集成侧**，回给加载项的 `control_targets` 行只有 {name, area}、
+  **没有 entity_id**（custom_components/huijian_ai/intent_turn.py:121-126 实证）。
+  在这种形上加载项无法确证"刚才开的是哪一台"；靠 area+name 反查再去关＝**猜目标**，
+  猜错会关掉用户根本没开过的设备，比"忘关"更坏。
+  ⇒ 本能力**默认关**（DEFAULTS["dialog"]["auto_restore"] = False），只在能确证 entity_id 的形
+    上生效：klar 直调、args 带 entity_id、回执 states 行含 entity_id。
+  ⇒ 下一步正解：集成把解析出的 entity_id 放回回执行（那边本就有 item.state.entity_id），
+    上线后真机复验"打开办公室的灯"确被登记并收尾，再把默认翻成 True。
+
+★ 意图词表（10-10 第二版改掉自己的一处假绿）
+  慧尖自有意图名是 `TurnDeviceOn/TurnDeviceOff`（fast_path.py:295/327 是生产主车道），
+  HA 内置名 `HassTurnOn/Off` 只是透传族。第一版只认 Hass* ⇒ 生产一帧都不登记，
+  而当时 21 条钉全绿——因为它们喂的正是 Hass*。现在两族都认（见 _direction），
+  且钉**必须喂生产真名**并走 Executor.run。
+
+边界（故意保守，写清楚免得后人当成万能）
+  1. **只登记在"这一条真的执行成功且目标已被 grounded 成 entity_id"的设备上**。
+     只给区域（"把客厅灯打开"→ area 扇出由 HA 自己解析）时我们不知道打了哪台 ⇒ 不归位，
+     绝不靠"猜目标"去关设备（关错设备比忘关更糟）。
+  2. **默认域＝cover + light**：开合类（窗/门/遮阳）语义上"操作完就该闭合"；灯按用户点名纳入。
+     switch/fan/media_player 默认**不**归位——它们常被当"模式开关"用（摆风、提示音、播放），
+     自动关掉等于改别的语义；要加由用户在设置里显式扩域。
+  3. 再次语音打开同一台＝**续期**；语音关闭同一台＝**取消**（人已经关了，别再去关一次）。
+  4. 延时不落盘：加载项重启后未到期的归位任务丢失（不假装持久化）。这是已知限制，
+     在 pending 快照里可见，便于现场排查。
+  5. 归位动作本身**不再登记**（否则关一次又开一次计时，永远循环）。
+"""
+from __future__ import annotations
+
+import asyncio
+import fnmatch
+import logging
+from typing import Any, Iterable, Optional
+
+logger = logging.getLogger("huijian.auto_restore")
+
+# 意图 → 方向。**必须按生产词表来**：慧尖自有意图名是 `TurnDeviceOn/TurnDeviceOff`
+# （fast_path.py:295/327 主车道、executor.py:210 注释实锤），HA 内置名 `HassTurnOn/Off`
+# 是透传族。10-10 第一版只认 Hass*，结果真语音链路（产 TurnDeviceOn）**一帧都不登记**
+# ——测试全绿而生产不生效，正是本仓"钉没喂生产形状"那类假绿的翻版。
+_ON_INTENTS = {"TurnDeviceOn", "HassTurnOn", "HassOpenCover"}
+_OFF_INTENTS = {"TurnDeviceOff", "HassTurnOff", "HassCloseCover"}
+# 窗控族的方向在 args["action"]（fast_path.py:1441 集成 handler 直读它）；
+# 只认明确的两向，`stop/tilt/position/开一半` 这类方向或终态不唯一的**一律不登记**——
+# 归位是"补忘关"，猜错终态比不关更坏。
+_WINDOW_INTENTS = {"ControlWindow", "WindowControl"}
+_WIN_OPEN = ("open", "up", "on")
+_WIN_CLOSE = ("close", "down", "off", "shut")
+
+
+def _direction(intent: str, args: Any) -> Optional[str]:
+    """'on' / 'off' / None（None＝这条不参与归位判断）。"""
+    if intent in _ON_INTENTS:
+        return "on"
+    if intent in _OFF_INTENTS:
+        return "off"
+    if intent in _WINDOW_INTENTS and isinstance(args, dict):
+        act = str(args.get("action") or args.get("window_action") or "").strip().lower()
+        if act in _WIN_OPEN:
+            return "on"
+        if act in _WIN_CLOSE:
+            return "off"
+    return None
+
+# 域 → 收尾服务（官方域服务优先，跨域兜底用 homeassistant.turn_off）
+_CLOSE_SERVICE = {
+    "cover": ("cover", "close_cover"),
+    "light": ("light", "turn_off"),
+    "switch": ("switch", "turn_off"),
+    "fan": ("fan", "turn_off"),
+    "media_player": ("media_player", "media_off"),
+    "humidifier": ("humidifier", "turn_off"),
+    "vacuum": ("vacuum", "return_home"),
+}
+
+DEFAULT_MIN = 10
+DEFAULT_DOMAINS = ("cover", "light")
+
+
+def _eids(args: Any) -> list[str]:
+    """从步骤 args 里取**已 grounded** 的实体 id 列表；拿不到就返回空（绝不猜）。"""
+    if not isinstance(args, dict):
+        return []
+    raw = args.get("entity_id")
+    if isinstance(raw, str):
+        return [raw] if "." in raw else []
+    if isinstance(raw, Iterable):
+        return [e for e in raw if isinstance(e, str) and "." in e]
+    return []
+
+
+class AutoRestore:
+    """按实体的归位计时器。永不抛：任何异常都只记日志，不影响语音链主流程。"""
+
+    def __init__(self, ha, settings=None):
+        self.ha = ha
+        self.settings = settings
+        self._tasks: dict[str, asyncio.TimerHandle] = {}
+        self._loops: dict[str, asyncio.Task] = {}
+
+    # ── 配置面（settings 缺失时走保守默认）───────────────────────────
+    def _cfg(self) -> tuple[bool, float, tuple[str, ...], list[str]]:
+        get = (lambda k, d: d) if self.settings is None else \
+            (lambda k, d: self.settings.get(k, d))
+        enabled = bool(get("dialog.auto_restore", True))
+        try:
+            minutes = float(get("dialog.auto_restore_min", DEFAULT_MIN) or DEFAULT_MIN)
+        except (TypeError, ValueError):
+            minutes = float(DEFAULT_MIN)
+        minutes = max(0.5, min(minutes, 24 * 60.0))          # 钳位：0＝“不等待”不是本意
+        domains = get("dialog.auto_restore_domains", None) or list(DEFAULT_DOMAINS)
+        if isinstance(domains, str):
+            domains = [d.strip() for d in domains.split(",") if d.strip()]
+        exclude = get("dialog.auto_restore_exclude", None) or []
+        if isinstance(exclude, str):
+            exclude = [d.strip() for d in exclude.split(",") if d.strip()]
+        return enabled, minutes * 60.0, tuple(str(d) for d in domains), [str(x) for x in exclude]
+
+    def _wanted(self, eid: str, domains: tuple[str, ...], exclude: list[str]) -> bool:
+        dom = eid.split(".", 1)[0]
+        if dom not in domains:
+            return False
+        for pat in exclude:
+            if pat and (fnmatch.fnmatch(eid, pat) or pat == eid):
+                return False
+        return True
+
+    # ── 主入口：执行器在每步结束后调用 ──────────────────────────────
+    def note(self, intent: Optional[str], args: Any, ok: bool) -> None:
+        """成功开了一台策略内设备 → 登记归位；成功关闭 → 取消归位。永不抛。"""
+        try:
+            if not ok or not isinstance(intent, str):
+                return
+            eids = _eids(args)
+            if not eids:
+                return
+            enabled, delay, domains, exclude = self._cfg()
+            direction = _direction(intent, args)          # 生产词表实锤，见 _direction
+            if direction == "off":
+                for eid in eids:
+                    self._cancel(eid)
+                return
+            if direction != "on" or not enabled:
+                return
+            for eid in eids:
+                if self._wanted(eid, domains, exclude):
+                    self._arm(eid, delay)
+        except Exception:                                   # noqa: BLE001
+            logger.exception("[归位] 登记异常（不影响本轮播报）")
+
+    def _arm(self, eid: str, delay_s: float) -> bool:
+        """登记一枚归位计时。返回是否真的安排了——**没有事件循环时绝不谎称安排了**
+        （本仓教训：静默不执行比报错更坏，"配了没开"和"开了没接上"都长这样）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("[归位] 无运行事件循环 ⇒ %s **未登记**（不假装已安排收尾）", eid)
+            return False
+        old = self._tasks.pop(eid, None)
+        if old is not None:
+            old.cancel()
+        # 续期语义：重复打开同一台 = 重置计时，不是叠加成两个任务
+        self._tasks[eid] = loop.call_later(delay_s, self._spawn, eid, delay_s)
+        logger.info("[归位] %s 将在 %.0f 秒后自动关闭（语音打开）", eid, delay_s)
+        return True
+
+    def _cancel(self, eid: str) -> None:
+        h = self._tasks.pop(eid, None)
+        if h is not None:
+            h.cancel()
+            logger.info("[归位] %s 已被语音关闭 → 取消自动收尾", eid)
+        # 任务已起飞（正在等服务端）时无从撤回，交由 _fire 自查最新状态兜底
+
+    def _spawn(self, eid: str, delay_s: float) -> None:
+        self._tasks.pop(eid, None)
+        t = asyncio.get_running_loop().create_task(self._fire(eid))
+        self._loops[eid] = t
+        t.add_done_callback(lambda _f, k=eid: self._loops.pop(k, None))
+
+    async def _fire(self, eid: str) -> None:
+        """到点收尾：**先看当前状态**，已经是关的就不做（防与自动化/人手撞车），
+        失败只记日志——归位是"补忘关"，不是"必须成功"的硬闸。"""
+        try:
+            # 10-10 对抗复核补：登记之后用户把总开关关掉（或把这台豁免掉）时，
+            # 已到点的计时**不许**再去关设备——那条策略已经被他收回了。
+            # 只在真正要动手的这一刻重读策略，不靠登记时的旧快照。
+            enabled, _delay, domains, exclude = self._cfg()
+            if not enabled or not self._wanted(eid, domains, exclude):
+                logger.info("[归位] %s 到点，但策略已关/该设备已豁免 ⇒ 不动手", eid)
+                return
+            st = await self.ha.get_state(eid) if hasattr(self.ha, "get_state") else None
+            cur = None
+            if isinstance(st, dict):
+                cur = st.get("state")
+            elif st is not None:
+                cur = getattr(st, "state", None) or (st if isinstance(st, str) else None)
+            if cur is not None and str(cur) in ("off", "closed", "idle", "unavailable", "unknown"):
+                logger.info("[归位] %s 当前=%s，无需收尾", eid, cur)
+                return
+            dom = eid.split(".", 1)[0]
+            domain, svc = _CLOSE_SERVICE.get(dom, ("homeassistant", "turn_off"))
+            res = await self.ha.call_service(domain, svc, {"entity_id": eid})
+            ok = bool(res.get("success")) if isinstance(res, dict) else True
+            logger.info("[归位] %s 自动收尾 %s.%s → %s", eid, domain, svc,
+                        "成功" if ok else "失败:%s" % (res,))
+            if not ok:
+                # 失败不静默：再等一个周期重试一次，仍失败就放弃并留痕（不无限重试）
+                logger.warning("[归位] %s 收尾未成功，不再自动重试（避免与故障设备死循环）", eid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                   # noqa: BLE001
+            logger.exception("[归位] %s 收尾异常", eid)
+
+    # ── 观测/测试面 ────────────────────────────────────────────────
+    def pending(self) -> dict[str, Any]:
+        """当前登记待归位的实体（调试页与测试用；不含持久化承诺）。"""
+        now = asyncio.get_running_loop().time() if self._tasks else 0.0
+        return {eid: round(float(getattr(h, "_when", float("nan"))) - now, 1)
+                for eid, h in self._tasks.items()}
+
+    def cancel_all(self) -> None:
+        for h in self._tasks.values():
+            h.cancel()
+        self._tasks.clear()
+        for t in self._loops.values():
+            t.cancel()
+        self._loops.clear()

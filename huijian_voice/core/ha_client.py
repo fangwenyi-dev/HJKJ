@@ -196,6 +196,35 @@ class HAClient:
             return {"success": False, "message": "HA 通道异常", "raw": None,
                     "indeterminate": _indeterminate_exc(e)}
 
+    # HA 意图框架"没办事"的机器码。列进来的只可能是**明确没执行**的形状；
+    # 未知 code 一律不降级（宁可漏杀也不误杀真执行成功的回执——误杀会把已动的设备
+    # 说成没动，用户反而去重按，比漏杀更坏）。
+    _INTENT_FAIL_CODES = ("failed_to_handle", "no_intent_match", "not_supported", "not_found")
+
+    @staticmethod
+    def _intent_error(obj: dict) -> Optional[str]:
+        """回执里"HA 明确没执行"的证据 ⇒ 返回给用户的中文/原文话术；无证据返回 None。
+
+        出处（10-10 真机实锤，探针 _dbg_intent_path.py，射灯在 .91 上跑出来的原样回执）：
+        HassTurnOn 带 entity_id 时 HA 回 **HTTP 200** +
+          {"response_type":"error","data":{"code":"failed_to_handle"},
+           "speech":{"plain":{"speech":"Service handler cannot target all devices"}}}
+        旧归一兜底 `success = status < 300` 把它点亮成成功 ⇒ 话术播「好的」而 HA 侧
+        零状态变化（v1.0.21 / v1.0.34 / v1.0.39 假成功家族再来一枚）。
+        判据：**response_type / data.code 才证明"有没有办事"，HTTP 码只证明"有没有回"**。
+        """
+        rtype = str(obj.get("response_type") or "")
+        data_v = obj.get("data")
+        dcode = str(data_v.get("code") or "") if isinstance(data_v, dict) else ""
+        if rtype != "error" and dcode not in HAClient._INTENT_FAIL_CODES:
+            return None
+        sp = obj.get("speech") or obj.get("speech_result") or ""
+        if isinstance(sp, dict):
+            sp = (sp.get("plain") or {}).get("speech") or json.dumps(sp, ensure_ascii=False)[:120]
+        elif isinstance(sp, list) and sp:
+            sp = sp[0]
+        return str(sp or f"HA 意图未执行（{dcode or rtype}）")
+
     @staticmethod
     def _normalize_result(status: int, payload: str, name: str) -> dict:
         """防御式归一。可能的响应形制：
@@ -217,6 +246,12 @@ class HAClient:
             msg = obj.get("message") if isinstance(obj, dict) else str(obj)
             return {"success": False, "message": msg or f"HA 拒绝({status})", "raw": obj}
         if isinstance(obj, dict):
+            # 这道闸**先于所有早退出口**（含下面 `if "success" in obj`）：真机实锤过的
+            # "HTTP 200 + response_type=error" 形状若哪天同时带顶层 success，
+            # 挂在兜底里就白挂。判据与出处见 _intent_error。
+            err_msg = HAClient._intent_error(obj)
+            if err_msg is not None:
+                return {"success": False, "message": err_msg, "raw": obj}
             if "success" in obj:
                 return {**obj, "raw": obj}
             # v1.0.34（2026-09-10 实发）：旧版集成 AdjustDeviceAttribute 返回无

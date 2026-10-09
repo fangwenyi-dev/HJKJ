@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.3.0">
-<link rel="stylesheet" href="css/voice.css?v=1.3.0">
+<link rel="stylesheet" href="css/huijian.css?v=1.4.0">
+<link rel="stylesheet" href="css/voice.css?v=1.4.0">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -148,6 +148,10 @@
       <div><label><input id="dlg_context" type="checkbox" style="width:auto"> 上下文继承（"把它打开"跟随上一轮目标）</label></div>
       <div><label><input id="dlg_chain" type="checkbox" style="width:auto"> 复合句链发（"开灯再关窗帘"分步执行）</label></div>
       <div><label><input id="dlg_confirm" type="checkbox" style="width:auto"> 风险确认（解锁/删场景先问再办）</label></div>
+      <!-- ②「操作完成一定要关闭对应设备」（用户 2026-10-09 立规；判据见 core/auto_restore.py）
+           只归位"语音打开且已 grounded 到具体实体"的设备；区域扇出目标未知一律不动。 -->
+      <div><label><input id="dlg_restore" type="checkbox" style="width:auto"> 语音打开后自动收尾（默认：窗/灯，N 分钟后关回）</label>
+        <input id="dlg_restore_min" type="number" min="1" max="1440" step="1" style="width:64px"> 分钟</div>
     </div>
     <label class="hj-field">自定义纠错词条（JSON，一行一组；在内置 61 条之上叠加）</label>
     <textarea id="nlu_corr" placeholder='{"西顶灯": "吸顶灯"}'></textarea>
@@ -317,7 +321,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.3.0";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.4.0";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -552,6 +556,10 @@ async function loadSettings(){
   $("#dlg_context").checked = S.dialog?.context_enabled !== false;
   $("#dlg_chain").checked = S.dialog?.chain_enabled !== false;
   $("#dlg_confirm").checked = S.dialog?.confirm_risky !== false;
+  // opt-in 默认：缺键/老存档 ⇒ **未勾选**，与服务端 default False 同向。
+  // 旧写法 `!== false` 会把"没这个键"显示成"已开"，与实际行为相反（面板骗人）。
+  $("#dlg_restore").checked = S.dialog?.auto_restore === true;
+  $("#dlg_restore_min").value = Number(S.dialog?.auto_restore_min ?? 10);
   try { $("#sat_areas").value = JSON.stringify(S.spatial?.satellite_areas||{},null,0); } catch(e){}
   $("#music_wait").checked = S.music?.expect_wait_note !== false;
   seedMusicPanel();   // 先按已存值播种下拉/行编辑器，再异步拉 HA 播放器列表
@@ -761,7 +769,10 @@ $("#saveBtn").onclick = async ()=>{
     security:{ require_token:$("#req_token").checked },
     power:{ unload_when_idle_min: parseInt($("#unload").value,10)||0 },
     dialog:{ fallback_text: $("#fallback").value, context_enabled:$("#dlg_context").checked,
-             chain_enabled:$("#dlg_chain").checked, confirm_risky:$("#dlg_confirm").checked },
+             chain_enabled:$("#dlg_chain").checked, confirm_risky:$("#dlg_confirm").checked,
+             auto_restore:$("#dlg_restore").checked,
+             // 空/非法值不写进去：让服务端按已存值或默认走，绝不写 NaN（NaN 会绕过钳位）
+             ...((()=>{const v=parseInt($("#dlg_restore_min").value,10);return (v>=1&&v<=1440)?{auto_restore_min:v}:{}})()) },
     spatial:{ satellite_areas: safeJson($("#sat_areas").value, {}) },
     music:{ player_entity: $("#music_player").value.trim(),
             area_entities: _ma,
@@ -1117,6 +1128,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.3.0"></script>
+<script src="js/starsky.js?v=1.4.0"></script>
 </body>
 </html>
