@@ -711,7 +711,8 @@ class TurnDeviceIntentBase(intent.IntentHandler):
                     area_name,
                     results,
                 )
-                out = _all_window_result(area_name, action, results, failed_msgs)
+                out = _all_window_result(area_name, action, results, failed_msgs,
+                                         intent_obj.hass)
                 out.setdefault("control_targets",
                                [{"name": "窗户", "area": area_name or ""}])
                 return out

@@ -259,7 +259,10 @@ def test_v1052_f1_shape_pins_no_instance_timestamp_and_recheck():
 def _window_ns():
     return _extract_func(
         WINDOW,
-        ["_press_multi_buttons", "_all_window_result"],
+        # v1.4.4：`_all_window_result` 现在依赖 `_attach_window_close_targets`
+        # ⇒ 抽取名单必须跟着加。本文件 H4 那条"改返回形态必须 grep 全消费点"的病，
+        # 连**测试自己的装载名单**也算消费点（这次就是它先炸出 NameError 才提醒我）。
+        ["_press_multi_buttons", "_all_window_result", "_attach_window_close_targets"],
         {
             "BUTTON_DOMAIN": "button",
             "SERVICE_PRESS_BUTTON": "press",
@@ -409,3 +412,73 @@ def test_v1052_slots_marker_updated():
         encoding="utf-8")
     assert 'assert "_satellite_selfheal_at" in slots' not in marker, (
         "属性已删除，旧 marker 会让钉与实现打架")
+
+
+# ───────────────────────────────────────────────────────────── v1.4.4：全窗道也进归位契约
+def _window_ns_close():
+    """同一装载法，额外带进 `_attach_window_close_targets` 与两个依赖。"""
+    import logging
+
+    calls = []
+
+    def fake_covers(hass, button_ids):
+        calls.append(list(button_ids))
+        return getattr(hass, "covers", [])
+
+    ns = _extract_func(
+        WINDOW,
+        ["_all_window_result", "_attach_window_close_targets"],
+        {
+            "ACTION_CHINESE": {"open": "开启", "close": "关闭"},
+            "_LOGGER": logging.getLogger("t"),
+            "find_covers_for_buttons": fake_covers,
+        },
+    )
+    ns["__calls"] = calls
+    return ns
+
+
+def test_v144_全窗开向补close_entity_id_按下的按钮不当可关对象():
+    """「把办公室所有窗打开」也要进归位：control_targets 给**同设备 cover**，
+    且 `buttons` 仍是按钮（关不了窗）——绝不拿按钮实体冒充可关目标。"""
+    ns = _window_ns_close()
+    import types
+    hass = types.SimpleNamespace(
+        covers=[("开窗器A", "cover.a"), ("开窗器B", "cover.b")])
+    out = ns["_all_window_result"]("办公室", "open", ["button.a_open", "button.b_open"],
+                                   [], hass)
+    assert out["success"] is True and out["buttons"] == ["button.a_open", "button.b_open"]
+    rows = out["control_targets"]
+    assert [r["close_entity_id"] for r in rows] == ["cover.a", "cover.b"], rows
+    assert all("button." not in r["close_entity_id"] for r in rows), rows
+    # 解析喂进去的必须是**已按下的按钮**，不是凭空造的名单
+    assert ns["__calls"] == [["button.a_open", "button.b_open"]], ns["__calls"]
+
+
+def test_v144_关向与无cover与无hass三种情形都不写键():
+    """关向没有"再关一次"的归位语义；纯按钮机型没有 cover；没给 hass（旧 4 参调用）
+    ⇒ 三种情形一律**不写 close_entity_id**，加载项因此不登记（v1.4.3 同一纪律）。"""
+    import types
+    ns = _window_ns_close()
+    hass_cov = types.SimpleNamespace(covers=[("开窗器A", "cover.a")])
+    # ① 关向
+    out = ns["_all_window_result"]("办公室", "close", ["button.a_close"], [], hass_cov)
+    assert "control_targets" not in out, out
+    # ② 开向但机型没有 cover 实体
+    out = ns["_all_window_result"]("办公室", "open", ["button.a_open"],
+                                   [], types.SimpleNamespace(covers=[]))
+    assert "control_targets" not in out, out
+    # ③ 旧 4 参形态（既有 5 处测试都这么调，必须原样可用）
+    out = ns["_all_window_result"]("客厅", "open", ["button.a"], ["卧室平开窗 按压超时"])
+    assert out["success"] is True and "control_targets" not in out, out
+
+
+def test_v144_部分失败仍带契约_且partial_error不被吞():
+    """5 扇败 2 扇时话术折叠是 v1.1.38 的旧病；本版加契约**不得**把 partial_error 挤掉。"""
+    import types
+    ns = _window_ns_close()
+    hass = types.SimpleNamespace(covers=[("开窗器A", "cover.a")])
+    out = ns["_all_window_result"]("展厅", "open", ["button.a"], ["厨房窗：超时"], hass)
+    assert out["success"] is True
+    assert "partial_error" in out and "未成功" in out["partial_error"], out
+    assert out["control_targets"][0]["close_entity_id"] == "cover.a", out

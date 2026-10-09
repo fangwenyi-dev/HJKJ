@@ -302,13 +302,43 @@ async def _press_multi_buttons(
     return results, failed_msgs
 
 
+def _attach_window_close_targets(hass, area_name, action, results, out):
+    """把已按下的开窗按钮映射到同设备 cover，写进 `control_targets`（v1.4.4 全窗道）。
+
+    与单扇道（v1.4.3）同一形状、同一纪律：只有 `action == "open"` 才写；
+    解析失败或该机型没有 cover 实体 ⇒ **不写键**（加载项因此不登记）。
+    绝不把按钮实体当可关对象——那是"看着能关、实际不动"的假覆盖。
+    """
+    if hass is None or action != "open" or not results:
+        return out
+    try:
+        covers = find_covers_for_buttons(hass, list(results))
+    except Exception as err:                       # noqa: BLE001
+        _LOGGER.warning("全窗 close_entity_id 解析失败 %s: %s", list(results), err)
+        covers = []
+    if covers:
+        out["control_targets"] = [
+            {"name": dev_name, "area": area_name or "", "close_entity_id": cover_entity_id}
+            for dev_name, cover_entity_id in covers
+        ]
+    return out
+
+
 def _all_window_result(
     area_name: str | None,
     action: str,
     results: list[str],
     failed_msgs: list[str],
+    hass=None,
 ) -> dict:
-    """全窗按压的统一裁决：全成/部分成/全败三种话术，部分失败绝不折叠成全成功。"""
+    """全窗按压的统一裁决：全成/部分成/全败三种话术，部分失败绝不折叠成全成功。
+
+    v1.4.4（10-10）：全窗道也补上 **② 的归位契约**（单扇在 v1.4.3 已补）。
+    `results` 是**已按下的按钮实体 id**，而按钮关不了窗 ⇒ 用**既有** `find_covers_for_buttons`
+    （百分比定位道/参数通道同源在用）映射到同设备 cover，按 v1.4.3 同一形状写
+    `control_targets[i].close_entity_id`；**只有开向写**（方向由真源判，加载项不猜），
+    没有 hass / 没有 cover 实体（纯按钮机型）⇒ 不写键，加载项因此不登记。
+    """
     action_cn = ACTION_CHINESE.get(action, action)
     area_label = (area_name + chr(30340)) if area_name else ""
     if not results:
@@ -319,7 +349,7 @@ def _all_window_result(
         }
     if failed_msgs:
         _pe = f"{len(failed_msgs)}扇未成功：{'；'.join(failed_msgs[:3])}"
-        return {
+        return _attach_window_close_targets(hass, area_name, action, results, {
             "success": True,
             "message": (
                 f"已将{area_label}{len(results)}扇窗{action_cn}，"
@@ -332,12 +362,12 @@ def _all_window_result(
             # "N 扇压根没动"被折成 success=True 全绿，回放还播「已执行场景：X」。
             "partial_error": _pe,
             "buttons": results,
-        }
-    return {
+        })
+    return _attach_window_close_targets(hass, area_name, action, results, {
         "success": True,
         "message": f"已{area_label}所有窗户{action_cn}",
         "buttons": results,
-    }
+    })
 
 
 class ControlWindowIntent(intent.IntentHandler):
@@ -463,7 +493,8 @@ class ControlWindowIntent(intent.IntentHandler):
                             results, failed_msgs = await _press_multi_buttons(
                                 intent_obj.hass, intent_obj.context, action, all_buttons
                             )
-                            return _all_window_result(area_name, action, results, failed_msgs)
+                            return _all_window_result(area_name, action, results, failed_msgs,
+                                                      intent_obj.hass)
                     return {
                         "success": False,
                         "error": f"Could not find any {action} buttons in {area_name}",
@@ -489,7 +520,8 @@ class ControlWindowIntent(intent.IntentHandler):
                         results, failed_msgs = await _press_multi_buttons(
                             intent_obj.hass, intent_obj.context, action, all_buttons
                         )
-                        return _all_window_result(area_name, action, results, failed_msgs)
+                        return _all_window_result(area_name, action, results, failed_msgs,
+                                                  intent_obj.hass)
                 return {
                     "success": False,
                     "error": f"Could not find any {action} buttons in {area_name}",
