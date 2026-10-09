@@ -273,9 +273,16 @@ def _bulk_area_prefix(args) -> str:
         return ""
 
 
-def _bulk_all_devices_slot(args: dict) -> bool:
-    """本次批量是否为"所有设备"口径（域集覆盖可开关白名单）。
+def _bulk_all_devices_slot(args: dict, flags=frozenset()) -> bool:
+    """本次批量是否为"所有设备"口径。
 
+    **旗标优先**（第七轮审计 B2）：旧判据是"域集 ⊇ 白名单"的集合相等——它同时
+    是这条口径唯一的身份来源，于是「关闭**展厅**所有灯」这类**单域批量**只要
+    表长出来恰好覆盖白名单就会误触发这条"还有多少台没动"的注，把"只关灯"念成
+    "整个展厅还有一堆没动"（播报噪音＝对用户编了个不相干的因果）。t0 在
+    `_area_bulk_target` 里产这条口径时已经打了 `FLAG_AREA_BULK`＋空名，旗标才
+    是"这是设备面批量"的**权威身份**；域集判据降级为**旗标传不到时**（链里
+    次腿不随 extra_steps 带 flags、旧回放、直呼 Executor 的测试）的兼容形状。
     只有它需要如实交代"还有哪些台不支持开关、没动"——用户点名「所有灯」时
     不提空调是正解，提了反而是噪音。永不抛。
     """
@@ -283,6 +290,14 @@ def _bulk_all_devices_slot(args: dict) -> bool:
         wl = set(capability.BULK_TOGGLEABLE_DOMAINS)
         for slot in ((args or {}).get("target") or []):
             for d in ((slot or {}).get("devices") or []):
+                # 空名是**设备面**的形状本身（「所有灯」这类具名批量带的是用户说的
+                # 那个词），旗标只回答"这条是不是区域批量"。两件都得在：只看旗标会把
+                # 「关闭办公室所有灯」也念成"还有多少台没动"，只看集合判据又会给
+                # "具名批量的域集恰好铺满白名单"那种表漂移留误判面（B2 两个方向）。
+                if str((d or {}).get("name") or "").strip():
+                    continue
+                if "area_bulk" in (flags or ()):
+                    return True
                 if set(str(x) for x in ((d or {}).get("domains") or [])) >= wl:
                     return True
         return False
@@ -879,8 +894,38 @@ class Executor:
         groups: dict = {}
         for e in bulk:
             groups[dev_of[e]] = groups.get(dev_of[e], 0) + 1
+        _unzoned = self._bulk_unzoned_shadow(states, area, wl, area_map,
+                                             dev_map, sat)
         return {"collapse": len(doms) > 1, "sat_devices": sat, "dev_of": dev_of,
-                "groups": groups}
+                "groups": groups, "unzoned": _unzoned, "touched_area": bool(bulk)}
+
+    def _bulk_unzoned_shadow(self, states: dict, area: str, wl: set,
+                             area_map: dict, dev_map: dict, sat: set) -> list[str]:
+        """本区域批量面上"整台没登记区域"的候选（core 侧视图，v1.2.11）。
+
+        与集成侧 `find_bulk_entities_by_area` 的 tier 2 同判据的**近似**：域在白名单、
+        `_entity_area` 取不到归属（含设备层继承）、友好名里没有**别的**注册区域名
+        （有就是确凿别区，本来就该静默不动）。core 侧拿不到设备显示名，所以只在
+        友好名上找区域词 ⇒ 只会**少数**不会多数；最终是否真"没跟着动"由调用方拿
+        **回执**再减一次（集成侧才是执行权威）。永不抛。
+        """
+        try:
+            other = [str(n) for n in (getattr(self.ha, "_areas", {}) or {}).values()
+                     if n and str(n) != area]
+            out: list[str] = []
+            for eid, ent in (states or {}).items():
+                if area_map.get(eid) or str(eid).split(".", 1)[0] not in wl:
+                    continue
+                if (dev_map.get(eid) or f"@{eid}") in sat:
+                    continue
+                fn = str(((ent or {}).get("attributes") or {})
+                         .get("friendly_name") or "") or str(eid)
+                if any(o and o in fn for o in other):
+                    continue
+                out.append(str(eid))
+            return out
+        except Exception:  # noqa: BLE001
+            return []
 
     def _bulk_dev_count(self, targets: list) -> int:
         """回执行了台数（一台三路开关模块的三条通道＝1 台）。
@@ -912,7 +957,7 @@ class Executor:
                 return len(cands or [])
         return self._bulk_dev_count(rows) or len(cands or [])
 
-    async def _bulk_skipped_note(self, args: dict) -> str:
+    async def _bulk_skipped_note(self, args: dict, result=None) -> str:
         """「(区域)所有设备」没碰到的部分，分因如实报（v1.2.10 用户拍板口径）。
 
         · **功能位**：同一台设备名下、被"只动电源位"折叠掉的那些条（空调的
@@ -979,9 +1024,84 @@ class Executor:
                 # 防自杀式静音：卫星的麦克风开关/媒体播放器都在可开关域里，客户把它
                 # 登记在房间里的话，「所有设备」就会把它自己关掉——下一句再没人听得见。
                 segs.append(f"{len(own_devs)} 台是语音卫星自身")
-            return ("另有 " + "、".join(segs) + "，都没动") if segs else ""
+            tail = ("另有 " + "、".join(segs) + "，都没动") if segs else ""
+            # v1.2.11：批量面按**区域证据**展开后，"没登记房间"的那一批要么被
+            # 兜底一起动了、要么被区域实锤遮掉——两种都必须说出来（判据见
+            # `_bulk_unzoned_segs`）。静默处理＝拿一句「已关闭」替一份残缺的
+            # 注册表背书，正是本仓"半假成功/静默跳过"那条老账的形状。
+            parts = self._bulk_unzoned_segs(args, result, states, view)
+            if tail:
+                parts.append(tail)
+            return "；".join(parts)
         except Exception:  # noqa: BLE001 数不出来就不说，绝不编
             return ""
+
+    def _bulk_unzoned_segs(self, args: dict, result, states: dict,
+                           view: Optional[dict] = None) -> list[str]:
+        """批量面里"整台没登记区域、却被一起动了"的设备，点名说给用户（v1.2.11）。
+
+        执行面（`intent_window_const.find_bulk_entities_by_area`）按**区域证据**收
+        集成侧 `find_bulk_entities_by_area` 按**区域证据**三档选实体，与窗控同一条
+        纪律：本房间有区域实锤 ⇒ 只动实锤；一条实锤都没有 ⇒ 才把"整台没挂区域"的
+        候选兜底放行。两种结果都必须说出来——不说就是拿一句「已关闭」替一份残缺的
+        注册表背书（本仓"半假成功/静默跳过"老账），而且这一档本身就是诊断：用户
+        听见「没登记房间」就会去 HA 把设备归到房间，补上之后这句话自动消失。
+        · **一起动了**（兜底放行）：回执里真动了、但注册表没有区域归属；
+        · **没跟着动**（被实锤遮掉）：候选里没进回执的那些，附"归到本区域就一起动"。
+
+        判据只用**回执**（集成侧真动了谁）＋ core 的注册表视图，绝不在此重算 tier
+        三档——重算就是第二条时钟，"区域"的判据必须只有一处（本仓"一条链一个时钟"）。
+        台数按 device_id 归堆（一台三路开关＝一台），拿不到 device_id 时各自成组
+        （与集成侧 `_bulk_one_per_device` 同口径，宁多不少）。回执读不出 entity_id
+        ⇒ 一个字都不说（绝不编数）。永不抛。
+        """
+        segs: list[str] = []
+        try:
+            cts = (result or {}).get("control_targets") or []
+            if not isinstance(cts, list) or not cts:
+                return segs
+            emap = getattr(self.ha, "_entity_area", {}) or {}
+            dev_map = getattr(self.ha, "_entity_device", {}) or {}
+            touched = [str((t or {}).get("entity_id") or "")
+                       for t in cts if isinstance(t, dict)]
+            if not any(touched):
+                return segs              # 旧集成/窗侧回执形制：数不出就不说
+
+            def bucket(eids):
+                devs: set = set()
+                names: list[str] = []
+                for e in eids:
+                    devs.add(dev_map.get(e) or f"@{e}")
+                    nm = str((((states or {}).get(e) or {})
+                              .get("attributes") or {})
+                             .get("friendly_name") or "").strip() or e
+                    if nm not in names:
+                        names.append(nm)
+                shown = ("（" + "、".join(names[:3])
+                         + ("…" if len(names) > 3 else "") + "）") if names else ""
+                return len(devs), shown
+
+            area = _bulk_area_prefix(args).rstrip("的 ")
+            area_say = f"「{area}」" if area else "本区域"
+
+            moved = [e for e in touched if e and not emap.get(e)]
+            if moved:
+                n, shown = bucket(moved)
+                segs.append(f"其中 {n} 台没登记房间，按{area_say}一起动了{shown}"
+                            f"——在 HA 里给它们归好区域，这句就没了")
+            # 本区域**有**区域实锤 ⇒ 无证据候选被集成侧遮掉（与窗控同一条纪律）。
+            # 用户以为"这间房全关了"，必须点名；一条实锤都没有时不走这支
+            # （那些已经落进上面那句「一起动了」）。
+            view = view or {}
+            if view.get("touched_area"):
+                shadow = [e for e in (view.get("unzoned") or []) if e not in touched]
+                if shadow:
+                    n, shown = bucket(shadow)
+                    segs.append(f"另有 {n} 台没登记房间，这次没跟着动{shown}"
+                                f"——在 HA 里把它们归到{area_say}就会一起动")
+        except Exception:  # noqa: BLE001 数不出来就不说，绝不编
+            return segs
+        return segs
 
     async def run(self, plan: Plan) -> tuple[bool, str]:
         """执行 Plan（klar 多分句/复合链逐步顺序执行）。返回 (success, 中文播报)。永不抛。"""
@@ -1125,8 +1245,11 @@ class Executor:
                     no_receipt.append(nm)
             # v1.2.10「(区域)所有设备」：只数**没碰**的台数，成功支与后继腿早退支
             # 共用同一条注（走 _accum_notes），不得因后面一腿被闸拦下而蒸发。
-            if not skip_note and _area_bulk_slot(args) and _bulk_all_devices_slot(args):
-                skip_note = await self._bulk_skipped_note(args)
+            if not skip_note and _area_bulk_slot(args) and \
+                    _bulk_all_devices_slot(args, getattr(plan, "flags", ())):
+                # 旗标优先（B2）：旗标传不到（链里次腿不带 flags、旧回放）时
+                # `_bulk_all_devices_slot` 内部退回集合+空名判据，逐字等于旧形。
+                skip_note = await self._bulk_skipped_note(args, result)
             if len(steps) > 1:
                 # 逐腿留痕（D2 旧病：整链只印首步的 intent/args，第二腿在账上不存在，
                 # 现场无法对账"到底动了几台"）；通道名一并印——D6 的病灶正是"走了

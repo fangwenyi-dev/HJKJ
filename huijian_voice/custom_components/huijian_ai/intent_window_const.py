@@ -707,6 +707,89 @@ def find_all_window_buttons_by_action(
     return result
 
 
+def find_bulk_entities_by_area(hass, area_name: str | None, domains) -> list[str]:
+    """「(区域)所有设备」批量面：按**区域证据**三档选实体（v1.2.11，不是 HA 严格区域匹配）。
+
+    病灶（办公 .91 现场两条实锤）：
+      · `async_match_targets(area_name=…)` 对"区域"只认注册表归属，而网关设备常常
+        整台没挂区域 ⇒ 只剩空调/灯，「关闭办公室所有设备」播「已关闭」而窗纹丝不动；
+        同房间说「所有窗户」却能成——窗控那条走的就是本文件这套三档区域证据。
+        两条车道对"区域"必须同一个口径，否则用户在同一间房拿到两个答案。
+      · 但**不能**把"没有任何区域证据"的实体无条件算进本房间：.91 实测无证据的
+        可开关设备里除了办公室平开窗，还有**厕所推拉门**——无条件带上＝一句
+        「关闭办公室所有设备」把厕所门也关了（v1.0.90「不敢把整屋设备冒按」同族，
+        红线：绝不猜房间）。
+
+    三档判据与窗控**同源**（同一批单源 helper：`_build_area_constraint`/
+    `_entity_effective_area`/`_candidate_area_tier`），收口也**逐字同一条**：
+      · tier 0/1（区域实锤 / 友好名·设备名回声明）= `hard` → 收；
+      · tier 2（整台没登记区域）= `loose` → 只在 **hard 为空**时兜底放行
+        （小家庭、全没挂区域的现场照能用；这就是 v1.0.71 窗控立下的那条纪律）；
+      · tier −1（确凿挂别区、或友好名/设备名明写别屋）= 剔除，**永不放行**
+        （红线：没点名的设备任何方向都不动、绝不猜房间）。
+    本函数换的是"匹配的**判据**"（从 HA 严格注册表匹配换成区域证据），**没有**放宽
+    "无证据不算在本房间"这条——那一条松掉就是上面第二条实锤。
+    被遮掉的 `loose` 不许静默吞掉：由 core 侧 `Executor._bulk_unzoned_segs` 拿注册表
+    视图点名说给用户（「另有 N 台没登记房间，这次没跟着动——归到本区域就会一起动」），
+    兜底放行时同样点名（那时是真动了）。静默处理＝拿一句「已关闭」替一份残缺的
+    注册表背书，正是本仓"半假成功/静默跳过"那条老账。
+    永不抛：注册表形态异常 ⇒ 回空表，调用方退回 HA 严格匹配（逐字节等于旧行为）。
+    """
+    try:
+        from homeassistant.helpers import area_registry as ar
+        from homeassistant.helpers import device_registry as dr
+        from homeassistant.helpers import entity_registry as er
+
+        wanted = {str(d).split(".", 1)[0] for d in (domains or []) if str(d)}
+        if not wanted:
+            return []
+        entity_registry = er.async_get(hass)
+        device_registry = dr.async_get(hass)
+        target_id, area_norm, signals = _build_area_constraint(
+            ar.async_get(hass), area_name)
+        hard: list[str] = []
+        loose: list[str] = []
+        for state in hass.states.async_all():
+            eid = str(getattr(state, "entity_id", "") or "")
+            if not eid or eid.split(".", 1)[0] not in wanted:
+                continue
+            if str(getattr(state, "state", "") or "") == "unavailable":
+                continue
+            entry = entity_registry.async_get(eid)
+            if entry is None:
+                continue
+            cand_area, dev_display = _entity_effective_area(
+                entity_registry, device_registry, eid)
+            text_norm = _norm_area_token(
+                f"{getattr(state, 'name', '') or ''} {dev_display or ''}")
+            tier = _candidate_area_tier(cand_area, text_norm, target_id,
+                                        area_norm, signals)
+            if tier < 0:
+                continue
+            (loose if tier >= 2 else hard).append(eid)
+        if hard and loose:
+            _LOGGER.info("bulk: %d area-evidenced entity(ies) in %r shadow %d "
+                         "unknown-area candidate(s): %s",
+                         len(hard), area_name, len(loose), loose)
+        # 收口纪律与窗控 `find_all_window_buttons_by_action` **逐字同一条**：有区域
+        # 实锤就只动实锤，一条实锤都没有时才按"无证据"兜底放行（小家庭/全没挂区域
+        # 的现场照能用，与 v1.0.71 那条纪律同源）。
+        # 为什么设备面也不放开——本轮实测推翻了我最初的"放开"方案，这是决定性证据：
+        # .91 未登记区域的可开关候选里，除了办公室两扇开窗器，还有**厕所推拉门**和
+        # **小米小爱音箱**；一句「关闭办公室所有设备」把它们一起带走＝跨房关门＋关掉
+        # 别处音箱，正撞 v1.0.90「不敢把整屋设备冒按」与「绝不猜房间」两条红线。
+        # 区域归属只能来自注册表，代码补不出来；补不出来就不能靠猜来兑现承诺。
+        # 所以本道的正解是**不遮声**而不是**放开**：被遮掉的候选交给 core 侧
+        # `Executor._bulk_unzoned_segs` 拿注册表视图点名说给用户（"这几台没登记房间，
+        # 归到本区域就会一起动"）——用户第一次听见就知道去 HA 补哪一台，而不是事后
+        # 猜"我说的办公室怎么把厕所门开了"。兜底放行时同样点名（那时是真动了）。
+        return hard if hard else loose
+    except Exception:  # noqa: BLE001 拿不到注册表=不接管，交回 HA 严格匹配兜底
+        _LOGGER.warning("bulk area-evidence scan failed; caller falls back",
+                        exc_info=True)
+        return []
+
+
 def find_covers_for_buttons(hass, button_entity_ids: list[str]) -> list[tuple[str, str]]:
     """窗类按钮实体 → 同设备 cover 实体，返回 [(设备名, cover_entity_id)]。
 

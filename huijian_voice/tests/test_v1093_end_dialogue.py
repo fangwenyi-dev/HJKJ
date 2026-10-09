@@ -129,7 +129,7 @@ def _mk_pipe_stub(reply_plan):
     p._last = {}
     p.ha = SimpleNamespace(fire_event=lambda *a: None)
 
-    async def _confirm_answer(text, origin):
+    async def _confirm_answer(text, origin, *, raw_text=""):
         return None
 
     async def _voice_creation(text, origin):
@@ -138,7 +138,7 @@ def _mk_pipe_stub(reply_plan):
     async def _try_compound(text, origin):
         return None
 
-    async def _match_pair(text):
+    async def _match_pair(text, origin=""):
         return reply_plan, None
 
     p._confirm_answer = _confirm_answer
@@ -243,10 +243,10 @@ def test_chain_end_clause_filtered_and_flagged():
     p._confirm = {}
     ran = {}
 
-    async def _confirm_answer(text, origin):
+    async def _confirm_answer(text, origin, *, raw_text=""):
         return None
 
-    async def _match_pair(clause):
+    async def _match_pair(clause, origin=""):
         if clause == "退下":
             return Plan(intent=END_DIALOGUE_INTENT, args={},
                         source="t0_end"), None

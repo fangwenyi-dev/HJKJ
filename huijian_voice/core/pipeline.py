@@ -256,7 +256,65 @@ _TAIL_TOKENS = (
     r"打开|开启|开一下|启动|关闭|关掉|关上|关了|停止|调成|调到|调节|调整|调|设成|设为|"
     r"设置|设为|切换|改成|变成|成|为|到|至|亮|暗|一下|一些|一|点|些|所有|全部|都|全|"
     r"部|每|任何|个|只|盏|根|台|头|的|地|得|了|吗|呢|吧|啊|啦|哦|呀|嗯|度")
+# 第六轮审计 A8（v1.2.10 实测·整机级）：这里原本是 `(?:TOK)+$`——词元表里有
+# 「一些|一|些」「全部|全|部」这类**可两切**的成员，遇到"剥不干净又收尾非词表字"
+# 的长串（远场/静音段 ASR 复读幻听），`+` 会在每个位置重试两种切法 ⇒ 指数回溯。
+# 实测：`一些`×20（41 字）0.85s、×24（49 字）**11.5~18.2s**、`全部`×28 **267s**，
+# 全程无 await，而同步跑在 HA 事件循环里（本加载项就跑在 HA loop 内）——一句话
+# 能把整机拖住十几秒到分钟级，且 :448 的 `2<=len(pre)<=4` 弃权判据排在剥尾**之后**，
+# 花完这些时间最终什么也没拦。一轮还要跑 3~4 次，复合链每分句再各一遍。
+# 现状（第七轮审计 A8 勘误）：**这个正则已经不被调用**——生效的是下面
+# `_strip_tail_tokens` 的线性等价实现。此处原有两段注释自相矛盾（一段写"改成一次
+# 只剥一个词元、逐次剥离交给下面的循环"，另一段写"曾试过…别再走这条路"），且两段
+# 都与代码不符：照第一段动手的人会去拆真正生效的那道刹车，所以只留事实、不留方案。
+# 留着这个编译对象是给"等价性"对照钉当参照物（钉拿它与 DP 实现穷举对拍），别顺手清。
+# 对照 `_NAME_HEAD_STRIP`：它形如 `(?:TOK)+` 却锚在 `^`、无尾锚 ⇒ 失配即返回，
+# 实测 0.000s，不在此险区，故不动它。
 _NAME_TAIL_STRIP = re.compile(r"(?:" + _TAIL_TOKENS + r")+$")
+# 第六轮审计 A8（v1.2.10 实测·整机级）：上面这个 `(?:TOK)+$` 的词元表里有
+# 「一些|一|些」「全部|全|部」这类**可两切**成员，遇"收尾不是任何词元"的长串
+# （远场/静音段 ASR 复读幻听）会指数回溯：实测「一些」×24（49 字）单次 sub
+# = 11.5~18.2s、「全部」×28（57 字）= **267s**，全程同步无 await 跑在 HA 事件循环里
+# ⇒ 一句话把整机拖住十几秒到分钟级；而下面 :448 的弃权判据排在剥尾**之后**，
+# 花完时间什么也没拦住（一轮还要跑 3~4 次，复合链每分句再各一遍）。
+# 修法只治成本、不动判据：爆炸**只发生在失配路径**上，而"会不会匹配"的精确线性
+# 判据就是 `cur.endswith(词元表)`（C 层实现，O(n·k) 无回溯）。不匹配时正则本来
+# 也只能整体失配返回原串 ⇒ 跳过它，终态逐字节等价。
+# ⚠ 曾试过把 `+$` 改成"一次剥一个词元"（`(?:TOK)$`＋逐步循环）：它确实线性，
+#   但**改了判据**——v1.1.36 复核⑥ 的孤字下限 `(len(tail) < 2 <= len(cur))` 依赖
+#   `+` 一步跳到终态，粒度变细后刹车落在不同中间态上，三条既有钉当场转红
+#   （test_v1136_area_modifier ×2、test_v1136_second_batch ×1）。别再走这条路。
+_TAIL_TOKEN_TUPLE = tuple(_TAIL_TOKENS.split("|"))
+_TAIL_TOKEN_SET = frozenset(_TAIL_TOKEN_TUPLE)
+_TAIL_MAX_TOKEN_LEN = max(len(w) for w in _TAIL_TOKEN_TUPLE)
+
+
+def _strip_tail_tokens(cur: str) -> str:
+    """剥掉句尾"整段可由词元表拼成"的最长后缀——`(?:TOK)+$` 的**线性等价实现**。
+
+    为什么不用那个正则本身：表里有「一些|一|些」「全部|全|部」这类可两切成员，
+    串中间又夹着一个非词元字（ASR 幻听「一些…阳的」）时，`+` 会在每个起点上
+    把两种切法各重试一遍直到确认失配 ⇒ 实测 49 字 11.5~18.2s、57 字 267s，
+    全程同步跑在 HA 事件循环里＝一句话冻整机（:448 的弃权判据还排在它后面，
+    花完时间什么也没拦）。先试 `cur.endswith(表)` 只挡掉"句尾非词元"那一半，
+    夹心形照样炸——故改此处自算。
+    判据逐字保持：原正则的最左匹配 = 让 `text[i:]` 能整段切成词元串的**最小 i**
+    （非重叠、只有一个匹配，因为它锚在 `$`）。这里用一次从右往左的 DP 求出全部
+    可切点，取最小者；不可切则原样返回（= 原来的整体失配）。O(n·k)。
+    """
+    n = len(cur)
+    if n == 0:
+        return cur
+    cut = None
+    ok = [False] * (n + 1)
+    ok[n] = True
+    for i in range(n - 1, -1, -1):
+        for ln in range(1, min(_TAIL_MAX_TOKEN_LEN, n - i) + 1):
+            if ok[i + ln] and cur[i:i + ln] in _TAIL_TOKEN_SET:
+                ok[i] = True            # 最左可切点即 sub 的起点，继续往左找
+                cut = i
+                break
+    return cur if cut is None else cur[:cut]
 
 # 「这段不像名字，别拿它去判有没有这台设备」的两种形状（v1.1.36 复核批二）。
 # 形状一：动词语素开头 + 趋向补语/短小 —— 锁上门 / 关好门 / 反锁上门 / 暂停扫地机 /
@@ -429,8 +487,13 @@ def _unknown_spoken_device_name(text: str, words, device_names,
                 if head == cur:
                     break
                 cur = head
+            # A8（第七轮审计勘误）：这里**没有** endswith 门——旧写法用
+            # `cur.endswith(词元表)` 只挡掉"句尾非词元"那一半，夹心形照样进正则炸
+            # 回溯，所以终态改由 `_strip_tail_tokens` 自算 DP 一次求出最左可切点。
+            # 循环结构与刹车（一步到终态、跌破 2 字即停）一字未动；要改判据先看
+            # 该函数注释里的等价性对拍，别在这里加回 endswith 当作"优化"。
             while True:
-                tail = _NAME_TAIL_STRIP.sub("", cur).strip()
+                tail = _strip_tail_tokens(cur).strip()
                 if tail == cur or (len(tail) < 2 <= len(cur)):
                     break
                 cur = tail
@@ -1046,7 +1109,15 @@ class Pipeline:
         听到别人房间的回答）。"""
         # 第四轮审计 P2：键用 canonical() 归一——「调亮一点/请调亮一点/调亮一点吧」
         # 是同一句的三种转写，旧键按原文分桶 ⇒ 三条各执行一遍（相对量叠加）。
-        return (origin or "", canonical(text))
+        # 第六轮审计 B14（v1.2.10 实测）：这里**没带 settings**，而级联入口
+        # `canonical(text, self.settings)` 带了 ⇒ 用户手工纠错表
+        # （nlu.corrections_extra，正是为听岔写法准备的那张）在键侧不参与归一：
+        # 「关掉蒸汽灯」(纠错表→射灯) 与「关掉射灯」在级联里是同一句、在键里是
+        # 两个桶 ⇒ dedup_window_s 内重说一遍即**重复下发**（相对量 ±10% 叠加、
+        # 锁/卷帘/扫地机这类非幂等动作做两遍）。第四轮 P2 的修法在纠错表这一维没生效。
+        # 键与级联必须同源，故带 self.settings。裸对象直调本方法的钉（无 settings
+        # 属性）保持旧行为：canonical(text, None) 就是不带纠错表的归一。
+        return (origin or "", canonical(text, getattr(self, "settings", None)))
 
     async def _dedup_gate(self, text: str, origin: str = "") -> Optional[Reply]:
         """契约 §1.4-② 短时去重的成熟形态：
@@ -1123,9 +1194,11 @@ class Pipeline:
             logger.debug("[词表] 动态同步异常", exc_info=True)
 
     # ── 两路并行判定（P0-1）────────────────────────────────────
-    async def _match_fp(self, text: str) -> Optional[Plan]:
+    async def _match_fp(self, text: str, origin: str = "") -> Optional[Plan]:
+        # origin 只给 t0 一条用途：未点名区域的「所有设备」句折**本卫星区域**
+        # （见 fast_path._wholehouse_plan）；其余判据逐字不看它，直呼方传空串零漂移。
         try:
-            return await self.fast_path.match(text)
+            return await self.fast_path.match(text, origin)
         except Exception:
             logger.exception("[级联] fast_path 异常（视为未命中）")
             return None
@@ -1137,9 +1210,11 @@ class Pipeline:
             logger.exception("[级联] klar 异常（fail-open，视为未命中）")
             return None
 
-    async def _match_pair(self, text: str) -> tuple[Optional[Plan], Optional[Plan]]:
+    async def _match_pair(self, text: str,
+                          origin: str = "") -> tuple[Optional[Plan], Optional[Plan]]:
         """fp 与 klar 互不依赖：gather 并行，关键路径不再串行吃 klar 的 HTTP 往返。"""
-        return await asyncio.gather(self._match_fp(text), self._match_klar(text))  # type: ignore[return-value]
+        return await asyncio.gather(self._match_fp(text, origin),
+                                    self._match_klar(text))  # type: ignore[return-value]
 
     # ── 级联主流程 ─────────────────────────────────────────────
     async def _cascade(self, text: str, origin: str = "",
@@ -1148,9 +1223,10 @@ class Pipeline:
         # 承接/复合拆分/fp∥klar/查询族/LLM 兜底吃同一文本（旧状：corrector 只在
         # fp 内生效，「开床器电量多少」fp 认得、query 不认得——同句因档位而异
         # 即漂移源）。幂等纪律见 canonical 模块头；fp 内部原调用保留作纵深。
+        raw_text = text            # A9：整句等值表必须还能看到折字前的原话
         text = canonical(text, self.settings)
         # P2-13 确认环优先：有 pending 时本句是对问句的回答（是/否/改口）
-        answered = await self._confirm_answer(text, origin)
+        answered = await self._confirm_answer(text, origin, raw_text=raw_text)
         if answered is not None:
             return answered
 
@@ -1204,7 +1280,7 @@ class Pipeline:
             return chain
 
         # ⓪①②③④ klar 引擎与 T0/T1/场景并行判定，三层裁决（见模块头）
-        fp_plan, kl_plan = await self._match_pair(text)
+        fp_plan, kl_plan = await self._match_pair(text, origin)
         plan = select_primary_plan(fp_plan, kl_plan, self._known_areas(),
                                  self._device_names(), self._real_areas())
         if plan is None:
@@ -2158,7 +2234,7 @@ class Pipeline:
             clauses = T.coord_clauses(text)
         if not clauses:
             return (None, None, [], False)
-        pairs = await asyncio.gather(*[self._match_pair(c) for c in clauses])
+        pairs = await asyncio.gather(*[self._match_pair(c, origin) for c in clauses])
         plans: list[Plan] = []
         chain_spec: Optional[dict] = None       # 链内回指：同句先行分句的具名目标
         for (fpp, klp), clause in zip(pairs, clauses):
@@ -2337,6 +2413,12 @@ class Pipeline:
         # 回指标记：fast_path 已裁定的"代词目标/回指"以**旗标**为准（trace 文案
         # 只作诊断，改措辞不得改语义）；裸代词句与句首副词句式（"再打开"/"把它
         # 关了"）兜底文本级判定。
+        # ⚠ 第七轮审计 A3 的分职说明（两处 `"们" in text` **同名不同职**，别再当
+        #   一处改）：本行这份只管"**没有明示目标的句子要不要沿用上一轮目标**"
+        #   （「关闭卧室空调」→「我们都关掉」：继承空调才是正解）；`_is_anaphoric`
+        #   那份管"已解析出的目标是不是回指来的、能不能再叠卫星区域"，A3 收窄的是
+        #   那一份。带明示目标的「我们把灯打开」在 :2305 就早退，根本走不到这里
+        #   （实测两分支各钉在 tests/test_v1211_bulk_area.py）。
         marked = (bool({FLAG_PRONOUN_TARGET, FLAG_ANAPHORA_STRIPPED} & plan.flags)
                   or is_pronoun(text) or "它" in text or "们" in text
                   or any(t in text for t in ("再", "还是", "继续", "也")))
@@ -2377,10 +2459,26 @@ class Pipeline:
 
     @staticmethod
     def _is_anaphoric(plan: Plan, text: str) -> bool:
-        """该计划的目标是否来自代词/回指解析（此类目标不得再叠卫星区域）。"""
+        """该计划的目标是否来自代词/回指解析（此类目标不得再叠卫星区域）。
+
+        第六轮审计 A3（v1.2.10 实测）：`"们" in text` 是无主语子串判据，中文里
+        「们」几乎总挂在**人**身上（我们/你们/咱们），于是「我们把灯打开」被判成
+        "目标来自回指" ⇒ 跳过卫星区域注入 ⇒ 目标退化成全屋按名子串匹配，
+        名字含「灯」的实体一起动。同句少一个「我们」就只动本房间——差一个字
+        行为翻转，直接顶到"所有设备不冒然全动"这条红线。
+        收窄成"回指代词＋们"：它们/这些/那些/哪些 才是设备回指；主语人称
+        （我们/你们/咱们）不是。`is_pronoun`/裸「它」的既有面一字不动（不在本条射程）。
+
+        ⚠ 分职（第七轮审计 A3）：本函数只管"**已解析出的目标能不能再叠卫星区域**"。
+        `_apply_context` 里 `marked`（:2414）还有一份同形 `"们" in text`，那份管的是
+        "**没有明示目标的句子要不要沿用上一轮目标**"——两件事，不是同一处漏改：
+        「关闭卧室空调」→「我们都关掉」（空 args）必须继承空调，删掉那份就是回归。
+        两条分支的正反钉在 tests/test_v1211_bulk_area.py，别再合并成一份判据。
+        """
         return (bool({FLAG_PRONOUN_TARGET, FLAG_ANAPHORA_STRIPPED,
                       FLAG_CHAIN_ANAPHORA} & plan.flags)
-                or is_pronoun(text) or "它" in text or "们" in text)
+                or is_pronoun(text) or "它" in text
+                or re.search(r"(?:它|这|那|哪)们", text or "") is not None)
 
     def _apply_spatial(self, plan: Plan, args: dict, origin: str) -> None:
         """卫星区域空间化：只补缺（明示区域优先），永不发 area-only 目标。
@@ -3123,7 +3221,19 @@ class Pipeline:
                             d["domains"] = list(want)
                     return
 
-    async def _confirm_answer(self, text: str, origin: str) -> Optional[Reply]:
+    async def _confirm_answer(self, text: str, origin: str, *,
+                              raw_text: str = "") -> Optional[Reply]:
+        """确认环应答裁决。`raw_text`= canonical 折字**前**的原话（默认空＝旧调用形）。
+
+        第六轮审计 A9（v1.2.10 实测）：本表是**整句等值表**，而入参 text 已被
+        `canonical()` 折掉语气词——表里收着「继续吧」，折完变成「继续」就不再在表里，
+        既不落 YES 也不落 NO ⇒ 走末尾"改口"分支把挂起的高风险计划 `pop` 掉，
+        用户只听到兜底句（以为做了、或以为设备坏了）。对照同表其它词条：
+        好吧→好✓ 执行吧→执行✓ 取消吧→取消✓，只有「继续吧」折出表外 ⇒ 这一条
+        从上线起就永不命中。修法取档案立的通用纪律——「礼貌/纠错折字后不许再吃
+        整句等值表」，与 v1.1.38 对「退下」表的既有先例（同时判原话）同源；
+        不往表里补裸「继续」（那会把"继续做某事"这类真指令吸成确认）。
+        """
         origin = origin or "panel"
         pend = self._confirm.get(origin)
         if pend is None:
@@ -3134,7 +3244,8 @@ class Pipeline:
             self._confirm.pop(origin, None)
             return None
         token = _strip_punct(text).lower()
-        if token in _CONFIRM_YES:
+        raw_token = _strip_punct(raw_text or "").lower()
+        if token in _CONFIRM_YES or raw_token in _CONFIRM_YES:
             self._confirm.pop(origin, None)
             plan = pend["plan"]
             ok, speech = await self.executor.run(plan)
@@ -3143,7 +3254,7 @@ class Pipeline:
             self._remember_turn(origin, text, speech)
             return Reply(speech, "confirm_exec", ok,
                          list(getattr(plan, "trace", [])) + ["确认环:已确认"])
-        if token in _CONFIRM_NO:
+        if token in _CONFIRM_NO or raw_token in _CONFIRM_NO:
             self._confirm.pop(origin, None)
             return Reply("好的，已取消", "confirm_cancel", True, ["确认环:取消"])
         # 改口：撤挂起计划，本句按新指令走级联
@@ -3170,7 +3281,7 @@ class Pipeline:
         # （零执行、零记账；origin 固定 "panel"）。
         chain_reply, chain_plan, _chain_legs, _chain_end = await self._chain_decide(
             text, "panel")
-        fp_plan, kl_plan = await self._match_pair(text)   # 与真流量同构（并行）
+        fp_plan, kl_plan = await self._match_pair(text, "panel")   # 与真流量同构（并行）
         plan = chain_plan or select_primary_plan(fp_plan, kl_plan, self._known_areas(),
                                        self._device_names(), self._real_areas())
 

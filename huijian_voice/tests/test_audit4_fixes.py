@@ -264,7 +264,7 @@ class _ChainLane:
     def __init__(self, table):
         self.table = table
 
-    async def match(self, text):
+    async def match(self, text, origin=""):
         return self.table.get(text)
 
 

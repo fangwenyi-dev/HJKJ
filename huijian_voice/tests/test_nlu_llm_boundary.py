@@ -71,7 +71,7 @@ class StubKlar:
     def __init__(self, plan=None):
         self.plan = plan
 
-    async def match(self, text):
+    async def match(self, text, origin=""):
         return self.plan
 
 

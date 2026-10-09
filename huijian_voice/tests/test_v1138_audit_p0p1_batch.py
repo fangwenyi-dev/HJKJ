@@ -123,7 +123,7 @@ def test_chain_flattens_each_legs_own_steps():
         def __init__(self, table):
             self.table = table
 
-        async def match(self, text):
+        async def match(self, text, origin=""):
             return self.table.get(text)
 
     p = Pipeline.__new__(Pipeline)
@@ -167,7 +167,7 @@ def test_chain_single_step_legs_unchanged():
         def __init__(self, table):
             self.table = table
 
-        async def match(self, text):
+        async def match(self, text, origin=""):
             return self.table.get(text)
 
     p = Pipeline.__new__(Pipeline)

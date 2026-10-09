@@ -23,7 +23,7 @@ class Lane:
     def __init__(self, table=None, single=None):
         self.table, self.single = table or {}, single
 
-    async def match(self, text):
+    async def match(self, text, origin=""):
         return self.table.get(text, self.single)
 
 

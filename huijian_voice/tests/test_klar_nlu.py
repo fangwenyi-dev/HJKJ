@@ -341,7 +341,7 @@ def _mk_pipe(fp_plan, kl_plan, ex, agent=None):
     p = Pipeline.__new__(Pipeline)
     class _M:
         def __init__(self, pl): self.pl = pl
-        async def match(self, t): return self.pl
+        async def match(self, t, origin=""): return self.pl
     class _Q:
         async def answer(self, t): return None
     class _S:

@@ -164,6 +164,21 @@ STATE_QUESTION_ALT = re.compile(
     r"|是不是(?:还)?开|是不是(?:还)?关|是否开着|是否关着|有没有开|有没有关"
     r"|(?:现在|目前)?什么状态|状态怎么样|状态如何|现在怎样|怎么样了吗"
     r"|查询.{0,10}状态|查一下.{0,10}状态|查.{0,10}状态)")
+# v1.2.11 A2 软疑问档：**状态进行体 `V着` + 口语语气字**（或问号）收尾。
+# 现场三条实锤（本机跑生产码路，命令档此前无人拦）：「客厅的灯开着呢？」判成
+# TurnDeviceOn、「客厅的灯关着吧？」判成 TurnDeviceOff、「卧室空调开着呢」判成
+# TurnDeviceOn。最后一条**连问号都没有**——ASR 常丢问句标点只剩语气字，所以本档
+# 不能挂在 `[?]` 上；也不能全句扫 吗/呢（那会吞掉「打开所有灯好吗？」这类礼貌请求
+# 命令，v1.1.2 的 IMPERATIVE_STILL_COMMAND 八句反向钉就是量这个的）。
+# 与 STATE_QUESTION_TAIL 的分工：那张表要 吗/没/不/？ 这类**硬疑问标记**，本档补
+# 的是「进行体 + 语气」一族。都只喂 `is_state_question`（一处定义，命令档与查询族
+# 共守）——本仓在"疑问闸只挂一侧"上翻过两次车（v1.1.2 klar 侧、v1.1.17 锚位）。
+# 裸「把灯开着」（祈使：要求保持开着）不带语气字 ⇒ 不在射程，命令面一寸不让。
+STATE_QUESTION_SOFT = re.compile(
+    r"(?:开着|关着|亮着|灭着|拉着|插着|锁着|连着|通着|运行着|打开着)"
+    r"(?:呢|吧|啊|呀|嘛)\s*[？?]?[\s。，,！!、]*$"
+    r"|(?:开着|关着|亮着|灭着|拉着|插着|锁着|连着|通着|运行着|打开着)"
+    r"\s*[？?]\s*$")
 
 
 # v1.1.19 复审：触发词必须是**疑问形**——裸「状态」会把祈使句一起吞掉（实测
@@ -227,13 +242,14 @@ def is_status_query(text: str) -> bool:
 
 def is_state_question(text: str) -> bool:
     """状态疑问句判据：命令档必须让路（实测「射灯关了吗」曾被 ^关了 接成
-    TurnDeviceOff，问一句关一次设备）；v1.1.17 补 V没V 与尾巴后置副词/标点。
-    永不抛。"""
+    TurnDeviceOff，问一句关一次设备）；v1.1.17 补 V没V 与尾巴后置副词/标点；
+    v1.2.11 A2 补 `STATE_QUESTION_SOFT`（进行体 + 语气字，可无问号）。永不抛。"""
     try:
         t = (text or "").strip().rstrip("。！!，,、")
         return bool(STATE_QUESTION_TAIL.search(t)
                     or STATE_QUESTION_ALT.search(t)
-                    or STATE_QUESTION_V_NOT_V.search(t))
+                    or STATE_QUESTION_V_NOT_V.search(t)
+                    or STATE_QUESTION_SOFT.search(t))
     except Exception:  # noqa: BLE001 判据故障=不误拦命令（保守放行原链）
         return False
 

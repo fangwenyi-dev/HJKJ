@@ -58,7 +58,7 @@ class FakeScenes:
 
 
 class StubKlar:
-    async def match(self, text):
+    async def match(self, text, origin=""):
         return None
 
 

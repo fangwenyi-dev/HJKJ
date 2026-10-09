@@ -84,7 +84,7 @@ class HA:
 
 
 class Klar:
-    async def match(self, t):
+    async def match(self, t, origin=""):
         return None
 
 

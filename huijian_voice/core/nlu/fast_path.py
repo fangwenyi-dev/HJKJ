@@ -56,8 +56,22 @@ _BARE_DEV_HEADS = ("灯光", "灯")
 
 
 def _strip_heads() -> tuple:
-    """②③ 剥离候选（具名表 ∪ 裸设备词，长词在前）。每次现读：动态词表会扩表。"""
-    return tuple(sorted(set(T.KNOWN_DEVICES_PREFIX) | set(_BARE_DEV_HEADS),
+    """②③ 剥离候选（具名表 ∪ 裸设备词 ∪ **本家在装整名**，长词在前）。
+
+    第六轮审计 A1（v1.2.10 实测）：本行原注释就写着"每次现读：动态词表会扩表"，
+    可函数体只读了静态 `KNOWN_DEVICES_PREFIX` ⇒ 动态词表从来没进来过。后果落在
+    以「开关」结尾的在装整名上（墙面开关/插座在 HA 里极常见）：
+      · 「把客厅灯开关关掉」——句首裸 开 一旦被动作表当动词，就是**要关却下发 On**
+        （动作表原护栏只挡 窗器/合器，挡不住 开关）；
+      · 补上 开(?!…\\|关) 护栏后裸开不再下刀，可 ②③ 又剥不动「客厅灯开关」这个
+        本家真名 ⇒ 整句失能掉 fallback。
+    两半合起来才是修法：动作表让位 + ②③ 认得在装整名，残段「关掉/关闭」才落回
+    TurnDeviceOff。只并**动态侧**（注册表派生的本家名，≥2 字），不并静态泛词表——
+    后者已在 KNOWN_DEVICES_PREFIX 里，且单字泛称的剥离由 _BARE_DEV_HEADS 明确点名
+    收着（进一张表会污染 parse_target 评分与窗族守卫，见其注释）。
+    """
+    installed = {w for w in T._dyn_vocab if len(w) >= 2}
+    return tuple(sorted(set(T.KNOWN_DEVICES_PREFIX) | set(_BARE_DEV_HEADS) | installed,
                         key=len, reverse=True))
 
 
@@ -88,6 +102,13 @@ def resolve_absolute_lane(domains: list, raw_delta: str) -> Optional[tuple]:
 
     单位口径（parse_delta/calc_target 实测）：只有 档/挡 会改变集成侧分支
     （level），% 对 number 分支等价 → 剥掉，免得把 "50%" 发成非法形态。
+
+    第七轮审计 A5 的结论（实测后**不动行为**，只把口径钉住）：「空调开到3档」带
+    `delta="3档"` 是**对的**——集成 `parse_delta` 把单位单独切出来交给 level 分支，
+    剥成 "3" 反而会落成 number 语义（同一句话换一台设备另一种算法）；而「亮度调到
+    3档」根本不在本车道（灯族没有"档"这个量纲，`class_of` 认不出设备词 ⇒ 整句不接管，
+    宁 MISS 不猜）。两者是**同一条口径**的两面：单位只在它所属的族里保留，族配不上
+    单位就弃权，不是"两处不一致"。
     """
     m = re.match(r"^\s*(一半|百分之([零一二三四五六七八九十百]+)|(\d+(?:\.\d+)?))\s*"
                  r"([%％]|档|挡)?\s*$", (raw_delta or "").strip())
@@ -265,7 +286,13 @@ _ACTION_PATTERNS: list[tuple[re.Pattern, str, Any]] = [
     (re.compile(r"^(上锁|锁上|落锁)"), "HassLock", None),
     # 裸 开 加器字护栏：「开窗器/开合器」句首时不得从中间下刀（残「窗器…」），
     # 让位给 ② 设备前缀剥离（开窗器∈KNOWN_DEVICES_PREFIX 后整词回捞）。
-    (re.compile(r"^(打开|开启|开一下|开了|开(?!窗器|合器))"), "TurnDeviceOn", None),
+    # 第六轮审计 A1（v1.2.10 实测）：同一护栏漏了「开关」——墙面开关/插座的
+    # friendly_name 常以「开关」结尾（本仓 targets 表自己就把「开关」映射到
+    # switch 域），于是「把客厅灯开关关掉」「客厅灯开关关闭」的句首 开 被当动词
+    # ⇒ 用户要关、真下发 **TurnDeviceOn**，且残名剥到「客厅灯」动的还是 light 那台。
+    # 补 关 进负向预查：开后面紧跟 关 的一律不是本表的裸开，让位给尾动词道
+    # （关掉/关闭/关上在句尾才是真动词）。护栏与 窗器/合器 同一条纪律、同一形状。
+    (re.compile(r"^(打开|开启|开一下|开了|开(?!窗器|合器|关))"), "TurnDeviceOn", None),
     (re.compile(r"^(关闭|关掉|关了|关一下|关)"), "TurnDeviceOff", None),
     (re.compile(r"^(open (?:the )?window)(?:\s+|$)", re.I), "ControlWindow", "open"),
     (re.compile(r"^(close (?:the )?window)(?:\s+|$)", re.I), "ControlWindow", "close"),
@@ -1144,7 +1171,58 @@ class FastPath:
         except Exception:  # noqa: BLE001
             return ()
 
-    def _wholehouse_plan(self, text: str, trace: list[str]) -> Optional[Plan]:
+    def _area_registered(self, area: str) -> bool:
+        """区域名是否**逐字**在本台注册表里（v1.2.11 收敛「区域宣称过头」）。
+
+        病灶：本道注释一直写"区域必须逐字命中已知区域"，而实际吃的
+        `targets._area_of_prefix` 是**词形 + 静态基准表**判据——厨房/书房/客厅
+        这些"听起来像房间"的词在家里根本没这间房时照样过闸，计划照产 area
+        （终态由 `_plan_area_problem` 拦成"查无"，但那是**后置**另一道闸的功劳，
+        不是本道的判据）。注释与判据不一致，下一个人照注释改代码就会改错地方
+        （第七轮审计 §3 同族）。
+        三档语义与 `_areas()` 同纪律：`areas_of` 未装配（None）或注册表空 ⇒ 回
+        True 保持旧行为——手工替身/直呼方零漂移，绝不因装配面差异把功能闸死；
+        拿到表才逐字比。永不抛。
+        """
+        live = self._areas()
+        if not live:
+            return True
+        return str(area or "").strip() in {str(a).strip() for a in live}
+
+    def _satellite_device_bulk(self, word: str, intent_type: str, origin: str,
+                               trace: list, text: str) -> Optional[Plan]:
+        """全屋口径的「所有设备/电器/家电」+ 本卫星登记了区域 → **折成本区域批量**。
+
+        用户口径（2026-10-09）：「(办公室)所有设备」要控制**当前语音区域**里的全部设备。
+        现场形态是没点房间名的那半句：说话人就站在办公室里说「关闭所有设备」——旧裁决
+        在这里 `return None`（"认不出域不冒然全屋全动"），句子掉进 LLM，而 LLM 常只给
+        `domains=["light"]` ⇒ 用户听到的就是"只动灯"（办公 .91 实锤第二条路）。
+        折成本区域是**缩小作用域**（不是扩大）：卫星登记区域是唯一证据，拿不到区域、
+        区域名不在注册表里、词不是设备泛称，三种情况一律维持原样回 None。
+        产物与 `_area_bulk_plan` 同形：空名 + 可开关域白名单 + `FLAG_AREA_BULK`，
+        播报面因此与点名区域句共用同一套"没登记的如实说"。永不抛。
+        """
+        try:
+            if word not in _BULK_DEVICE_WORDS or not origin:
+                return None
+            area = str(((self.settings.get("spatial.satellite_areas") or {})
+                        .get(origin) or "")).strip()
+            if not area or not self._area_registered(area):
+                return None                     # 没登记区域/不在注册表：绝不猜房间
+            entry, intent_name, extra = self._area_bulk_target(
+                area, word, intent_type, None)
+            if entry is None:
+                return None
+            trace.append(f"全屋→本区域批量:{area}+{word}")
+            return Plan(intent=intent_name, args={"target": [entry], **extra},
+                        source="t0", utterance=text, trace=trace) \
+                .mark(FLAG_AREA_BULK)
+        except Exception:  # noqa: BLE001 判据故障=不接管（原车道逐字不变）
+            logger.exception("[fastpath] 全屋折本区域异常（视为不接管）")
+            return None
+
+    def _wholehouse_plan(self, text: str, trace: list[str],
+                         origin: str = "") -> Optional[Plan]:
         """显式全屋动作句（动词在前："打开所有灯/关掉全部窗帘"）→ Plan。
         必须在复杂查询守卫**之前**裁决：守卫的 `所有.*(?:灯|设备|开关)` 分支会把
         「打开所有灯」误判成查询句交上层（2026-09-15 实测），而它是命令。
@@ -1169,7 +1247,11 @@ class FastPath:
             word = _wholehouse_word(rest or text)
             doms = [str(d) for d in (T.turn_domains(word) if word else [])]
             if not doms:
-                return None
+                # 认不出域 ⇒ 本卫星登记了区域、且词是「设备/电器/家电」时折成
+                # **本区域**批量（缩小作用域，用户口径「当前语音区域所有设备」）；
+                # 其余一律维持原样不接管——绝不冒然全屋全动（会带上门锁）。
+                return self._satellite_device_bulk(word, intent_type, origin,
+                                                   trace, text)
             trace.append(f"全屋显式:{word}→domains={doms}")
             return Plan(intent=intent_type,
                         args={"target": [{"devices": [{"name": "", "domains": doms}]}]},
@@ -1186,7 +1268,9 @@ class FastPath:
             word = _wholehouse_word(text[:m_tw.start()].strip() or text)
             doms = [str(d) for d in (T.turn_domains(word) if word else [])]
             if not doms:
-                return None
+                # 与前置支同判据、同产物（认不出域不冒然全屋全动；设备泛称折本区域）
+                return self._satellite_device_bulk(word, intent_type, origin,
+                                                   trace, text)
             trace.append(f"全屋尾动:{word}→domains={doms}")
             return Plan(intent=intent_type,
                         args={"target": [{"devices": [{"name": "", "domains": doms}]}]},
@@ -1205,6 +1289,15 @@ class FastPath:
     # 两条支路共用同一批单源表：动词用 _ACTION_PATTERNS，全屋标记用 _WHOLEHOUSE_RE，
     # 类别词→域用 query.class_of，尾动词用 _WH_TRAIL_RE。
     _AB_STRIP = re.compile(r"(?:里的|里面的|内的|的|里|内|中)+$")
+    # v1.2.11 后置标记形：「客厅灯全部打开」「办公室设备都关掉」——区域在前、类别居中、
+    # 范围标记+动词收尾。`_area_bulk_split` 的尾动词支已把「全部/都」连同动词一起剥掉
+    # （`_WH_TRAIL_RE` 的 0 组含可选标记前缀），所以残句里**看不到标记**，旧的
+    # `if not mk: return None` 于是把这一整族句形判成"没有显式标记＝具名句"退回上层
+    # （N1 挂账 + 本轮「办公室设备全部打开」只动灯的第二条路，都是这一个洞）。
+    # 判据必须**要求标记在场**且紧贴句尾动词：没有标记的「客厅灯打开」仍归具名原车道。
+    _AB_RANGE_TAIL = re.compile(
+        r"(?:全都|全部|都|全)\s*(?:关闭|关掉|关了|打开|开了|开启|开一下|开|关)"
+        r"(?:了|啦|吧|呀|呢)?\s*$")
 
     def _area_bulk_plan(self, text: str, trace: list) -> Optional[Plan]:
         """「关闭客厅所有灯」/「把展厅所有窗户关掉」→ 区域内按类别批量。
@@ -1224,10 +1317,20 @@ class FastPath:
             if intent is None:
                 return None
             mk = _WHOLEHOUSE_RE.search(body)
-            if not mk:
+            if mk:
+                area = self._AB_STRIP.sub("", body[:mk.start()]).strip()
+                cat = body[mk.end():].strip(" 的地得了吧啦").strip()
+            elif self._AB_RANGE_TAIL.search(t):
+                # 后置标记形（v1.2.11）：残句＝「区域 + 类别词」，标记已随尾动词剥掉。
+                # 类别词只认**在册词表**（query 的类别表单源 + 设备泛称 + 裸窗泛称），
+                # 认不出就退回原车道——本道永不猜类别，也就永不按错设备族。
+                cat = self._ab_tail_cat(body)
+                if not cat:
+                    return None
+                area = self._AB_STRIP.sub(
+                    "", body[:len(body) - len(cat)]).strip()
+            else:
                 return None                       # 没有显式"所有/全部"标记＝具名句，归原车道
-            area = self._AB_STRIP.sub("", body[:mk.start()]).strip()
-            cat = body[mk.end():].strip(" 的地得了吧啦").strip()
             if not (1 <= len(area) <= 8) or not (1 <= len(cat) <= 6):
                 return None
             if re.search(r"内倒|暂停|停止|调[大小高亮暗成到为]|设为|设置|度|[%％]|[0-9]",
@@ -1240,7 +1343,11 @@ class FastPath:
                 return None
             if "的" in cat:
                 return None                       # 「所有窗户的电源」：目标不是纯类别词
-            if T._area_of_prefix(area) != area:
+            if T._area_of_prefix(area) != area or not self._area_registered(area):
+                # 两道同判：前者是**词形+静态基准**能不能拆出区域前缀，后者是**本台
+                # 注册表**里有没有这间房（装配了 areas_of 才生效，没装配/空表回 True
+                # ⇒ 逐字等于旧行为）。只留前者就是第七轮审计 §3 的"区域宣称过头"：
+                # 家里没这间房照样出 area 计划，靠后置闸兜一句"查无"——宣称与判据同源。
                 return None                       # 区域必须逐字命中已知区域（绝不猜房间）
             if _AREA_VERB_RESIDUE.search(area):
                 return None                       # 区域段带动词＝连排未切分
@@ -1278,6 +1385,27 @@ class FastPath:
             intent_type = ("TurnDeviceOff" if verb[0] in "关关停" else "TurnDeviceOn")
             return intent_type, None, text[:mt.start()].strip()
         return None, "", ""
+
+    # 后置标记形的类别词候选：设备泛称 + 裸窗泛称（类别表本身走 query.class_of 单源，
+    # 这两张表是 class_of 覆盖不到的两个特例，与 `_area_bulk_target` 的例外支同源）。
+    _AB_TAIL_CATS = tuple(sorted(set(_BULK_DEVICE_WORDS) | set(BARE_WINDOW_NAMES),
+                                 key=len, reverse=True))
+
+    @classmethod
+    def _ab_tail_cat(cls, body: str) -> str:
+        """残句**末尾**的类别词（后置标记形专用）；不在任何在册词表里 ⇒ 空串。
+
+        只用现成词表（`query.class_of` 的类别表 + 设备泛称 + 裸窗泛称），且必须**以词表
+        词收尾**——句中撞到别类词不算（「办公室灯带」的类别是灯带，不是灯）。认不出就
+        交回原车道，本道绝不猜类别。
+        """
+        w, _doms = class_of(body)
+        if w and body.endswith(w):
+            return w
+        for c in cls._AB_TAIL_CATS:
+            if body.endswith(c):
+                return c
+        return ""
 
     @staticmethod
     def _area_bulk_target(area: str, cat: str, intent: str, action_val):
@@ -1425,7 +1553,7 @@ class FastPath:
             return None
 
     # ── 主入口 ──────────────────────────────────────────────────
-    async def match(self, raw_text: str) -> Optional[Plan]:
+    async def match(self, raw_text: str, origin: str = "") -> Optional[Plan]:
         trace: list[str] = []
         text = _extract_text(raw_text)
         text = corrector.apply(text, self.settings.get("nlu.corrections_extra") or {})
@@ -1433,6 +1561,11 @@ class FastPath:
             return None
         text = text.strip()
         text = re.sub(r"^[把将]\s*", "", text)   # 处置介词核心化："把灯打开"→"灯打开"
+        # v1.2.11 A2：状态疑问判据要用**剥礼貌尾之前**的句子——`normalize_polite`
+        # 会把 呢/吧/？ 一起剥掉（实测「客厅的灯开着呢？」剥成「客厅的灯开着」），
+        # 剥完就看不出这是问句了。留着原形只给那一道闸用，其余判据照旧吃改写后的
+        # `text`（不动既有裁决链，零漂移）。
+        ask_src = text
         # 体验批 P2-16：礼貌语归一（迭代剥，可能再次暴露 把/将）
         polite = normalize_polite(text)
         polite = re.sub(r"^[把将]\s*", "", polite).strip()
@@ -1488,8 +1621,31 @@ class FastPath:
             trace.append("并列宾语:链已拒或含不识分片,单发拒猜")
             return self._miss(trace)
 
+        # v1.2.11 A2：**状态进行体收尾**是在问"是不是这样"，不是在命令。
+        # 现场三条实锤（本机跑生产码路，判据面此前无人拦）：「客厅的灯开着呢？」
+        # 判成 TurnDeviceOn、「客厅的灯关着吧？」判成 TurnDeviceOff、「卧室空调开着呢」
+        # 判成 TurnDeviceOn —— 问一句动一次设备，正是 v1.1.2 那条红线在 t0 的复现
+        # （当年只补了 klar 一侧，"同类洞只修一边"又犯了一次）。
+        # 判据只看**尾部形状**「V着 (+语气词) (+标点)」，不动全句扫 吗/呢：
+        #   ·「打开所有灯好吗？」不算（礼貌尾剥掉后是明确命令，剥完不含 V着 尾）；
+        #   ·「把灯开着」这类"要求保持开着"的祈使会被弃权交上层——宁 MISS 不冒动，
+        #     该形极罕见，且查询族/LLM 接得住（弃权=如实回答或如实不会，不是动设备）。
+        # v1.2.11 A2：**状态进行体收尾**（V着 (+语气) (+标点)）是在问/在陈述"是不是
+        # 这样"，不是在命令。现场三条实锤（本机跑生产码路，此前无人拦）：
+        # 「客厅的灯开着呢？」→TurnDeviceOn、「客厅的灯关着吧？」→TurnDeviceOff、
+        # 「卧室空调开着呢」→TurnDeviceOn——问一句动一次设备，正是 v1.1.2 那条红线
+        # 在 t0 批量道上的复现（当年只补了字面表/klar 一侧，"同类洞只修一边"又犯）。
+        # 判据**不另立一份**：吃 query.is_state_question 的软疑问档（单源，命令档与
+        # 查询族共守）。位置在全屋道/区域批量道**之前**：这两条道都不经过
+        # `_is_complex_query`，挂在那道守卫上够不到（实测就是从这里漏出去的）。
+        # 「打开所有灯好吗？」不受影响——礼貌尾 normalize_polite 已先剥，剥后不含
+        # V着 尾；「把灯开着」这类极罕见祈使会被弃权交上层，宁 MISS 不冒动。
+        if is_state_question(ask_src) or is_state_question(text):
+            trace.append("状态疑问尾→命令道不接管（问一句绝不动设备）")
+            return self._miss(trace)
+
         # 显式全屋命令先于复杂查询守卫裁决（守卫会吞掉"打开所有灯"，见方法注释）
-        wh = self._wholehouse_plan(text, trace)
+        wh = self._wholehouse_plan(text, trace, origin)
         if wh is not None:
             return wh
         # v1.2.10：区域+「所有」+类别词（「关闭展厅所有窗户」）同位次裁决——

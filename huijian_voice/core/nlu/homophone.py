@@ -25,6 +25,9 @@ pypinyin 缺失或异常 ⇒ 原样返回，行为逐值回落到没有本层之
 import logging
 import re
 
+from .corrector import _PRONOUN_HEADS   # 禁入族**单源**（第七轮审计 A7 层二同闸；
+                                        # 两族判据在 corrector 一处定义，不两处各抄）
+
 logger = logging.getLogger(__name__)
 
 MIN_LEN, MAX_LEN = 2, 8                       # 与 targets._name_tokens 同口径
@@ -236,6 +239,15 @@ def rewrite(text: str, names) -> tuple[str, list[tuple[str, str]]]:
                 continue
             span = out[start:start + width]
             if not _HAN.match(span) or span in literal:
+                start += 1
+                continue
+            if span[0] in _PRONOUN_HEADS:
+                # 第七轮审计 A7 的**层二**同闸（判据单源取自 corrector，不两处各抄）：
+                # 「我室」↔「卧室」音节只差一个调号，Tier A 近音档照样会把它折成
+                # 在册区域「卧室」——只删手工表那条键治不到这里（实测：删键后
+                # 「打开我室的灯」在本家有卧室的家里仍被改成卧室）。代词开头的片段
+                # 按中文常态是**属格 + 类别词**（"我室的灯"＝我这间的灯），不是听岔，
+                # 改了就是凭空猜房间（红线：绝不猜房间）。两档（同音/近音）共用这道闸。
                 start += 1
                 continue
             if any(span in g and span != g for g in guarding):

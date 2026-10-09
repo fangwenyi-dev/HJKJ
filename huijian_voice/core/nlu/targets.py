@@ -989,6 +989,17 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
     if best_score < 3 and "的" not in stripped and "里" not in stripped and " " not in stripped:
         return None, None, best_score
     cleaned = clean_name(normalize_name(name))
+    # 第六轮审计 A6（v1.2.10 实测）：在册**整名**不得被尾剥成子名。
+    # `_NAME_TAIL_VERBS` 收了裸 开|关（为「灯打开→灯」这类动词语尾残留立的），
+    # 而「客厅灯开关」「空调开关」是用户亲手起的全名，末两轮 关→开 被连着剥掉 ⇒
+    # parse_target('客厅灯开关') 回「客厅灯」：用户点名的 switch 实体被换成
+    # light 那台（同病灶的回显侧早立过反向钉——test_klar_nlu.py 原文
+    # 「设备名自身含动作字：不得被剥残（实发风险：灯开关 → 灯）」）。
+    # 判据：原名整词已在册（ALL_SET 含注册表派生的 friendly_name）且尾剥
+    # 改变了它 ⇒ 带回原名。只认"整名在册"这一条，动词语尾残留（「灯打开」）不受影响。
+    raw_norm = normalize_name(name)
+    if (cleaned and cleaned != raw_norm and raw_norm in ALL_SET):
+        cleaned = raw_norm
     return area, cleaned or name, best_score
 
 

@@ -317,6 +317,39 @@ async def _match_with_constraints(
             requested_name = str(device.get("name") or "").strip() or None
             expanded_domains = _expand_domains(device.get("domains") or [])
             all_expanded_domains.update(expanded_domains)
+            # v1.2.11「(区域)所有设备」= 本区域**全部**可开关设备，判据换成区域证据。
+            # 病灶（办公 .91 现场）：`async_match_targets(area_name=…)` 对"区域"只认
+            # HA 注册表归属，而网关那两台开窗器整台设备没挂任何区域 ⇒ 一条都不返回，
+            # 「关闭办公室所有设备」只剩空调/射灯，播「已关闭」而窗纹丝不动；同一间房
+            # 说「所有窗户」却能成——窗控那条从来走的是 `intent_window_const` 的三档
+            # 区域证据。两条车道对"区域"必须同一个口径，否则用户在同一间房里说
+            # 「所有窗」和「所有设备」会拿到两个答案（本仓"判据面与执行面同源"旧账）。
+            # 触发面**只此一种**：空名 + 点名区域 + 域集覆盖可开关白名单
+            # （＝加载项「(区域)所有设备」批量道的形状，与 core
+            # `executor._bulk_all_devices_slot` 的兼容判据同源）。
+            # 为什么不能只看"空名+区域"（第七轮审计自查出来的越界）：LLM/klar 也会给
+            # `{area:客厅, devices:[{name:"", domains:["light"]}]}` 这种**单域空名**目标，
+            # 走进证据展开就会把整台没登记区域的灯（现场真有：走廊感应灯）算成
+            # "客厅的灯"一起开——那是拿批量判据去接具名句，比原病更危险。单域/具名句
+            # 一律留在 HA 严格匹配那侧，逐字节零扰动。
+            # 展开为空（这真没这间房／全被确凿别区剔除／注册表形态拿不到）⇒ 落回原支，
+            # 与旧行为一致地如实查无——绝不因为换了判据就冒按。
+            if _bulk_evidence_eligible(requested_name, raw_area, expanded_domains):
+                from .intent_window_const import find_bulk_entities_by_area
+                bulk_eids = find_bulk_entities_by_area(
+                    hass, area_name, expanded_domains)
+                if bulk_eids:
+                    _LOGGER.info("Bulk area-evidence matched %d entities for area %r",
+                                 len(bulk_eids), area_name)
+                    found_states.append(
+                        StateWithAreaConstraint(
+                            states=[s for s in (hass.states.get(e) for e in bulk_eids)
+                                    if s is not None],
+                            unset_area_constraint=False,
+                            requested_name=None,
+                        )
+                    )
+                    continue
             match_constraints = intent.MatchTargetsConstraints(
                 name=device.get("name"),
                 area_name=area_name,
@@ -368,6 +401,26 @@ _BULK_DOMAIN_PRIORITY = ("climate", "water_heater", "humidifier", "vacuum",
                          "cover", "fan", "light", "media_player", "switch")
 # 配置/诊断实体（指示灯、信息按钮、配对键、升级位）不是"一台设备"，批量面一律不碰。
 _BULK_SKIP_CATEGORIES = frozenset({"config", "diagnostic"})
+
+
+def _bulk_evidence_eligible(requested_name, raw_area, expanded_domains) -> bool:
+    """这条目标是不是「(区域)所有设备」的批量面（只有它才走区域证据展开）。
+
+    三件缺一不可：**空名**（用户没点名某台/某类）＋ **点名区域**（批量必须有房间硬
+    约束，无区域的全屋句归 HA 严格匹配那侧）＋ **域集覆盖可开关白名单**（这就是
+    「所有设备」的形状本身）。少了第三件，LLM/klar 的单域空名目标
+    （`{area:客厅, name:"", domains:["light"]}`）会被拖进展开，把整台没登记区域的灯
+    当成"客厅的灯"一起开——拿批量判据接具名句，比原病更危险（第七轮审计自查）。
+    `_BULK_DOMAIN_PRIORITY` 与 core 的 `BULK_TOGGLEABLE_DOMAINS` 等值由
+    tests/test_v1210_area_bulk.py 的字面量钉守着，所以这里不需要再引 core。
+    纯函数、永不抛：判据故障 ⇒ False（走原路，保守）。
+    """
+    try:
+        return (requested_name is None and bool(raw_area)
+                and set(str(d) for d in (expanded_domains or ()))
+                >= {str(d) for d in _BULK_DOMAIN_PRIORITY})
+    except Exception:                                        # noqa: BLE001
+        return False
 
 
 def _is_bulk_auxiliary(entity_entry) -> bool:

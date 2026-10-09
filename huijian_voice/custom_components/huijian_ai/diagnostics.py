@@ -14,7 +14,12 @@ from .const import CONF_DEVICE_NAME
 from .dashboard import async_get_dashboard
 from .entry_data import ESPHomeConfigEntry
 
-REDACT_KEYS = {CONF_NOISE_PSK, CONF_PASSWORD, "mac_address", "bluetooth_mac_address"}
+# 第六轮审计 B9（v1.2.10 实测）：入驻/重配把设备 MAC 写进 entry.data 的键名是
+# **`"mac"`**（config_flow.py:442/894/977/1010），而本表只有 `mac_address`/
+# `bluetooth_mac_address`——`diag["config"] = config_entry.as_dict()` 原样导出时
+# 裸 MAC 直通诊断下载（async_redact_data 按精确键名掩码，不做子串）。补 `"mac"`。
+REDACT_KEYS = {CONF_NOISE_PSK, CONF_PASSWORD, "mac_address", "bluetooth_mac_address",
+               "mac"}
 CONFIGURED_DEVICE_KEYS = (
     "configuration",
     "current_version",

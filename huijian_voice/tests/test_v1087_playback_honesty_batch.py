@@ -319,7 +319,7 @@ def test_indeterminate_failure_does_not_replay_fallback():
         ex = FakeEx(mode)
         pipe = B._pipe(executor=ex)
 
-        async def match_pair(text):
+        async def match_pair(text, origin=""):
             return fp, kl
         pipe._match_pair = match_pair
         return ex, pipe

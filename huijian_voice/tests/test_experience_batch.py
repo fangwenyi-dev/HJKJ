@@ -28,7 +28,7 @@ class Lane:
         self.table, self.single = table or {}, single
         self.seen = []
 
-    async def match(self, text):
+    async def match(self, text, origin=""):
         self.seen.append(text)
         return self.table.get(text, self.single)
 
@@ -116,7 +116,7 @@ def test_match_pair_runs_fp_and_klar_concurrently():
         def __init__(self, tag, delay, plan):
             self.tag, self.delay, self.plan = tag, delay, plan
 
-        async def match(self, text):
+        async def match(self, text, origin=""):
             order.append(self.tag + ":s")
             await asyncio.sleep(self.delay)
             order.append(self.tag + ":e")
