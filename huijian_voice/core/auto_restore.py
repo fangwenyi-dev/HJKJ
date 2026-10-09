@@ -15,17 +15,19 @@
     ⇒ 但结论不变：**"操作完成"设备侧不会自己发生**，UI 自动化覆盖不到的设备（灯、插座、
       非循环执行器）仍没人收尾，所以归位放在加载项执行层，且**默认只管明确点名的域**。
 
-★ 覆盖面实况与**默认关**的原因（10-10 复核；别把这条读成"已经做好了"）
-  真链路里最常见的一条形是
-      `TurnDeviceOn {target:[{area:'办公室', devices:[{name:'灯'}]}]}`
-  ——实体解析发生在**集成侧**，回给加载项的 `control_targets` 行只有 {name, area}、
-  **没有 entity_id**（custom_components/huijian_ai/intent_turn.py:121-126 实证）。
-  在这种形上加载项无法确证"刚才开的是哪一台"；靠 area+name 反查再去关＝**猜目标**，
-  猜错会关掉用户根本没开过的设备，比"忘关"更坏。
-  ⇒ 本能力**默认关**（DEFAULTS["dialog"]["auto_restore"] = False），只在能确证 entity_id 的形
-    上生效：klar 直调、args 带 entity_id、回执 states 行含 entity_id。
-  ⇒ 下一步正解：集成把解析出的 entity_id 放回回执行（那边本就有 item.state.entity_id），
-    上线后真机复验"打开办公室的灯"确被登记并收尾，再把默认翻成 True。
+★ 覆盖面实况（10-10 我连着判错两次，最终结论以读码＋真机各一遍为准）
+  ✘ 第一版结论：“target 形拿不到 entity_id ⇒ 不覆盖，所以默认关”——**错**。
+    设备道的回执 `control_targets` 行自 v1.2.10 起就带 `item.state.entity_id`
+    （intent_turn.py:213-214，当时为的是播报按设备数数，不是为归位）。
+    只有**窗控子道**那几行（:121-126/716/756）仍只有 {name, area}。
+  ✔ 现在归位**吃回执**（_receipt_eids）：target 形（“打开办公室的灯”，args 里只有
+    area+name）⇒ 登记回执里那台；klar 直调 /api/services/* ⇒ 200 body 就是
+    “状态真变了的实体列表”，空列表＝谁都没变 ⇒ changed=False 等价 noop，不登记
+    （10-10 实测四次，off→on / on→on / on→off / off→off 全部对称成立）。
+  ⇒ 默认**翻回开**（用户立规要的就是这条真实生效）。真机端到端证据：生产 target 形
+    “打开办公室的灯”→播“办公室射灯开了”、HA 实测 on、60 秒后自己 off、终态复原 off。
+  ⚠ 仍未覆盖：窗控子道回执不带 id ⇒ “打开办公室的平开窗”这类不登记；要覆盖得先给
+    窗控行补 entity_id（那边同样有 item.state.entity_id 可用）。cover 也已不在默认域。
 
 ★ 意图词表（10-10 第二版改掉自己的一处假绿）
   慧尖自有意图名是 `TurnDeviceOn/TurnDeviceOff`（fast_path.py:295/327 是生产主车道），
@@ -112,6 +114,31 @@ def _eids(args: Any) -> list[str]:
     return []
 
 
+def _receipt_eids(receipt: Any) -> list[str]:
+    """从**执行回执**里取"HA 说它真动过/真选中"的实体 id。两个来源，都不猜：
+      · 直调道 `/api/services/*`：200 body 就是状态真变了的实体列表（10-10 实测）⇒ `entities`
+      · 意图道（慧尖 TurnDevice*）：`control_targets` 行自 v1.2.10 起带 `entity_id`
+        （intent_turn.py:213-214），`states`/`results` 行同理
+    拿不到就返回空。**回执比 args 硬**：args 是"用户点了什么名"，回执才是"动了哪台"。"""
+    if not isinstance(receipt, dict):
+        return []
+    ids: list[str] = []
+    for rows in (receipt.get("entities"), receipt.get("control_targets"),
+                 receipt.get("states"), receipt.get("results")):
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, str):
+                eid = row
+            elif isinstance(row, dict):
+                eid = str(row.get("entity_id") or "")
+            else:
+                continue
+            if "." in eid and eid not in ids:
+                ids.append(eid)
+    return ids
+
+
 class AutoRestore:
     """按实体的归位计时器。永不抛：任何异常都只记日志，不影响语音链主流程。"""
 
@@ -156,17 +183,26 @@ class AutoRestore:
 
     # ── 主入口：执行器在每步结束后调用 ──────────────────────────────
     def note(self, intent: Optional[str], args: Any, ok: bool,
-             noop: bool = False) -> None:
+             noop: bool = False, receipt: Any = None) -> None:
         """成功开了一台策略内设备 → 登记归位；成功关闭 → 取消归位。永不抛。
 
         `noop`（10-10 对抗复核）：执行器**执行前**的证据 `kind == "noop"` ⇒ 目标本来就在
         要求的状态上，这一步**没打开任何东西**。原先这种步也登记（播报都会说「本来就在
         要求的状态上」了，10 分钟后却把用户正在用的灯关掉）——这是"关掉用户没开过的设备"，
-        比忘关更坏，所以：noop ⇒ 绝不登记（关闭方向仍照取消处理）。"""
+        比忘关更坏，所以：noop ⇒ 绝不登记（关闭方向仍照取消处理）。
+
+        `receipt`（10-10 实测后加）：执行回执。**登记对象以回执里的实体为准**，args 只作兜底
+        （klar 直调改旧集成时回执可能没带 id）。回执里 `changed=False`（直调道 200 body 是
+        `[]`）等价于 noop：谁都没被动过 ⇒ 不登记。这条同时把覆盖面打开到
+        `target` 形（"打开办公室的灯"）——集成侧解析实体，回执 `control_targets` 行带
+        `entity_id`（v1.2.10 起），加载项不再需要自己猜目标。"""
         try:
             if not ok or not isinstance(intent, str):
                 return
-            eids = _eids(args)
+            rec_ids = _receipt_eids(receipt)
+            eids = list(dict.fromkeys(rec_ids + _eids(args))) if rec_ids else _eids(args)
+            if isinstance(receipt, dict) and receipt.get("changed") is False:
+                noop = True
             if not eids:
                 return
             enabled, delay, domains, exclude = self._cfg()
@@ -178,8 +214,8 @@ class AutoRestore:
             if direction != "on" or not enabled:
                 return
             if noop:
-                logger.info("[归位] %s 本步是 noop（目标已在要求状态）⇒ 不登记，不动用户的东西",
-                            eids)
+                logger.info("[归位] %s 本步是 noop（目标已在要求状态/回执无人被改动）"
+                            "⇒ 不登记，不动用户的东西", eids)
                 return
             for eid in eids:
                 if self._wanted(eid, domains, exclude):

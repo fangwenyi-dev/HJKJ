@@ -58,10 +58,10 @@ def _arm(ha=None, settings=None, delay_min=10):
     return AutoRestore(ha or HA(), st)
 
 
-def _note(ar, intent, args, ok=True):
+def _note(ar, intent, args, ok=True, receipt=None):
     """生产形态：执行器在事件循环里调用 note()。返回登记后的 pending 快照。"""
     async def go():
-        ar.note(intent, args, ok)
+        ar.note(intent, args, ok, receipt=receipt)
         return dict(ar.pending())
     return asyncio.run(go())
 
@@ -319,10 +319,14 @@ def test_设置面默认值_in_opt_in_形态_UI读法必须同向():
     靠 area+name 反查去关＝猜目标，猜错比忘关更坏。所以先 opt-in。
     UI 的读值也必须同向：缺键显示成"已开"就是面板骗人。"""
     d = DEFAULTS["dialog"]
-    assert d["auto_restore"] is False, "默认值被改回 True 必须先解决 entity_id 覆盖面"
+    # 默认开的前提已由**真机**证明（10-10：生产 target 形那句“打开办公室的灯”端到端
+    # 登记＋60 秒自动收尾；登记对象取自回执 control_targets 行的 entity_id——
+    # intent_turn.py:213-214 自 v1.2.10 起就带着，不是我先前以为的“只有 name/area”；
+    # 那行只有窗控子道成立）。noop 与 changed=False 一律不登记，所以不会去关用户
+    # 本来开着的设备。默认域只留 light。
+    assert d["auto_restore"] is True, "翻回关需给出覆盖面退化的证据"
     assert d["auto_restore_min"] == 10
     assert d["auto_restore_domains"] == ["light"], "默认域被扩宽必须先回答『与现场自动化抢关』这条"
-    assert d["auto_restore"] is False
     assert d["auto_restore_exclude"] == []
 
     import pathlib
@@ -331,8 +335,11 @@ def test_设置面默认值_in_opt_in_形态_UI读法必须同向():
         encoding="utf-8")
     read = re.search(r'\$\("#dlg_restore"\)\.checked\s*=\s*([^;]+);', html)
     assert read, "dlg_restore 的读值语句找不到＝控件被拆了"
-    assert "=== true" in read.group(1), \
-        "UI 默认读法与服务端默认 False 不同向（缺键会被显示成已开）：%s" % read.group(1)
+    # UI 的“缺键怎么显示”必须与服务端默认同向（默认 True ⇒ 缺键应显示已勾选）。
+    want = "!== false" if d["auto_restore"] else "=== true"
+    assert want in read.group(1), \
+        "UI 缺键方向与服务端默认 %s 不同向（应含 %r）：%s" % (
+            d["auto_restore"], want, read.group(1))
 
 
 def test_延时钳位_不许把配置当成立刻关():
@@ -416,6 +423,34 @@ def test_域清空成空列表_必须真的一个都不登记():
                               "dialog.auto_restore_domains": []}))
     assert _note(ar, "TurnDeviceOn", {"entity_id": "light.desk"}) == {}, \
         "domains=[] 被当成没配 ⇒ 仍按默认域登记"
+    ar.cancel_all()
+
+
+def test_回执带实体id_target形也能登记_覆盖面不再只限klar():
+    """10-10 实测纠正我自己写在 CHANGELOG 的判断：慧尖集成 `TurnDeviceOn` 的回执
+    `control_targets` 行**自 v1.2.10 起就带 entity_id**（intent_turn.py:213-214），
+    所以「打开办公室的灯」这种 target 形（args 里只有 area/name）**是可以覆盖的**——
+    登记对象取回执里的实体，不靠加载项猜目标。这条钉住那条正道。"""
+    ar = _arm()
+    args = {"target": [{"area": "办公室", "devices": [{"name": "灯"}]}]}   # args 里没有 entity_id
+    receipt = {"success": True, "control_targets": [
+        {"name": "射灯", "area": "办公室", "entity_id": "light.ban_gong_shi_she_deng"}]}
+    pend = _note(ar, "TurnDeviceOn", args, receipt=receipt)
+    assert list(pend) == ["light.ban_gong_shi_she_deng"], \
+        "回执里明明有实体 id 却没登记＝覆盖面还是关着的：%s" % (pend,)
+    ar.cancel_all()
+
+
+def test_回执说没人被改动_changed_False_等同_noop_不登记():
+    """实测：/api/services/* 的 200 body 是**状态真变了的实体列表**，本来就在该状态时是 []。
+    空列表不是失败（目标状态已满足），但它是"谁都没被打开"的确证 ⇒ 不许登记归位。"""
+    ar = _arm()
+    r = {"success": True, "changed": False, "entities": []}
+    assert _note(ar, "TurnDeviceOn", {"entity_id": "light.desk"}, receipt=r) == {}, \
+        "changed=False 仍登记＝会把用户本来开着的灯关掉"
+    # 反向对照：真变了就必须登记
+    r2 = {"success": True, "changed": True, "entities": ["light.desk"]}
+    assert "light.desk" in _note(ar, "TurnDeviceOn", {"entity_id": "light.desk"}, receipt=r2)
     ar.cancel_all()
 
 

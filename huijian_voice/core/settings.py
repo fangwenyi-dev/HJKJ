@@ -114,7 +114,7 @@ DEFAULTS: dict[str, Any] = {
         #   ⇒ 先以 opt-in 出包；正解是集成把解析出的 entity_id 放回回执行（那边本就有
         #   item.state.entity_id），上线并真机复验覆盖后，再把本默认翻成 True。
         #   手动打开后＝只在能确证 entity_id 的设备上生效（目标未 grounded 一律不登记）。
-        "auto_restore": False,                 # 总开关：默认关＝行为逐值回到本批之前
+        "auto_restore": True,                  # 总开关：10-10 真机验证覆盖面后翻回开（用户立规）
         "auto_restore_min": 10,                # 语音打开后多少分钟自动收尾（钳位 0.5–1440）
         "auto_restore_domains": ["light"],
                                                # 10-10 复核：默认只留 light。cover 不默认纳入——

@@ -178,7 +178,28 @@ class HAClient:
                 self._reachable = r.status < 500
                 payload = await r.text()
                 if r.status in (200, 201):
-                    return {"success": True, "message": "", "raw": payload}
+                    # 10-10 实测（探针 _probe_service_body_semantics.py，射灯在 .91 上来回四次）：
+                    # /api/services/* 的 200 body 是**状态真变了的实体列表**——
+                    #   off→turn_on ⇒ [{entity_id, state:"on", …}]；on→turn_on（本来就在）⇒ **[]**
+                    #   on→turn_off ⇒ [{…state:"off"}]；off→turn_off ⇒ []
+                    # 旧写法把 payload 整个丢掉（只看状态码）⇒ 分不清"我打开了"与"它本来就开着"，
+                    # 归位也拿不到"哪台真被改过"。方向定死：**空列表不是失败**（目标状态已满足，
+                    # 判失败会把"本来就在要求的状态"播成没办好＝误杀），但它是 `changed=False`
+                    # 的确证，不许当"我做了件事"用，也不许拿去登记归位。
+                    obj = None
+                    if payload:
+                        try:
+                            obj = json.loads(payload)
+                        except Exception:                    # noqa: BLE001
+                            obj = None
+                    ids = [str(x.get("entity_id")) for x in obj
+                           if isinstance(x, dict) and x.get("entity_id")] \
+                        if isinstance(obj, list) else []
+                    out = {"success": True, "message": "", "raw": payload}
+                    if isinstance(obj, list):
+                        out["changed"] = bool(ids)
+                        out["entities"] = ids
+                    return out
                 try:
                     msg = (json.loads(payload) or {}).get("message", "") \
                         if payload else ""
