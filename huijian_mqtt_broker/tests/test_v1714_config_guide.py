@@ -63,3 +63,19 @@ def test_bridge_default_off_narrative_kept():
     row = re.search(r"<code>coexist_bridge_enabled</code></td>"
                     r"<td[^>]*>(.*?)</td>", guide, re.S).group(1)
     assert "默认关" in row and "1.7.13" in row, "桥开关叙述未随定案更新"
+
+
+def test_discovery_row_narrative_matches_v1762_ruling():
+    """v1.7.62 裁定：首台也要在卡片上点确认。说明卡是终端用户唯一的中文解释。
+
+    实发教训（10-09 审计 G-11）：本行自 v1.7.14 写死"零条目时首台全自动、第二台起
+    弹卡片确认"，而实现与 README 早已改成"每一台都要确认"——面板对外说的与做的相反，
+    用户会等一台"本该自动出现"的网关然后报障。反向臂（不得再出现"全自动"）是判据的
+    另一半：只肯定"含首台"而不禁旧口径，改一半也能过。
+    """
+    guide = _guide_block()
+    row = re.search(r"<code>fast_auto_discovery</code></td>"
+                    r"<td[^>]*>(.*?)</td>", guide, re.S).group(1)
+    assert "含首台" in row, "发现项叙述未随 v1.7.62 裁定更新（首台也要确认）"
+    assert "1.7.62" in row, "叙述要写明裁定出处，免得下轮被当成笔误改回去"
+    assert "全自动" not in row, "回潮：说明卡又对用户承诺首台不用确认"

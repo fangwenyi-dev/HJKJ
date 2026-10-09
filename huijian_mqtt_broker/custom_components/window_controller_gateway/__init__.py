@@ -267,8 +267,35 @@ async def async_ensure_hub_client(hass: HomeAssistant) -> None:
     if domain_data.get(HUB_STOPPED_KEY):
         return
 
+    # v1.8.6（审计 G-10）：attach 支此前**只挂集合、不比对端点与密钥**。base/install_key
+    # 是构造期绑死的（hub_client.py:378-379，长连与重连全读 self.base），于是
+    # "端点可用 entry.options 覆盖"（本文件下方注释的自述）在多条目下等于空头承诺：
+    # A 卸载尾部调本函数时 managers=[B] 非空 ⇒ 只 attach ⇒ 新配置永不生效，而
+    # "端点被覆盖"那行日志只在创建支打 ⇒ 连"用的是旧端点"都看不见。同形态在 ws_gateway
+    # 早已定案"比对 + 必要时热同步"（ws_gateway.py:1096-1102）——两条通道同判据是本仓纪律。
+    # 判据在**分支之前**算一次：创建支与重建路用同一份值，也不给本函数添第二个调用点
+    # （test_v1744 有条钉在数全仓 ensure 调用点，递归会把它顶成 4）。
+    base = resolve_hub_base(_hub_option(hass, "hub_base"))
+    key = _hub_option(hass, "hub_install_key") or HUB_DEFAULT_INSTALL_KEY
+    if current is not None and (current.base != base or current.install_key != key):
+        if domain_data.get(HUB_STOPPED_KEY) or getattr(hass, "is_stopping", False):
+            # 停机窗内绝不重建：新实例的 STOP 监听注册时事件已派发过 ⇒ 任务与 aiohttp
+            # 会话无人回收（C-2 那条实锤教训，见 _register_hub_stop_listener）。
+            # 此刻端口配置改不改都无所谓——进程马上要退了，交给下一个 ensure。
+            _LOGGER.debug("hub 端点/密钥与实例不一致，但处于停机窗，本次不重建")
+            current.attach_managers(managers)
+            return
+        # 密钥不回显（本仓口径：只说变了，不说变成什么）
+        _LOGGER.warning(
+            "hub 端点/安装密钥与在跑的长连不一致（端点 %s → %s；密钥%s）"
+            "——重建长连让配置生效（旧实例继续打旧端点会表现为"
+            "\"改了不生效、面板却显示已保存\"）",
+            current.base, base,
+            "已变更" if current.install_key != key else "未变")
+        await async_stop_hub_client(hass)
+        current = None
+
     if current is None:
-        base = resolve_hub_base(_hub_option(hass, "hub_base"))
         if base != HUB_DEFAULT_BASE:
             # 非内置默认＝有覆盖（entry.options 或 HUIJIAN_HUB_BASE 环境变量，后者是
             # 真栈 e2e 的黑洞杠杆）——显式记一行，覆盖永不静默（否则误设环境变量把生产
@@ -278,7 +305,7 @@ async def async_ensure_hub_client(hass: HomeAssistant) -> None:
             managers,
             config_dir=hass.config.config_dir,
             base=base,
-            install_key=_hub_option(hass, "hub_install_key") or HUB_DEFAULT_INSTALL_KEY,
+            install_key=key,
             control_fn=_make_hub_control(hass),
             # v1.8.5（审计 G-2）：把"该有几个 manager"的判据注入长连。缺了回调时
             # build_state_snapshot 退回旧行为（只防零 manager）——见该方法 docstring。

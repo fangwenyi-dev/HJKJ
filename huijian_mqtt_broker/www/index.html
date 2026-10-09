@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#071426">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E%F0%9F%93%A1%3C/text%3E%3C/svg%3E">
     <title>慧尖 LoRa 网关</title>
-    <link rel="stylesheet" href="css/huijian.css?v=1.8.5">
+    <link rel="stylesheet" href="css/huijian.css?v=1.8.6">
 </head>
 <body>
     <!-- v1.6.27「星辰大海」背景层（对齐小程序 UI 标准 0d2200c5）：
@@ -25,7 +25,7 @@
     <div class="page">
     <div class="header">
         <div class="brand">
-            <span class="brand-logo"><img src="img/logo.png?v=1.8.5" alt="慧尖 logo"></span>
+            <span class="brand-logo"><img src="img/logo.png?v=1.8.6" alt="慧尖 logo"></span>
             <div class="brand-text">
                 <h1>慧尖 LoRa 网关</h1>
                 <span class="ver" id="addonVersion"></span>
@@ -186,7 +186,7 @@
                 <tr style="border-bottom:1px solid rgba(255,255,255,.15);"><td style="padding:6px;"><code>coexist_official_user</code></td><td style="padding:6px;">共存桥登录<b>官方</b> Mosquitto 的用户名——是官方加载项自己「配置」页添加的账号，<b>不要</b>填 huijian/huijian2022（官方用户库里没有它）。</td></tr>
                 <tr style="border-bottom:1px solid rgba(255,255,255,.15);"><td style="padding:6px;"><code>coexist_official_password</code></td><td style="padding:6px;">上面官方账号的密码。两项必须一起填，只填一项会按匿名桥降级并打警告。</td></tr>
                 <tr style="border-bottom:1px solid rgba(255,255,255,.15);"><td style="padding:6px;"><code>coexist_bridge_topics</code></td><td style="padding:6px;">共存桥<b>追加桥接主题</b>（v1.7.19）。默认桥只接 z2m 两棵树；要让其他依赖官方 Mosquitto 的加载项（ESPHome、Tasmota、Shelly、自研前缀…）与慧尖互不干扰地共存，在此追加它们的主题树：逗号分隔 <code>主题[:方向]</code>，方向 in=设备→HA、out=HA→设备、both=双向（缺省）。例：<code>esphome/#</code> 或 <code>tele/#:in, stat/#:in, cmnd/#:out</code>。改后重启慧尖生效。<b>gateway、test 等保留树代码级拒绝</b>——开窗器指令面永不跨桥。</td></tr>
-                <tr><td style="padding:6px;"><code>fast_auto_discovery</code></td><td style="padding:6px;">快速自动发现（v1.7.11 引入）。开启后首次启动的慧尖网关上报会<b>自动完成配置</b>（零条目时首台全自动、第二台起弹卡片确认）。建议保持开启；关闭后需手动在「集成」页添加网关。</td></tr>
+                <tr><td style="padding:6px;"><code>fast_auto_discovery</code></td><td style="padding:6px;">快速自动发现（v1.7.11 引入）。开启后慧尖网关一上报就立刻弹出发现卡，不用等下一次心跳（间隔 5 分钟起）。<b>每一台都需在卡片上点「确认」才完成配置，含首台</b>（v1.7.62 起——此前首台会静默自动添加、不可见）。建议保持开启；关闭后网关仍会上报，但你要自己在「集成」页手动添加。</td></tr>
             </table>
             <p style="opacity:.75;margin-top:8px;">改完任何一项后：点「保存」→「重启」加载项生效。zigbee2mqtt 用户也可不经官方 broker，直连慧尖内置 :2022（账号 huijian_z2m，详见 README）。</p>
         </div>
@@ -207,9 +207,9 @@
     <!-- v1.6.25 Web UI 三文件化：css/js 外置（相对路径，兼容 HA ingress 前缀）。
          CURRENT_VERSION 按测试锚留在本文件；huijian.js 复用此全局 let 绑定。
          v1.6.27 新增 starsky.js：纯装饰星野生成器（固定种子，零依赖零网络）。 -->
-    <script>let CURRENT_VERSION = '1.8.5';</script>
-    <script src="js/starsky.js?v=1.8.5"></script>
-    <script src="js/qr.js?v=1.8.5"></script>
-    <script src="js/huijian.js?v=1.8.5"></script>
+    <script>let CURRENT_VERSION = '1.8.6';</script>
+    <script src="js/starsky.js?v=1.8.6"></script>
+    <script src="js/qr.js?v=1.8.6"></script>
+    <script src="js/huijian.js?v=1.8.6"></script>
 </body>
 </html>

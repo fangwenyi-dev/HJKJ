@@ -107,6 +107,27 @@ async def _fire_trailing(hass):
 class TestModelCapability:
     """SN 前四位 = 机型码 → 百分比能力（const.POSITION_CAPABLE_SN_PREFIXES）"""
 
+    def test_position_attr_only_for_capable_models(self):
+        """v1.8.6（审计 G-4 第二条）：无能力机型的属性里**不得出现 position**。
+
+        旧实现 `cover.py` 无条件写 `attrs["position"]=钳制(r_travel)`，而
+        `current_cover_position`（:267）与 Web 面板都按能力判——于是 5002 这类
+        机型常态并排显示「不支持百分比定位」＋「位置: 65%」，且这条矛盾**不需要
+        /states 失败**就存在。反向臂（有能力的仍要带 position）是判据另一半：
+        只禁无能力侧，改成"谁都不写"也能过。
+        """
+        capable = _cover("500700000001", status=DEVICE_STATUS_OPEN,
+                         attributes={"r_travel": 65, "voltage": 12.0})
+        plain = _cover("500200000001", status=DEVICE_STATUS_OPEN,
+                       attributes={"r_travel": 65, "voltage": 12.0})
+        assert capable.extra_state_attributes.get("position") == 65, \
+            capable.extra_state_attributes
+        assert "position" not in plain.extra_state_attributes, \
+            "无能力机型还在写 position：%r" % (plain.extra_state_attributes,)
+        # 原始行程仍要无条件持久化（v1.6.26 B-2：区分"真 100%"与"未校准 255 被钳成 100"）
+        assert plain.extra_state_attributes.get("r_travel_raw") == 65, \
+            plain.extra_state_attributes
+
     @pytest.mark.parametrize("prefix", sorted(POSITION_CAPABLE_SN_PREFIXES))
     def test_capable_models_declare_set_position(self, prefix):
         feats = _cover(f"{prefix}00000001")._attr_supported_features

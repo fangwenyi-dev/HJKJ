@@ -1,7 +1,7 @@
 {
   "domain": "window_controller_gateway",
   "name": "慧尖开窗器网关",
-  "version": "1.8.5",
+  "version": "1.8.6",
   "config_flow": true,
   "documentation": "https://github.com/fangwenyi-dev/HJKJ",
   "issue_tracker": "https://github.com/fangwenyi-dev/HJKJ/issues",

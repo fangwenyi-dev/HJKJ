@@ -177,6 +177,18 @@ def _attr_int(dev: Any, key: str) -> int:
         return -1
 
 
+def _wind_lock_mode(dev: Any) -> int:
+    """云快照里的 windLockMode（v1.8.5 审计 G-9）：解析过还要过域表。
+
+    `_attr_int` 只管"能不能解析"，2/999 会原样当合法数字上行；hub 再按
+    `Array.isArray(msg.items)` 的键集权威语义把它当全量收下（server.js:477），
+    三通道里云这一路就比 LAN 多一份垃圾。判据与 LAN 共用 utils 那份，
+    两条通道同判据是本仓纪律（见 :1266 的 A-2 旧案）。
+    """
+    from .utils import wind_lock_mode_or_unknown  # 懒 import：模块本体不依赖包内其他文件
+    return wind_lock_mode_or_unknown(_attr_int(dev, "wind_lock_mode"))
+
+
 def cred_brief(value: Any) -> str:
     """凭据摘要：只回长度+首字节（日志/视图都不回显明文）。"""
     if not value:
@@ -1273,7 +1285,7 @@ class HubClient:
                         # 云通道没有 LAN 那路 device_update 实时推送，锁定模式只能靠
                         # 状态上行带过去——device_ws_view 是 device_list 项视图（不含它），
                         # 这里补上与 LAN `_device_update_payload` 同源的字段。
-                        view["windLockMode"] = _attr_int(dev, "wind_lock_mode")
+                        view["windLockMode"] = _wind_lock_mode(dev)
                 except Exception as e:  # noqa: BLE001
                     self._logger.debug(
                         "hub 设备视图构造失败（%s），按上一轮视图上报：%s",

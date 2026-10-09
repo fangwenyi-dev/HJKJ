@@ -47,6 +47,12 @@ class FakeHub:
     def __init__(self, managers=None, **kw):
         self.managers = list(managers or [])
         self.kw = kw
+        # v1.8.6（审计 G-10）：真 HubClient 在构造期就把 base/install_key 绑成实例属性
+        # （hub_client.py:378-379，长连与重连全读 self.base），而 ensure 现在要读它们
+        # 判断"端点换没换"。替身缺这一面不是逻辑变了，是**桩窄于真实现**
+        # （本仓第六次踩同坑），只会以 AttributeError 冒充成缺陷。
+        self.base = kw.get("base", "")
+        self.install_key = kw.get("install_key", "")
         self.attached = []
         self.started = 0
         self.stopped = 0

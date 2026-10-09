@@ -12,7 +12,8 @@ from typing import Dict, Any, Optional, Tuple
 from homeassistant.core import HomeAssistant
 
 from .const import (DOMAIN, PROTOCOL_HEAD, TOPIC_GATEWAY_REQ_FORMAT,
-                    CONF_GATEWAY_SN, GLOBAL_IGNORED_GATEWAYS, SENSOR_TIMEOUT_MINUTES)
+                    CONF_GATEWAY_SN, GLOBAL_IGNORED_GATEWAYS, SENSOR_TIMEOUT_MINUTES,
+                    ATTRIBUTE_WIND_LOCK_MODE, CONTROL_ATTR_DOMAINS)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -829,3 +830,33 @@ def device_is_stale(device: dict) -> bool:
         # "1970 年 ⇒ 陈旧"，实发把 test_no_timestamp_treated_fresh 打红过。
         return False
     return (time.time() - wall) > limit_s
+
+
+def wind_lock_mode_or_unknown(raw: Any) -> int:
+    """风锁模式入界归一（v1.8.5 审计 G-9）：域表外一律 -1（未知约定）。
+
+    为什么必须有这一处：`ws_gateway.py:296` 的 docstring 立了"入界纪律与 position
+    同款"，speed/strength/position/battery 四个字段都有范围闸，**唯独 windLockMode
+    是 `_as_int()` 裸透传**，而 `_ctypes` 的写入点又原样存 value——于是异常上报
+    （2、999、"1"、dict）会以"合法数字"的形态经 device_list / device_update /
+    云快照三条通道一起分发出去，读侧再也分不出它是真值还是垃圾。
+
+    判据取自 `const.CONTROL_ATTR_DOMAINS[ATTRIBUTE_WIND_LOCK_MODE]`（域表**唯一天花板**，
+    出站 control 与入站回显同一份，不再第二处写死 0/1）。-1 是本仓既有的"未知"哨兵，
+    小程序侧 `getModeText` 对非 0/1 显示 '--'、`ws-gateway.js`/`gw-router.js` 的
+    nonNeg 闸也按 >=0 收，所以 -1 是安全落点，不会新增形态。
+
+    读侧再钳一次不是冗余：设备字典随 persist 落盘，历史版本可能已把垃圾值留在
+    `wind_lock_mode` 里，只修写入点对存量坏数据无效。
+    """
+    if raw is None or isinstance(raw, bool):
+        return -1
+    lo, hi, extra = CONTROL_ATTR_DOMAINS[ATTRIBUTE_WIND_LOCK_MODE]
+    try:
+        value = int(raw)
+    except (ValueError, TypeError, OverflowError):
+        return -1
+    if value in extra or lo <= value <= hi:
+        return value
+    return -1
+

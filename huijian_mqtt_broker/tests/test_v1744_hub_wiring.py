@@ -73,6 +73,11 @@ class FakeHub:
     def __init__(self, managers=None, **kw):
         self.managers = list(managers or [])
         self.kw = kw
+        # v1.8.6（审计 G-10）：与 test_v1743 的替身同款等宽——真 HubClient 的
+        # base/install_key 是构造期绑死的实例属性（hub_client.py:378-379），
+        # ensure 现在要读它们做端点比对；替身不带上这面就只能以 AttributeError 收场。
+        self.base = kw.get("base", "")
+        self.install_key = kw.get("install_key", "")
         self.started = 0
         self.stopped = 0
         FakeHub.made.append(self)

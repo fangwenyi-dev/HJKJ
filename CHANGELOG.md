@@ -3,7 +3,109 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## [1.8.5] - 2026-10-09 · 全量审计真 bug 收口：G-2/G-3/G-4/G-5/G-7/G-8 六条 + G-1/G-6 两条纪律缺口
+## [1.8.6] - 2026-10-09 · 10-09 清单收尾（G-9/G-10/G-11）+ 两条"字面量钉守不住控制流洞"的行为补强
+
+⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件
+拷进 `/config/custom_components`，已加载的模块不换）。
+⚠️ **v1.8.5 从未出货，本版是把它一起结掉**：`c0d1fea` 那次推送在 CI 的 Lint 当场红
+（`test_hub_client.py:934` 一条 ruff F841），下游 Build/Manifest/Release/Gitee **全部 skipped**
+⇒ ghcr 里没有 `1.8.5` 镜像（匿名 manifest 实测 404，同一探针的阳性对照 `1.8.4` 回 200），
+GitHub/Gitee 两源都没有 v1.8.5 那条 Release——而 main 上的 `config.yaml` 已写 1.8.5，
+Supervisor 读默认分支＝向全体用户广告一个装不上的版本。教训两条都记进了判据：
+**本地 pytest 全绿 ≠ 过门**（ruff 必须按 CI 同参同路径跑），**推 main 前必须核发布闸与镜像**。
+发布闸对"tag 已存在且指向他处"是响亮跳过，所以本批另起号段，不冒充 1.8.5。
+
+### G-11 面板对终端用户说了相反的话（唯一一条对外错文案）
+
+`www/index.html:189` 的 `fast_auto_discovery` 说明自 v1.7.14（`042c36a`）写死
+"零条目时首台全自动、第二台起弹卡片确认"，而 v1.7.62 的裁定与实现早已是
+"**每一台都要在卡片上点确认，含首台**"（README.md:52-53 同口径）。这是终端用户看到的
+唯一一段中文解释 ⇒ 照它理解的用户会等一台"本该自动出现"的网关，然后报障。
+订正后加**行级双向钉**（`test_v1714_config_guide.py`）：该行必须含"含首台"与裁定出处，
+且**同一行不得再出现"全自动"**——只肯定新口径不禁旧口径，改一半也能过。
+（清单原述"另四份翻译都改了、漏了第五份"不成立：`strings.json` 与三份 translations 里
+根本没有这句话，`git log -L 189,189` 显示该行唯一一次改动是 v1.7.14。）
+
+### G-9 windLockMode 是这一族里唯一没做入界闸的字段（自洽性，用户可见后果≈0）
+
+`ws_gateway.py:296` 的 docstring 立"入界纪律与 position 同款"，speed/strength 有
+`0<=x<=100`、position 钳 [0,100]、battery 判 [80,140]，唯独 `windLockMode` 走 `_as_int()`
+裸透传，而写入点 `_ctypes.py` 把 005 上报的 value **原样存进 attributes** 并随 persist 落盘。
+新增单一出口 `utils.wind_lock_mode_or_unknown()`：判据取自
+`const.CONTROL_ATTR_DOMAINS[ATTRIBUTE_WIND_LOCK_MODE]`（**与出站 control 同一份天花板**，
+不再第二处写死 0/1），域表外一律 -1（本仓既有"未知"哨兵）。三个出口同时接：005 写入点、
+LAN 视图 `device_ws_view`、云快照 `hub_client._wind_lock_mode`。
+判据三条：两通道异常值都回 -1（真跑）、**改域表必须两向跟着变**（同源臂，防"两处各写一份"）、
+写入点不得原样存 value（块内有界匹配，不跨函数）。
+诚实边界：清单原述"小程序按非 0 即平开渲染错态"**经跨仓只读核实为误报**——
+`pages/broker-device.js:219-223` 的 `getModeText` 是 `===0 内倒 / ===1 平开 / else '--'`，
+异常值显示"未知"，不出错态。所以这一刀的收益是自洽性与存量坏数据，不是止血。
+
+### G-10 ≥2 条目时改 hub 端点/安装密钥永不生效（代码不对称，现网无 UI 路径可达）
+
+`async_ensure_hub_client` 的 attach 支只挂集合、不比对：`base/install_key` 是构造期绑死的
+（`hub_client.py:378-379`，长连与重连全读 `self.base`），于是 A 卸载尾部 ensure 见
+managers=[B] 非空 ⇒ 只 attach ⇒ 带外覆盖永不生效，而"端点被覆盖"那行日志只在创建支打。
+同形态在 `ws_gateway.py:1096-1102` 早已定案"比对 + 必要时热同步"——两条通道同判据是本仓纪律。
+改法：attach 前比对 `resolve_hub_base(_hub_option(...))` 与 install_key，不一致即
+`async_stop_hub_client` 后重走创建支。
+两条反向臂与正向臂同样重要，也都钉了：① **端点没变不得重建**——重建＝重注册＝作废用户
+手上所有绑定码，把"改了不生效"修成"没改也天天作废"是更坏的结果；② **停机窗内不重建**
+（C-2 实锤：新实例的 STOP 监听注册时事件已派发过 ⇒ 任务与 aiohttp 会话无人回收）。
+可达性讲清楚：全仓 `hub_base/hub_install_key` **零写入点**（选项表单只有
+discovery_interval/auto_discovery/debug_logging/WS 口+令牌，无 reconfigure 步，
+`:838` 自陈"P1 再进 config_flow 表单"），现实只有环境变量与手改 `.storage` 两途且都要重启；
+单条目 reload 本来就走创建支（`:191-192` 空集合即停并 pop 键）。**这一刀修的是不对称，
+不是正在咬人的故障。**
+
+### 两条"字面量钉"升级成行为钉（G-4 的判据债，不是新缺陷）
+
+- 面板台架（`test_v1755_silent_refresh_behavior.py`）加**场景 D**：真设
+  `PENDING_REBUILD[entryId]` ⇒ id 集合未变也必须整建一次；再**真清**并跑**反向半条 D2**
+  ⇒ 没标记不得无谓整建。另加**自变异核验 3**：摘掉 `|| PENDING_REBUILD[entryId]`
+  必须变红且**红在 D 那条**。为什么必须有：G-4 当初就是从"字面量只判语句在位"的缝里过去的
+  （`test_v1731:624` 断言的那句 `loadDeviceState(dev, []);` 一直是同步调用，注释与
+  CHANGELOG 都写成"异步补拉"）。
+- `cover.py` 那半补**正反两臂**（`test_v1721_position_capability.py`）：同一条 r_travel=65，
+  有能力机型属性里要有 `position`，5002 这类**不得出现 `position`**，而 `r_travel_raw`
+  两侧都要在（v1.6.26 B-2 的"真 100% vs 未校准 255 被钳成 100"判据不许被顺手删掉）。
+  这条矛盾不需要 /states 失败就常态存在，是清单没找到的第二条路径，v1.8.5 已修代码、
+  本轮补上判据。
+
+### 本批故意不做 / 留作决策（写明，免得下轮当成"已闭"再翻）
+
+- **G-12 不动**：判为误报——`_ctypes.py:208 add_device` 之后 `:211` 紧跟
+  `_update_device_attributes` → `:241 if attributes:` → `update_device_status` 走漏斗标脏，
+  而 `hub_client.py:1163` 明写标脏就"重推**全量**"，`build_state_snapshot:1183` 也是全量 ⇒
+  同帧任一设备标脏就把裸设备带出去；残余形态要"整帧所有条目既无 battery 又无 r_travel"。
+- **G-2 修法留了一条要你定夺的口子**：不权威时 `_flush_loop` **整批不发**、只播一次 WARNING、
+  没有有界兜底。于是某个"带 SN 却长期进不了 `_setup_complete`"的条目（本仓自己就有
+  `broker_not_ready` 与"MQTT 条目被禁用"两张卡描述这状态）会让**全部网关的云端状态停更**。
+  比误删安全，但代价从"误删"换成了"静默停更"。可选退路：连续 N 轮不权威时改用 hub 认得的
+  非 snapshot 单条合并形（`server.js:478` 那条不夺键集）。**等点名，本轮没动。**
+- `renderDevice` 是嵌套在 `loadGatewayDevices` 里的函数，没法单独 node 真跑 ⇒
+  "读不到 ≠ 不支持"那三态（空 states / 有能力 / 无能力）目前仍是结构钉，列欠项。
+- C 段"run.sh CRLF 造成 18 条本地红"不成立：`bash -n run.sh` rc=0，读 run.sh 的行锚钉全绿，
+  本轮整跑一条红都没有。
+
+### 门禁（本机实测，非引用）
+
+`pytest huijian_mqtt_broker/tests` = **1817 passed / 0 failed / 0 skipped**（57.95s；基线 1807，
+本批 +10 条判据）；ruff **按 CI 同参同路径**（`--select F,E9,B --ignore B008,B905`，含
+`mdns_publisher.py` 与 `gateway_discovery_proxy.py`）= All checks passed——**这一条是本轮点名过的
+教训**：v1.8.5 那次本地 pytest 全绿照样被 CI Lint 当场打死。`compileall` exit 0、
+`bash -n run.sh` exit 0、`node --check` ×3 OK、YAML/JSON 全树 0 失败。
+跨仓契约钉**真跑臂 113 / 0 failed**（下限 110 已复核，对端＝本机 hub 与小程序真仓）、
+hub 生命周期真栈 **35 / 0**（下限 35 已复核）、**变异矩阵整跑 89 臂（应红 86）失守 0**
+——其中 2 条是本轮修掉的**既有臂失效**（`ghost_zero_manager_treated_as_full`：v1.8.5 新加的
+`elif` 让"整块删除"变成语法错；`c10_exit_clear_dropped`：G-3 把两行清单换成唯一出口后锚漂移
+`count=0`），两条都在整跑里以 FAIL+缘由点名过，修锚后重新验红。
+版本五源 + README 徽章文案与链接 = **1.8.6**（字节级替换，逐文件核 CRLF/裸-LF 计数未翻）。
+发布闸预演：`refs/tags/v1.8.6` 两远端都不存在 ⇒ 按 ci.yaml 判据本轮是真发版。
+未做：真机 .91 联调（要装上 1.8.6 才打得开，发版后补）；WSL HA 真栈 e2e 交 CI 的
+`E2E real stack` job（本机 Windows 侧不重跑）。
+
+
 
 ⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件
 拷进 `/config/custom_components`，已加载的模块不换）。两轮独立全仓审计（17 域只读深审）后逐条

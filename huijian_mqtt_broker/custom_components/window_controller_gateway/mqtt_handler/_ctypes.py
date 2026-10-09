@@ -18,7 +18,7 @@ from ..const import (
     DEVICE_TO_GATEWAY_MAPPING,
     get_device_display_name,
 )
-from ..utils import is_valid_device_sn
+from ..utils import is_valid_device_sn, wind_lock_mode_or_unknown
 
 # logger 名钉死为拆分前模块 __name__ 值——日志输出零差异（回归要求）
 _LOGGER = logging.getLogger("custom_components.window_controller_gateway.mqtt_handler")
@@ -530,8 +530,18 @@ class _CtypeHandlersMixin:
                             _LOGGER.error("设备 %s 位置状态格式错误: %s, 值: %s", device_sn, e, value)
                     elif attribute == "rwp_wind_lock_mode":
                         # 风锁模式上报：0=内倒模式，1=平开模式
-                        attributes["wind_lock_mode"] = value
-                        mode_name = "内倒模式" if str(value) == "0" else "平开模式"
+                        # v1.8.5（审计 G-9）：本行此前**原样存 value**，而同族的
+                        # speed/strength 至少做了 int 归一——域表外（2、999、"1"、
+                        # dict）会以"合法数字"形态经 device_list / device_update /
+                        # 云快照三条通道一起分发，读侧再也分不出真值与垃圾。
+                        # 归一＋域判收在 utils.wind_lock_mode_or_unknown（判据取自
+                        # CONTROL_ATTR_DOMAINS，与出站 control 同一份天花板）。
+                        mode = wind_lock_mode_or_unknown(value)
+                        if mode == -1:
+                            _LOGGER.warning(
+                                "设备 %s 风锁模式上报越界，按未知处理: 原值=%r", device_sn, value)
+                        attributes["wind_lock_mode"] = mode
+                        mode_name = {0: "内倒模式", 1: "平开模式"}.get(mode, "未知")
                         _LOGGER.info("设备 %s 风锁模式确认: %s (值=%s)", device_sn, mode_name, value)
                     elif attribute == "rwp_winact_speed":
                         # 开窗速度上报：0-100

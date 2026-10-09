@@ -228,10 +228,13 @@ ARMS = [
      "退回 v1.7.58 的 `if not items: continue`：删掉最后一台时全量快照不再上行，"
      "hub 的 merge-only 状态表永久留着那个 sn", GHOST),
     ("ghost_zero_manager_treated_as_full", HUBC,
-     "        if not self._managers:\n            authoritative = False\n", "",
+     "        if not self._managers:\n            authoritative = False\n",
+     "        if False:\n            authoritative = False\n",
      "test_zero_manager_batch_is_not_pushed", "red",
      "零 manager 的『空』当成全量交出去：启动未完成/条目全在卸载时把云端整表清空"
-     "（比幽灵设备更糟的反方向）", GHOST),
+     "（比幽灵设备更糟的反方向）。变异形态用 `if False:` 而不是整块删除——"
+     "v1.8.5 的 G-2 在这段后面加了 `elif expected > len(...)`，删行会让 elif 悬空"
+     "成语法错（语法闸把红判成无效，10-09 矩阵整跑实测失守）", GHOST),
     ("ghost_unbuildable_claimed_full", HUBC,
      "                if view is None:\n                    authoritative = False\n"
      "                    continue\n",
@@ -380,12 +383,14 @@ ARMS = [
      T1761AF),
     ("c10_exit_clear_dropped", MB,
      "                    if not getattr(hass, \"is_stopping\", False):\n"
-     "                        _clear_channel_issue(hass)\n"
-     "                        _clear_mdns_issue(hass)\n",
+     "                        _clear_huijian_issues(hass)\n",
      "                    if not getattr(hass, \"is_stopping\", False):\n"
      "                        pass\n",
      "test_healer_clears_cards_when_entries_all_disabled", "red",
-     "C-10 原形：启用条目清零直接退出不清卡 ⇒ 禁用后僵尸卡永留",
+     "C-10 原形：启用条目清零直接退出不清卡 ⇒ 禁用后僵尸卡永留。"
+     "锚点在 v1.8.5 的 G-3 之后改指**域级唯一清理出口**（旧锚是手写两张卡的清单，"
+     "G-3 收口后锚漂移 count=0，10-09 矩阵整跑实测失守）；现在这条臂同时守住了"
+     "『漏抄第三张 takeover』那个新形态——出口被摘掉，三张卡一起不回潮才判绿",
      T1763H),
     ("c11_fast_e2e_wiring_dropped", RUN_E2E_F,
      "    bash \"$DIR/fast_discovery_e2e.sh\" || RC_F=$?\n",
@@ -694,6 +699,55 @@ ARMS = [
      "test_format_gate_is_not_a_length_gate", "red",
      "谓词退化成无长度下限的字符集判据 ⇒ \"0\" 合法，全部五处闸一起失效",
      T186G),
+    # ── v1.8.6（10-09 清单 G-9/G-10/G-11 + G-4 判据债）──
+    ("v186_g9_domain_hardcoded", UTILS,
+     "    if value in extra or lo <= value <= hi:",
+     "    if value in (0, 1):",
+     "test_lock_mode_domain_is_single_sourced", "red",
+     "G-9：域判写死成 0/1 ⇒ 出站 control 与入站回显的天花板分成两份，"
+     "改域表时视图不跟着变（本仓反复栽的『同一条纪律只在个别点贯彻』）",
+     "tests/test_v1747_winact_echo.py"),
+    ("v186_g10_no_endpoint_compare", INIT,
+     "    if current is not None and (current.base != base or current.install_key != key):",
+     "    if False:",
+     "test_endpoint_change_rebuilds_the_long_connection", "red",
+     "G-10 原形：attach 支不比对端点/密钥 ⇒ 多条目下改了配置永不生效，"
+     "而『端点被覆盖』日志只在创建支打",
+     "tests/test_audit_2026_10_09_r2_fixes.py"),
+    ("v186_g10_rebuilds_always", INIT,
+     "    if current is not None and (current.base != base or current.install_key != key):",
+     "    if current is not None:",
+     "test_unchanged_endpoint_does_not_rebuild", "red",
+     "反向半条：把『比对后重建』做成『每次都重建』是更坏的结果——每次 ensure 都重注册，"
+     "作废用户手上全部一次性绑定码",
+     "tests/test_audit_2026_10_09_r2_fixes.py"),
+    ("v186_g10_rebuild_in_stop_window", INIT,
+     "        if domain_data.get(HUB_STOPPED_KEY) or getattr(hass, \"is_stopping\", False):",
+     "        if False:",
+     "test_no_rebuild_inside_ha_stop_window", "red",
+     "C-2 同形回归：停机窗内重建的新实例，其 STOP 监听注册时事件已派发过 ⇒ "
+     "任务与 aiohttp 会话无人回收",
+     "tests/test_audit_2026_10_09_r2_fixes.py"),
+    ("v186_g11_panel_row_reverts", "www/index.html",
+     "才完成配置，含首台",
+     "才完成配置",
+     "test_discovery_row_narrative_matches_v1762_ruling", "red",
+     "G-11 原形：这段是终端用户唯一的中文解释，退一句『首台不用确认』就与 v1.7.62 裁定相反",
+     "tests/test_v1714_config_guide.py"),
+    ("v186_g4_rebuild_marker_ignored", "www/js/huijian.js",
+     "|| PENDING_REBUILD[entryId]",
+     "",
+     "test_silent_refresh_really_updates_device_states", "red",
+     "G-4 判据债：降级登记的整建标记若不被消费，假能力声明与丢失的滑块仍只能靠手动 F5；"
+     "当年放行它的正是字面量钉",
+     "tests/test_v1755_silent_refresh_behavior.py"),
+    ("v186_g4_cover_writes_position_anyway", "custom_components/window_controller_gateway/cover.py",
+     "                    if self._position_capable:",
+     "                    if True:",
+     "test_position_attr_only_for_capable_models", "red",
+     "G-4 第二条：无能力机型常态并排『不支持百分比定位』＋『位置: 65%』，"
+     "这条矛盾不需要 /states 失败就存在",
+     "tests/test_v1721_position_capability.py"),
 ]
 
 

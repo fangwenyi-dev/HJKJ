@@ -250,6 +250,26 @@ function subs() {
        'C2: 未禁用的条目仍要逐设备更新（反向半条，防 C 靠"什么都不做"蒙过）: '
        + JSON.stringify(probe.loadDeviceState));
 
+  // ── 场景 D（v1.8.6 审计 G-4 行为臂）：降级渲染登记的整建标记必须被消费 ──
+  // /states 失败那一轮生产把 PENDING_REBUILD[entryId] 置真（瓷砖只能用空 states
+  // 渲染 ⇒ 能力判词是假的）。旧实现在 id 集合未变时只走 loadDeviceState（更新既有
+  // 元素、不重建 DOM）⇒「不支持百分比定位」与丢失的位置滑块永不自愈，只能手动 F5。
+  // 这一条是**行为钉**：G-4 当初正是从"字面量钉只判语句在位"的缝里过去的
+  // （test_v1731 断言的那句 `loadDeviceState(dev, []);` 一直是同步调用）。
+  // 真设真清，并配反向半条 D2：没有标记时同集合不得无谓整建（每 30s 重建＝面板自造抖动）。
+  resetProbe();
+  PENDING_REBUILD[ENTRY] = true;
+  await updateGatewayDevices(ENTRY, GW_SN);
+  want(probe.rebuild >= 1,
+       'D: 有降级标记时即使 id 集合未变也必须整建一次（rebuild=' + probe.rebuild
+       + '；0 ⇒ 假能力声明与丢失的滑块回不来）');
+  delete PENDING_REBUILD[ENTRY];
+  resetProbe();
+  await updateGatewayDevices(ENTRY, GW_SN);
+  want(probe.rebuild === 0,
+       'D2: 标记清掉后同集合不得再整建（反向半条，防"改成每轮都重建"蒙过 D）: '
+       + probe.rebuild);
+
   if (bad) { console.log('updateGatewayDevices 真跑: ' + bad + ' 处不符'); process.exit(1); }
   console.log('OK');
 })();
@@ -324,3 +344,22 @@ def test_probe_catches_the_disabled_entry_leak():
     rc, out, err = _run(_script(mutant))
     assert not (rc == 0 and "OK" in out), \
         "摘掉禁用条目守卫后场景 C 仍通过：这条钉是假绿，必须重写探针"
+
+
+def test_probe_catches_the_pending_rebuild_leak():
+    """自变异核验 3：摘掉整建标记那一半判据，场景 D 必须变红（v1.8.6 G-4）。
+
+    这条为什么必须有：G-4 的原始缺陷就是"恢复路径只更新既有元素"，而当时的守卫
+    是字面量钉（判 `loadDeviceState(dev, []);` 在不在），控制流洞照样过。
+    现在行为钉要自己证明抓得住——把 `|| PENDING_REBUILD[entryId]` 摘掉，
+    id 集合未变时就不整建，D 必须红；哪天这条变异不再变红，说明 D 的探针失真。
+    """
+    body = _extract()
+    mutant = body.replace("|| PENDING_REBUILD[entryId]", "")
+    assert mutant != body, \
+        "变异没生效：updateGatewayDevices 里已无 `|| PENDING_REBUILD[entryId]`" \
+        "——标记判据被改名/挪走/删掉了，G-4 的自愈与这条钉一起失效，必须重写"
+    rc, out, err = _run(_script(mutant))
+    assert not (rc == 0 and "OK" in out), \
+        "摘掉降级标记判据后场景 D 仍通过：这条行为钉是假绿"
+    assert "D:" in out, "红了但不是 D 那条（探针漂移？）:\n%s" % out

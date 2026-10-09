@@ -77,7 +77,7 @@ from .const import (
     WS_TOKEN_MAX_LEN,
     WS_TOKEN_MIN_LEN,
 )
-from .utils import log_throttled
+from .utils import log_throttled, wind_lock_mode_or_unknown
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -329,7 +329,7 @@ def device_ws_view(device_sn: str, gateway_sn: str, device: Dict[str, Any]) -> D
         "position": position_i,
         "battery": battery,
         "state": state,
-        "windLockMode": _as_int(attrs.get("wind_lock_mode")),
+        "windLockMode": wind_lock_mode_or_unknown(attrs.get("wind_lock_mode")),
         "winactSpeed": speed,
         "winactStrength": strength,
     }
