@@ -931,7 +931,7 @@ def test_no_manager_means_empty_items_and_no_crash(tmp_path):
 def test_partial_manager_set_is_not_authoritative(tmp_path):
     """该挂 2 个、只挂上 1 个 ⇒ 不权威（否则云端把那台网关的设备整片删掉）。"""
     m1 = FakeManager(gateway_sn="GW1", devices={"A1B2": {"attributes": {"r_travel": 30}}})
-    m2 = FakeManager(gateway_sn="GW2", devices={"C3D4": {"attributes": {"r_travel": 70}}})
+    # GW2 存在（期望数 2）但**故意不挂进 managers**——这正是 reload 窗口的形态。
     client, _, _ = make_client(tmp_path, managers=[m1], expected_managers_fn=lambda: 2)
     items, authoritative = client.build_state_snapshot()
     assert [i["sn"] for i in items] == ["A1B2"], "可见的那台仍要构造出来（供恢复后比对）"
