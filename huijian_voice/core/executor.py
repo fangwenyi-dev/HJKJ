@@ -1246,7 +1246,10 @@ class Executor:
             results.append(result)
             # ② 归位登记：只对**本步真的执行成功**且目标已 grounded 的设备生效；
             # 关闭方向则撤销登记（人已关，别再补刀）。永不抛、不参与播报判定。
-            self.restore.note(name, args, True)
+            # 10-10 对抗复核修：把**执行前证据**一起交出去。`kind == "noop"` 意味着目标
+            # 本来就在要求的状态上（播报会直说「本来就在要求的状态上」），这种步**没打开
+            # 任何东西** ⇒ 不许登记归位，否则 10 分钟后会把用户正在用的灯关掉。
+            self.restore.note(name, args, True, noop=(kind == "noop"))
             # 同栅栏收口：单步也要点名"点了名却没回执"的那台（此前只对链生效）。
             for nm in await self._unanswered(args, result):
                 if nm not in no_receipt:

@@ -116,9 +116,12 @@ DEFAULTS: dict[str, Any] = {
         #   手动打开后＝只在能确证 entity_id 的设备上生效（目标未 grounded 一律不登记）。
         "auto_restore": False,                 # 总开关：默认关＝行为逐值回到本批之前
         "auto_restore_min": 10,                # 语音打开后多少分钟自动收尾（钳位 0.5–1440）
-        "auto_restore_domains": ["cover", "light"],
-                                               # 默认只管"开合类＋灯"：switch/fan 多为模式类
-                                               # （摆风、提示音）自动关会改别的语义，不默认纳入
+        "auto_restore_domains": ["light"],
+                                               # 10-10 复核：默认只留 light。cover 不默认纳入——
+                                               # 办公室那扇平开窗由 YAML 自动化每 ~10 分钟开合，
+                                               # 默认计时会与它抢关；"打开窗帘"的终态本就是人要
+                                               # 留下的状态（遮光/采光），自动合帘不是"补忘关"。
+                                               # switch/fan 多为模式类（摆风、提示音）同理不纳入
         "auto_restore_exclude": [],            # 点名不参与（支持 fnmatch，如 "light.bed_*"）
     },
     "spatial": {

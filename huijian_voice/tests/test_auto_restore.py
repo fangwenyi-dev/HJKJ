@@ -139,11 +139,20 @@ def test_到点_灯亮着才关_并走官方关服务():
     assert ha.calls == [("light", "turn_off", {"entity_id": "light.ban_gong_shi_she_deng"})]
 
 
-def test_到点_窗开着_走_close_cover():
+def test_到点_窗开着_走_close_cover_但必须显式扩域():
+    """默认域已收窄成 light（10-10 复核：办公室那扇平开窗由 YAML 自动化每 ~10 分钟
+    开合，默认计时会与它抢关）。本钉因此**显式把 cover 加进 domains**——
+    它要证的是"cover 在策略内时收尾服务选对了"，不是"cover 默认在策略内"。"""
     ha = HA(state="open")
-    ar = AutoRestore(ha, Set(**{"dialog.auto_restore": True}))
+    ar = AutoRestore(ha, Set(**{"dialog.auto_restore": True,
+                                "dialog.auto_restore_domains": ["cover", "light"]}))
     asyncio.run(ar._fire("cover.ping_kai_chuang"))
     assert ha.calls == [("cover", "close_cover", {"entity_id": "cover.ping_kai_chuang"})]
+    # 反向：不扩域时到点不许动窗（默认口径）
+    ha2 = HA(state="open")
+    ar2 = AutoRestore(ha2, Set(**{"dialog.auto_restore": True}))
+    asyncio.run(ar2._fire("cover.ping_kai_chuang"))
+    assert ha2.calls == [], "cover 已不在默认域，却仍去关窗：%s" % (ha2.calls,)
 
 
 def test_到点_已经关了_不做二次动作():
@@ -236,17 +245,20 @@ def test_生产主车道意图名TurnDeviceOn_从Executor_run到登记一条龙(
         "生产主车道名字不登记＝真机上这条功能不存在"
 
 
-def test_窗控族按action判方向_stop这类不登记():
-    """`ControlWindow` 的方向位在 args["action"]（fast_path.py:1441 集成直读它）。
-    open→登记、close→取消；`stop/tilt/position` 终态不唯一 ⇒ 一律不动（猜错终态比不关更坏）。"""
-    ar = _arm()
-    assert "cover.window" in _note(ar, "ControlWindow",
-                                   {"entity_id": "cover.window", "action": "open"})
-    assert "cover.window" not in _note(ar, "ControlWindow",
-                                       {"entity_id": "cover.window", "action": "close"})
-    for ambiguous in ("stop", "tilt", "position", "", None):
-        assert "cover.w2" not in _note(ar, "ControlWindow",
-                                       {"entity_id": "cover.w2", "action": ambiguous}), ambiguous
+def test_窗控族在生产形状下不登记_and_钉不再喂生产产不出的形状():
+    """10-10 对抗复核：旧版这里有一段 `ControlWindow` 按 args["action"] 判方向的代码，
+    而钉喂的是 `{"entity_id": "cover.window", "action": "open"}` ——生产**产不出**这形：
+    慧尖窗控车道的 args 是 action/position/target（fast_path.py:173-178），实体解析在集成侧，
+    回执行只有 {name, area}。⇒ 那段代码永不生效、那条钉是假绿（同一病灶的第二例）。
+    现在代码已删，钉改成钉**真实形状不登记**。"""
+    ar = _arm(settings=Set(**{"dialog.auto_restore": True,
+                              "dialog.auto_restore_domains": ["cover", "light"]}))
+    prod = {"action": "open", "target": [{"area": "办公室",
+                                         "devices": [{"name": "平开窗"}]}]}
+    assert "cover.window" not in _note(ar, "ControlWindow", prod)
+    assert _note(ar, "ControlWindow", {"entity_id": "cover.window",
+                                       "action": "open"}) == {}, \
+        "凭空造的形状不再登记：_direction 已删窗控支（评审 #6）"
     ar.cancel_all()
 
 
@@ -309,7 +321,8 @@ def test_设置面默认值_in_opt_in_形态_UI读法必须同向():
     d = DEFAULTS["dialog"]
     assert d["auto_restore"] is False, "默认值被改回 True 必须先解决 entity_id 覆盖面"
     assert d["auto_restore_min"] == 10
-    assert d["auto_restore_domains"] == ["cover", "light"]
+    assert d["auto_restore_domains"] == ["light"], "默认域被扩宽必须先回答『与现场自动化抢关』这条"
+    assert d["auto_restore"] is False
     assert d["auto_restore_exclude"] == []
 
     import pathlib
@@ -357,4 +370,64 @@ def test_登记之后该设备被豁免_到点同样不许动手():
     st.v["dialog.auto_restore_exclude"] = ["light.desk"]
     asyncio.run(ar._fire("light.desk"))
     assert ha.calls == [], ha.calls
+    ar.cancel_all()
+
+
+
+# ── 10-10 对抗复核补的四条（每条都在评审探针里复现过，不是假想）──────────
+def test_noop步绝不登记_用户本来开着的灯不许到点被关():
+    """评审 #1（高）：设备本来就在要求状态（执行器判 kind="noop"、播报都直说
+    「本来就在要求的状态上」），这种步没打开任何东西。旧代码无条件登记 ⇒
+    10 分钟后把用户**正在用**的灯关掉。走生产入口复现并钉死。"""
+    ha = _HAWithSvc(states={"light.ban_gong_shi_she_deng": {
+        "entity_id": "light.ban_gong_shi_she_deng", "state": "on",
+        "attributes": {"friendly_name": "射灯"}}})
+    ex = Executor(ha, Set(**{"dialog.auto_restore": True,
+                             "dialog.auto_restore_domains": ["light"]}))
+
+    async def go():
+        ok, reply = await ex.run(_plan("TurnDeviceOn",
+                                       {"entity_id": "light.ban_gong_shi_she_deng"},
+                                       source="klar", utterance="打开办公室射灯"))
+        return ok, reply, dict(ex.restore.pending())
+
+    ok, reply, pend = asyncio.run(go())
+    assert ok, reply
+    assert "本来就在要求的状态" in reply or "noop" in reply.lower(), reply
+    assert pend == {}, "noop 步登记了归位＝会关掉用户本来就开着的灯：%s" % pend
+    ex.restore.cancel_all()
+
+
+def test_到点读不到状态_不动手_not_fail_open():
+    """评审 #3（中高）：get_state 返回 None 是真机常见形（改名/删除/首刷未完成/刷新失败
+    折叠成 None）。旧写法 `cur is not None and …` 让 None **绕过**"已关就别动"，
+    在毫无状态证据时发关服务——与模块红线"绝不靠猜去关"相反。"""
+    ha = HA(state="missing")
+    ar = AutoRestore(ha, Set(**{"dialog.auto_restore": True,
+                                "dialog.auto_restore_domains": ["light"]}))
+    asyncio.run(ar._fire("light.x"))
+    assert ha.calls == [], "读不到状态却发了关服务：%s" % (ha.calls,)
+
+
+def test_域清空成空列表_必须真的一个都不登记():
+    """评审 #8：旧写法 `get(...) or DEFAULT_DOMAINS` 把显式 [] 当"没配"⇒ 用户
+    清空域来停功能停不掉，只能去关总开关。"""
+    ar = _arm(settings=Set(**{"dialog.auto_restore": True,
+                              "dialog.auto_restore_domains": []}))
+    assert _note(ar, "TurnDeviceOn", {"entity_id": "light.desk"}) == {}, \
+        "domains=[] 被当成没配 ⇒ 仍按默认域登记"
+    ar.cancel_all()
+
+
+def test_pending_在事件循环外也必须可读_现场排查靠它():
+    """评审 #7：旧实现在 _tasks 非空时取 running loop ⇒ 循环外调用直接 RuntimeError，
+    而模块头承诺"在 pending 快照里可见，便于现场排查"。"""
+    ar = _arm()
+
+    async def go():
+        ar.note("TurnDeviceOn", {"entity_id": "light.a"}, True)
+    asyncio.run(go())
+    pend = ar.pending()                      # 循环外读——不许抛
+    assert "light.a" in pend, pend
+    assert isinstance(pend["light.a"], float)
     ar.cancel_all()

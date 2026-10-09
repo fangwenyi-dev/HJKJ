@@ -150,7 +150,7 @@
       <div><label><input id="dlg_confirm" type="checkbox" style="width:auto"> 风险确认（解锁/删场景先问再办）</label></div>
       <!-- ②「操作完成一定要关闭对应设备」（用户 2026-10-09 立规；判据见 core/auto_restore.py）
            只归位"语音打开且已 grounded 到具体实体"的设备；区域扇出目标未知一律不动。 -->
-      <div><label><input id="dlg_restore" type="checkbox" style="width:auto"> 语音打开后自动收尾（默认：窗/灯，N 分钟后关回）</label>
+      <div><label><input id="dlg_restore" type="checkbox" style="width:auto"> 语音打开后自动收尾（默认关；只管灯，窗/帘需在下方扩域）</label>
         <input id="dlg_restore_min" type="number" min="1" max="1440" step="1" style="width:64px"> 分钟</div>
     </div>
     <label class="hj-field">自定义纠错词条（JSON，一行一组；在内置 61 条之上叠加）</label>

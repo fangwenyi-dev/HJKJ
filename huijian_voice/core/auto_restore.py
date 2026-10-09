@@ -37,9 +37,7 @@
   1. **只登记在"这一条真的执行成功且目标已被 grounded 成 entity_id"的设备上**。
      只给区域（"把客厅灯打开"→ area 扇出由 HA 自己解析）时我们不知道打了哪台 ⇒ 不归位，
      绝不靠"猜目标"去关设备（关错设备比忘关更糟）。
-  2. **默认域＝cover + light**：开合类（窗/门/遮阳）语义上"操作完就该闭合"；灯按用户点名纳入。
-     switch/fan/media_player 默认**不**归位——它们常被当"模式开关"用（摆风、提示音、播放），
-     自动关掉等于改别的语义；要加由用户在设置里显式扩域。
+  2. **默认域＝light 一族**（10-10 复核后从 cover+light 收窄）：灯是“忘关”语义最干净的一类；窗/帘**不**默认纳入——现场证据是办公室那扇平开窗由一条 YAML 自动化每 ~10 分钟开合，默认计时必然与它抢关；而“打开窗帘”的终态本就是人要留下的状态（遮光/采光），自动合帘不是“补忘关”。switch/fan/media_player 同理（摆风、提示音、播放属模式语义）。要管哪几族，由用户在设置里显式扩域。
   3. 再次语音打开同一台＝**续期**；语音关闭同一台＝**取消**（人已经关了，别再去关一次）。
   4. 延时不落盘：加载项重启后未到期的归位任务丢失（不假装持久化）。这是已知限制，
      在 pending 快照里可见，便于现场排查。
@@ -50,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import logging
+import time
 from typing import Any, Iterable, Optional
 
 logger = logging.getLogger("huijian.auto_restore")
@@ -60,26 +59,25 @@ logger = logging.getLogger("huijian.auto_restore")
 # ——测试全绿而生产不生效，正是本仓"钉没喂生产形状"那类假绿的翻版。
 _ON_INTENTS = {"TurnDeviceOn", "HassTurnOn", "HassOpenCover"}
 _OFF_INTENTS = {"TurnDeviceOff", "HassTurnOff", "HassCloseCover"}
-# 窗控族的方向在 args["action"]（fast_path.py:1441 集成 handler 直读它）；
-# 只认明确的两向，`stop/tilt/position/开一半` 这类方向或终态不唯一的**一律不登记**——
-# 归位是"补忘关"，猜错终态比不关更坏。
-_WINDOW_INTENTS = {"ControlWindow", "WindowControl"}
-_WIN_OPEN = ("open", "up", "on")
-_WIN_CLOSE = ("close", "down", "off", "shut")
+# 注：这里**没有** ControlWindow/WindowControl 一支。10-10 复核判定它在生产上永不成立
+# （那族的 args 不带 entity_id，见 _direction 的说明），保留只会让读代码的人以为"窗也管"。
 
 
 def _direction(intent: str, args: Any) -> Optional[str]:
-    """'on' / 'off' / None（None＝这条不参与归位判断）。"""
+    """'on' / 'off' / None（None＝这条不参与归位判断）。
+
+    10-10 对抗复核：原先这里还有一段"`ControlWindow` 按 args['action'] 判开/关"，**已删**。
+    理由不是判据写错，而是它**在生产上永不生效**：慧尖窗控车道的 args 是
+    action/position/target（fast_path.py:173-178），实体解析在集成侧，**没有 entity_id**
+    ⇒ `_eids()` 恒空，那段分支拿不到任何可登记的主体；而当时钉它的用例喂的
+    `{"entity_id": …, "action": "open"}` 是生产产不出的形状＝第二例"钉没喂生产形状"的假绿。
+    留着读起来像"窗也管"，实际不管——这种"看起来有覆盖面"比明写不管更坏。
+    窗/帘要纳入的前提是集成回执带 entity_id（见模块头"下一步"）+ 用户显式扩域。
+    """
     if intent in _ON_INTENTS:
         return "on"
     if intent in _OFF_INTENTS:
         return "off"
-    if intent in _WINDOW_INTENTS and isinstance(args, dict):
-        act = str(args.get("action") or args.get("window_action") or "").strip().lower()
-        if act in _WIN_OPEN:
-            return "on"
-        if act in _WIN_CLOSE:
-            return "off"
     return None
 
 # 域 → 收尾服务（官方域服务优先，跨域兜底用 homeassistant.turn_off）
@@ -94,7 +92,12 @@ _CLOSE_SERVICE = {
 }
 
 DEFAULT_MIN = 10
-DEFAULT_DOMAINS = ("cover", "light")
+# 10-10 对抗复核：默认域**只留 light**。原先带上 cover 的理由是"开合类语义上操作完就该闭合"，
+# 但这条被我自己的现场证据推翻：`light.ban_gong_shi_she_deng` 所在办公室的那扇平开窗，
+# 整夜由一条 YAML 自动化每 ~10 分钟开→7~11 分钟关（见模块头撤回记录）⇒ 10 分钟归位计时
+# 与它必然抢关；而"打开客厅的窗帘"的终态语义根本不是"忘关"（遮光/采光是要人留下的状态）。
+# ⇒ 窗/帘要纳入请用户在设置里显式扩域，不默认替他决定。
+DEFAULT_DOMAINS = ("light",)
 
 
 def _eids(args: Any) -> list[str]:
@@ -117,18 +120,24 @@ class AutoRestore:
         self.settings = settings
         self._tasks: dict[str, asyncio.TimerHandle] = {}
         self._loops: dict[str, asyncio.Task] = {}
+        # 登记那一刻算出的绝对终点（monotonic），让 pending() 不依赖事件循环
+        self._deadline: dict[str, float] = {}
 
     # ── 配置面（settings 缺失时走保守默认）───────────────────────────
     def _cfg(self) -> tuple[bool, float, tuple[str, ...], list[str]]:
         get = (lambda k, d: d) if self.settings is None else \
             (lambda k, d: self.settings.get(k, d))
-        enabled = bool(get("dialog.auto_restore", True))
+        # 缺键（老存档）＝**未启用**：这条能力是 opt-in，不能因为存档里没写过就默认开。
+        enabled = bool(get("dialog.auto_restore", False))
         try:
             minutes = float(get("dialog.auto_restore_min", DEFAULT_MIN) or DEFAULT_MIN)
         except (TypeError, ValueError):
             minutes = float(DEFAULT_MIN)
         minutes = max(0.5, min(minutes, 24 * 60.0))          # 钳位：0＝“不等待”不是本意
-        domains = get("dialog.auto_restore_domains", None) or list(DEFAULT_DOMAINS)
+        # 显式空列表＝"一个域都不归位"，必须与"没配"区分开（旧写法 `or DEFAULT` 把
+        # [] 当没配 ⇒ 用户清空域来停功能停不掉，只能去关总开关）。
+        raw_domains = get("dialog.auto_restore_domains", None)
+        domains = list(DEFAULT_DOMAINS) if raw_domains is None else raw_domains
         if isinstance(domains, str):
             domains = [d.strip() for d in domains.split(",") if d.strip()]
         exclude = get("dialog.auto_restore_exclude", None) or []
@@ -146,8 +155,14 @@ class AutoRestore:
         return True
 
     # ── 主入口：执行器在每步结束后调用 ──────────────────────────────
-    def note(self, intent: Optional[str], args: Any, ok: bool) -> None:
-        """成功开了一台策略内设备 → 登记归位；成功关闭 → 取消归位。永不抛。"""
+    def note(self, intent: Optional[str], args: Any, ok: bool,
+             noop: bool = False) -> None:
+        """成功开了一台策略内设备 → 登记归位；成功关闭 → 取消归位。永不抛。
+
+        `noop`（10-10 对抗复核）：执行器**执行前**的证据 `kind == "noop"` ⇒ 目标本来就在
+        要求的状态上，这一步**没打开任何东西**。原先这种步也登记（播报都会说「本来就在
+        要求的状态上」了，10 分钟后却把用户正在用的灯关掉）——这是"关掉用户没开过的设备"，
+        比忘关更坏，所以：noop ⇒ 绝不登记（关闭方向仍照取消处理）。"""
         try:
             if not ok or not isinstance(intent, str):
                 return
@@ -161,6 +176,10 @@ class AutoRestore:
                     self._cancel(eid)
                 return
             if direction != "on" or not enabled:
+                return
+            if noop:
+                logger.info("[归位] %s 本步是 noop（目标已在要求状态）⇒ 不登记，不动用户的东西",
+                            eids)
                 return
             for eid in eids:
                 if self._wanted(eid, domains, exclude):
@@ -177,15 +196,18 @@ class AutoRestore:
             logger.warning("[归位] 无运行事件循环 ⇒ %s **未登记**（不假装已安排收尾）", eid)
             return False
         old = self._tasks.pop(eid, None)
+        self._deadline.pop(eid, None)
         if old is not None:
             old.cancel()
         # 续期语义：重复打开同一台 = 重置计时，不是叠加成两个任务
+        self._deadline[eid] = time.monotonic() + delay_s
         self._tasks[eid] = loop.call_later(delay_s, self._spawn, eid, delay_s)
         logger.info("[归位] %s 将在 %.0f 秒后自动关闭（语音打开）", eid, delay_s)
         return True
 
     def _cancel(self, eid: str) -> None:
         h = self._tasks.pop(eid, None)
+        self._deadline.pop(eid, None)
         if h is not None:
             h.cancel()
             logger.info("[归位] %s 已被语音关闭 → 取消自动收尾", eid)
@@ -193,6 +215,7 @@ class AutoRestore:
 
     def _spawn(self, eid: str, delay_s: float) -> None:
         self._tasks.pop(eid, None)
+        self._deadline.pop(eid, None)
         t = asyncio.get_running_loop().create_task(self._fire(eid))
         self._loops[eid] = t
         t.add_done_callback(lambda _f, k=eid: self._loops.pop(k, None))
@@ -214,7 +237,14 @@ class AutoRestore:
                 cur = st.get("state")
             elif st is not None:
                 cur = getattr(st, "state", None) or (st if isinstance(st, str) else None)
-            if cur is not None and str(cur) in ("off", "closed", "idle", "unavailable", "unknown"):
+            if cur is None:
+                # 10-10 对抗复核：读不到状态**不 fail-open**。`get_state` 的 None 是真机常见形
+                # （实体改名/删除、states 首刷未完成、刷新失败折叠成 None）。原先 `cur is None`
+                # 不进"已关"集合、直接发关服务 ⇒ 在**毫无状态证据**的情况下去关设备，
+                # 与模块自己写的红线"绝不靠猜去关（关错设备比忘关更糟）"相反。
+                logger.warning("[归位] %s 到点但读不到状态（None）⇒ 不动手，宁可不管", eid)
+                return
+            if str(cur) in ("off", "closed", "idle", "unavailable", "unknown"):
                 logger.info("[归位] %s 当前=%s，无需收尾", eid, cur)
                 return
             dom = eid.split(".", 1)[0]
@@ -233,15 +263,20 @@ class AutoRestore:
 
     # ── 观测/测试面 ────────────────────────────────────────────────
     def pending(self) -> dict[str, Any]:
-        """当前登记待归位的实体（调试页与测试用；不含持久化承诺）。"""
-        now = asyncio.get_running_loop().time() if self._tasks else 0.0
-        return {eid: round(float(getattr(h, "_when", float("nan"))) - now, 1)
-                for eid, h in self._tasks.items()}
+        """当前登记待归位的实体与剩余秒数（观测/测试用；不含持久化承诺）。
+
+        10-10 对抗复核：旧写法在 `_tasks` 非空时取 `get_running_loop()` ⇒ **在循环外调用直接抛**
+        RuntimeError，而这条函数正是"现场排查"要看的那一个（模块头承诺了"在 pending 快照里可见"）。
+        现在剩余时间从登记那一刻存的 `time.monotonic()` 终点算，**任何上下文都能读**。"""
+        now = time.monotonic()
+        return {eid: round(float(self._deadline.get(eid, float("nan"))) - now, 1)
+                for eid in self._tasks}
 
     def cancel_all(self) -> None:
         for h in self._tasks.values():
             h.cancel()
         self._tasks.clear()
+        self._deadline.clear()
         for t in self._loops.values():
             t.cancel()
         self._loops.clear()
