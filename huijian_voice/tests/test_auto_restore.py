@@ -495,6 +495,29 @@ def test_用户开在收尾窗口之外_不得多发明细():
     ar.cancel_all()
 
 
+def test_窗控回执带close_entity_id才登记_且登记的是cover不是按钮():
+    """② 的窗道契约（2026-10-10）：窗由 button.press_button 驱动，按钮实体关不了窗。
+    集成只在 **开向** 写 `close_entity_id`＝同设备 cover 实体（find_covers_for_buttons 既有
+    口径）⇒ 加载项以它为登记对象；没有这个键（纯按钮机型/关向）就**不登记**，绝不冒充可关对象。"""
+    st = Set(**{"dialog.auto_restore": True,
+                "dialog.auto_restore_domains": ["cover", "light"]})
+    ha = HA(state="open")
+    ar = AutoRestore(ha, st)
+    args = {"action": "open", "target": [{"area": "办公室",
+                                       "devices": [{"name": "平开窗"}]}]}
+    rec_open = {"success": True, "message": "已经帮你执行了",
+                "close_entity_id": "cover.kai_chuang_qi_0006_0005_02_kai_chuang_qi"}
+    pend = _note(ar, "ControlWindow", args, receipt=rec_open)
+    assert list(pend) == ["cover.kai_chuang_qi_0006_0005_02_kai_chuang_qi"], pend
+    # 关向：集成不给这个键 ⇒ 不新增登记（原来那枚还在，不是"关一次窗又排一次队"）
+    assert list(_note(ar, "ControlWindow", {"action": "close", "target": []},
+                      receipt={"success": True, "message": "已经帮你执行了"})) == list(pend)
+    # 纯按钮机型（无 cover 实体）⇒ 不登记
+    assert list(_note(ar, "ControlWindow", {"action": "open", "target": []},
+                      receipt={"success": True})) == list(pend)
+    ar.cancel_all()
+
+
 def test_pending_在事件循环外也必须可读_现场排查靠它():
     """评审 #7：旧实现在 _tasks 非空时取 running loop ⇒ 循环外调用直接 RuntimeError，
     而模块头承诺"在 pending 快照里可见，便于现场排查"。"""

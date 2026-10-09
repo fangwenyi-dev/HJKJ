@@ -125,6 +125,27 @@ def _eids(args: Any) -> list[str]:
     return []
 
 
+def _receipt_close_ids(receipt: Any) -> list[str]:
+    """窗控回执里的 **cover 实体**（`close_entity_id`）。
+
+    集成只在**开向**给这个键（`intent_window_control.py` 里 `action == "open"` 才写），
+    所以"键存在"本身就是"这次是打开"的证据——方向由真源判，加载项不猜。
+    纯按钮机型没有 cover 实体 ⇒ 不给键 ⇒ 不登记（绝不用按钮实体冒充可关对象）。"""
+    if not isinstance(receipt, dict):
+        return []
+    out: list[str] = []
+    cand = [receipt.get("close_entity_id")]
+    for key in ("control_targets", "states", "results"):
+        rows = receipt.get(key)
+        if isinstance(rows, list):
+            cand += [r.get("close_entity_id") for r in rows if isinstance(r, dict)]
+    for eid in cand:
+        e = str(eid or "").strip()
+        if "." in e and e not in out:
+            out.append(e)
+    return out
+
+
 def _receipt_eids(receipt: Any) -> list[str]:
     """从**执行回执**里取"HA 说它真动过/真选中"的实体 id。两个来源，都不猜：
       · 直调道 `/api/services/*`：200 body 就是状态真变了的实体列表（10-10 实测）⇒ `entities`
@@ -215,13 +236,21 @@ class AutoRestore:
             if not ok or not isinstance(intent, str):
                 return
             rec_ids = _receipt_eids(receipt)
-            eids = list(dict.fromkeys(rec_ids + _eids(args))) if rec_ids else _eids(args)
+            close_ids = _receipt_close_ids(receipt)      # 窗控道：可关的 cover 实体
+            eids = list(dict.fromkeys(rec_ids + close_ids + _eids(args)))
+            if eids and close_ids and close_ids[0] not in rec_ids:
+                # 回执里只给了 cover 可关对象（窗道）⇒ 以它为登记对象，
+                # 不把按钮实体或 args 里的名字当可关目标。
+                eids = list(dict.fromkeys(close_ids + rec_ids))
             if isinstance(receipt, dict) and receipt.get("changed") is False:
                 noop = True
             if not eids:
                 return
             enabled, delay, domains, exclude = self._cfg()
             direction = _direction(intent, args)          # 生产词表实锤，见 _direction
+            if direction is None and close_ids:
+                # 键的存在＝集成判定这次是"开"（它只在 action=="open" 时写 close_entity_id）
+                direction = "on"
             if direction == "off":
                 for eid in eids:
                     self._cancel(eid)

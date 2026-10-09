@@ -527,9 +527,26 @@ class ControlWindowIntent(intent.IntentHandler):
                     blocking=True,
                 )
                 _LOGGER.info("Successfully pressed: %s", button_entity_id)
+                # ② 归位契约（2026-10-10）：窗是 button.press_button 驱动的，加载项拿到
+                # 按钮 id 也关不了窗 ⇒ 回执必须给**同设备的 cover 实体**（既有口径
+                # find_covers_for_buttons，百分比定位道与参数通道同源用它）。
+                # 只有 **开向** 才带这个键：关向没有"再关一次"的归位语义，方向由集成判，
+                # 加载项不猜。机型没有 cover 实体（纯按钮机型）时不给键 ⇒ 加载项不登记，
+                # 绝不拿按钮实体冒充可关对象。
+                extra = {}
+                if action == "open":
+                    try:
+                        covers = find_covers_for_buttons(intent_obj.hass, [button_entity_id])
+                    except Exception as cov_err:                       # noqa: BLE001
+                        _LOGGER.warning("close_entity_id 解析失败 %s: %s", button_entity_id, cov_err)
+                        covers = []
+                    if covers:
+                        extra["close_entity_id"] = covers[0][1]
+                        extra["close_entity_name"] = covers[0][0]
                 return {
                     "success": True,
                     "message": "已经帮你执行了",
+                    **extra,
                 }
             except Exception as err:
                 _LOGGER.error("Failed to press %s: %s", button_entity_id, err)
