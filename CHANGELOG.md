@@ -7,13 +7,13 @@
 
 ⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件
 拷进 `/config/custom_components`，已加载的模块不换）。
-⚠️ **v1.8.5 从未出货，本版是把它一起结掉**：`c0d1fea` 那次推送在 CI 的 Lint 当场红
-（`test_hub_client.py:934` 一条 ruff F841），下游 Build/Manifest/Release/Gitee **全部 skipped**
-⇒ ghcr 里没有 `1.8.5` 镜像（匿名 manifest 实测 404，同一探针的阳性对照 `1.8.4` 回 200），
-GitHub/Gitee 两源都没有 v1.8.5 那条 Release——而 main 上的 `config.yaml` 已写 1.8.5，
-Supervisor 读默认分支＝向全体用户广告一个装不上的版本。教训两条都记进了判据：
-**本地 pytest 全绿 ≠ 过门**（ruff 必须按 CI 同参同路径跑），**推 main 前必须核发布闸与镜像**。
-发布闸对"tag 已存在且指向他处"是响亮跳过，所以本批另起号段，不冒充 1.8.5。
+⚠️ **v1.8.5 的发布过程值得记一笔（本版是它的后续批，不是补发）**：`c0d1fea` 那次推送在 CI 的
+Lint 当场红（`test_hub_client.py:934` 一条 ruff F841），下游 Build/Manifest/Release/Gitee 全部
+skipped ⇒ 那一刻 main 已把 1.8.5 广告出去，而 ghcr 里 `1.8.5` 镜像实测 404（同一探针阳性对照
+`1.8.4` 回 200）、两源都没有 Release。随后的 lint 修口 `5b889ac` 把它补齐：**Release 与 Gitee
+Release 均 success，tag `v1.8.5` 现指 `5b889ac`，GitHub Release 已建（2026-10-09 05:13:09Z），
+ghcr `1.8.5` manifest 实测 200** ⇒ 1.8.5 最终是出了货的。教训照记两条：**本地 pytest 全绿 ≠ 过门**
+（ruff 必须按 CI 同参同路径跑），**推 main 前先核 lint**——Supervisor 读默认分支，推上去就是广告。
 
 ### G-11 面板对终端用户说了相反的话（唯一一条对外错文案）
 
