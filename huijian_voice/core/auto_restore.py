@@ -21,13 +21,31 @@
     （intent_turn.py:213-214，当时为的是播报按设备数数，不是为归位）。
     只有**窗控子道**那几行（:121-126/716/756）仍只有 {name, area}。
   ✔ 现在归位**吃回执**（_receipt_eids）：target 形（“打开办公室的灯”，args 里只有
-    area+name）⇒ 登记回执里那台；klar 直调 /api/services/* ⇒ 200 body 就是
-    “状态真变了的实体列表”，空列表＝谁都没变 ⇒ changed=False 等价 noop，不登记
-    （10-10 实测四次，off→on / on→on / on→off / off→off 全部对称成立）。
+    area+name）⇒ 登记回执里那台；klar 直调 /api/services/* ⇒ 200 body 是
+    “**本轮状态已发生变化**的实体列表”，对**同步实体**（light 一族）实测四种迁移全对称
+    （off→on / on→on / on→off / off→off，见 `_probe_service_body_semantics.py`），
+    空列表 ⇒ changed=False，与 noop 等价，不登记。
+  ⚠ **异步实体不成立（10-10 追加实测，本模块原断言过宽）**：对 `cover.*` 这类
+    “接受指令≠到位”的实体，已在 open 态下发 `cover.close_cover` 也回 `[]`，而 30 s 后
+    才真到位 ⇒ `[]` 至少有“已在目标态”和“已接受、待变化”**两种含义**，不能用来判成没成。
+    ⇒ 验证/记账一律**轮询终态**；本模块只在 `changed is False` 时按 noop 处理，
+      异步实体上的误判面已知，**代码面本轮未改**（纯注释动作，改判据要单独一轮 + 钉）。
   ⇒ 默认**翻回开**（用户立规要的就是这条真实生效）。真机端到端证据：生产 target 形
     “打开办公室的灯”→播“办公室射灯开了”、HA 实测 on、60 秒后自己 off、终态复原 off。
-  ⚠ 仍未覆盖：窗控子道回执不带 id ⇒ “打开办公室的平开窗”这类不登记；要覆盖得先给
-    窗控行补 entity_id（那边同样有 item.state.entity_id 可用）。cover 也已不在默认域。
+  ✔ 窗控道**已覆盖**（v1.4.3 单窗 / v1.4.4 全窗）：集成只在 `action=="open"` 成功时写
+    `close_entity_id`（`intent_window_control.py:576` 单窗 / `:321` 全窗），加载项
+    `_receipt_close_ids()`(:128-146，含多目标 rows 分支) 读它并以其为登记对象；
+    关向/纯按钮机型/解析失败 ⇒ 不给键 ⇒ 不登记（绝不用按钮实体冒充可关对象）。
+    钉：`tests/test_auto_restore.py:498`、`tests/test_v1052_fixes.py:441/484`。
+    ——这里曾写过“⚠ 仍未覆盖：窗控子道回执不带 id ⇒ 不登记”，那是 v1.4.2 之前的旧账，
+    10-10 核对实现后撤销。
+  ⚠ 但 **cover 不在默认域**（`core/settings.py:119` 默认 `auto_restore_domains: ["light"]`）
+    ⇒ 机制有、策略默认不开：“语音打开办公室的平开窗”默认**不会**自动关。
+    理由见本文件边界第 2 条（现场一条 YAML 自动化每 ~10 分钟开合此窗，默认计时必与它抢关）；
+    该形态 10-10 又被实测复现一次：一次 `cover.close_cover` 关到位后 ~50 s 窗被自主复开，
+    且近 90 s 内**零卫星会话**⇒ 这个与语音无关的自主执行者仍在跑（身份按本文件头 :9-14
+    的历史证据记为 YAML 自动化；`/api/config` 只列 UI 建的自动化，**看不到 YAML**，
+    故我们没有直接读到那份 YAML 本身——别把这行当成直证）。用户要管窗，需显式把 cover 扩进域。
 
 ★ 意图词表（10-10 第二版改掉自己的一处假绿）
   慧尖自有意图名是 `TurnDeviceOn/TurnDeviceOff`（fast_path.py:295/327 是生产主车道），
@@ -148,7 +166,9 @@ def _receipt_close_ids(receipt: Any) -> list[str]:
 
 def _receipt_eids(receipt: Any) -> list[str]:
     """从**执行回执**里取"HA 说它真动过/真选中"的实体 id。两个来源，都不猜：
-      · 直调道 `/api/services/*`：200 body 就是状态真变了的实体列表（10-10 实测）⇒ `entities`
+      · 直调道 `/api/services/*`：200 body 是"本轮状态已发生变化"的实体列表 ⇒ `entities`
+        （**只对同步实体成立**；cover 这类异步实体的 `[]` 也含"已接受、待变化"，
+         见模块头覆盖面实况的 ⚠ 条——判成没成只能轮询终态）
       · 意图道（慧尖 TurnDevice*）：`control_targets` 行自 v1.2.10 起带 `entity_id`
         （intent_turn.py:213-214），`states`/`results` 行同理
     拿不到就返回空。**回执比 args 硬**：args 是"用户点了什么名"，回执才是"动了哪台"。"""
@@ -229,7 +249,11 @@ class AutoRestore:
 
         `receipt`（10-10 实测后加）：执行回执。**登记对象以回执里的实体为准**，args 只作兜底
         （klar 直调改旧集成时回执可能没带 id）。回执里 `changed=False`（直调道 200 body 是
-        `[]`）等价于 noop：谁都没被动过 ⇒ 不登记。这条同时把覆盖面打开到
+        `[]`）**对同步实体（light 一族）**等价于 noop：谁都没被动过 ⇒ 不登记。
+        ⚠ 对 cover 这类**异步**实体该等价不成立：10-10 实测在 open 态下发 `close_cover`
+        也回 `[]`、30 s 后才真到位 ⇒ 那里 `[]` 还含"已接受、待变化"。本函数只据此决定是否
+        登记、不改播报话术口径（判成没成一律轮询终态），异步面上的已知局限见模块头 ⚠ 条。
+        这条同时把覆盖面打开到
         `target` 形（"打开办公室的灯"）——集成侧解析实体，回执 `control_targets` 行带
         `entity_id`（v1.2.10 起），加载项不再需要自己猜目标。"""
         try:
