@@ -439,8 +439,10 @@ def _window_ns_close():
 
 
 def test_v144_全窗开向补close_entity_id_按下的按钮不当可关对象():
-    """「把办公室所有窗打开」也要进归位：control_targets 给**同设备 cover**，
-    且 `buttons` 仍是按钮（关不了窗）——绝不拿按钮实体冒充可关目标。"""
+    """「把办公室所有窗打开」也要**如实带可关对象**：control_targets 给**同设备 cover**，
+    且 `buttons` 仍是按钮（关不了窗）——绝不拿按钮实体冒充可关目标。
+    ⚠ v1.4.5 起加载项不再消费这个键（归位守卫整支移除）；本钉的是**集成侧字段语义**，
+      与有没有消费者无关，所以保留。"""
     ns = _window_ns_close()
     import types
     hass = types.SimpleNamespace(
@@ -456,8 +458,9 @@ def test_v144_全窗开向补close_entity_id_按下的按钮不当可关对象()
 
 
 def test_v144_关向与无cover与无hass三种情形都不写键():
-    """关向没有"再关一次"的归位语义；纯按钮机型没有 cover；没给 hass（旧 4 参调用）
-    ⇒ 三种情形一律**不写 close_entity_id**，加载项因此不登记（v1.4.3 同一纪律）。"""
+    """关向没有"再关一次"的对象；纯按钮机型没有 cover；没给 hass（旧 4 参调用）
+    ⇒ 三种情形一律**不写 close_entity_id**（v1.4.3 同一纪律：宁缺毋假）。
+    v1.4.5：加载项不再读这个键，但"没有可关对象就不给键"仍是集成侧要钉的行为。"""
     import types
     ns = _window_ns_close()
     hass_cov = types.SimpleNamespace(covers=[("开窗器A", "cover.a")])

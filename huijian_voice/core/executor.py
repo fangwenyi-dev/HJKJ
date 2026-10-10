@@ -14,9 +14,7 @@ import re
 from contextvars import ContextVar
 from typing import Optional
 
-from . import auto_restore as _auto_restore_mod  # noqa: F401  （文档/判据的所在）
 from . import capability
-from .auto_restore import AutoRestore
 from .nlu.schema import ATTR_CN, ATTR_TO_WIRE
 from .nlu.fast_path import Plan, color_word, is_pronoun, normalize_polite
 
@@ -344,9 +342,6 @@ class Executor:
         # 本轮"代打"留痕（收口批）：目标离线→同名改指过的 (设备名, 改指目标区域)，
         # 按轮复位，由 _named() 落到播报——绝不静默换设备（见 _repoint_offline_twin）。
         self._repointed: list[tuple[str, str]] = []
-        # ②「操作完成一定要关闭对应设备」（用户 2026-10-09 立规）：语音成功打开的策略内
-        # 设备，到点自动收尾。判据与边界全写在 auto_restore 模块头，不在此重复。
-        self.restore = AutoRestore(ha, settings)
 
     async def run_raw(self, plan: Plan) -> tuple[bool, dict]:
         """单步意图执行，返回 (success, 原始 result dict)——供列表类意图
@@ -1244,14 +1239,6 @@ class Executor:
                 logger.info("[执行] %s %s → 失败 | %s", name, args, reply)
                 return self._named(False, reply)
             results.append(result)
-            # ② 归位登记：只对**本步真的执行成功**且目标已 grounded 的设备生效；
-            # 关闭方向则撤销登记（人已关，别再补刀）。永不抛、不参与播报判定。
-            # 10-10 对抗复核修：把**执行前证据**和**执行回执**一起交出去。`kind == "noop"`
-            # 意味着目标本来就在要求的状态上（播报会直说「本来就在要求的状态上」），这种步
-            # 没打开任何东西；而直调道 /api/services/* 的 200 body 会明确列出"状态真变了的实体"
-            # （空列表＝谁都没变，10-10 实测）。登记对象因此以**回执为准**——args 只是
-            # "用户点了什么名"，回执才是"动了哪台"。
-            self.restore.note(name, args, True, noop=(kind == "noop"), receipt=result)
             # 同栅栏收口：单步也要点名"点了名却没回执"的那台（此前只对链生效）。
             for nm in await self._unanswered(args, result):
                 if nm not in no_receipt:
