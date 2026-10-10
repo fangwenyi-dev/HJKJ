@@ -1596,6 +1596,14 @@ class FastPath:
         phrase = self.scenes.check(text)
         if phrase and phrase == text:
             return await self._scene_plan(phrase, text, trace)
+        # P4′（2026-10-10 复核实锤后改）：语音库**只要认领这句**（等值或最长前缀，
+        # v1.1.27 契约）就轮不到原生场景。第一版只让语音库跑"等值"，于是
+        # 触发词「观影」的句子「观影场景」被原生道抢走——用户被告知的"说 X 就 Y"
+        # 静默改指到另一个场景，那是 C1 级回归。原生道因此只在 `phrase is None` 时尝试。
+        if phrase is None:
+            hit = await self._native_scene_plan(text, trace)
+            if hit is not None:
+                return hit
 
         # v1.0.93 「退下」字面表：仅次于场景契约的最高优先——在并列宾语闸/
         # 全屋分支/动作表扫描之前。此前"退下"走 T0 落兜底「我还不会」且照常
@@ -1703,6 +1711,14 @@ class FastPath:
         phrase = self.scenes.check(text)
         if phrase and phrase == text:
             return await self._scene_plan(phrase, text, trace)
+        # P4′（2026-10-10 复核实锤后改）：语音库**只要认领这句**（等值或最长前缀，
+        # v1.1.27 契约）就轮不到原生场景。第一版只让语音库跑"等值"，于是
+        # 触发词「观影」的句子「观影场景」被原生道抢走——用户被告知的"说 X 就 Y"
+        # 静默改指到另一个场景，那是 C1 级回归。原生道因此只在 `phrase is None` 时尝试。
+        if phrase is None:
+            hit = await self._native_scene_plan(text, trace)
+            if hit is not None:
+                return hit
 
         # v1.1.27 否定祈使拒执行闸（安全级）：否定句此前无全局守卫——「别开灯」
         # 被 ①② 与 T1 吃成 TurnDeviceOn(灯)，真机语义 = **把灯开了**（反向执行，
@@ -1826,6 +1842,12 @@ class FastPath:
             phrase = self.scenes.check(text)
             if phrase:
                 return await self._scene_plan(phrase, text, trace)
+            # P4：语音库未命中 ⇒ 再试 HA 原生场景（同一条"语音优先"次序）。
+            # 这两位允许出 clarify 计划（目标 P4④：同名多个列候选，绝不猜）——
+            # 动作表/T1/构造都试过仍收不住，此时把候选念给用户比"我还不会"有用。
+            hit = await self._native_scene_plan(text, trace, allow_clarify=True)
+            if hit is not None:
+                return hit
         # ⑤ T1 TextCNN（仅一次；OOS/阈值不足返回 None）
         if not matched_intent and self.settings.get("nlu.textcnn_enabled", True) and self.textcnn:
             # F3：ort 推理与会话构建（首调用 ~百ms、预热持锁时更久）必须出事件
@@ -1924,9 +1946,87 @@ class FastPath:
             phrase = self.scenes.check(text)
             if phrase:
                 return await self._scene_plan(phrase, text, trace)
+            # P4：同上，最后一位也允许出 clarify 候选（前面各闸都没收下这句才轮得到）
+            hit = await self._native_scene_plan(text, trace, allow_clarify=True)
+            if hit is not None:
+                return hit
         return plan
 
     # ── 场景与参数组装 ──────────────────────────────────────────
+    def _scene_extra_names(self) -> set:
+        """原生场景让路的**补充**来源：只补**真区域名**。
+
+        ⚠ 不再补 `targets._dyn_vocab`：那张表由全部实体名切词而来、**含 scene 实体自己的名字**
+        （scene 域不在 `_VOCAB_EXCLUDED_DOMAINS` 里），拿它当 blocked 会让每个原生场景都被
+        "自己"挡死（10-11 真机双臂实锤：表建好了、`match('观影场景')` 仍恒 None）。
+        设备整名的可靠来源是同一份 states 快照里的 `SceneCache._occupied`，它本就排除了 scene 域。
+        主清单已改由 `SceneCache._occupied`（states 快照里的在装设备整名）承担——这里只是
+        补区域名（「观影」同时是个房间名时也该让路）与词表里可能存在的别名。拿不到就少补，
+        绝不因为补不全而放开接管（判据在 `check_native` 里是"命中即让路"）。永不抛。"""
+        words: set = set()
+        try:
+            words |= {str(a).strip() for a in (self._areas() or ()) if str(a).strip()}
+        except Exception:  # noqa: BLE001
+            pass
+        # （故意不再并 `_dyn_vocab`：见上面 docstring 的自我遮蔽防线）
+        return words
+
+    async def _native_scene_plan(self, text: str, trace: list[str],
+                                 allow_clarify: bool = False) -> Optional[Plan]:
+        """P4′：HA **原生场景**（`scene.*`）可被语音执行——只在用户自己说了"场景"时。
+
+        现场实锤（10-10，`scene.guan_ying` 友好名「观影」）：「观影场景」「执行观影场景」
+        全落 `[fallback] '这句话我还不会'`，根因是场景缓存只有 `HassListVoiceScenes`
+        （加载项自有语音库）一个数据源。第一版把它接上后，对抗复核复现出三类危害，本版逐条封死：
+          · 裸名/动词形抢设备口令（「启动扫地机」→ 触发场景、机器没动播成功）
+            ⇒ **必须有字面「场景」标记**，裸名通道整体取消；
+          · 语音库前缀契约被抢（触发词「观影」时「观影场景」走原生）⇒ 调用侧只在
+            `scenes.check(text)` **整条不认领**时才试本道；
+          · blocked 依赖 `targets._dyn_vocab`（只留 2~8 个纯汉字）⇒ 在装设备整名改由
+            states 快照自带（`SceneCache._occupied`），本处只再补区域名等额外来源。
+        触发**不走** `HassTriggerVoiceScene`（集成库里没这个场景＝"回执成功而什么都没发生"），
+        由执行器直发 `scene.turn_on{entity_id}`；歧义/抢名/离线场景一律不接管。永不抛。
+        """
+        try:
+            nat = getattr(self.scenes, "native_scenes", None)
+            if nat is None:
+                return None          # 旧替身/未升级的缓存对象：原生道整体不启用（逐字旧行为）
+            # 表还空 ⇒ 请 SceneCache 自愈（后台单飞重建，本道不 await、不阻塞）。
+            # 旧写法是 `if not nat() and self.scenes.needs_blocking(): await refresh()`——
+            # 那是借**语音库**的闸：语音库只要"尝试过"就不再同步刷，原生表一旦没建成就
+            # 永远空着（10-11 真机慢链路实锤：「观影场景」永久落 fallback）。
+            if not nat():
+                # 快照热 ⇒ 当句同步建表（零网络）；冷 ⇒ 只调度后台自愈（绝不等网络）。
+                warm = getattr(self.scenes, "native_from_cache", None)
+                built = bool(warm()) if warm is not None else False
+                if not built:
+                    heal = getattr(self.scenes, "native_soon", None)
+                    if heal is not None:
+                        heal()
+            extra = self._scene_extra_names()
+            kind, payload = self.scenes.check_native(text, extra_occupied=extra)
+            if kind == "ambiguous":
+                trace.append(f"原生场景歧义:{payload.get('reason')}→不猜")
+                if not allow_clarify:
+                    # 契约最高的前两位**不出 clarify**：那句还可能是设备口令
+                    # （早于动作表/T1/构造），在这里抢一个对话回合就是新的高度污染。
+                    return None
+                return Plan(intent=SCENE_CLARIFY_INTENT,
+                            args={"reason": payload.get("reason") or "",
+                                  "names": list(payload.get("names") or []),
+                                  "entity_ids": list(payload.get("entity_ids") or [])},
+                            source="scene", utterance=text, trace=trace)
+            if kind != "hit":
+                return None
+            trace.append(f"原生场景触发={payload['name']}")
+            return Plan(intent="TriggerHaScene",
+                        args={"entity_id": payload["entity_id"],
+                              "name": payload["name"]},
+                        source="scene", utterance=text, trace=trace)
+        except Exception:  # noqa: BLE001 判据故障=不接管，语音链逐字不变
+            logger.exception("[fastpath] 原生场景判定异常（不接管）")
+            return None
+
     async def _scene_plan(self, phrase: str, text: str, trace: list[str]) -> Optional[Plan]:
         if not await self.scenes.verify_or_refresh(phrase):
             return self._miss(trace, "场景触发未缓存")
@@ -2325,6 +2425,55 @@ _WH_TRAIL_RE = re.compile(r"(?:全都|全部|都|全)?"
                           r"(关闭|关掉|关了|打开|开了|开启|开一下|开|关)(?:了|啦)?$")
 # 全屋句的合法句首（守卫与尾动分支共用）：句首即全屋标记才算全屋句。
 _WH_HEAD_RE = re.compile(r"^(所有|全部|全屋|整屋|整个家|家里|全家|各个|每个)")
+
+# ── P0′（2026-10-10）：批量口径的"集合形"判据——只看计划，不看文本 ──────────
+# 病灶（出货 1.4.5 现场复现，日志逐字对得上）：「关闭办公室所有设备」本地 t0 明明产出
+# **集合形**（`_area_bulk_plan` → flags=area_bulk、domains 含 climate/cover＝窗与空调都在
+# 内），却在 `pipeline.select_primary_plan` 被 klar 的**单台点形**
+# `HassTurnOff{'entity_id': 'light.ban_gong_shi_she_deng'}` 抢走——裁决只看 intent 名
+# （TurnDeviceOff 不在 HUIJIAN_ONLY_INTENTS）、不看计划形状，于是"标准控制 klar 恒优先"
+# 把批量口径一起压掉；播报侧 `echo_target` 再复读用户原话 ⇒ 只关一盏灯却播
+# 「办公室所有设备关了」。HomeKit 的正面口径：作用域＝房间∩类别的数据集合，永不折成
+# "最像的那一台"（developer.apple.com/cn/design/human-interface-guidelines/homekit）。
+#
+# ⚠ 本处曾有第二套**文本**判据（`bulk_scope_face`/`bulk_shape_ok`：按原话子串匹配
+#   `_WHOLEHOUSE_RE`/`_BULK_DEVICE_WORDS`/`BARE_WINDOW_NAMES` 判"哪一面集合"），当日即被
+#   对抗复核实锤推翻并整体删除：同一批词表在 `_area_bulk_target`（本文件 1424-1438）用的是
+#   **精确词**，子串版把「关闭展厅所有窗帘」「关闭办公室所有监控设备」「把家里的小爱同学
+#   关掉」「打开全家福」「关掉所有窗式空调」一律点亮，把本仓钉过的合法具名类别批量判死，
+#   还可能把更宽的本地集合形提到引擎精确点形之前。教训就写在本文件 1429-1434——"设备"
+#   按子串判是**已发生过一次的事故**。判据只保留下面这一个，且只看计划形状。
+
+# P4④（10-10）：**原生场景重名/名字相撞**时发射的澄清哨兵意图。
+# 它**不是**可执行意图、永不下发任何服务或集成调用：`pipeline._cascade`（单发）与
+# `_chain_decide`（链内分句）见名即转 `Reply(…, "clarify", ok=False)`，列出候选请用户说清。
+# 同 `HuijianEndConversation` 那条先例——纯会话控制意图在级联当场收口。
+# 契约测试把它登记在 `LOCAL_ONLY_INTENTS`，并有 `test_local_only_exemptions_are_justified`
+# 断言 core 源码里确实存在该处理点（不是"随手加个白名单名字"）。
+SCENE_CLARIFY_INTENT = "ClarifyNativeScene"
+
+
+def plan_is_bulk_shape(plan) -> bool:
+    """计划是否是**区域批量道**（`FLAG_AREA_BULK`）产出的集合形。只看计划，不看文本。
+
+    为什么只认 area_bulk、**故意不含 `whole_house`**（2026-10-10 对抗复核第二轮教训，
+    我第一版含了它，被复现推翻）：全屋道由「家里/全家/所有」这类标记点亮，宽松到会吃掉
+    用户点名的设备——实测「把家里的小爱同学关掉」t0 出的是
+    `{name:'', domains:['media_player']}` **整类**集合，而 klar 给的正是用户点的那一台；
+    若"集合形优先"也吃 whole_house，这句就会去关**全屋音箱**，比原病更糟。
+    area_bulk 不一样：它要求 ①在册区域 ②显式"所有/全部"标记 ③类别词出自
+    `_area_bulk_target` 的**精确词**表（该函数 1429-1434 就记着"『设备』按子串判＝事故"），
+    三条齐了才出计划——恰好是现场那句「关闭办公室所有设备」的形状。
+    ⇒ 本判据只兜"区域批量被引擎点形抢走"，其余句子（含全屋口径）逐字走原路：
+      宁少拦，不误杀、也绝不为"更彻底"而扩大动作面。
+    """
+    try:
+        if plan is None:
+            return False
+        return bool(FLAG_AREA_BULK in (getattr(plan, "flags", None) or ()))
+    except Exception:  # noqa: BLE001 判据故障=不接管（保持原次序）
+        return False
+
 
 # 连排残渣检测（2026-09-10）：区域名里出现这些动作动词＝parse_target 把第二个动作
 # 子句当成了区域（见 _build_plan 守卫）。与 creation._SERIAL_VERB 同表。

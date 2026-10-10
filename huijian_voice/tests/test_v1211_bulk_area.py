@@ -77,15 +77,20 @@ def _entry(eid, did, area_id):
                                  aliases=(), name=None, entity_category=None)
 
 
-def make_hass(area_override=None, dev_name=None):
+def make_hass(area_override=None, dev_name=None, extra_rows=()):
     """区域只挂**设备**（实体级 area_id 全 None）——与真机同形。
 
     `dev_name`：{entity_id: 设备显示名}，用来造"设备名里写着别屋"的现场形态。
+    `extra_rows`：追加地形（P3 前置用它造"卫星自己的一台设备"），默认空 ⇒ 既有用例逐字不变。
     """
     State = bench._State
     states, entries, devices = [], [], {}
-    for i, (eid, st, fn, area) in enumerate(ROWS):
-        did = f"dev{i}"
+    for i, row in enumerate(list(ROWS) + list(extra_rows)):
+        eid, st, fn, area = row[0], row[1], row[2], row[3]
+        # 第 5 位可选：显式指定 device_id——真机上「assist_satellite 实体」与它的
+        # 麦克风开关/连续对话挂在**同一台设备**下，而本夹具默认"一行一台设备"。
+        # 不给就按老行为 dev{i}（既有用例逐字不变）。
+        did = str(row[4]) if len(row) > 4 else f"dev{i}"
         states.append(State(eid, fn, {"friendly_name": fn}, st))
         entries.append(_entry(eid, did, None))
         a = area if area_override is None else area_override.get(did, area)
@@ -503,3 +508,67 @@ def test_broadcast_says_nothing_when_receipt_has_no_entity_id():
     ok, speech = asyncio.run(Executor(ha).run(plan))
     assert ok is True, speech
     assert "没登记房间" not in speech, speech
+
+
+# ══ P3 前置（10-10）：语音卫星自己绝不进设备面批量 ═════════════════════
+# 病灶（真机因果臂顺带挖出来的，全程见 `docs\语音线v14x_归位与假成功_实测账` 十七节）：
+# v1.2.10 那道"绝不关语音卫星自己"的守卫（`intent_helper._is_own_integration`）按
+# **归属集成**判（platform/config_entry==huijian_ai），可现网的
+# `switch.huijian_1f04_mai_ke_feng_kai_guan` 是 **ESPHome 侧实体** ⇒ 够不到；
+# 而真正承接「(区域)所有设备」的**设备面道**（本文件的 `find_bulk_entities_by_area`）
+# 此前**根本没有这道守卫**。它们今天侥幸没被关掉，只因为**没登记区域**；用户一旦为
+# "这间房"好使把它们归进房间（P3b），「关闭办公室所有设备」就会**把麦克风关掉**，
+# 下一句再没人听得见（自杀式静音，`fast_path.py:1025` 早警告过）。
+# 修法只认一件事：**该实体所属设备上有没有 `assist_satellite.*`**（与归属集成无关），
+# 且只作用于**空名批量目标**——点名「关掉小智音箱」这类具名句照旧能动它。
+SAT_ROWS = [
+    # (entity_id, state, friendly_name, 设备区域, 设备 id)——三行**同一台设备**，与真机同形
+    ("assist_satellite.huijian_1f04_sat", "idle", "HUIJIAN-1F04 语音助手卫星", "办公室", "dev_sat"),
+    ("switch.huijian_1f04_mai_ke_feng_kai_guan", "on", "HUIJIAN-1F04 麦克风开关", "办公室", "dev_sat"),
+    ("switch.huijian_1f04_lian_xu_dui_hua", "off", "HUIJIAN-1F04 连续对话", "办公室", "dev_sat"),
+    ("light.office_desk_lamp", "off", "台灯", "办公室", "dev_lamp"),
+]
+
+
+def _sat_ids(hass):
+    return IWC.satellite_self_device_ids(hass)
+
+
+def test_p3_satellite_self_ids_are_found_by_device_not_by_integration():
+    """判据按设备取：卫星那台设备（含 assist_satellite 实体）被认出来。"""
+    hass = make_hass(extra_rows=SAT_ROWS)
+    ids = _sat_ids(hass)
+    assert ids, "一台都没认出 ⇒ 守卫形同不存在"
+    # 卫星自己那台设备的两条 switch 必须同属一个 device_id
+    er = hass._er
+    assert (er.async_get("switch.huijian_1f04_mai_ke_feng_kai_guan").device_id
+            == er.async_get("switch.huijian_1f04_lian_xu_dui_hua").device_id
+            == er.async_get("assist_satellite.huijian_1f04_sat").device_id)
+    assert ids == {er.async_get("assist_satellite.huijian_1f04_sat").device_id}, ids
+
+
+def test_p3_device_face_bulk_never_includes_the_speaker_itself():
+    """P3b 那一格：卫星实体**已登记进办公室**时，设备面批量也不得把它带进去。"""
+    hass = make_hass(extra_rows=SAT_ROWS)
+    got = IWC.find_bulk_entities_by_area(hass, "办公室", WL)
+    assert "switch.huijian_1f04_mai_ke_feng_kai_guan" not in got, \
+        f"批量口令会把说话的那台设备关掉（自杀式静音）：{got}"
+    assert "switch.huijian_1f04_lian_xu_dui_hua" not in got, got
+    assert "light.office_desk_lamp" in got, \
+        f"守卫过头把客户的正常设备也剔了：{got}"
+
+
+def test_p3_zero_change_when_home_has_no_satellite_registered():
+    """反向零漂移：家里没有 assist_satellite 实体 ⇒ 判据回空集，批量面逐字不变。"""
+    hass = make_hass()
+    assert _sat_ids(hass) == set(), "无卫星的家凭空多出排除集"
+    got = IWC.find_bulk_entities_by_area(hass, "办公室", WL)
+    assert "light.ban_gong_shi_she_deng" in got, got
+
+
+def test_p3_helper_never_raises_on_broken_registry():
+    """判据故障 ⇒ 空集（宁多带一台也不凭空剔客户设备，与原守卫同纪律）。"""
+    bad = types.SimpleNamespace(states=types.SimpleNamespace(
+        async_all=lambda: (_ for _ in ()).throw(RuntimeError("注册表炸了"))))
+    assert IWC.satellite_self_device_ids(bad) == set()
+    assert IWC.find_bulk_entities_by_area(bad, "办公室", WL) == []

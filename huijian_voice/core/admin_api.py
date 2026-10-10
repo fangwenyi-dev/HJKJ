@@ -385,9 +385,28 @@ async def _scenes(request):
     rows = [_scene_row(sc) for sc in
             (ctx.scenes.all() if hasattr(ctx.scenes, "all") else [])
             if isinstance(sc, dict)]
+    # P4 收尾（10-10）：用户现在**能喊动** HA 原生场景，却在"语音场景"页里看不见它们——
+    # 既不知道哪些名字已被占、也不知道哪些会走原生通道。这里只读列出（删改归 HA 管，
+    # 加载项不提供，免得越权）；`shadowed_by_voice` 把"同名时语音契约优先"这条次序显式
+    # 摊给用户看，否则"我建了原生场景怎么没反应"又是一轮无解疑云。
+    native_map: dict = {}
+    try:
+        if hasattr(ctx.scenes, "native_scenes"):
+            native_map = dict(ctx.scenes.native_scenes() or {})
+    except Exception:  # noqa: BLE001 观测面不得把面板弄成 500
+        logger.exception("[面板] 原生场景列表读取失败")
+        native_map = {}
+    voice_trig = {str(t) for t in (ctx.scenes.triggers or [])}
+    natives = [{"name": n, "entity_ids": list(ids or []),
+                "shadowed_by_voice": n in voice_trig}
+               for n, ids in sorted(native_map.items())]
+    if error and natives:
+        error += (f"；HA 原生场景 {len(natives)} 个不受影响，"
+                  f"仍可用「X场景」或「执行X」喊动")
     # triggers 键保留（旧前端/排障脚本兼容）
     return web.json_response({"triggers": ctx.scenes.triggers,
-                              "scenes": rows, "error": error})
+                              "scenes": rows, "native_scenes": natives,
+                              "error": error})
 
 
 _HV_INTENT_CN = {"TurnDeviceOn": "打开", "TurnDeviceOff": "关闭",

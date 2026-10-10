@@ -32,7 +32,21 @@ HA_CORE_INTENTS = {
 # 的分句也在 _try_compound 滤除——设计上永不到 /api/intent/handle。豁免有据：
 # 行为钉 tests/test_v1093_end_dialogue.py 以 executor 桩「一碰即红」+链中
 # extra_steps 不含本名双证，不是靠注释自证。
-LOCAL_ONLY_INTENTS = {"PlayMusic", "HuijianEndConversation"}
+LOCAL_ONLY_INTENT_NAMES = {"PlayMusic", "HuijianEndConversation", "TriggerHaScene",
+                           "ClarifyNativeScene"}
+LOCAL_ONLY_INTENTS = set(LOCAL_ONLY_INTENT_NAMES)
+# ClarifyNativeScene（P4④，2026-10-10）：原生场景**同名多条/名字相撞**时发射的澄清哨兵。
+# 它**没有任何执行面**，也不该有：`pipeline._cascade` 与 `_chain_decide` 见名即转
+# `Reply(…, "clarify", ok=False)` 列出候选并零下发（同 HuijianEndConversation 的先例）。
+# 依据不是注释：tests/test_p4_native_scenes.py 用 `RecExecutor` 断言"一进执行面即红"，
+# 另有源码级钉断言两个接入点都在（见 test_local_only_exemptions_are_justified）。
+# TriggerHaScene（P4，2026-10-10 HA 原生场景）：执行面在 core 侧——`Executor.run` 见名
+# 即走 `call_service("scene","turn_on",{entity_id})`，**永不**进 /api/intent/handle
+# （集成的场景库只认自己登记的 trigger_phrase，把原生场景发过去＝"回执成功而什么都没
+# 发生"那类假成功）。豁免依据同前两名一样是行为钉，不是注释：
+# tests/test_p4_native_scenes.py 断言 `ha.intent_calls == []`（一发到集成即红）＋
+# `ha.svc_calls == [("scene","turn_on",{"entity_id": …})]` 双证，另有一条反向钉：
+# 缺 entity_id 时**不得**播成功。见 test_local_only_exemptions_are_justified。
 
 
 def _registered_intents() -> set[str]:
@@ -128,6 +142,40 @@ def test_every_emitted_intent_has_a_handler():
         f"新车道发射名无执行面：{sorted(unhandled)}——"
         "须在 custom_components/huijian_ai/intent*.py 注册 handler"
         "（或确认 HA core 内置后加入 HA_CORE_INTENTS）")
+
+
+def test_local_only_exemptions_are_justified():
+    """豁免表不得烂成"随手加名字"：每个 LOCAL_ONLY 名字都要有**真实的本地落点**。
+
+    三条判据（任一不满足即红）：
+      · 它确实**没有**注册在集成端——否则它根本不需要豁免，写在这张表里只会掩盖真相；
+      · core 侧源码（executor / pipeline / fast_path）里存在对该名字的**处理点**
+        （执行、当场收口或显式丢弃），不是凭注释自称本地；
+      · TriggerHaScene 这类"改名不改道"的坑单独加一条：必须由 `call_service` 承接，
+        源码里出现"发往 handle_intent 的分支"覆盖它即红（那是假成功通道）。
+    """
+    reg = _registered_intents()
+    core_src = {
+        "executor.py": (HERE / "core" / "executor.py").read_text(encoding="utf-8"),
+        "pipeline.py": (HERE / "core" / "pipeline.py").read_text(encoding="utf-8"),
+        "fast_path.py": (HERE / "core" / "nlu" / "fast_path.py").read_text(encoding="utf-8"),
+    }
+    for n in sorted(LOCAL_ONLY_INTENTS):
+        assert n not in reg, f"{n} 已在集成注册，却仍列在 LOCAL_ONLY——豁免掩盖事实"
+        where = [f for f, src in core_src.items() if f'"{n}"' in src]
+        assert where, (f"{n} 在 core 侧没有任何处理点：豁免无据，"
+                       "要么实现本地执行、要么从 LOCAL_ONLY_INTENTS 移除")
+    # TriggerHaScene 专项：本地执行必须是服务直调，且不得被路由到集成意图通道
+    ex = core_src["executor.py"]
+    assert 'name == "TriggerHaScene"' in ex, "P4 本地执行分支被摘（原生场景会走假成功通道）"
+    assert '"scene", "turn_on"' in ex, "P4 未用 scene.turn_on 服务直调"
+    # ClarifyNativeScene 专项：它必须**没有**执行面，只在级联两处当场收口
+    from core.pipeline import Pipeline
+    import inspect as _ins
+    cas, chain = _ins.getsource(Pipeline._cascade), _ins.getsource(Pipeline._chain_decide)
+    assert "SCENE_CLARIFY_INTENT" in cas, "单发链路的场景澄清收口被摘（会退化成泛化兜底）"
+    assert "SCENE_CLARIFY_INTENT" in chain, "链内分句的场景澄清收口被摘（会静默丢腿）"
+    assert "SCENE_CLARIFY_INTENT" not in ex, "澄清哨兵竟有执行面：它可能真被下发成服务调用"
 
 
 def test_lock_family_registered_in_integration():

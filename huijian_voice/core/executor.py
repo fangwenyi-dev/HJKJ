@@ -16,7 +16,8 @@ from typing import Optional
 
 from . import capability
 from .nlu.schema import ATTR_CN, ATTR_TO_WIRE
-from .nlu.fast_path import Plan, color_word, is_pronoun, normalize_polite
+from .nlu.fast_path import (FLAG_AREA_BULK, Plan, color_word, is_pronoun, is_whole_house,
+                            normalize_polite)
 
 logger = logging.getLogger("huijian.executor")
 
@@ -194,7 +195,6 @@ _INDETERMINATE_SAY = ("这一步没拿到执行回执，设备可能已经动作
 _INDETERMINATE_SAY_INTEGRATION = (
     "这一步没拿到执行回执，设备可能已经动作了——为防重复执行，我不自动再试。"
     "如果反复出现，请在 Supervisor 重启（或重载）HA Core 再试一次")
-
 
 def is_indeterminate(err: str) -> bool:
     """失败原因是否"结果不确定"：超时/连接断开/5xx——HA 侧可能已经执行，只是
@@ -1191,12 +1191,24 @@ class Executor:
             # /api/intent/handle——HassTurnOn/Off 不在慧尖集成注册面内（intent.py:27-44
             # 只登记 TurnDevice*/HassLock/HassUnlock/…），HA 内置 handler 又不认
             # 慧尖口径 ⇒ 第二腿发出去没人按，顶层照样回 success（2026-09-27 实锤）。
-            direct = self._klar_direct(name, args) if src == "klar" else None
-            if direct is not None:
-                domain, service, data = direct
-                result = await self.ha.call_service(domain, service, data)
+            # P4（2026-10-10）：HA **原生场景**必须走服务直调。集成侧
+            # `HassTriggerVoiceScene` 只认自有场景库（`trigger_phrase` 记账），拿原生场景名
+            # 去问它 = 它"成功"而场景什么都没发生——正是一整族假成功里最贵的那一类。
+            # 带 entity_id 下发，二次按名字猜的余地都不留。
+            if name == "TriggerHaScene":
+                _eid = str((args or {}).get("entity_id") or "")
+                if not _eid.startswith("scene."):
+                    result = {"success": False, "error": "native scene entity_id missing"}
+                else:
+                    result = await self.ha.call_service("scene", "turn_on",
+                                                       {"entity_id": _eid})
             else:
-                result = await self.ha.handle_intent(name, wire_args(name, args))
+                direct = self._klar_direct(name, args) if src == "klar" else None
+                if direct is not None:
+                    domain, service, data = direct
+                    result = await self.ha.call_service(domain, service, data)
+                else:
+                    result = await self.ha.handle_intent(name, wire_args(name, args))
             for _nm in await self._offline_names(name, args):
                 if _nm not in offline:
                     offline.append(_nm)
@@ -1292,7 +1304,23 @@ class Executor:
             return self._named(False, reply)
         partial = f"（另有 {bad_n} 台没成功）" if bad_n > 0 else ""
         klar_speech = (getattr(plan, "speech", "") or "").strip()
-        if plan.source == "klar" and len(results) == 1:
+        # P1（2026-10-10 HomeKit 对齐）：**范围词只能来自回执，不能来自原话**。
+        # 现场证据（出货 1.4.5 日志，10-10 用户贴回）：「关闭办公室所有设备」播成
+        # 「办公室所有设备关了」，而实际只动了 `light.ban_gong_shi_she_deng` 一台——
+        # 那句是 `_klar_echo` 用 `echo_target(原话)` 拼的（2026-09-14 为治"缺主语病句"
+        # 加的，对**具名句**是对的：说「打开办公室射灯」→播「射灯开了」）。而"所有/全部"
+        # 这类句子承诺的是一个集合，集合有多大只有回执知道。
+        #
+        # 判据刻意用 `is_whole_house`（只问"原话里有没有批量标记"），**不问形状**：
+        # 对抗复核实锤（台账第二十四节）"子串面判据"会误杀合法句子，而话术这一侧的
+        # 误判代价是**不对称的安全方向**——误判只会让播报更保守（改用回执派生台数），
+        # 绝不会少动设备、也绝不会多动设备。所以这里宁可宽：`家里/全家/所有/全部…`
+        # 命中即弃用"原话回显"与引擎泛化句，走 `self.speech()`（台数取回执里确证成功的
+        # 行归并出的设备数，v1.2.10 口径），后面再追加 `partial`/`skip_note`。
+        if plan.source == "klar" and is_whole_house(plan.utterance or ""):
+            logger.info("[执行] 原话含批量标记 ⇒ 播报改走回执派生，弃用原话回显与引擎泛化句")
+            klar_speech = ""
+        elif plan.source == "klar" and len(results) == 1:
             # 标准开关族：引擎那句缺主语的话术让位给「原话目标词 + 方向动词」
             klar_speech = self._klar_echo(plan) or klar_speech
         if klar_speech:
@@ -1362,6 +1390,12 @@ class Executor:
         for _pe in _extra_partials:
             if _pe and _pe not in reply:
                 reply = reply.rstrip("。") + "（" + _pe.strip("（）") + "）"
+        # P1 收尾（2026-10-10 对抗复核 A2/B2 那半）：用户明确说的是**全部**，而这一支
+        # 执行的并不是集合形计划（既没 `area_bulk` 也没 `whole_house` 扇出）⇒ 设备名与
+        # 台数都是真话，但"其余没动"必须说出来，不能让用户以为整批都办了。
+        # 方向安全性：只加限定语，**不改执行面、不拒答**——拒答那版已被证伪（会误杀
+        # 「关闭展厅所有窗帘」这类合法具名类别批量，见台账二十四节）。
+        reply = self._scope_underdelivered(reply, plan, results)
         self.last_run = {"steps": len(steps), "applied": len(steps),
                          "indeterminate": False}
         logger.info("[执行] %s %s%s → 成功 | %s", plan.intent, plan.args, tag, reply)
@@ -1707,6 +1741,16 @@ class Executor:
     def speech(self, plan: Plan, result: dict) -> str:
         args = plan.args
         intent = plan.intent
+        # P4（2026-10-10）HA 原生场景：话术只说"已执行"，且这支只在回执成功时到达
+        # （失败支在 run() 里走 zh_error，不会走到这里）——不写"观影模式已开启"这种
+        # 我们并不知道的话（scene.turn_on 的 HA 应答本来就没有内容）。
+        if intent == "TriggerHaScene":
+            nm = str(args.get("name") or "").strip() or "场景"
+            msg = result.get("message")
+            if isinstance(msg, str) and msg.strip() \
+                    and any("\u4e00" <= c <= "\u9fff" for c in msg):
+                return msg if msg.endswith(("。", "！", "!", "了")) else msg + "了"
+            return f"好的，{nm}已执行"
         # 场景
         if intent == "HassTriggerVoiceScene":
             msg = result.get("message")
@@ -1789,6 +1833,77 @@ class Executor:
         if "success_count" in result:
             return "好的，已执行"
         return "好的"
+
+    # 口径不足限定语的触发词：**只认显式"全部"词汇**。
+    # 刻意不含 `is_whole_house` 那张表里的「家里/全家/整个家」——它们经常只是定语或名字
+    # 的一部分（「把**家里**的小爱同学关掉」「打开**全家福**」），拿它们点亮限定语会
+    # 硬说用户"要的是全部"，那是**新的不实陈述**。复核推翻的第一版正是栽在这类宽判据上。
+    _SCOPE_WORDS_RE = re.compile(r"所有|全部|全都|统统|每个|各个|全屋|整屋|一率")
+
+    def _scope_underdelivered(self, reply: str, plan: Plan, results=None) -> str:
+        """说的是"全部"、执行的却是点形（没按区域/全屋扇出）⇒ 在句尾加一句如实限定。
+
+        还要**把真办成的台补回播报**：P1 把 klar 那句按原话拼的话术置空后，回执派生路径
+        在"单步＋点形"形态下只剩「好的」（本轮实测钉抓到的），光说"好的；这句要的是全部…"
+        等于把办了哪台藏起来——用户最需要的那一半也不能丢。
+
+        永不抛、永不改动作：这里只动话术。已有分因交代（离线/没成功/没动/不支持/查无）
+        时不重复叠加——两种事实各说一次是本仓的铁律（见 bits 支）。
+        """
+        try:
+            utt = plan.utterance or ""
+            if not self._SCOPE_WORDS_RE.search(utt):
+                return reply
+            if getattr(plan, "whole_house", False) or \
+                    FLAG_AREA_BULK in (getattr(plan, "flags", None) or ()):
+                return reply          # 确实按集合扇出过，无须限定
+            text = reply or ""
+            if any(k in text for k in ("没能确定", "没动", "没成功", "离线",
+                                       "不支持", "没有找到", "本来就在")):
+                return text
+            # 真办成的台名。**两个来源，按可靠度排序**：① 本步回执的 control_targets
+            # （集成侧回的行）；② 计划里的 entity_id 去 states 快照查友好名。
+            # 为什么必须有②：P1 把 klar 的"原话回显"置空是对的（那句把整批承诺成已办），
+            # 但标准 `HassTurnOff` 走 HA core 通道时回执常是折叠过的 `{"success": true}`
+            # （本文件 1828 行的"raw 折叠"注释记过同族现象）⇒ 光弃用回显会把
+            # "到底动了哪台"一起丢掉，诚实变成含糊（本轮实测钉抓到的正是这个）。
+            proven: list = []
+
+            def _push(nm):
+                nm = str(nm or "").strip()
+                if nm and nm not in proven:
+                    proven.append(nm)
+
+            for r in (results or []):
+                if isinstance(r, dict):
+                    for ct in (r.get("control_targets") or []):
+                        if isinstance(ct, dict):
+                            _push(ct.get("name"))
+            if not proven:
+                snapshot = getattr(self.ha, "_states", None) or {}
+                raw = (plan.args or {}).get("entity_id")
+                eids = [raw] if isinstance(raw, str) else list(raw or [])
+                for eid in eids[:3]:
+                    ent = snapshot.get(str(eid))
+                    if isinstance(ent, dict):
+                        _push(((ent.get("attributes") or {}).get("friendly_name")))
+            done_part = ""
+            named = [n for n in proven[:3] if n not in text]
+            if named:
+                done_part = ("「" + named[0] + "」这台办了" if len(named) == 1
+                             else "「" + "、".join(named) + "」这几台办了")
+            tail = "这句要的是全部，其余该动哪几台我没能确定，没敢代做"
+            base = (text or "").rstrip("。")
+            if done_part:
+                if base in ("好的", ""):
+                    # 别留「好的；」这种空壳字头：无主语时直接把办成的台接上去
+                    base = "好的，" + done_part
+                else:
+                    base = base + "；" + done_part
+            return base + "；" + tail
+        except Exception:  # noqa: BLE001 话术层故障=原样播报
+            logger.exception("[执行] 口径限定语异常（原样播报）")
+            return reply
 
     def _targets_speech(self, plan: Plan, targets: list) -> str:
         names = "、".join([t.get("name", "") for t in targets if t.get("name")]) or "设备"

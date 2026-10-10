@@ -501,3 +501,51 @@ def test_scene_ops_routes_registered():
     assert {"/api/scenes/delete", "/api/scenes/rename", "/api/scenes/test",
             "/api/automations/delete", "/api/automations/test",
             "/api/automations/edit"} <= paths
+
+
+def test_scenes_endpoint_lists_native_scenes_and_shadow_flag():
+    """P4 收尾（10-10）：用户**能喊动** HA 原生场景，面板就必须看得见它们。
+
+    看不见就必然产生"我建了原生场景怎么没反应"的无解疑云；`shadowed_by_voice` 把
+    "同名时语音契约优先"这条次序显式摊开。语音库拉取失败时也要说清"原生不受影响"
+    ——这条 error 文案是用户唯一能看到的解释，不许只报失败。
+    """
+    from core.admin_api import CTX_KEY, _scenes
+    from types import SimpleNamespace
+
+    class Sc:
+        triggers = ["观影"]
+
+        async def refresh(self, force=False):
+            return False                      # 集成掉线：语音库拉不到
+        def all(self):
+            return [{"trigger_phrase": "观影", "name": "观影", "scene_id": "s1",
+                     "created_at": "", "actions": []}]
+
+        def native_scenes(self):
+            return {"观影": ["scene.a"], "回家": ["scene.b", "scene.b2"]}
+
+    ctx = AppContext(settings=SettingsFake(), ha=FakeHAClient(), asr=None,
+                     tts=TtsFake(), pipeline=PipelineFake(), scenes=Sc(),
+                     textcnn=None, store=StoreSnap(), started_at=time.time())
+    j = json.loads(asyncio.run(_scenes(SimpleNamespace(app={CTX_KEY: ctx}))).body)
+    nat = {n["name"]: n for n in j["native_scenes"]}
+    assert set(nat) == {"观影", "回家"}, j["native_scenes"]
+    assert nat["观影"]["shadowed_by_voice"] is True, "同名遮蔽没摊给用户"
+    assert nat["回家"]["shadowed_by_voice"] is False
+    assert nat["回家"]["entity_ids"] == ["scene.b", "scene.b2"]
+    assert "拉取失败" in j["error"] and "不受影响" in j["error"], j["error"]
+    assert j["triggers"] == ["观影"], "兼容键语义被动过"
+
+
+def test_scenes_endpoint_tolerates_cache_without_native_api():
+    """旧缓存替身/未来实现没有 native_scenes() ⇒ 面板照常出，不许 500。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from core.admin_api import CTX_KEY, _scenes
+    ctx = AppContext(settings=SettingsFake(), ha=FakeHAClient(), asr=None,
+                     tts=TtsFake(), pipeline=PipelineFake(), scenes=ScenesFake(),
+                     textcnn=None, store=StoreSnap(), started_at=time.time())
+    j = json.loads(asyncio.run(_scenes(SimpleNamespace(app={CTX_KEY: ctx}))).body)
+    assert j["native_scenes"] == [] and j["scenes"], j

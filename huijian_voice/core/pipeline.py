@@ -44,7 +44,9 @@ from .nlu.fast_path import (END_DIALOGUE_INTENT, FLAG_ANAPHORA_STRIPPED,
                             FastPath, Plan,
                             attribute_domain_target, is_end_dialogue, is_pronoun,
                             is_bare_negation_imperative, is_negation_imperative,
-                            is_whole_house, split_compound)
+                            is_whole_house, plan_is_bulk_shape,
+                            SCENE_CLARIFY_INTENT,
+                            split_compound)
 from .nlu import targets as T
 from .nlu import corrector
 from .nlu import homophone
@@ -803,6 +805,24 @@ def select_primary_plan(fp: Optional[Plan], kl: Optional[Plan],
     if fp is not None:
         if fp.intent in HUIJIAN_ONLY_INTENTS or _mentions_window_device(fp.args):
             return fp
+    # P0′（2026-10-10，**推翻当日第一版设计后重做**）：本地字面表已经产出**集合形**
+    # 批量计划、而引擎给的是**点形**（grounded `entity_id`）时，集合形优先。
+    # 病灶仍是现场那句「关闭办公室所有设备」：t0 出 `area_bulk`（域含 climate/cover＝窗与
+    # 空调），klar 出单台射灯，而本函数只看 intent 名 ⇒ "标准控制 klar 恒优先"把批量压掉。
+    #
+    # 第一版在这里写了 `bulk_scope_face(原话)` 文本判据 + 三格拒答，对抗复核（md5 见台账
+    # 第二十四节）实锤推翻：同一批词表在 `_area_bulk_target` 用**精确词**、我却用**子串**，
+    # 于是「关闭展厅所有窗帘」「关闭办公室所有监控设备」「把家里的小爱同学关掉」「打开全家福」
+    # 「关掉所有窗式空调」全被点亮 ⇒ 把本仓钉过的合法具名类别批量**判死**（基线下发、现役 0 下发，
+    # 连链式句里正确的另一腿也一起打死）；更危险的一面是"谁给集合形谁赢"可能把**更宽**的
+    # 本地集合形提到引擎精确点形之前（点名一台音箱、实际去关整类）。
+    #
+    # 现在的判据只看**计划形状**（`fast_path.plan_is_bulk_shape`：flags 里有 area_bulk 或
+    # whole_house 为真），形状由精确词道产出，不复制第二份词表；且**只调优先次序、不做任何
+    # 拒答**——本地批量道没认出来的句子逐字走原路（宁少拦不误杀）。"不许谎报"那一半交给 P1：
+    # 集合形计划的播报本来就取回执台数，点形计划的播报不再复读原话（executor 侧）。
+    if fp is not None and plan_is_bulk_shape(fp) and not plan_is_bulk_shape(kl):
+        return fp
     if kl is not None:
         # v1.1.17 复审（线上实锤）：**查询句不得由 klar 执行**。疑问闸此前只在字面表
         # 一侧，引擎支没有 ⇒「客厅射灯关了吗」被落成 HassTurnOff 真关了灯、
@@ -1283,6 +1303,16 @@ class Pipeline:
         fp_plan, kl_plan = await self._match_pair(text, origin)
         plan = select_primary_plan(fp_plan, kl_plan, self._known_areas(),
                                  self._device_names(), self._real_areas())
+        if plan is not None and plan.intent == SCENE_CLARIFY_INTENT:
+            # P4④（10-10）：原生场景**同名多条**或"一条的 X场景 形撞另一条的整名" ⇒
+            # 列候选请用户说清，**零下发**（同 `HuijianEndConversation` 的先例：纯会话
+            # 控制在级联当场收口，绝不进执行面）。目标原文那句"同名多个一律 clarify
+            # 列候选，绝不猜"到这一格才算真做到——此前只是"不接管"，用户听到的是
+            # 泛化兜底，既不知道有重名也不知道怎么修。
+            logger.info("[级联] 原生场景歧义(%s) → 列候选、零下发：%s",
+                        plan.args.get("reason"), plan.args.get("names"))
+            return Reply(self._scene_clarify_say(plan), "clarify", ok=False,
+                         trace=list(plan.trace))
         if plan is None:
             absent = _klar_named_absent_target(kl_plan, self._device_names(),
                                             self._known_areas(),
@@ -2265,6 +2295,13 @@ class Pipeline:
                                   trace=[f"链内点名设备查无:{absent}"]),
                             None, [], False)
                 return (None, None, [], False)   # 任一分句不中 → 整句回退单发
+            if p.intent == SCENE_CLARIFY_INTENT:
+                # 链里这条腿是"场景重名待澄清" ⇒ **整链不执行**并列候选。
+                # 不能只丢这条腿继续跑其余腿：那正是档案里「只剩一腿、播『都办妥了』」
+                # 的事故形态；也不能退化成泛化兜底（用户就不知道是重名挡的）。
+                logger.info("[级联] 链内分句「%s」命中场景歧义 → 整链不下发", clause)
+                return (Reply(self._scene_clarify_say(p), "clarify", ok=False,
+                              trace=list(p.trace)), None, [], False)
             # 上下文注入按分句文本（先前误用整句文本，"它"会误标到首句）；
             # 链内先行目标优先，跨轮目标/卫星区域兜底。
             p = self._apply_context(p, clause, origin, seed=chain_spec)
@@ -3096,6 +3133,33 @@ class Pipeline:
         n = max(int(n_entities or 0), len(nm))
         return (f"家里有 {n} 台设备名字相近（{others}），我没法确定你要哪一台，"
                 f"这次先不动。带上房间名再说一次（比如「打开办公室的射灯」）。")
+
+    @staticmethod
+    def _scene_clarify_say(plan) -> str:
+        """P4④（10-10）：原生**场景**重名/名字相撞时的澄清话术。
+
+        两条纪律：① **绝不沿用设备那句模板**——候选是场景，说成"设备名字相近"就是不实
+        陈述，还会把用户引去"带房间名"（对场景重名毫无帮助）；② 必须给一条**能照着做**
+        的下一步：同名多条的唯一解法是在 HA 里把其中一个改成独一无二的名字。
+        永不抛（抛了就是拿澄清话术遮住故障，宁可退回保守句式）。
+        """
+        try:
+            args = getattr(plan, "args", None) or {}
+            names = [str(x).strip() for x in (args.get("names") or []) if str(x).strip()]
+            ids = [str(x).strip() for x in (args.get("entity_ids") or []) if str(x).strip()]
+            reason = str(args.get("reason") or "")
+            if reason == "duplicate_name" or len(names) <= 1:
+                nm = names[0] if names else "这个名字"
+                n = max(len(ids), 2)
+                return (f"家里有 {n} 个场景都叫「{nm}」，我没法确定要触发哪一个，这次没动。"
+                        f"在 Home Assistant 里把其中一个改成独一无二的名字（比如「{nm}客厅」），"
+                        f"再说一次就行。")
+            others = "、".join(f"「{x}」" for x in names[:3]) + ("…" if len(names) > 3 else "")
+            return (f"你要触发的场景名字有 {len(names)} 个相近的（{others}），"
+                    f"我没替你挑，这次没动。把要触发的那个场景名字说完整再说一次。")
+        except Exception:  # noqa: BLE001
+            logger.exception("[级联] 场景澄清话术异常")
+            return "这句涉及多个同名场景，我没敢替你挑，这次没动。"
 
     def _ambiguity_ask(self, plan, origin):
         """点了名、却在本家匹配到**多台不同设备**时先问一句再动。

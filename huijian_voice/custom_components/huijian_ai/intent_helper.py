@@ -489,6 +489,15 @@ def _build_entities_for_item(
 ) -> list[EntityInfo]:
     """单个 target×device 命中组的候选实体（v1.1.27：逐组构建，供逐目标过滤）。"""
     candidate_entities: list[EntityInfo] = []
+    # P3 前置（10-10）：卫星自己绝不进批量。下面那道 `_is_own_integration` 只认归属本集成
+    # （platform/config_entry==huijian_ai），而现网的麦克风开关/连续对话/回声消除是
+    # **ESPHome 侧实体** ⇒ 够不到。补一条与归属无关的**设备级**判据，判据单源在
+    # `intent_window_const.satellite_self_device_ids`（设备面批量道用的是同一个）。
+    # 只作用于空名批量目标：点名「关掉小智音箱」这类具名句照旧能动它。
+    self_devs: set = set()
+    if not item.requested_name:
+        from .intent_window_const import satellite_self_device_ids
+        self_devs = satellite_self_device_ids(hass) or set()
 
     for state in item.states:
         if state.state == "unavailable":
@@ -500,7 +509,10 @@ def _build_entities_for_item(
         # 卫星的麦克风开关/媒体播放器天然落在可开关域里，客户把它登记在哪个房间，
         # 那句「关闭客厅所有设备」就会把它自己关掉——下一句再没人听得见（自杀式静音）。
         # 只挡**批量展开**（空名目标）；用户点名「关闭小智音箱」这类具名句照旧能动它。
-        if not item.requested_name and _is_own_integration(entity_entry, hass):
+        if (not item.requested_name
+                and (_is_own_integration(entity_entry, hass)
+                     or (self_devs and str(getattr(entity_entry, "device_id", "") or "")
+                         in self_devs))):
             _LOGGER.info("Bulk target skips own-assistant entity: %s", state.entity_id)
             continue
         # v1.2.10「(区域)所有设备」不碰设备零件位（用户拍板"空调只需要关闭空调电源"）：

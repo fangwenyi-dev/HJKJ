@@ -707,6 +707,45 @@ def find_all_window_buttons_by_action(
     return result
 
 
+def satellite_self_device_ids(hass) -> set:
+    """挂了 `assist_satellite.*` 实体的 device_id 集合＝**"语音卫星自己"**（P3 前置）。
+
+    为什么按设备判、不按归属集成判（10-10 现场实锤）：
+      · `intent_helper._is_own_integration` 只认 `platform/config_entry == huijian_ai`；
+        而现网那几台「麦克风开关 / 连续对话 / 设备侧回声消除」的 entity_id 形制是
+        设备名＋实体名（`switch.huijian_1f04_mai_ke_feng_kai_guan`）＝**ESPHome 侧实体**
+        ⇒ 那条守卫在**设备面批量道**上根本够不到它们。
+      · 设备面道（本文件 `find_bulk_entities_by_area`）此前**压根没有**这道守卫。
+      · 它们今天侥幸没被「关闭办公室所有设备」带走，只因为**没登记区域**；用户一旦为
+        "这里/这间房"好使而把它们归进房间（P3b），批量口令就会**把麦克风关掉**——
+        下一句再没人听得见（`core/nlu/fast_path.py:1025` 那条警告的形状）。
+    ⇒ 判据只问一件事：**这台设备上有没有 assist_satellite 实体**，与哪个集成提供无关。
+      拿不到 ⇒ 空集（宁多带一台，也不凭空剔掉客户能点名的设备——与原守卫同纪律）。永不抛。
+    """
+    ids: set = set()
+    try:
+        er = None
+        try:
+            from homeassistant.helpers import entity_registry as er_mod
+            er = er_mod.async_get(hass)
+        except Exception:                                    # noqa: BLE001 替身/老 HA
+            er = getattr(hass, "_er", None)
+        if er is None:
+            return ids
+        for st in hass.states.async_all():
+            eid = str(getattr(st, "entity_id", "") or "")
+            if not eid.startswith("assist_satellite."):
+                continue
+            ent = er.async_get(eid)
+            did = getattr(ent, "device_id", None) if ent is not None else None
+            if did:
+                ids.add(str(did))
+    except Exception:                                        # noqa: BLE001
+        _LOGGER.warning("satellite-self device scan failed; treated as none", exc_info=True)
+        return set()
+    return ids
+
+
 def find_bulk_entities_by_area(hass, area_name: str | None, domains) -> list[str]:
     """「(区域)所有设备」批量面：按**区域证据**三档选实体（v1.2.11，不是 HA 严格区域匹配）。
 
@@ -749,6 +788,8 @@ def find_bulk_entities_by_area(hass, area_name: str | None, domains) -> list[str
             ar.async_get(hass), area_name)
         hard: list[str] = []
         loose: list[str] = []
+        # P3 前置：语音卫星自己绝不进设备面批量（判据见 `satellite_self_device_ids`）
+        self_devs = satellite_self_device_ids(hass)
         for state in hass.states.async_all():
             eid = str(getattr(state, "entity_id", "") or "")
             if not eid or eid.split(".", 1)[0] not in wanted:
@@ -757,6 +798,9 @@ def find_bulk_entities_by_area(hass, area_name: str | None, domains) -> list[str
                 continue
             entry = entity_registry.async_get(eid)
             if entry is None:
+                continue
+            if self_devs and str(getattr(entry, "device_id", "") or "") in self_devs:
+                _LOGGER.info("bulk: skipping the satellite's own entity %s", eid)
                 continue
             cand_area, dev_display = _entity_effective_area(
                 entity_registry, device_registry, eid)

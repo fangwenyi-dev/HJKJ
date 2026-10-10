@@ -126,6 +126,13 @@ class Service:
         # （ensure_loaded 收尾）需要 call_soon_threadsafe 才能安全推送。
         self._loop = asyncio.get_running_loop()
         self.scenes.refresh_soon()   # 体验批 P0-2：场景契约词表预热（首句零阻塞）
+        # P4′（10-11 真机慢链路实锤）：原生场景表**自己也要预热**。它此前借用语音库的
+        # 刷新闸，语音库一"尝试过"就不再重试 ⇒ 首轮没建成就永久空着，用户说「观影场景」
+        # 永远落 fallback。这里显式调度一次后台自愈，让功能从**第一句**起可用
+        # （仍是后台单飞、带退避，绝不在语音路径上 await 网络）。
+        heal = getattr(self.scenes, "native_soon", None)
+        if heal is not None:
+            heal()
         # v1.0.48（P5）：音色指纹基线必须在挂监听器之前取好——否则首笔保存
         # 会被当"初值"吞掉，错过一次缓存键轮换。
         self._voice_fp = self.tts.voice_fingerprint()
