@@ -785,13 +785,15 @@ def _klar_write_without_target_evidence(kl: Optional[Plan],
 
 def select_primary_plan(fp: Optional[Plan], kl: Optional[Plan],
                         known_areas=(), device_names=(),
-                        real_areas=None) -> Optional[Plan]:
+                        real_areas=None, context_ready: bool = False) -> Optional[Plan]:
     """纯裁决函数（可单测）：scene 契约 > 慧尖独占 > klar 标准 > 字面表剩余。
 
     v1.0.92：known_areas 传入时启用「控制步目标证据」闸——见
     _klar_write_without_target_evidence。
     v1.1.35：device_names（在装设备名清单）传入时启用「点名设备查无」闸——见
-    _unknown_spoken_device_name；不传=该子闸不参与（既有钉零漂移）。"""
+    _unknown_spoken_device_name；不传=该子闸不参与（既有钉零漂移）。
+    v1.4.7：context_ready（本轮 origin 有新鲜焦点目标）传入时启用**代词句继承优先**——见
+    下方 P5 注释；默认 False＝逐字旧行为（既有钉零漂移）。"""
     if fp is not None and fp.source == "scene":
         # scene 契约**恒最高优先**（模块头裁决①／fast_path:1060-1066）：等值触发词
         # 是用户自己绑的"说 X 就 Y"。查询闸此前压在它前面（先把 fp 置 None）⇒
@@ -822,6 +824,27 @@ def select_primary_plan(fp: Optional[Plan], kl: Optional[Plan],
     # 拒答**——本地批量道没认出来的句子逐字走原路（宁少拦不误杀）。"不许谎报"那一半交给 P1：
     # 集合形计划的播报本来就取回执台数，点形计划的播报不再复读原话（executor 侧）。
     if fp is not None and plan_is_bulk_shape(fp) and not plan_is_bulk_shape(kl):
+        return fp
+    # v1.4.7 P5（任务2·HomePod 焦点对齐；10-11 线上实锤补道）：**代词/回指句 + 本轮
+    # origin 有新鲜焦点目标 ⇒ 本地继承道赢引擎**。病灶（部署版 1.4.5 级联日志逐字）：
+    #   [级联] '打开办公室射灯' → [klar] '办公室射灯开了'
+    #   [级联] '关掉它'        → [klar] '办公室关了。'      ← 只动了一台射灯
+    # 引擎没有会话记忆，"它"落给引擎＝拿全户图谱猜指代：猜对了台、播错了范围
+    # （"办公室关了"把单台泛化成整间房——P1"话术不得超额承诺"同族），猜错了就是
+    # v1.1.35 钉过的"顶同类别另一台"。慧尖的 `_last_target[origin]` 焦点栈才是
+    # HomePod 口径的指代来源（会话内最近受控设备、按发起音箱分桶、新明示目标覆盖）。
+    # 判据三窄化，一条多放都不行：
+    #   · 只吃**缺明示目标**的计划（`_has_explicit_target` 为假）——「再打开书房门」
+    #     这种剥离后带明示目标的回指句照旧走原仲裁，本闸不碰；
+    #   · 只认 fast_path 已裁定的**旗标**（代词/回指，与 `_apply_context` 的 marked
+    #     同源）。裸值调节形（「暗一点」）**不在本闸**——`AdjustDeviceAttribute/
+    #     SetDeviceMode` 本就挂 `HUIJIAN_ONLY_INTENTS`（:70），已在上方"慧尖独占
+    #     恒胜 klar"处赢下；在这里重复判据＝死代码（10-11 写钉时夹具实锤抓出，已删）；
+    #   · `context_ready` 默认 False＝逐字旧行为——既有钉零漂移（含 v1092 的
+    #     `fp=None` 单 kl 形状，那些轮本闸永不触发）。
+    if (fp is not None and context_ready and kl is not None
+            and not _has_explicit_target(fp.args)
+            and bool({FLAG_PRONOUN_TARGET, FLAG_ANAPHORA_STRIPPED} & fp.flags)):
         return fp
     if kl is not None:
         # v1.1.17 复审（线上实锤）：**查询句不得由 klar 执行**。疑问闸此前只在字面表
@@ -1302,7 +1325,8 @@ class Pipeline:
         # ⓪①②③④ klar 引擎与 T0/T1/场景并行判定，三层裁决（见模块头）
         fp_plan, kl_plan = await self._match_pair(text, origin)
         plan = select_primary_plan(fp_plan, kl_plan, self._known_areas(),
-                                 self._device_names(), self._real_areas())
+                                 self._device_names(), self._real_areas(),
+                                 context_ready=self._focus_ready(origin))
         if plan is not None and plan.intent == SCENE_CLARIFY_INTENT:
             # P4④（10-10）：原生场景**同名多条**或"一条的 X场景 形撞另一条的整名" ⇒
             # 列候选请用户说清，**零下发**（同 `HuijianEndConversation` 的先例：纯会话
@@ -2277,7 +2301,9 @@ class Pipeline:
                             clause)
                 continue
             p = select_primary_plan(fpp, klp, self._known_areas(),
-                                self._device_names(), self._real_areas())
+                                self._device_names(), self._real_areas(),
+                                context_ready=(chain_spec is not None
+                                               or self._focus_ready(origin)))
             if p is None:
                 absent = _klar_named_absent_target(klp, self._device_names(),
                                                 self._known_areas(),
@@ -2420,6 +2446,27 @@ class Pipeline:
         return reply
 
     # ── P2-10/11 上下文与空间注入 ──────────────────────────────
+    def _focus_ready(self, origin: str) -> bool:
+        """P5（10-11 HomePod 对齐）：本轮发起源是否有**新鲜**焦点目标可继承。
+        判据与 `_apply_context` 的注入闸**同表同源**（`_last_target` +
+        `dialog.context_enabled` + `dialog.context_ttl_s`）——仲裁偏袒继承道之前，
+        必须先证继承道真拿得到目标，否则只是把引擎的猜换成空目标的"查无设备"。
+        永不抛：`_last_target` 缺席（退下句等**先于注入闸**收口的最小夹具形态，
+        v1093 三钉实锤）＝无焦点栈＝False，逐字旧仲裁。"""
+        try:
+            if not self.settings.get("dialog.context_enabled", True):
+                return False
+            spec = getattr(self, "_last_target", None)
+            if not spec:
+                return False
+            spec = spec.get(origin or "panel")
+            if not spec:
+                return False
+            ttl = float(self.settings.get("dialog.context_ttl_s", CONTEXT_TTL_S))
+            return (time.time() - spec["ts"]) <= ttl
+        except Exception:  # noqa: BLE001 —— 判据故障＝不偏袒（旧行为）
+            return False
+
     def _apply_context(self, plan: Optional[Plan], text: str,
                        origin: str, seed: Optional[dict] = None) -> Optional[Plan]:
         """明示目标零改动；无目标句按 代词/回指>上轮目标 > 卫星区域 > 全屋 兜底。
@@ -3347,7 +3394,8 @@ class Pipeline:
             text, "panel")
         fp_plan, kl_plan = await self._match_pair(text, "panel")   # 与真流量同构（并行）
         plan = chain_plan or select_primary_plan(fp_plan, kl_plan, self._known_areas(),
-                                       self._device_names(), self._real_areas())
+                                       self._device_names(), self._real_areas(),
+                                       context_ready=self._focus_ready("panel"))
 
         def _dump(p):
             return None if p is None else {

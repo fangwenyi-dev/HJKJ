@@ -470,10 +470,14 @@ def test_pipeline_dispatch_wired():
     # 折叠空白再比：实参换行不算断开（v1.1.35 入口又多了 device_names，行宽必换行）。
     # v1.1.36 复核⑥：再加 third 原料 real_areas（真注册区域表）——位置词豁免从此
     # 只认家里真有的房间，入口漏传就等于闸退回静态判据（猜房间回潮）。
+    # v1.4.7 P5：再加第四味 context_ready（`_focus_ready(origin)`）——代词/回指句
+    # 的"焦点栈优先"判据必须接上真栈（`_last_target`+TTL+开关同源）；入口漏传＝
+    # P5 闸永远关着，「关掉它」继续被引擎猜（10-11 线上实锤的第二课）。
     flat = " ".join(pl.split())
     assert ("select_primary_plan(fp_plan, kl_plan, self._known_areas(), "
-            "self._device_names(), self._real_areas())") in flat, \
-        "主裁决入口没把三份原料都传进去"
+            "self._device_names(), self._real_areas(), "
+            "context_ready=self._focus_ready(origin))") in flat, \
+        "主裁决入口没把四份原料都传进去（三原料+context_ready）"
     mn = _text("core/main.py")
     assert "self.klar = KlarClient(self.settings)" in mn and "klar=self.klar" in mn
     assert "await self.klar.close()" in mn
