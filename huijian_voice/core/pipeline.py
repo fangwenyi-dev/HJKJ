@@ -2981,6 +2981,23 @@ class Pipeline:
             return False
         return self._plan_has_risky_step(plan)
 
+    def _lock_family_absent(self) -> bool:
+        """v1.5.0（深审⑮）：「家里根本没有锁」的存在性判据（仅供锁族风险环预审）。
+
+        三态收两态：快照不可得（空 dict＝从未读成功/代理故障窗）一律 False＝不可判、
+        照旧挂环——判据故障绝不放松风险闸（v1.1.35 查无闸的 fail-open 同律）；
+        快照可信且 `lock.` 前缀零实体才 True。现网证据：1.4.9 线上 234 实体、lock 域
+        0 台，「解锁大门」仍挂环问「接下来要解锁门」——无锁的家被索要解锁许可，
+        用户答「确认」后执行侧才失败＝拿假许可空转一轮。"""
+        try:
+            states = getattr(self.ha, "_states", None) or {}
+            if not states:
+                return False
+            return not any(str(k).startswith("lock.") for k in states)
+        except Exception:  # noqa: BLE001 判据故障＝不可判＝照旧挂环
+            logger.exception("[环] 锁族存在性判据异常（按不可判处理）")
+            return False
+
     @staticmethod
     def _plan_has_risky_step(plan: Plan) -> bool:
         """整案风险扫描（主步骤 + extra_steps 全查）。
@@ -3076,6 +3093,17 @@ class Pipeline:
             # v1.1.27：HassLock 进闸后旧写法会把"上锁"问成"解锁"（语义反转，
             # 用户按「确认」时以为在解锁）——按意图名取动词，主步同理。
             verb = rverb or ("上锁" if plan.intent == "HassLock" else "解锁")
+            # v1.5.0（深审⑮，1.4.9 线上复验实锤）：**家里没有锁**也照问解锁许可——
+            # 现网 234 实体快照 lock 域 0 台，「解锁大门」仍挂环念「接下来要解锁门」。
+            # 判"无锁"只在快照可信时做：读到过快照且 lock 域零实体 ⇒ 如实报查无、
+            # **零下发**（执行侧其实会失败，但把失败留到用户答完"确认"之后＝拿假许可
+            # 空转一轮）；快照不可得（冷启动/代理故障窗）＝不可判 ⇒ 照旧挂环——
+            # 判据故障永不放松风险闸，这条方向与 v1.1.35 查无闸的 fail-open 同理。
+            if verb in ("解锁", "上锁") and self._lock_family_absent():
+                logger.info("[环] %s族：快照里没有锁实体 → 不挂环、零下发", verb)
+                return Reply(f"家里没找到能{verb}的锁——这条没执行",
+                             "no_such_device", ok=False,
+                             trace=list(getattr(plan, "trace", [])) + ["确认环:锁族零在位"])
             act = f"{verb}{what}"
         text = f"接下来要{act}，说「确认」执行，或说「取消」放弃"
         self._confirm[origin] = {"plan": plan, "ts": time.time(),
