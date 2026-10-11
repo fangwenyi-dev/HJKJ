@@ -39,7 +39,7 @@ from . import const
 from .tts import _SPEED_MAX, _SPEED_MIN      # 语速钳位单点（确认环 TTL 与合成账同源）
 from .nlu.query import is_query_like
 from .nlu.fast_path import (END_DIALOGUE_INTENT, FLAG_ANAPHORA_STRIPPED,
-                            FLAG_CHAIN_ANAPHORA, FLAG_PRONOUN_TARGET,
+                            FLAG_CHAIN_ANAPHORA, FLAG_CTX_RELAY, FLAG_PRONOUN_TARGET,
                             TRACE_TAG_CHAIN, TRACE_TAG_CONTEXT,
                             FastPath, Plan,
                             attribute_domain_target, is_end_dialogue, is_pronoun,
@@ -2523,6 +2523,23 @@ class Pipeline:
                 args["entity_id"] = spec["target"]
                 plan.trace.append(f"{tag}:沿用实体 {spec['target']}")
                 injected = True
+            elif (not injected and spec["kind"] == "entity_id" and marked
+                    and plan.intent in ("TurnDeviceOn", "TurnDeviceOff")
+                    and not _has_explicit_target(args)):
+                # P5.1（10-11 线上复测实锤）：上一句具名轮是 **klar 执行**的，栈记
+                # 的是 kind=entity_id；P5 裁决抬起的代词 t0 计划若拿不到注入，就空参
+                # 撞集成 require、降级回引擎、播报泛化成「办公室关了。」。此处把它复装成
+                # Hass*+entity_id 精确直调形（执行器 v1.1.17 起能力/可用性/话术全认这形）。
+                # 绝不改道 fuzzy target 形——那会把"它"从一台扩成同类多台（两台名含射灯
+                # 的灯一起动）。非代词句（无 marked/有明示目标）永不到这里，零漂移。
+                # 旗＝直调资格的**唯一**新通道：executor 只给 klar 来源或持这枚旗的
+                # 计划开 /api/services/* 精确直调——t1/llm 等来源拿不到旗，防回潮钉逐字成立。
+                plan.intent = ("HassTurnOn" if plan.intent == "TurnDeviceOn"
+                               else "HassTurnOff")
+                args["entity_id"] = spec["target"]
+                plan.mark(FLAG_CTX_RELAY)
+                plan.trace.append(f"{tag}:继承焦点实体→{plan.intent} {spec['target']}")
+                injected = True
             if injected and seed is not None:
                 # 链内回指旗标就地落，供 _is_anaphoric/复合链聚合消费
                 plan.mark(FLAG_CHAIN_ANAPHORA)
@@ -2605,8 +2622,13 @@ class Pipeline:
         链内回指与跨轮继承共用（同一抽取纪律，行为可对齐单测钉）。"""
         args = plan.args or {}
         try:
-            if (plan.source == "klar" and isinstance(args.get("entity_id"), str)
-                    and "." in args["entity_id"]):
+            if isinstance(args.get("entity_id"), str) and "." in args["entity_id"]:
+                # P5.1：记账不再按 source 挑形——klar 具名轮与 P5.1 改写出的
+                # Hass*+entity_id 继承轮都算焦点实体；但 **scene.* 永不记账**
+                # （场景是"一串动作"不是设备，「观影场景」后说「关掉它」绝不能
+                # 去关场景实体）。
+                if args["entity_id"].startswith("scene."):
+                    return None
                 return {"kind": "entity_id", "target": args["entity_id"]}
             if _target_names(args) or _target_areas(args):
                 tgt = copy.deepcopy(args.get("target")) or None

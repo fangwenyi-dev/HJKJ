@@ -230,6 +230,139 @@ def test_stale_focus_does_not_trigger_p5():
         f"过期焦点仍触发继承：{ex.plans[-1].trace}"
 
 
+# ── ④ 线上形态复刻（1.4.7 白天复测抓出的 P5.1 缺口）────────────────
+# 线上真实序列：Q1「打开办公室射灯」由 **klar 具名执行**（entity_id 平铺形），
+# 焦点栈记的是 kind=entity_id；Q2「关掉它」P5 裁决虽然抬了 fp 代词计划，
+# `_apply_context` 的 entity_id 注入支被 `plan.source=="klar"` 闸挡死 ⇒
+# t0 空参计划必死在集成 require ⇒ 降级回 klar ⇒ 播报泛化成「办公室关了。」。
+# 现网级联日志逐字（2026-10-11 12:19:16）：
+#   [级联] t0 执行失败 → 降级 klar:HassTurnOff（'TurnDeviceOff 参数校验未通过: require'）
+#   [级联] '关掉它'   → [klar] '办公室关了。'
+# 离线既有两轮钉的 Q1 用 **target 形**（kind=target）恰好罩住了这一格——
+# 夹具形态第三次没罩住线上形态（前两次：P4 替身、P5 仲裁面）。
+class SvcHa:
+    """直调面替身：states() 给快照，call_service 记直调，handle_intent 记意图通道。"""
+
+    def __init__(self):
+        self._states = {"light.ban_gong_shi_she_deng":
+                        {"state": "on", "attributes": {"friendly_name": "射灯"}}}
+        self.services = []
+        self.intents = []
+
+    async def states(self):
+        return self._states
+
+    async def handle_intent(self, name, data, timeout=10.0):
+        self.intents.append((name, data))
+        # 集成端 slot schema：TurnDevice* 无 target 即 require 失败（线上原形）
+        if name.startswith("TurnDevice") and not (data or {}).get("target"):
+            return {"success": False, "error": "参数校验未通过: require"}
+        return {"success": True, "message": "好"}
+
+    async def call_service(self, domain, service, data, timeout=10.0):
+        self.services.append((domain, service, data))
+        # 真形态：/api/services/* 的应答没有话术文本（裸成功）——点名话术必须由
+        # 执行器从回执派生，不许靠替身塞 message。
+        return {"success": True}
+
+    async def fire_event(self, name, data):
+        return None
+
+
+def _prod_shape_pipe():
+    """线上形态复刻装配：Q1 由 klar 计划（HassTurnOn+entity_id）执行；
+    Q2 走真 FastPath（假 ha），代词产物进仲裁。"""
+    from core.executor import Executor
+    from core.nlu.scenes import SceneCache
+    from core.pipeline import Pipeline
+    from core.settings import Settings  # noqa: F401  仅为可读性；下方用轻量替身
+    ha = SvcHa()
+    p = Pipeline.__new__(Pipeline)
+    p.settings = PSettings()
+    p.ha = ha
+    p.executor = Executor(ha, PSettings())
+    p.agent = None
+    p.query = NullQuery()
+    sc = SceneCache(ha)
+    sc._triggers = []
+    sc._scenes = []
+    p.scenes = sc
+    p.fast_path = _real_fp(sc)
+    kl_tab = {"打开办公室射灯": Plan(
+        intent="HassTurnOn", args={"entity_id": "light.ban_gong_shi_she_deng"},
+        source="klar", utterance="打开办公室射灯", trace=[])}
+    p.klar = Lane(table=kl_tab)
+    from collections import OrderedDict
+    p._last = OrderedDict()
+    p._turns, p._last_target, p._origin_ts, p._confirm = {}, {}, {}, {}
+    p._pending = set()
+    p._vocab_ts = time.time()
+    return p, ha
+
+
+def _real_fp(sc):
+    from core.nlu.fast_path import FastPath
+    return FastPath(sc, None, PSettings(), areas_of=lambda: ["办公室"])
+
+
+def test_prod_shape_pronoun_inherits_entity_id_spec_directly():
+    """Q1 klar 具名轮（entity_id 形）→ 栈记 kind=entity_id；
+    Q2「关掉它」必须由继承道**精确直调那台**：call_service(homeassistant,
+    turn_off, {entity_id})，不再空参撞 require、不再降级、播报点名实动设备。"""
+    p, ha = _prod_shape_pipe()
+    r1 = _arun(p.handle("打开办公室射灯", origin="sat-p"))
+    assert r1.ok, r1.text
+    spec = p._last_target.get("sat-p")
+    assert spec and spec["kind"] == "entity_id", \
+        f"前提不成立：Q1 klar 具名轮没把 entity_id 形记进栈（{spec}）"
+    ha.services.clear(); ha.intents.clear()
+    r2 = _arun(p.handle("关掉它", origin="sat-p"))
+    assert r2.ok, r2.text
+    assert ("homeassistant", "turn_off",
+            {"entity_id": "light.ban_gong_shi_she_deng"}) in ha.services, \
+        f"P5.1 失效：继承句没精确直调焦点实体（svc={ha.services} intents={ha.intents}）"
+    assert not [n for n, _ in ha.intents if n.startswith("TurnDevice")], \
+        f"空参 TurnDevice* 又去撞 require（降级回引擎的旧路径复活）：{ha.intents}"
+    assert "射灯" in r2.text, f"播报必须点名实动设备，不得泛化成区域：{r2.text}"
+    assert "办公室关了" not in r2.text, r2.text
+
+
+def test_pronoun_adjust_shape_not_rewritten_stays_old_path():
+    """边界：本次只改写代词 Turn* 形。代词调节句（Adjust 带属性值）拿不到
+    entity_id 精确复装的合法形态 ⇒ 逐字旧行为（属性域兜底/旧降级），不扩权。"""
+    p, ha = _prod_shape_pipe()
+    _arun(p.handle("打开办公室射灯", origin="sat-q"))
+    ha.services.clear(); ha.intents.clear()
+    r = _arun(p.handle("把它亮度调到30%", origin="sat-q"))
+    # 不真动别的台即可；形态维持旧路（意图通道或直调 HassLightSet 均可接受，
+    # 唯独不许把"它"泛化成整间房——不点名区域、不空参 require）
+    assert "办公室关了" not in r.text and "办公室亮度" not in r.text, r.text
+
+
+def test_scene_entity_never_becomes_focus_spec():
+    """TriggerHaScene 的 entity_id 是场景不是设备——绝不得进焦点栈
+    （否则「观影场景」后说「关掉它」会把场景实体当设备关）。"""
+    from core.pipeline import Pipeline
+    p = _pipe(Lane(), Lane(), RecExecutor())
+    sc_plan = Plan(intent="TriggerHaScene",
+                   args={"entity_id": "scene.guan_ying", "name": "观影"},
+                   source="scene", utterance="观影场景", trace=[])
+    assert p._spec_of(sc_plan) is None, "场景实体进了焦点栈：『关掉它』会去关场景"
+    kl = Plan(intent="HassTurnOn", args={"entity_id": "scene.guan_ying"},
+              source="klar", utterance="观影场景", trace=[])
+    assert p._spec_of(kl) is None or p._spec_of(kl)["kind"] != "entity_id", \
+        "klar 形指到 scene.* 同样不得记账"
+
+
+def test_target_shape_pins_still_pass_and_spec_unchanged():
+    """零漂移面：target 形（慧尖具名轮）记账逐字不变——钉"新闸不吃旧形"。"""
+    p = _pipe(Lane(), Lane(), RecExecutor())
+    plan = Plan(intent="TurnDeviceOn", args=_tgt(), source="t0",
+                utterance="打开办公室射灯", trace=[])
+    spec = p._spec_of(plan)
+    assert spec and spec["kind"] == "target" and spec["target"] == _tgt()["target"], spec
+
+
 def test_context_disabled_kill_switch_honored():
     """dialog.context_enabled=False 必须连 P5 一起关死（配置开关说到做到）。"""
     class OffSettings(PSettings):

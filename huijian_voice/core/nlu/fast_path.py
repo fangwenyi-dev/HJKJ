@@ -661,6 +661,12 @@ FLAG_PRONOUN_TARGET = "pronoun_target"        # 代词目标，待上下文注�
 FLAG_ANAPHORA_STRIPPED = "anaphora_stripped"  # 句首回指副词已剥离成具名短句
 FLAG_CHAIN_ANAPHORA = "chain_anaphora"        # 链内回指：同句先行分句供目标
 FLAG_AREA_BULK = "area_bulk"                  # 区域+「所有」+类别词的批量目标（v1.2.10）
+# P5.1（2026-10-11 线上复测）：焦点栈 entity_id 形代词继承轮的**显式标记**——
+# 不进 _FLAG_TRACE_TOKENS（非 trace 派生，由 pipeline._apply_context 改写时代地）；
+# executor 只给"klar 来源 **或带此旗**"的 entity_id 形开直调资格。LLM/引擎等
+# 非受信来源拿不到这枚旗 ⇒ `test_llm_channel_does_not_gain_direct_call` /
+# `test_non_klar_source_never_direct` 两条防回潮钉逐字成立。
+FLAG_CTX_RELAY = "ctx_relay"
 
 # 批量"整屋全部可开关设备"的三个**精确**词（不是子串！见 `_area_bulk_target`）。
 _BULK_DEVICE_WORDS = ("设备", "电器", "家电")

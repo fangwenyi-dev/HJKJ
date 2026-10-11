@@ -16,7 +16,7 @@ from typing import Optional
 
 from . import capability
 from .nlu.schema import ATTR_CN, ATTR_TO_WIRE
-from .nlu.fast_path import (FLAG_AREA_BULK, Plan, color_word, is_pronoun, is_whole_house,
+from .nlu.fast_path import (FLAG_AREA_BULK, FLAG_CTX_RELAY, Plan, color_word, is_pronoun, is_whole_house,
                             normalize_polite)
 
 logger = logging.getLogger("huijian.executor")
@@ -1203,7 +1203,14 @@ class Executor:
                     result = await self.ha.call_service("scene", "turn_on",
                                                        {"entity_id": _eid})
             else:
-                direct = self._klar_direct(name, args) if src == "klar" else None
+                # 直调资格=本步来源 klar，或 P5.1 焦点继承旗（FLAG_CTX_RELAY，
+                # pipeline 注入代词继承句时显式落旗）——其余来源逐字走 intent 通道
+                # （t1/llm 的 entity_id 不得借此获得免确认可达路径，两条防回潮钉在
+                # tests/test_chain_leg_channel.py::test_llm_channel_does_not_gain_direct_call
+                # 与 tests/test_klar_nlu.py::test_non_klar_source_never_direct）。
+                direct = None
+                if src == "klar" or FLAG_CTX_RELAY in (getattr(plan, "flags", None) or ()):
+                    direct = self._klar_direct(name, args)
                 if direct is not None:
                     domain, service, data = direct
                     result = await self.ha.call_service(domain, service, data)
@@ -1821,6 +1828,25 @@ class Executor:
         if isinstance(_msg, str) and _msg.strip():
             msg = _msg.strip()
             return msg if any("\u4e00" <= c <= "\u9fff" for c in msg) else zh_error(msg)
+        # P5.1（10-11 线上复测配套）：entity_id 平铺形的服务直调回执常是裸 success
+        # （/api/services/* 应答没有文本）——话术按「动作 + 快照友好名」派生，点名实动
+        # 设备，绝不只剩「好的」（P1 纪律：播报只来自执行回执，且不得把单台含糊掉）。
+        # 只在无 control_targets/无 message 时进入；既有话术路径零改动。
+        eid_raw = (args or {}).get("entity_id")
+        eids = ([eid_raw] if isinstance(eid_raw, str) and "." in str(eid_raw)
+                else [e for e in (eid_raw or []) if isinstance(e, str) and "." in str(e)])
+        if eids and intent in ("HassTurnOn", "HassTurnOff", "HassToggle"):
+            snapshot = getattr(self.ha, "_states", None) or {}
+            names = []
+            for eid in eids[:3]:
+                ent = snapshot.get(str(eid)) or {}
+                fn = str(((ent.get("attributes") or {}).get("friendly_name")) or "").strip()
+                if fn and fn not in names:
+                    names.append(fn)
+            if names:
+                _v = {"HassTurnOn": "开了", "HassTurnOff": "关了",
+                      "HassToggle": "切换了"}[intent]
+                return f"好的，{'、'.join(names)}{_v}"
         if result.get("states"):
             names = [s.get("name", "") for s in (result.get("states") or [])
                      if isinstance(s, dict) and s.get("success")]
