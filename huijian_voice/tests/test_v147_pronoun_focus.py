@@ -363,6 +363,54 @@ def test_target_shape_pins_still_pass_and_spec_unchanged():
     assert spec and spec["kind"] == "target" and spec["target"] == _tgt()["target"], spec
 
 
+def test_scenes_retry_gated_only_after_real_failure():
+    """⑭ 行为钉：语音库**成功**时 TTL 到期照常排后台刷新（退避不得误伤周期刷新）；
+    一次真失败后 30s 内 refresh_soon 不再排新请求（每句白烧 5s 超时的收口），
+    成功腿把失败账清零。"""
+    import time as _t
+    from core.nlu.scenes import SceneCache, TTL_S
+
+    class Ha:
+        def __init__(self, ok=True):
+            self.ok, self.n = ok, 0
+        async def handle_intent(self, name, data, timeout=10.0):
+            self.n += 1
+            await asyncio.sleep(0)
+            if not self.ok:
+                return {"success": False}
+            return {"success": True, "scenes": [{"trigger_phrase": "x"}]}
+
+    async def scenario():
+        ha = Ha(ok=True)
+        sc = SceneCache(ha)
+        await sc.refresh(force=True)
+        assert sc._last_fail == 0.0
+        # 模拟 TTL 到期：无失败账 ⇒ 后台照排（周期刷新不误伤）
+        sc._last_refresh = _t.time() - TTL_S - 1
+        sc.refresh_soon()
+        assert sc._bg is not None, "成功态下 ⑭ 退避把正常周期刷新也挡了"
+        await sc._bg
+        # 换失败源：一次失败立账 ⇒ 后续 refresh_soon 全部不排（网络零调用）
+        sc.ha = Ha(ok=False)
+        sc._last_refresh = _t.time() - TTL_S - 1
+        sc.refresh_soon()
+        if sc._bg is not None:
+            await sc._bg
+        assert sc._last_fail > 0.0, "失败腿没立账"
+        n_after_fail = sc.ha.n
+        sc._last_refresh = _t.time() - TTL_S - 1
+        sc.refresh_soon()
+        sc.refresh_soon()
+        assert sc._bg is None or sc._bg.done()
+        assert sc.ha.n == n_after_fail, "失败退避没生效（又排了新请求）"
+        # 清账后恢复：把失败账推到 31s 前 ⇒ 放行
+        sc._last_fail = _t.time() - 31.0
+        sc.refresh_soon()
+        assert sc._bg is not None, "退避窗口过后没恢复调度"
+        await sc._bg
+    asyncio.run(scenario())
+
+
 def test_context_disabled_kill_switch_honored():
     """dialog.context_enabled=False 必须连 P5 一起关死（配置开关说到做到）。"""
     class OffSettings(PSettings):

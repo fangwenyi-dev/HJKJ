@@ -88,9 +88,30 @@ class SceneCache:
         self._native_bg: asyncio.Task | None = None
         self._last_refresh = 0.0
         self._last_attempt = 0.0
+        self._last_fail = 0.0       # v1.4.9（深审⑭）：失败专账（0=无失败/已成功清零）
         self._loaded = False          # 是否成功加载过一次（冷启动判据）
         self._lock = asyncio.Lock()
         self._bg: asyncio.Task | None = None   # 后台刷新单飞（强引用，session F7b 纪律）
+
+    # v1.4.9（10-11 深审⑭，101001 台账 §8 在册未修的收口）：语音库不可达时
+    # `refresh_soon()` 此前**每句**都排一次后台 `HassListVoiceScenes`（5s 超时）——
+    # 失败不推进 `_last_refresh` ⇒ TTL 判断每句都"到期"，集成挂掉/HA 重启窗口里
+    # 每一轮语音都白烧一次 5s 超时 + 日志噪声（本轮 supervisor 502 窗口对拍实锤）。
+    # native_soon 有 5s 退避（_native_attempt），语音库这条同形不该双标。
+    # 判据=「两次后台尝试的最小间隔」：成败都吃 `_last_attempt`（refresh 锁内统一
+    # 置时），**只挡排新请求**——冷启动 needs_blocking 的同步兜底口径逐字不变。
+    _RETRY_GAP_S = 30.0
+
+    def _retry_gated(self) -> bool:
+        # 退避只对**真失败**：显式 `_last_fail` 账（refresh 失败腿置时、成功腿清零）。
+        # 两版反推都被既有钉当场抓回——①按 _last_attempt 间隔：把 TTL 到期后的正常
+        # 刷新也压 30s；②"attempt>refresh 失败指纹"：与测试/现实中的人为老化缓存
+        # 同形误伤。反推皆歧义，失败要立专账。
+        try:
+            return self._last_fail > 0.0 and \
+                time.time() - self._last_fail < self._RETRY_GAP_S
+        except Exception:      # noqa: BLE001 判据故障=不挡路（宁多试不漏试）
+            return False
 
     def needs_blocking(self) -> bool:
         """仅「从未加载成功 且 距上次尝试超 TTL」才允许同步刷新（冷启动兜底）；
@@ -115,11 +136,13 @@ class SceneCache:
                 self._scenes = [s for s in result["scenes"] if isinstance(s, dict)]
                 self._triggers = [s.get("trigger_phrase", "") for s in self._scenes if s.get("trigger_phrase")]
                 self._last_refresh = now
+                self._last_fail = 0.0          # v1.4.9（深审⑭）：成功腿清失败账
                 self._loaded = True
                 logger.debug("[场景] 缓存 %d 个触发词、%d 个原生场景",
                              len(self._triggers), len(self._native))
                 return True
             # 失败保留旧缓存（HA 重启窗口期不误清空）
+            self._last_fail = now              # v1.4.9（深审⑭）：真失败才立账，退避 30s
             return False
 
     async def _refresh_native(self, allow_fetch: bool = False) -> bool:
@@ -232,6 +255,8 @@ class SceneCache:
         if self._bg is not None and not self._bg.done():
             return
         if time.time() - self._last_refresh < TTL_S:
+            return
+        if self._retry_gated():          # v1.4.9（深审⑭）：失败后 30s 内不再排新请求
             return
 
         async def _job():

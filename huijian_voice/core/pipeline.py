@@ -1385,10 +1385,19 @@ class Pipeline:
                              f"换个叫法或带上房间名再试试",
                              "no_such_device", ok=False,
                              trace=[f"点名设备查无:{absent_self}({plan.source})"])
-            ask = self._confirm_ask(plan, origin)
+            # v1.4.9（10-11 深审⑫）：两闸**换序**——歧义收窄必须先于风险挂环。
+            # 旧次序下 _confirm_ask 先挂环并 `return`，同轮 _ambiguity_ask 永不被调
+            # （即便被调，其 `origin in self._confirm` 早退还会再吞一次）——而歧义闸
+            # 承重的不只是"问一句"，还有 `_narrow_target` 把目标改成全等名+主域
+            # （集成端 6 级匹配锁死一台的唯一手段）。现网病灶：家有两台名含「大门」
+            # 的锁，「解锁大门」是风险意图 → 挂环话术只念"大门"、用户答"确认" →
+            # 下发**未收窄**目标 → 集成前缀级匹配两台一起解锁（多解锁一台门＝物理害）。
+            # 换序后：能收窄→收窄后照常挂风险环；收不住→歧义 clarify 列候选零下发，
+            # 风险问句在用户指明那台后的下一轮自然补上（宁多问一次，不多动一台）。
+            ask = self._ambiguity_ask(plan, origin)   # v1.1.4 多台同名先问
             if ask is not None:
                 return ask
-            ask = self._ambiguity_ask(plan, origin)   # v1.1.4 多台同名先问
+            ask = self._confirm_ask(plan, origin)
             if ask is not None:
                 return ask
             ok, speech = await self.executor.run(plan)
@@ -1427,10 +1436,12 @@ class Pipeline:
                         logger.info("[级联] 降级计划过宽目标拦截（%s 全部设备）: %s", ob, fb.args)
                         return Reply(self._overbroad_say(ob), "clarify", ok=False,
                                      trace=trace + [f"降级过宽目标拦截:{ob}"])
-                    ask = self._confirm_ask(fb, origin)   # 降级计划同样过风险闸
+                    # v1.4.9（深审⑫同律）：降级支两闸同样换序——歧义收窄先行，
+                    # 理由与主发次一致（孪生前缀名在降级腿上同样会两台同动）。
+                    ask = self._ambiguity_ask(fb, origin)  # 多台同名先问（v1.1.4 同款）
                     if ask is not None:
                         return ask
-                    ask = self._ambiguity_ask(fb, origin)  # 多台同名同样先问（v1.1.4 同款）
+                    ask = self._confirm_ask(fb, origin)   # 降级计划同样过风险闸
                     if ask is not None:
                         return ask
                     logger.info("[级联] %s 执行失败 → 降级 %s:%s（%r）",
@@ -1440,6 +1451,12 @@ class Pipeline:
                     trace.append(f"降级→{fb.source}:{fb.intent}" + ("✓" if ok2 else "✗"))
                     if ok2:
                         self._note_target(origin, fb)
+                        # v1.4.9（深审⑬）：降级成功轮同样 `_remember_turn`——主发次
+                        # 成功支（下方 :1458-1460）两本账都记，这里漏了历史账 ⇒
+                        # 这一轮从 LLM 多轮历史（llm.history_rounds 吃 _turns）里消失：
+                        # 用户下一句"刚才那条又开了吗"断链。行为账（焦点栈）不缺，
+                        # 缺的是对话账——补齐两路成功形态同账。
+                        self._remember_turn(origin, text, speech2)
                         return Reply(speech2, fb.source, True, trace)
                     # 两路全挂：降级话术点破「集成」根因者更可用（用户指令①的诊断价值）
                     if (any(h in speech2 for h in _INTEGRATION_HINTS)
