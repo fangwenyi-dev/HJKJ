@@ -1348,7 +1348,15 @@ class Executor:
                     if i > 0:
                         s = s.removeprefix("好的，")
                     segs.append(s)
-                reply = "，".join(x for x in segs if x) or "好的，都办妥了"
+                # v1.5.1（N1 姊妹小修）：某腿回执是裸 {"success":true}（无逐台行）时
+                # speech() 模板退化成裸"好的"——两腿 bare success 拼出「好的，好的」
+                # 复读机（1.5.0 复测回放同分支亲见）。相邻裸"好的"去重，有内容的腿不动。
+                segs2 = []
+                for s in segs:
+                    if s in ("好的", "好的。") and segs2 and segs2[-1] in ("好的", "好的。"):
+                        continue
+                    segs2.append(s)
+                reply = "，".join(x for x in segs2 if x) or "好的，都办妥了"
                 if not reply.startswith("好的"):
                     reply = "好的，" + reply
             except Exception:
@@ -1376,7 +1384,18 @@ class Executor:
             if skip_note:
                 bits.append(skip_note)
                 skip_note = ""
-            reply = "好的，" + "；".join(bits)
+            joined = "；".join(bits)
+            # v1.5.1（N1，1.5.0 线上复测实锤 18:48:47）：「打开办公室射灯，亮度调到80%」
+            # 两腿都已发出、首腿直调成功，Adjust 腿撞上 mesh 瞬断读到 unavailable ⇒
+            # 旧写法把 bits 整句**覆写**成「好的，『射灯』现在离线、这条没执行」——
+            # 灯实际开着，播报却否定已完成事实；用户听"没执行"整句重说＝重复动作。
+            # v1.1.19 立过的"部分执行不得播成整句没做"只配到全失败/中腿失败两支，
+            # 本支漏配。修：链式且前面已有正面播报 ⇒ 证伪句降为尾注、不覆写；
+            # 单步与"都办妥了"笼统形维持 v1.1.15 覆写纪律原样（分句被证伪禁止笼统收口）。
+            if len(steps) > 1 and reply and not reply.startswith("好的，都办妥"):
+                reply = reply.rstrip("。") + "；" + joined
+            else:
+                reply = "好的，" + joined
             partial = ""
         tag = f"(+%d步)" % (len(steps) - 1) if len(steps) > 1 else ""
         if partial and not reply.endswith(partial):

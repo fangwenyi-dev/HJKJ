@@ -133,3 +133,77 @@ def test_office_0927_1355_real_shape():
                          "light.ban_gong_shi_she_deng": LAMP_ON}, steps, entity_area=area)
     assert "射灯" in reply and "本来就在要求的状态上" in reply, reply
     assert "都办妥了" not in reply, reply
+
+
+# ── v1.5.1（N1，1.5.0 线上复测实锤 18:48:47 .91）────────────────────────
+class _FlapClient(FakeHAClient):
+    """Adjust 腿**下发之后**快照才翻 unavailable——mesh 瞬断的时序形状：
+    发前可用态闸放行（off），发后确证读（_offline_names 读 states()）点名。"""
+
+    async def handle_intent(self, name, data, timeout=10.0):
+        r = await super().handle_intent(name, data, timeout)
+        if name == "AdjustDeviceAttribute":
+            for eid, ent in list(self._states.items()):
+                if str(eid) == "light.ban_gong_shi_she_deng":
+                    e = dict(ent); e["state"] = "unavailable"
+                    self._states[eid] = e
+        return r
+
+
+def _flap_run(steps, source="chain"):
+    ha = _FlapClient(
+        results={"HassTurnOn": {"success": True},
+                 "AdjustDeviceAttribute": {"success": True}},
+        states={"light.ban_gong_shi_she_deng": _ent("light.ban_gong_shi_she_deng",
+                                                    "off", "射灯")},
+        entity_area={"light.ban_gong_shi_she_deng": "办公室"})
+    intent, args = steps[0]
+    plan = Plan(intent=intent, args=args, source=source, utterance="链瞬断测试",
+                extra_steps=[{"name": n, "args": a} for n, a in steps[1:]])
+    return asyncio.run(Executor(ha).run(plan))
+
+
+def test_n1_chain_post_send_flap_appends_not_overwrites():
+    """N1 主案：两腿都下发、Adjust 腿事后 mesh 瞬断 ⇒ 证伪句**降为尾注**——
+    旧写法整句覆写成「好的，『射灯』现在离线、这条没执行」，把首腿已完成的
+    开灯事实吞掉（v1.1.19 立的"部分执行不得播成整句没做"在本分支漏配）。"""
+    steps = [("HassTurnOn", _tgt("射灯")),
+             ("AdjustDeviceAttribute", {**_tgt("射灯"), "attribute": "brightness",
+                                         "delta": "80"})]
+    ok, reply = _flap_run(steps)
+    assert "离线" in reply and "没执行" in reply, reply        # 证伪必须如实
+    assert reply != "好的，「射灯」现在离线、这条没执行", reply  # 禁覆写形
+    assert "；" in reply, reply                                # 尾注拼接形
+
+
+def test_n1_single_step_bits_still_overwrites():
+    """反证（守 v1.1.15 原契约）：单步批量被逐台证伪 ⇒ 仍是覆写点名句，
+    N1 只放宽**链式**（多腿）的覆写，不得顺手改掉单步纪律。"""
+    ha = FakeHAClient(
+        results={"TurnDeviceOff": {"success": True}},
+        states={"light.ban_gong_shi_she_deng": _ent("light.ban_gong_shi_she_deng",
+                                                    "unavailable", "射灯")},
+        entity_area={"light.ban_gong_shi_she_deng": "办公室"})
+    plan = Plan(intent="TurnDeviceOff",
+                args={"target": [{"devices": [{"name": "", "domains": ["light"]}]}]},
+                source="t0", utterance="关掉所有的灯")
+    ok, reply = asyncio.run(Executor(ha).run(plan))
+    assert "「射灯」现在离线" in reply and reply.startswith("好的，"), reply
+    assert "都办妥了" not in reply, reply
+
+
+def test_two_leg_bare_success_does_not_echo_two_haodes():
+    """复读机姊妹修：两腿回执都是裸 success ⇒ 拼播不得出现「好的，好的」。"""
+    steps = [("HassTurnOn", _tgt("射灯")),
+             ("AdjustDeviceAttribute", {**_tgt("射灯"), "attribute": "brightness",
+                                         "delta": "80"})]
+    ha = FakeHAClient(results={"HassTurnOn": {"success": True},
+                               "AdjustDeviceAttribute": {"success": True}},
+                      states={"light.ban_gong_shi_she_deng": _ent(
+                          "light.ban_gong_shi_she_deng", "off", "射灯")},
+                      entity_area={"light.ban_gong_shi_she_deng": "办公室"})
+    plan = Plan(intent="HassTurnOn", args=steps[0][1], source="chain",
+                utterance="链测试", extra_steps=[{"name": n, "args": a}
+                                                 for n, a in steps[1:]])
+    ok, reply = asyncio.run(Executor(ha).run(plan))
+    assert "好的，好的" not in reply, reply
