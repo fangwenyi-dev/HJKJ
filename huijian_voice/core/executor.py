@@ -331,6 +331,13 @@ def _leg_want(name: str, args: dict):
 
 
 class Executor:
+    # v1.5.2（N2，1.5.1 现网实锤 21:47）：百分比语义族——这些 attribute 的**裸绝对值**
+    # 合法量程是 0~100；越界形态（「亮度调到200」）在分发前如实拦下（见
+    # _adjust_range_refuse）。temperature（℃）与 color_temperature（K）各有自己的
+    # 量程、number 域逐实体不同——不在本表＝不判（判不准就不判，v1.1.15 纪律）。
+    _PERCENT_ATTRS = frozenset({"brightness", "position", "fan_speed",
+                                "humidity", "volume", "opacity"})
+
     def __init__(self, ha, settings=None):
         self.ha = ha
         self.settings = settings
@@ -1103,6 +1110,38 @@ class Executor:
             return segs
         return segs
 
+    def _adjust_range_refuse(self, name: str, args: dict) -> Optional[str]:
+        """v1.5.2（N2，1.5.1 现网实锤 21:47/21:48）：百分比族 Adjust 的**越界绝对值**
+        在分发前如实拦下。现网形：「把亮度调到200」→ 表规则 :207 裸数直收（v1.1.27
+        量程闸只拦 4 位裸数，3 位的 150/200 漏网）→ 集成把 200 当量程顶钳位执行，
+        播报「亮度已设为200%」——灯确实变了，但 200% 是不可能状态（谎报）。
+        判据口径与 parse_percent_value 的 `0-100 之外不属百分比语义`（fast_path :130）
+        同源：**只判裸绝对值**——带符号相对档（+20/-10）由集成 calc_target 自行
+        clamp（那是合法"调高20"），max/min/中文数词已在上游换算，都不是本闸射程。
+        射程＝百分比语义族：brightness/position/fan_speed/humidity/volume/opacity；
+        temperature（℃）与 color_temperature（K）有各自量程，value（number 域量程
+        逐实体不同）一概不判——判不准就不判（v1.1.15 纪律），绝不把合法句拦死。"""
+        try:
+            if name != "AdjustDeviceAttribute":
+                return None
+            attr = str((args or {}).get("attribute") or "").strip()
+            if attr not in self._PERCENT_ATTRS:
+                return None
+            raw = str((args or {}).get("delta") or "").strip().rstrip("%％")
+            if not raw or raw in ("max", "min") or raw[0] in "+-":
+                return None
+            try:
+                val = float(raw)
+            except ValueError:
+                return None
+            if not 0.0 <= val <= 100.0:
+                zh = ATTR_CN.get(attr, attr)
+                return (f"抱歉，{zh}只有 0 到 100，「{raw}」这个数我做不到")
+            return None
+        except Exception:  # noqa: BLE001 判据故障=放行（由集成兜量纲，绝不误拦合法句）
+            logger.exception("[执行] 百分比量程闸判据异常（放行）")
+            return None
+
     async def run(self, plan: Plan) -> tuple[bool, str]:
         """执行 Plan（klar 多分句/复合链逐步顺序执行）。返回 (success, 中文播报)。永不抛。"""
         # 每一步带**自己的**来源（src）：一条链由 select_primary_plan 逐分句裁决，
@@ -1147,6 +1186,17 @@ class Executor:
                 logger.info("[执行] %s %s → 开关族能力闸拦下（防area扇出/假成功）",
                             name, args)
                 return self._named(False, self._step_say(idx, steps, gate)
+                                 + self._accum_notes(missing, noops, no_receipt,
+                                                     offline, lock_notes, anon_missing,
+                                                     skip_note))
+            # v1.5.2（N2）：百分比族越界绝对值分发前如实拦下（见 _adjust_range_refuse）
+            rng = self._adjust_range_refuse(name, args)
+            if rng is not None:
+                self.last_run = {"steps": len(steps), "applied": len(results),
+                                 "indeterminate": False}
+                logger.info("[执行] %s %s → 百分比量程闸拦下（防越界谎报）| %s",
+                            name, args, rng)
+                return self._named(False, self._step_say(idx, steps, rng)
                                  + self._accum_notes(missing, noops, no_receipt,
                                                      offline, lock_notes, anon_missing,
                                                      skip_note))

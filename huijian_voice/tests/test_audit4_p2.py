@@ -185,8 +185,10 @@ def test_accum_notes_helper_and_wiring():
     for seg in ("我没找到", "状态上", "回执", "离线", "没确认到", "另有 2 条"):
         assert seg in out, (seg, out)
     assert acc([], [], [], [], []) == ""
-    # 三处早退（能力闸/预裁/可用态）都必须带尾注
-    assert src.count("+ self._accum_notes(missing, noops, no_receipt,") == 3, \
+    # 早退路径（能力闸/预裁/可用态＋v1.5.2 百分比量程闸）都必须带尾注——
+    # 计数钉是"每处早退接尾注"的代理判据：新增早退闸时如实 +1（本行现=4，
+    # 第四处见 executor.run 的 _adjust_range_refuse 支，N2），漏接尾注才是红。
+    assert src.count("+ self._accum_notes(missing, noops, no_receipt,") == 4, \
         "早退路径未接已攒判据尾注（部分执行被说成整句没做）"
 
 
