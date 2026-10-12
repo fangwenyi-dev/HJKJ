@@ -42,8 +42,13 @@ def test_step_say_chain_forms_keep_step_order():
 
 def test_all_front_gates_share_the_template():
     """四道前置闸（开关族能力/能力预裁/可用态/百分比量程）都走 _step_say ⇒ 单点修全族受益；
-    这里把"都调用 _step_say"钉成契约，防将来某闸绕过模板自己拼字头。"""
-    import inspect, io
-    src = io.open(r"core\executor.py", encoding="utf-8").read()
+    这里把"都调用 _step_say"钉成契约，防将来某闸绕过模板自己拼字头。
+
+    路径纪律：必须走 ROOT（＝本文件所在 tests/ 的上级＝huijian_voice），**不得用相对
+    CWD 路径**——CI 在仓库根跑 pytest（`pytest huijian_voice/tests`），CWD≠huijian_voice，
+    相对写法在 CI 上 FileNotFoundError（1.5.3 首跑实锤，本钉自己把发布挡了一轮）。"""
+    from pathlib import Path
+    ROOT = Path(__file__).resolve().parent.parent
+    src = (ROOT / "core" / "executor.py").read_text(encoding="utf-8")
     n = src.count("_step_say(idx, steps,")
     assert n >= 4, f"前置闸调用 _step_say 处数={n}（应≥4：四道闸共用文案）"
