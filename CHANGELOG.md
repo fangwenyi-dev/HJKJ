@@ -3552,6 +3552,29 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
      ═══════════════════════════════════════════════════════════════════════ -->
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
+## [1.5.4] - 2026-10-13 · HomePod 对标批：静音轮不再对空气说话（AED 控制符 <sil> 根修）
+
+> 用户令「对标 HomePod，按 HomePod 标准执行」。本批＝加载项侧首个 HomePod 口径缺陷：
+> **夜里每 ~30 秒对着空气播「这句话我还不会」**（HomePod 遇静音是安静收轮，我方在答话）。
+
+- 现网日志实锤（10-13 加载项 logs）：12:26–12:30 连条 [级联] '<sil>' → fallback；12:30:44 一条
+  '<unk>SPK<unk>' → fallback——间隔规律、无人为激励，正是夜间空轮。
+- 根因链（读码逐点闭合）：FireRedASR2-AED 对纯静音轮吐**尖括号形**控制 token（<sil>/<unk>/SPK…），
+  而 asr 出口 _STRIP_TAGS 只认 SenseVoice 时代的竖线形 <|zh|> ⇒ token 原样漏出成**非空**转写：
+  既越过 assist 的空文本判据、又绕过 pipeline.handle 的 if not text 空闸（<sil>≠空串），
+  一路 cascade 到 fallback ⇒ 设备对空气答话。真静音轮（空串）本就走既有静默契约不播——
+  所以**只有 token 轮会说话**，与现网「深夜偶发应答」形态严丝合缝。
+- 修法（单点根修，不造新静默路径）：asr._local_transcribe 出口加 _STRIP_CTRL 剥 AED 控制 token
+  （尖括号形 + 裸大写控制词 SIL/SPK/UNK/PAD/BOS/EOS——现网实测形态 <unk>SPK<unk> 只剥尖括号会残留
+  裸 SPK，仍非空照播，钉里把这形钉死），纯静音轮塌成空串落回**既有、已测**的空转写静默契约。
+  双向不伤：真人话术一屏（含 turn on the light/speak/SPKx/xSPK）逐字不动（过剥比漏剥更糟）。
+- 副产认知（记账）：固件侧 wake→VAD 仅 0.38s 达标，A2 续答 2.9s 的账在 STT/裁决/TTS 链——本批的
+  <sil> 假轮还顺带解释了台架「already listening 吞唤醒」（假轮占链）。时延专项另批追，本批先把
+  对空气说话这颗钉死。
+- 测试：新钉 tests/test_v154_silence_token.py 4 条（真实日志形全塌空/真人话术逐字不动/带前缀真话
+  token 剥净/接线面双钉：.sub 必须在 _local_transcribe 且在取 result.text 之后——防「加了正则没接线」）。
+  路径纪律沿用 1.5.3 教训（ROOT 锚定不吃 CWD）。
+
 ## [1.5.3] - 2026-10-12 · N-M1：失败支话术不再叠「抱歉，抱歉」
 
 1.5.2 上线后 LAN 复验（09:29 现网日志实锤）抓到一条体验级缺陷：

@@ -141,6 +141,16 @@ _DECODE_QUEUE_WAIT_S = 10.0
 
 # SenseVoice 输出的语言/情感/事件标签：zh/yue/EN/NEUTRAL/Speech/woitn 等
 _STRIP_TAGS = re.compile(r"<\|[^<>|]*\|>")
+# v1.5.4（HomePod 对标批·"半夜对空气说话"根修）：FireRedASR2-AED 的**尖括号形**控制 token——
+# <sil>（静音）、<unk>、</s>、<s>、<pad>、<BOS>、<SPK> 等。上一条正则只认竖线形 <|...|>
+# （SenseVoice 时代遗产），AED 这套 <sil> 原样漏出 ⇒ 静音轮转写成**非空** <sil>，越过 assist 的
+# 空文本判据、又绕过 pipeline.handle 的 `if not text` 空闸（<sil>≠""），一路 cascade 到 fallback，
+# **设备每 ~30s 对着空气播「这句话我还不会」**（现网日志实锤：12:26–12:30 连条 <sil>→fallback、
+# 12:30:44 一条 <unk>SPK<unk>→fallback）。HomePod 遇静音是安静收轮；这里剥干净后纯静音轮塌成 ""，
+# 落回**既有、已测**的空转写静默契约（stt.text="" 带分因 → assist/固件空轮闸安静收轮）。
+# ⚠ 现网那条是 <unk>SPK<unk>：只剥尖括号会残留**裸 SPK**（非空）照样播「我不会」，
+# 所以裸大写控制词（SIL/SPK/UNK/PAD/BOS/EOS/CTC，AED 词表里的非语音标记、真人语音不会出现）也要一并剥。
+_STRIP_CTRL = re.compile(r"</?[a-zA-Z_][a-zA-Z0-9_-]*>|\b(?:SIL|SPK|UNK|PAD|BOS|EOS)\b")
 
 # ── 云 STT 整包超时（N8）────────────────────────────────────────
 _CLOUD_TIMEOUT_DEFAULT_S = 12.0
@@ -549,6 +559,10 @@ class AsrEngine:
                 stream.accept_waveform(const.SAMPLE_RATE, samples)
                 rec.decode_stream(stream)
                 text = _STRIP_TAGS.sub("", stream.result.text or "")
+                # v1.5.4：再剥 AED 尖括号控制符（<sil>/<unk>/</s>/<pad>/<SPK>…）。纯静音轮剥完即塌成 ""，
+                # 落回**既有**空转写静默契约（stt.text="" 带分因，assist/固件空轮闸安静收轮），
+                # 不再作为非空文本越过判据、被 cascade 成「这句话我还不会」对空气播报。
+                text = _STRIP_CTRL.sub("", text)
                 # 复位？1.13.7 的 OfflineRecognizer 根本没有那个方法（实测 dir()），
                 # 旧形那一行每轮抛 AttributeError 被吞——它从未做任何复位，而且离线
                 # 形态本来就每轮新建 stream。
