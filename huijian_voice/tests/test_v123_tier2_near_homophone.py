@@ -105,3 +105,43 @@ def test_tier2_hooked_at_the_same_single_point():
     hs = open(os.path.join(here, "..", "core", "nlu", "homophone.py"),
               encoding="utf-8").read()
     assert "near_index" in hs or "_NEAR" in hs, "近音档没实现（只是文档）"
+
+
+# ── v1.5.6 第四类：方言 n↔l（同部位异方法，须同韵母、恰一差、唯一命中）──────
+def test_tier2_resolves_n_l_same_final():
+    """`内开累倒`(lei 位) → 本家 `内开内倒`（用户真形『打开内开累倒』）。
+    nei↔lei：声母 n/l 同址（都是舌尖中/齿龈的鼻音↔边音）、韵母同为 ei ⇒ 恰一位可容差。"""
+    prior = ("内开内倒",)
+    out, pairs = homophone.rewrite("打开内开累倒", prior)
+    assert out == "打开内开内倒" and pairs == [("内开累倒", "内开内倒")], (out, pairs)
+
+
+def test_tier2_resolves_l_n_same_final():
+    """`推拿窗` → 本家 `推拉窗`（反向 l→n）。tuan/tui 韵母差——**不该折**；
+    真正同址的是 `扭拉窗`↔`牛拉窗` 类。这里钉的是拉位 l→n：`推那窗`(na↔la)。"""
+    prior = ("推拉窗",)
+    out, pairs = homophone.rewrite("打开推那窗", prior)   # na ↔ la，韵母同 a
+    assert out == "打开推拉窗" and pairs == [("推那窗", "推拉窗")], (out, pairs)
+
+
+def test_tier2_n_l_refuses_different_final():
+    """n↔l 只在**同韵母**才容（`nian`↔`lan` 韵母差＝两个特征，不许改）。"""
+    prior = ("内开窗",)
+    out, pairs = homophone.rewrite("打开连开窗", prior)   # lian↔nei 差声母+介音两处
+    assert pairs == [], f"n/l 韵母不同仍被折：{out} {pairs}"
+
+
+def test_tier2_n_l_refuses_when_ambiguous():
+    """本家同时有 `内开内倒` 与 `内开累倒`（都真装了）⇒ `内开累倒` 字面已在本家，
+    红线 3「不许动说对的」优先，一个字都不改。"""
+    prior = ("内开内倒", "内开累倒")
+    out, pairs = homophone.rewrite("打开内开累倒", prior)
+    assert out == "打开内开累倒" and pairs == [], (out, pairs)
+
+
+def test_tier2_n_l_never_fabricates_absent_target():
+    """本家没有『内开内倒』只有『内开窗』时，『内开累倒』不得被凭空造出『内开内倒』
+    ——射程收窄方向＝宁漏改不多改（v1.1.17『摄像机→洗碗机』同族红线）。"""
+    prior = ("内开窗", "平开窗")
+    out, pairs = homophone.rewrite("打开内开累倒", prior)
+    assert out == "打开内开累倒" and pairs == [], (out, pairs)
