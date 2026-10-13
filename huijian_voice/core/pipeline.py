@@ -3237,16 +3237,35 @@ class Pipeline:
             return None
 
     @staticmethod
-    def _ambiguity_clarify_say(names: list, n_entities: int = 0) -> str:
+    def _ambiguity_clarify_say(names: list, n_entities: int = 0,
+                               area: str = "") -> str:
         """收不住候选时的话术：列出来让用户说清，绝不替他挑一台（v1.1.28）。
 
         n_entities＝候选**实体**台数（同名孪生时 distinct 只有一个名字，但确实是两台
-        设备——话术按台数说，免得念成"有 1 台设备名字相近"）。"""
+        设备——话术按台数说，免得念成"有 1 台设备名字相近"）。
+
+        HomePod 对标两条硬改（1.5.5，10-13 金标 #4 现网实锤）：
+          · **台数只算收窄池**——旧调用点传全候选池，同一台设备的按钮/数值/传感器
+            兄弟全被数成"名字相近的设备"，播成"家里有 9 台设备名字相近（平开窗 ①
+            开启…）"＝对用户不实陈述（那是 2 台窗 + 一堆零件）；
+          · **给照做得到的下一步**——用户**已经带了房间名**时，"带上房间名再说一次"
+            是死循环（照着做还是死循环）。area 在句里 ⇒ 直接列出候选真名让用户挑
+            名字；无 area ⇒ 才引导补房间名，且示例用真实候选名而非硬编码「办公室
+            的射灯」（那句在客厅场景是指错地方）。"""
         nm: list = [str(n) for n in (names or []) if str(n)]
         others = "、".join(nm[:3]) + ("…" if len(nm) > 3 else "")
         n = max(int(n_entities or 0), len(nm))
-        return (f"家里有 {n} 台设备名字相近（{others}），我没法确定你要哪一台，"
-                f"这次先不动。带上房间名再说一次（比如「打开办公室的射灯」）。")
+        lead = (f"家里有 {n} 台设备名字相近（{others}），我没法确定你要哪一台，"
+                f"这次先不动。")
+        if area:
+            if nm:
+                return (lead + "你说的是哪一台？下次直接带上它的名字"
+                        f"（比如「打开{area}的{nm[0]}」）。")
+            return lead + "下次直接带上设备名字再说一次。"
+        if nm:
+            return (lead + "带上房间名再说一次"
+                    f"（比如「打开客厅的{nm[0]}」）。")
+        return lead + "带上房间名或设备名字再说一次。"
 
     @staticmethod
     def _scene_clarify_say(plan) -> str:
@@ -3352,26 +3371,43 @@ class Pipeline:
                 return None
             if not pick:
                 # 收不住 ⇒ 不许替用户挑：列出来请他说清（零下发、不挂执行桩）
-                text = self._ambiguity_clarify_say(distinct, len(cands))
-                logger.info("[级联] 歧义目标 %d 台（%s）→ 无收敛证据，列出让用户说清",
-                            len(distinct), "、".join(distinct[:3]))
+                # 1.5.5（金标 #4 实锤）：话术的台数与名字**只报主域收窄池**——旧形
+                # 用全候选池，同一台窗的按钮/数值/传感器兄弟被数成"名字相近的设备"，
+                # 2 台窗播成"9 台设备"＝不实陈述。用户已带区域时引导也换成挑名字，
+                # 不再让他重复一个已经说过的东西。
+                pool_names = list(dict.fromkeys(
+                    [self._cand_name(c) for c in pool if self._cand_name(c)]))
+                said_area = ""
+                for sl in tgt:
+                    if isinstance(sl, dict) and str(sl.get("area") or "").strip():
+                        said_area = str(sl.get("area") or "").strip()
+                        break
+                text = self._ambiguity_clarify_say(pool_names, len(pool),
+                                                   area=said_area)
+                logger.info("[级联] 歧义目标 全池%d台/主域池%d台（%s）→ 无收敛证据，"
+                            "列出让用户说清", len(cands), len(pool),
+                            "、".join(pool_names[:3]))
                 return Reply(text, "clarify", ok=False,
                              trace=list(getattr(plan, "trace", []))
-                             + [f"歧义未收敛{len(cands)}"])
+                             + [f"歧义未收敛{len(pool_names)}"])
             # 域收敛：t0 给的是域并集，带着并集下发＝兄弟零件一起动（#9 同族语义）
             self._narrow_target(args, pick, domain_note)
-            others = "、".join(distinct[:3]) + ("…" if len(distinct) > 3 else "")
-            text = (f"家里有 {len(distinct)} 台设备名字相近（{others}）。"
+            # 1.5.5 同律：确认环那句也按**主域收窄池**报台数/列名（旧形同 clarify
+            # 一样拿全池 distinct，把一台窗的按钮/传感器数成"名字相近的设备"）。
+            conf_names = list(dict.fromkeys(
+                [self._cand_name(c) for c in pool if self._cand_name(c)]) or distinct)
+            others = "、".join(conf_names[:3]) + ("…" if len(conf_names) > 3 else "")
+            text = (f"家里有 {len(conf_names)} 台设备名字相近（{others}）。"
                     f"我先对「{pick}」执行，说「确认」就这么办，说「取消」先不动。")
             self._confirm[origin] = {"plan": plan, "ts": time.time(),
                                      "ttl": self._confirm_ttl(text)}
             self._origin_ts[origin] = time.time()
-            logger.info("[级联] 歧义目标 %d 台（%s）→ 收窄到「%s」并挂确认环",
-                        len(distinct), others, pick)
+            logger.info("[级联] 歧义目标 全池%d台/主域池%d台（%s）→ 收窄到「%s」并挂确认环",
+                        len(cands), len(conf_names), others, pick)
             return Reply(
                 text,
                 "confirm", ok=True,
-                trace=list(getattr(plan, "trace", [])) + [f"确认环:歧义{len(distinct)}"])
+                trace=list(getattr(plan, "trace", [])) + [f"确认环:歧义{len(conf_names)}"])
         except Exception:  # noqa: BLE001 判定故障=照旧执行，绝不新增哑口
             logger.exception("[级联] 歧义确认异常（放行）")
             return None
