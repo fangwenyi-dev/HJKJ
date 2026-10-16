@@ -54,6 +54,7 @@ from . import capability
 from .nlu.canonical import canonical
 from .nlu import music
 from .nlu import creation
+from .nlu import delay
 from .nlu.klar_client import KlarClient
 
 logger = logging.getLogger("huijian.pipeline")
@@ -1075,6 +1076,9 @@ class Pipeline:
         # P0-3/P2-15 后台 task 强引用袋（session F7b 纪律）
         self._pending: set[asyncio.Task] = set()
         self._vocab_ts = 0.0
+        # v1.5.8 时间语音批：相对延时排程袋（内存调度）。task 强引用防 GC；
+        # 上限 DELAY_MAX_PENDING 防堆积。重启即清（不谎称持久）。
+        self._delay_tasks: set[asyncio.Task] = set()
         # v1.1.20（去重分桶的消费侧）：命中判定同样按 (origin, text)——见下方 _dedup_gate
     # v1.0.62 P0-1/P0-2：漏斗指标 + 兜底语料回流（观测件，永不干预主链；
         # 测试用 __new__ 构造的 Pipeline 无此属性，钩子端 getattr 容错）。
@@ -1316,6 +1320,16 @@ class Pipeline:
         if _homophones:
             logger.info("[级联] 清单同音改写 %s",
                         "、".join(f"「{a}」→「{b}」" for a, b in _homophones))
+
+        # v1.5.8 时间语音批：相对延时句**先于复合切分**当场处置（2026-10-15 18:00
+        # 现网实锤：'打开办公室射灯然后十秒钟后关闭办公室射灯' 被 split_compound
+        # 切腿后延时前缀遭下游剥词 ⇒ 立即开又立即关＋谎报「都办妥了」。本闸把一切
+        # 延时形状的句子在切链前接管：句首前导+干净正文＝排程到点执行；其余（链中
+        # 延时/越界）＝如实拒并教分开说。非延时句 has_delay_shape=False 直接放行，
+        # 主链逐字不变（既有链族钉零触碰）。
+        dly = self._delay_gate(text, origin)
+        if dly is not None:
+            return dly
 
         # P2-12 复合句：分句全命中才链发，否则原样回退单发路径
         chain = await self._try_compound(text, origin)
@@ -2461,6 +2475,98 @@ class Pipeline:
             else:
                 reply.text = const.END_DIALOGUE_SAY
         return reply
+
+    # ── v1.5.8 相对延时（时间语音批） ─────────────────────────────
+    # 判据形状见 nlu/delay.py 模块头（现网实锤：链切分剥掉"十秒钟后"⇒ 立即执行
+    # ＋谎报都办妥了）。三档处置：
+    #   ① 句首前导+干净正文（1s..1h）→ **真排程**：回执"好的，X后…"（预约语气，
+    #      绝不"已做完"），到点重入**正常 handle(body) 全闸**（延时不是绕过
+    #      歧义/风险/离线/区域四道闸的特权通道），到期**静默执行**、不主动播报
+    #      （"对着空气说话"是 v1.5.4 刚收口的缺陷，同条纪律）。
+    #   ② 其它延时形状（链中延时/正文里还藏第二个延时）→ **整句如实拒并教分开
+    #      说**——本批不逐腿拆链排程（那要动 _chain_decide 一族承重钉），半执行
+    #      或谎报都不许。
+    #   ③ 形状对但越界（如"2小时后"，>1h）→ 如实拒"超出支持范围"，不放回老链。
+    # 非延时句 has_delay_shape=False **直接放行**：主链逐字不变，既有链族钉零触碰。
+    # 已知边界（如实）：内存调度，**加载项重启丢预约**（不谎称持久，持久化＝HA
+    # automation 方向，列入设计稿）；并发上限防堆积。
+    DELAY_MAX_PENDING = 16
+
+    @staticmethod
+    def _secs_desc(sec: int) -> str:
+        """秒数→播报友好中文（120→"2分钟"、3600→"1小时"、45→"45秒"）。"""
+        if sec % 3600 == 0:
+            return f"{sec // 3600}小时"
+        if sec % 60 == 0:
+            return f"{sec // 60}分钟"
+        return f"{sec}秒"
+
+    def _delay_gate(self, text: str, origin: str) -> Optional[Reply]:
+        """延时形状句的当场处置；非延时句返回 None（放行主链）。永不抛。"""
+        try:
+            if not delay.has_delay_shape(text):
+                return None
+            parsed = delay.parse_leading(text)
+            if parsed is None:
+                # ②/③：认得出是延时句，但这批形状不排（链中延时/正文再含延时/越界）。
+                # 话术分两档：明显是"多件事带时间"（连接词/逗号串）→ 教**分开说**；
+                # 其它时间安排形（如「七点十分后开灯」）→ 只说不把握、给标准样例，
+                # **绝不**猜一个时刻去执行。
+                combo = bool(re.search(r"然后|接着|顺便|并且|同时|[，,、]", text))
+                if delay.DELAY_MIN_S <= (delay.delay_seconds(text) or 0) <= delay.DELAY_MAX_S:
+                    if combo:
+                        say = ("带时间点的组合指令我还不会，请分开说："
+                               "先说现在要做的那件，再单独说一句「十秒后打开办公室射灯」")
+                    else:
+                        say = ("这句里的时间安排我还把握不准，请一次只说一件，"
+                               "比如「十秒后打开办公室射灯」")
+                else:
+                    say = ("这个等待时长超出我的支持范围（最长 1 小时），"
+                           "可以先用「当…就…」建个语音自动化，或换个短点的等待")
+                logger.info("[级联] 延时形状接管→不排程不谎报: %r", text)
+                return Reply(say, "delay", ok=False, trace=[f"延时不排:{text}"])
+            sec, body, _phrase = parsed
+            tasks = getattr(self, "_delay_tasks", None)
+            if tasks is None:                 # __new__ 手搓夹具无此袋 → 不排（保守）
+                return Reply("稍后再试", "delay", ok=False, trace=["延时袋缺席"])
+            if len(tasks) >= self.DELAY_MAX_PENDING:
+                logger.warning("[级联] 延时预约达上限(%d) → 拒新单", self.DELAY_MAX_PENDING)
+                return Reply("待执行的定时指令已经排满了，先等它们跑完再来", "delay",
+                             ok=False, trace=[f"延时上限:{len(tasks)}"])
+            t = asyncio.create_task(self._fire_delay(body, sec, origin))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+            logger.info("[级联] 相对延时已排程 %ds: %r（原话:%r）", sec, body, text)
+            # 回执＝预约确认（将来时），绝不"已做完"。
+            return Reply(f"好的，「{body}」我记下了，{self._secs_desc(sec)}后执行",
+                         "delay", ok=True, trace=[f"延时排程:{sec}s->{body}"])
+        except Exception:  # noqa: BLE001 —— 本闸任何意外＝放行主链（保守到不发虚）
+            logger.exception("[级联] 延时闸异常 → 放行主链")
+            return None
+
+    async def _fire_delay(self, body: str, sec: int, origin: str) -> None:
+        """到期执行：**重入正常 handle()**（全闸），不建特权通道、不主动播报。
+        永不抛（后台 task 里抛出来只会被 asyncio 吞掉并污染日志）。"""
+        try:
+            await asyncio.sleep(sec)
+            reply = await self.handle(body, origin)
+            logger.info("[延时] 到期执行 %r → ok=%s reply=%r", body, reply.ok, reply.text)
+        except asyncio.CancelledError:
+            logger.info("[延时] 预约被取消（停机/主动撤单）: %r", body)
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("[延时] 到期执行异常（不影响主链）")
+
+    def cancel_delays(self) -> int:
+        """停机钩子：取消全部在途延时预约（防孤儿 task 携旧引用触设备）。返回撤单数。"""
+        tasks = getattr(self, "_delay_tasks", None) or set()
+        n = 0
+        for t in list(tasks):
+            t.cancel()
+            n += 1
+        if n:
+            logger.info("[延时] 停机撤单 %d 条在途预约（重启不恢复，见边界注记）", n)
+        return n
 
     # ── P2-10/11 上下文与空间注入 ──────────────────────────────
     def _focus_ready(self, origin: str) -> bool:

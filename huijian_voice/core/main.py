@@ -397,6 +397,10 @@ class Service:
 
     async def shutdown(self) -> None:
         logger.warning("[退出] 优雅停机开始")
+        # v1.5.8：先撤在途延时预约——否则 asyncio.sleep 到点会在 ha/klar 关闭后
+        # 重入 handle() 触设备（孤儿 task 携旧引用）。重启不恢复（内存调度，边界如实）。
+        with contextlib.suppress(Exception):
+            self.pipeline.cancel_delays()
         # F4：①abort 让下载线程在下个分块边界主动退出（否则默认 executor
         # join 会把分钟级下载拖成 SIGKILL 收尾）；②会话在飞 task 先取消
         # （runner.cleanup 对 WS handler 最长可等 60s）；③循环 task await

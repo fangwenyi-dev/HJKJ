@@ -1818,9 +1818,75 @@ class Executor:
             if eids and eids[0].split(".", 1)[0] == "lock":
                 verb = _KLAR_ECHO_LOCK.get(plan.intent, verb)   # D7 锁语义反转
             word = echo_target(plan.utterance or "", str(args.get("area") or ""))
+            # v1.5.8（问题2 工单）：词与实际执行设备真名不符 ⇒ 改播真名。
+            # 改指轮让路（v1.1.15 D4 契约）：本轮发生过"离线→同名改指"时，word 与
+            # 真名不符是**目标被替换**造成的，不是听岔，本闸"设备挑对了"的前提不
+            # 成立；那条链的如实机制＝"原话术＋改指注"（test_offline_twin_repoint
+            # 收口批钉着原话术不被吞）。桶读取与 _named() 同形：ContextVar 优先、
+            # None 才回落共享表——直接读 self._repointed 会踩第四轮审计 P1 记过的
+            # 同款病灶（真链路写的是任务桶，共享表恒空＝让路永不生效）。
+            _rep = _REPOINTED.get()
+            if _rep is None:
+                _rep = self._repointed
+            if word and len(eids) == 1 and not _rep:
+                truth = self._echo_truth_word(word, eids[0], str(args.get("area") or ""))
+                if truth:
+                    logger.info("[执行] 回显词「%s」与实际设备真名不符 → 改播真名「%s」",
+                                word, truth)
+                    word = truth
             return f"{word}{verb}" if word else ""
         except Exception:  # noqa: BLE001
             logger.exception("[执行] 目标词回显异常 → 沿用引擎话术")
+            return ""
+
+    def _echo_truth_word(self, word: str, eid: str, area: str) -> str:
+        """回显词与"实际执行的那台"对不上时给出真名替换词；**该不改就返回 ""**。
+
+        现场形态（2026-10-15 现网日志）：说「打开办公室射灯」，STT 把「射灯」听成
+        「设置」——klar 靠拼音模糊**仍把设备挑对了**（`light.ban_gong_shi_she_deng`，
+        灯真开了），但 `_klar_echo` 按 2026-09-14 的设计"回显用户原话的词"，于是把
+        听岔词原样念出＝「办公室设置开了」。播报对用户必须真实（v1.5.5 同一条原则），
+        所以修在回显层：不动转写、不动裁决（裁决已对，动文本会污染 homophone 先验
+        与审计取证），只让**播报落到真名**。
+
+        判据保守到不发虚（宁漏不误改，方向与本仓"绝不凭空猜目标"一致）：
+        · 只在**单 entity_id** 形进闸（多目标/域形/纯 area 形不动——批量承诺归 P1
+          回执派生支 :1377 管，此处不重复）；
+        · 真名只认 `ha._states` 快照的 friendly_name，**与 speech() 平铺支 :1921
+        同一取法**（快照缺失/无 friendly_name ⇒ 返回 ""＝现行为逐字不变）；
+        · 相容＝用户说的确是这台：全等 / word 是真名子串 / 真名剥区域后的设备段落进
+          原话 / word 命中该 eid 的注册表别名（`_entity_alias`，:862 同形）⇒ 不改；
+        · 不相容 ⇒ 播真名设备段（去掉英文型号后缀首段，与 query.say_name 同族口径）；
+          真名不自带区域时补回区域，但**绝不重念**（v1.1.28「办公室的办公室空调」
+          那条钉的同一规矩）。
+        永不抛。
+        """
+        try:
+            word = str(word or "").strip()
+            if not word:
+                return ""
+            states = getattr(self.ha, "_states", None) or {}
+            ent = states.get(eid)
+            if not isinstance(ent, dict):
+                return ""
+            fn = str(((ent.get("attributes") or {}).get("friendly_name")) or "").strip()
+            if not fn:
+                return ""
+            # ① 相容：照原样播（听对时的行为逐字不变）
+            if word == fn or word in fn:
+                return ""
+            amap = getattr(self.ha, "_entity_alias", None) or {}
+            if any(str(a).strip() == word for a in (amap.get(eid) or [])):
+                return ""
+            stem = (fn.replace(area, "", 1).strip() if area else fn).split(" ")[0] or fn
+            if stem and (stem in word or word in stem):
+                return ""
+            # ② 不相容：改播真名；真名不含区域时把区域补回（信息不减），含则不叠加
+            if area and area not in fn:
+                return f"{area}的{stem}" if stem != fn else f"{area}的{fn}"
+            return stem
+        except Exception:  # noqa: BLE001 —— 话术层任何意外都不该伤语音链，也不该改动作
+            logger.exception("[执行] 回显真名闸异常 → 沿用原回显词")
             return ""
 
     def speech(self, plan: Plan, result: dict) -> str:
