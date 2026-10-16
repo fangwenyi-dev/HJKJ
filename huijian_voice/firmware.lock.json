@@ -2,6 +2,19 @@
   "_doc": "ESP32 卫星固件发布锁（OTA 方案 Phase 2）。releases 每条=一个可下发版本：version(x.y.z)/file(public 目录内落盘名)/urls(按容灾顺序 gh-proxy 代理→GitHub 直连→Gitee 兜底，私有仓须内嵌一次性访问串)/sha256(64hex 必填，缺=拒下载)/size/notes_zh(对外话术，受内部文档禁发约束)/min_compatible。镜像内置文件之外，/data/firmware/firmware.lock.json 同名整文件优先（现场热修不重打镜像）。版本值以固件仓 release 实测为准，禁止凭记忆填写。",
   "releases": [
     {
+      "version": "2.2.9",
+      "file": "huijian-s3-2.2.9.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/HJKJ/releases/download/vo-1.5.9/huijian-s3-2.2.9.bin",
+        "https://github.com/fangwenyi-dev/HJKJ/releases/download/vo-1.5.9/huijian-s3-2.2.9.bin",
+        "https://gitee.com/fangwenyi-dev/HJKJ/releases/download/vo-1.5.9/huijian-s3-2.2.9.bin"
+      ],
+      "sha256": "fd820c0e934ae164d3d7c1714ea461567769515d9f6ffa915a3f401ac1590873",
+      "size": 2602064,
+      "notes_zh": "卫星固件 v2.2.9（含 2.2.7 深审批 + 2.2.8 泄漏族 + 2.2.9 唤醒模型档，自 2.1.x 升级一次性带上全部 app 侧修复）：①配网 120s 熔丝误杀根修（BLE 配网被每 2 分钟软复位掐死，实机 122614ms 铁证）；②回滚自检误杀健康镜像收口、尸检门补四条腿（旧轮残尸掐麦/退下旗毒化新轮/拆新轮）；③按钮两支过静音闸（静音态不再被 BOOT 键清零）；④本地 url_play 在飞不再被 Idle 强写孤儿化（播报失声停不掉根修）；⑤唤醒腿 enable 收进互斥（AS/DET 撕位稳态关闭）；⑥模式 B 语音采集缓存关闸（7x24 每帧堆分配+66KB 常驻零读者）；⑦assets 解析 cJSON 泄漏族 RAII 根修（配置错一次泄一块堆）；⑧CMD21 核字节闸先行（谎报「接受升级」收口）。⚠ 如实边界：本批主打的唤醒模型升档（wn9s→wn9l）住在 **assets 分区**，OTA 只换 app 分区——OTA 后开机自证行 Model 0: 若仍是 wn9s，唤醒灵敏度维持原档（9L 体验需产线/售后串口 app+assets 两段同刷）；升级本身对旧版设备仍有上述八项收益。登记依据：bin 为本机构件 0513gujian wt2159yuanma/build-v1fix/huijian-s3-2.2.9.bin，sha256/size 为该文件实测；逐支核过内嵌版本串「2.2.9」x3、无邻版号；镜像头 0x20=3254cdab（app 镜像形态，过 OTA 形态闸）；配套 assets 实测 sha256 019eaf22b5061269f063c7869606bbaedf3fc69cf6d61c3360b9e36a7ed3673e / 565034B / 内含 wn9l_nihaoxiaozhi_tts3 x1、wn9s x0。资产随 vo-1.5.9 release 落地后补传（既有流程）。",
+      "min_compatible": "2.1.36"
+    },
+    {
       "version": "2.1.79",
       "file": "huijian-s3-2.1.79.bin",
       "urls": [
