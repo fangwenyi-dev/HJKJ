@@ -1422,7 +1422,7 @@ class Executor:
             if len(steps) > 1 and reply and not reply.startswith("好的，都办妥"):
                 reply = reply.rstrip("。") + "；" + joined
             elif len(steps) > 1:
-                # v1.5.10（A2，审计 2026-10-17 发布树实锤 + C4 对抗定案）：klar 首腿链
+                # v1.6.0（A2，审计 2026-10-17 发布树实锤 + C4 对抗定案）：klar 首腿链
                 # 在 :1389 先产笼统"都办妥了"，被上一条 N1 条件 `not startswith`
                 # 恰好踢回覆写支 ⇒ 首腿已完成的事实被嘴上否认（现网 18:48:47 原案
                 # 在 klar 档位仍未修；部署版级联日志逐字在案：标准开关句恒让 klar 胜）。
@@ -1486,7 +1486,7 @@ class Executor:
         return ("（" + "；".join(bits) + "）") if bits else ""
     def _chain_stepwise_reply(self, plan: "Plan", steps: list,
                               results: list) -> str | None:
-        """链式逐腿真话术串播（P2-12 原 run() 内联逻辑，v1.5.10 A2 批提成单点）。
+        """链式逐腿真话术串播（P2-12 原 run() 内联逻辑，v1.6.0 A2 批提成单点）。
 
         提成方法的原因：bits 证伪支对 **klar 首腿链**（:1389 先产笼统形）需要
         以同一口径重建逐腿形再拼尾注——两处口径必须同源，复制一份＝表间漂移
