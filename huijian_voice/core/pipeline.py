@@ -32,6 +32,7 @@ import logging
 import re
 import time
 from collections import OrderedDict, deque
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
@@ -46,6 +47,7 @@ from .nlu.fast_path import (END_DIALOGUE_INTENT, FLAG_ANAPHORA_STRIPPED,
                             is_bare_negation_imperative, is_negation_imperative,
                             is_whole_house, plan_is_bulk_shape,
                             SCENE_CLARIFY_INTENT,
+                            _PRON_ACT_TAIL,
                             split_compound)
 from .nlu import targets as T
 from .nlu import corrector
@@ -952,6 +954,35 @@ def _strip_punct(text: str) -> str:
     return re.sub(r"[\s。，,！!？?~～.]+$", "", (text or "").strip()).strip()
 
 
+# v1.6.2（刀3·A3）：延时到期轮的对话态隔离旗。
+# 病灶（审计 2026-10-17 发布树实锤入账）：_fire_delay 到期重入**裸 handle()**，而
+# Pipeline 是常驻单实例、_confirm/_turns/_last_target 都是**按 origin 索引的实例级
+# 共享字典**（非 ContextVar）⇒ 无人值守的定时器与真人对话腿互踩，三向实测复现：
+#   ①吃环：到期正文恰好撞进用户正等的确认环（如「解锁大门」挂起中，延时腿的
+#     「打开大门」被 canonical 折词后落进 _CONFIRM_YES）→ 用户的"确认"还没出口，
+#     环已被延时轮消费/改指；
+#   ②挂环：风险正文（删除族/锁族）到期**静默**写 _confirm[origin]——到期不播报，
+#     环无声挂起，用户下一句随口的「好的」直接放行删除；
+#   ③污染：到期轮写 _turns/_last_target，把真对话的焦点栈顶掉（代词轮解析漂移）。
+# 延时**不是**绕过歧义/风险/离线/区域四道闸的特权通道（_fire_delay 原注释的纪律
+# 本意如此，实现漏了对话态这一半）；但对话态与四道闸性质不同——四道闸是"这一条
+# 该不该现在做"，对到期轮依然成立；对话态是"用户此刻在跟我对话吗"，到期轮答案是
+# 确定的"不在"，所以这一半**该隔离**而非该拒。
+# 隔离靠旗不靠参数：create_task 复制当前上下文 ⇒ 在 _fire_delay 内设旗，整条
+# handle() 调用链（含 _cascade/挂环点/环消费点）自然看见，无需给十几个方法传参。
+# contextvars 按 asyncio 任务天然隔离，真人轮与到期轮互不串（executor._REPOINTED
+# 同型先例，第四轮审计 P1 定案的桶形读取）。
+_DELAY_TURN: ContextVar[bool] = ContextVar("huijian_delay_turn", default=False)
+
+
+def _delay_turn_isolated() -> bool:
+    """本协程上下文是否处于"延时到期轮"。读不到（无上下文）＝False＝真人轮原行为。"""
+    try:
+        return bool(_DELAY_TURN.get())
+    except Exception:  # noqa: BLE001 —— 旗本身永不成为新故障面
+        return False
+
+
 def _target_names(args: dict) -> list[str]:
     """从两种 args 形态提设备名（慧尖 target 列表 / klar 平铺 name）。永不抛。"""
     out: list[str] = []
@@ -1745,6 +1776,17 @@ class Pipeline:
     async def _voice_creation(self, text: str, origin: str) -> Optional[Reply]:
         if not self.settings.get("nlu.creation_enabled", True):
             return None
+        # v1.6.2（刀3·A3 承接顺序洞，本批新钉钓出）：创建承接跑在 _delay_gate 之前
+        # （级联顺序：确认环→创建→同音改写→延时→链切分…），旧形「1秒后把办公室的
+        # 自动化删掉」被 creation.parse 吃掉——**延时前缀被静默剥掉、删除当场执行**。
+        # 这正是 v1.5.8 立"延时先于链切分"要防的"剥词→立即跑"病灶在创建支的复现
+        # （创建支必须前置于链切分＝承重语义不动，但前置于延时接管没有依据）。
+        # 修法＝带延时形状的整句**一律不进创建承接**，交回 _delay_gate：正文含
+        # 删除/锁族由排程拒层如实拒；合法正文（如「5秒后当我说X就Y」＝延时创建）
+        # 到点重入 handle 时再过创建承接，时序语义照旧。判据在 parse 之前＝创建
+        # 内部（_scene_delete 等）永不触达延时句，零执行零建档。永不抛由外层兜。
+        if delay.has_delay_shape(text):
+            return None
         c = creation.parse(text)
         if c is None:
             return None
@@ -2400,6 +2442,10 @@ class Pipeline:
                 # 第四轮审计 P2：挂起键一律归一（写入侧全是 `origin or "panel"`）——
                 # 旧形 pop 未归一 origin，origin 为空时挂起清不掉，TTL 内一句
                 # 「嗯」就执行一条**从未问出口**的计划。
+                # v1.6.2 定性轮（刀3）：这里**不加**延时旗守卫——本 pop 摘的是
+                # 上一行 _ambiguity_ask 刚挂的环（自己挂的自己摘＝无条件安全）；
+                # 加了守卫反而让残留环活到 TTL 后被真人「好的」吃掉＝把 A3-B 事故
+                # 放回来。撤守卫比加守卫安全（自查抓到的自家新洞，如实入账）。
                 self._confirm.pop(origin or "panel", None)
                 return (None, None, [], False)
             # risky 判定放到注入后：代词分句继承出「锁」类目标同样要拦
@@ -2501,6 +2547,50 @@ class Pipeline:
             return f"{sec // 60}分钟"
         return f"{sec}秒"
 
+    def _delay_body_refusal(self, body: str) -> Optional[Reply]:
+        """v1.6.2（刀3·A3）排程拒层：正文命中"不能无人值守"的两类 → 当场如实拒、不排。
+
+        返回 Reply(ok=False)＝拒排（话术用将来时口吻讲清为什么）；None＝可排。
+        判据是**正文词法**（此刻还没有 plan，级联未跑），取**宽**不取窄——
+        误拒只会让用户换个说法，漏排则是无人值守时把不可逆动作做出去：
+
+        ①风险族（正文含"锁"字即拒——解锁/上锁/「把门锁上」/D7 反转「关闭门锁」
+           全覆盖，宽到宁可误拒；删除族＝删除/删掉/移除/撤下/撤掉）——这类计划
+           级联后会挂确认环，但延时腿到期
+           **不播报**（v1.5.4 静音纪律），环会无声挂起，用户下一句随口的「好的」
+           就放行删除/解锁＝审计实测复现的活缺陷（现网 lock 0 台，锁形被 v1.5.0
+           预审拦＝假警报；删除族不受预审管、现网确有「我回来了/晚安」场景＝活形）。
+        ②指代正文：只拦**零描述性**代词（is_pronoun 裸代词句 / _PRON_ACT_TAIL
+           代词+动作尾 / 含"它"或"们"）——「那个射灯」带真名能正常解析，**不误拒**
+           （过度拒排也是回归）。代词按**执行时刻**
+           的焦点栈解析，延时跨了时间＝可能关掉用户根本没指的那台（实测 F2 复现）。
+
+        两类都不是"延时做不到"，是"延时**不该**这么做"，故话术给替代方案（现在就说 /
+        点名目标），绝不"剥词→立即跑→谎报"回老路（v1.5.8 那条红线）。永不抛。"""
+        try:
+            b = (body or "").strip()
+            if not b:
+                return None
+            # ①风险族（宽口径＝正文含"锁"即拒，不必凑齐动宾；「把门锁上」这类
+            #   锁在上、动词在下的形制近音改写无穷尽，宁误拒勿漏排）+ 删除族
+            if ("锁" in b
+                    or any(w in b for w in ("删除", "删掉", "移除", "撤下", "撤掉"))):
+                return Reply("删除和锁这类不可逆的操作，我不能替你定时到点自动做——"
+                             "要的话现在直接说一次，我会照常规先问你再动手。",
+                             "delay", ok=False, trace=[f"延时拒排:风险族:{b}"])
+            # ②指代正文：只拦**零描述性**代词（它/们/裸代词句/代词+动作尾），
+            #   不拦「那个射灯」这类带真名的指示词——那能正常解析，误杀＝过度拒排。
+            if (is_pronoun(b) or _PRON_ACT_TAIL.match(b)
+                    or "它" in b or "们" in b):
+                return Reply("定时指令里请把要操作的设备点名——过一会儿设备可能不止"
+                             "一个，我怕替你关错东西。说成「十秒后打开办公室射灯」这样就行。",
+                             "delay", ok=False, trace=[f"延时拒排:指代:{b}"])
+            return None
+        except Exception:  # noqa: BLE001 —— 判据异常绝不放行成"照排"（保守=拒排交给上层）
+            logger.exception("[延时] 排程拒层判据异常")
+            return Reply("这条定时指令我先不排，换个简单的说法再试。",
+                         "delay", ok=False, trace=["延时拒排:判据异常"])
+
     def _delay_gate(self, text: str, origin: str) -> Optional[Reply]:
         """延时形状句的当场处置；非延时句返回 None（放行主链）。永不抛。"""
         try:
@@ -2526,6 +2616,11 @@ class Pipeline:
                 logger.info("[级联] 延时形状接管→不排程不谎报: %r", text)
                 return Reply(say, "delay", ok=False, trace=[f"延时不排:{text}"])
             sec, body, _phrase = parsed
+            # v1.6.2（刀3·A3 排程拒层）：不可无人值守的正文当场拒排（docstring 详）
+            refuse = self._delay_body_refusal(body)
+            if refuse is not None:
+                logger.info("[级联] 延时正文拒排: %r（原话:%r）", body, text)
+                return refuse
             tasks = getattr(self, "_delay_tasks", None)
             if tasks is None:                 # __new__ 手搓夹具无此袋 → 不排（保守）
                 return Reply("稍后再试", "delay", ok=False, trace=["延时袋缺席"])
@@ -2546,16 +2641,30 @@ class Pipeline:
 
     async def _fire_delay(self, body: str, sec: int, origin: str) -> None:
         """到期执行：**重入正常 handle()**（全闸），不建特权通道、不主动播报。
-        永不抛（后台 task 里抛出来只会被 asyncio 吞掉并污染日志）。"""
+        永不抛（后台 task 里抛出来只会被 asyncio 吞掉并污染日志）。
+
+        v1.6.2（刀3·A3）：重入前置 `_DELAY_TURN` 旗（本 task 的上下文，create_task
+        时已从排程轮拷贝、set 只影响本 task 及其下游调用链）——延时轮与真人对话
+        腿互不踩踏：不吃/不挂确认环、不写对话态、不跨轮代词注入；歧义/风险/离线/
+        区域四道闸**照常全过**（隔离的是"用户此刻不在对话"这一半，不是该不该做
+        这一半）。旗必须在 handle 前 set、finally reset（同一 task 内多次到期复用
+        形态防粘旗；现行一 task 一回合，reset 是纵深）。
+        """
+        token = _DELAY_TURN.set(True)
         try:
             await asyncio.sleep(sec)
             reply = await self.handle(body, origin)
             logger.info("[延时] 到期执行 %r → ok=%s reply=%r", body, reply.ok, reply.text)
         except asyncio.CancelledError:
-            logger.info("[延时] 预约被取消（停机/主动撤单）: %r", body)
+            # v1.6.2：撤单出口如实——当前唯一取消路径是**停机**（main.shutdown）；
+            # "主动撤单"（按 origin 存 booking 的语音撤单）尚未实现＝刀5 在册，
+            # 旧注释把它写成已具备能力＝对用户不实（本仓红线：注释不得宣称未做的）。
+            logger.info("[延时] 预约被取消（停机）: %r", body)
             raise
         except Exception:  # noqa: BLE001
             logger.exception("[延时] 到期执行异常（不影响主链）")
+        finally:
+            _DELAY_TURN.reset(token)
 
     def cancel_delays(self) -> int:
         """停机钩子：取消全部在途延时预约（防孤儿 task 携旧引用触设备）。返回撤单数。"""
@@ -2613,10 +2722,18 @@ class Pipeline:
         if seed is not None:
             spec, fresh = seed, True           # 链内先行分句，天然新鲜
         else:
-            spec = self._last_target.get(origin or "panel")
-            now = time.time()
-            ttl = float(self.settings.get("dialog.context_ttl_s", CONTEXT_TTL_S))
-            fresh = bool(spec) and (now - spec["ts"] <= ttl)
+            # v1.6.2（刀3·A3 注入闸）：延时到期轮**不读**真人焦点栈——排程拒层已挡
+            # 代词正文，这是纵深：「再开一下」这类不含代词字面却被 marked 判真的
+            # 形状，若吃 _last_target 会开/关用户此刻根本没指的那台（F2 漂移的另一半）。
+            # 不提前 return：置 spec=None/fresh=False 令注入不成立即可，函数其余
+            # 兜底支（卫星区域→全屋）照常——那是执行安全语义不是对话态，延时轮保留。
+            if _delay_turn_isolated():
+                spec, fresh = None, False
+            else:
+                spec = self._last_target.get(origin or "panel")
+                now = time.time()
+                ttl = float(self.settings.get("dialog.context_ttl_s", CONTEXT_TTL_S))
+                fresh = bool(spec) and (now - spec["ts"] <= ttl)
         # 回指标记：fast_path 已裁定的"代词目标/回指"以**旗标**为准（trace 文案
         # 只作诊断，改措辞不得改语义）；裸代词句与句首副词句式（"再打开"/"把它
         # 关了"）兜底文本级判定。
@@ -2765,6 +2882,11 @@ class Pipeline:
 
     def _note_target(self, origin: str, plan: Plan) -> None:
         """执行成功的明示目标入上下文。只存不改写（空目标句不覆写，保留最近具名目标）。"""
+        # v1.6.2（刀3·A3 污染闸）：延时到期轮不写焦点栈——实测 F2 形态：延时腿
+        # 执行后把它的目标顶进 _last_target[origin]，用户真人轮的代词（"把它关了"）
+        # 会解析到那台定时器关过的设备＝用户根本没指它。同理不碰 _turns。
+        if _delay_turn_isolated():
+            return
         if not origin:
             origin = "panel"
         spec = self._spec_of(plan)
@@ -2788,6 +2910,11 @@ class Pipeline:
             return False
 
     def _remember_turn(self, origin: str, user: str, assistant: str) -> None:
+        # v1.6.2（刀3·A3 污染闸）：延时到期轮不写对话账——_turns 是 LLM 历史与
+        # 回指裁决的原料，无人值守轮插一行会挤掉真人轮、并可能成为下一句代词的
+        # 指代来源（焦点栈走 _note_target，账本走本函数，两处同闸）。
+        if _delay_turn_isolated():
+            return
         if not origin:
             origin = "panel"
         dq = self._turns.get(origin)
@@ -3170,6 +3297,19 @@ class Pipeline:
     def _confirm_ask(self, plan: Plan, origin: str) -> Optional[Reply]:
         if not self._risky(plan):
             return None
+        # v1.6.2（刀3·A3 挂环闸）：延时到期轮**绝不写确认环**——到期不播报（v1.5.4
+        # 静音纪律），环会无声挂起，用户下一句随口的「好的」就放行删除/解锁
+        # （审计实测的活缺陷形态：「N秒后删除语音场景晚安」）。排程拒层已把
+        # 删除/锁族词法挡在排期外；走到这里＝词法没见过的形状（如近音改写后
+        # 仍被级联接地成风险意图），纵深处置＝**拒执行且不挂环**，零下发。
+        # 不选"照常执行"：确认环存在的前提"用户在场能回答"此刻不成立；
+        # 不选"静默吞掉"：handle 的 EVENT 旁路仍在（HA 侧可建自动化接），日志留痕。
+        if _delay_turn_isolated():
+            logger.warning("[延时] 到期正文被判风险意图且无人可确认 → 拒执行零下发: %s",
+                           plan.intent)
+            return Reply("这条定时任务需要你的当场确认才能执行，这次先没做。",
+                         "delay_guard", ok=False,
+                         trace=list(getattr(plan, "trace", [])) + ["延时隔离:风险拒执行"])
         origin = origin or "panel"
         args = plan.args or {}
         if plan.intent == "HassDeleteVoiceScene":
@@ -3505,6 +3645,14 @@ class Pipeline:
             others = "、".join(conf_names[:3]) + ("…" if len(conf_names) > 3 else "")
             text = (f"家里有 {len(conf_names)} 台设备名字相近（{others}）。"
                     f"我先对「{pick}」执行，说「确认」就这么办，说「取消」先不动。")
+            # v1.6.2（刀3·A3 挂环闸之二）：延时到期轮无人可答——歧义环同样不挂，
+            # 且**不代挑**：收窄靠的是"用户会确认"这半截承诺，无人承诺时挑一台
+            # 执行＝把启发式猜的当成授权（clarify 语义＝零下发如实收口）。
+            if _delay_turn_isolated():
+                logger.warning("[延时] 歧义目标无人可确认 → 不挂环不代挑，零下发")
+                return Reply("有设备名字相近，定时任务里我不替你挑，这次先没做。",
+                             "clarify", ok=False,
+                             trace=list(getattr(plan, "trace", [])) + ["延时隔离:歧义不挂环"])
             self._confirm[origin] = {"plan": plan, "ts": time.time(),
                                      "ttl": self._confirm_ttl(text)}
             self._origin_ts[origin] = time.time()
@@ -3555,6 +3703,12 @@ class Pipeline:
         不往表里补裸「继续」（那会把"继续做某事"这类真指令吸成确认）。
         """
         origin = origin or "panel"
+        # v1.6.2（刀3·A3 吃环闸）：延时到期轮**不是**用户对任何问句的回答——旧形
+        # 到期正文撞进真人挂起的环（如环等「解锁大门」，延时腿「打开大门」折词后
+        # 落 _CONFIRM_YES/改口支）＝环被无人值守轮消费或撤销，实测三向互踩之一。
+        # 返回 None＝本句照常走级联（四道闸一个不少），只是碰不到对话态。
+        if _delay_turn_isolated():
+            return None
         pend = self._confirm.get(origin)
         if pend is None:
             return None
