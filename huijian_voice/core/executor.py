@@ -1390,31 +1390,8 @@ class Executor:
         else:
             # P2-12 复合链：逐步真话术串播（"好的，灯打开了，窗帘关了"），
             # 拿不准的一步退"都办妥了"，不硬拼英文意图名
-            try:
-                segs = []
-                for i, ((n, a, step_src), r) in enumerate(zip(steps, results)):
-                    s = self.speech(Plan(intent=n, args=a, source=step_src,
-                                         utterance=plan.utterance), r)
-                    if i > 0:
-                        s = s.removeprefix("好的，")
-                    segs.append(s)
-                # v1.5.1（N1 姊妹小修）：某腿回执是裸 {"success":true}（无逐台行）时
-                # speech() 模板退化成裸"好的"——两腿 bare success 拼出「好的，好的」
-                # 复读机（1.5.0 复测回放同分支亲见）。相邻裸"好的"去重，有内容的腿不动。
-                segs2 = []
-                for s in segs:
-                    if s in ("好的", "好的。") and segs2 and segs2[-1] in ("好的", "好的。"):
-                        continue
-                    segs2.append(s)
-                reply = "，".join(x for x in segs2 if x) or "好的，都办妥了"
-                if not reply.startswith("好的"):
-                    reply = "好的，" + reply
-            except Exception:
-                # 话术拼装自身出问题不改成败（各腿都已如实返回 success），但必须留痕：
-                # 这一支会把播报退成笼统的"都办妥了"，2026-09-27 14:04 那条现场签名
-                # 就是从这儿出来的——不留痕则下一次仍然无从归因（同 D2 的教训）。
-                logger.exception("[执行] 复合链逐腿话术拼装异常 → 退笼统回执")
-                reply = "好的，都办妥了"
+            reply = self._chain_stepwise_reply(plan, steps, results) \
+                or "好的，都办妥了"
         bits = [f"「{n}」我没找到" for n in missing] + \
                [f"「{n}」本来就在要求的状态上" for n in noops] + \
                [f"「{n}」没拿到执行回执" for n in no_receipt] + \
@@ -1444,6 +1421,20 @@ class Executor:
             # 单步与"都办妥了"笼统形维持 v1.1.15 覆写纪律原样（分句被证伪禁止笼统收口）。
             if len(steps) > 1 and reply and not reply.startswith("好的，都办妥"):
                 reply = reply.rstrip("。") + "；" + joined
+            elif len(steps) > 1:
+                # v1.5.10（A2，审计 2026-10-17 发布树实锤 + C4 对抗定案）：klar 首腿链
+                # 在 :1389 先产笼统"都办妥了"，被上一条 N1 条件 `not startswith`
+                # 恰好踢回覆写支 ⇒ 首腿已完成的事实被嘴上否认（现网 18:48:47 原案
+                # 在 klar 档位仍未修；部署版级联日志逐字在案：标准开关句恒让 klar 胜）。
+                # 修：笼统形不是终点——用与 else 支**同源**的 _chain_stepwise_reply
+                # 重建逐腿真话术再降尾注（"逐腿 segs"正是复核定罪给出的正解）。
+                # 重建失败（异常退 None／无可播退 ""）才维持 v1.1.15 覆写纪律原样，
+                # 绝不拿"拼装可能出问题"当借口回到谎报。
+                rebuilt = self._chain_stepwise_reply(plan, steps, results)
+                if rebuilt and not rebuilt.startswith("好的，都办妥"):
+                    reply = rebuilt.rstrip("。") + "；" + joined
+                else:
+                    reply = "好的，" + joined
             else:
                 reply = "好的，" + joined
             partial = ""
@@ -1493,6 +1484,45 @@ class Executor:
         if skip_note:
             bits.append(skip_note)
         return ("（" + "；".join(bits) + "）") if bits else ""
+    def _chain_stepwise_reply(self, plan: "Plan", steps: list,
+                              results: list) -> str | None:
+        """链式逐腿真话术串播（P2-12 原 run() 内联逻辑，v1.5.10 A2 批提成单点）。
+
+        提成方法的原因：bits 证伪支对 **klar 首腿链**（:1389 先产笼统形）需要
+        以同一口径重建逐腿形再拼尾注——两处口径必须同源，复制一份＝表间漂移
+        老病根（2026-10-08 声学链同族教训）。
+        返回 ""＝无可播内容；None＝拼装异常（调用方退笼统回执并留痕，
+        行为与原内联块逐字等价）。永不抛。
+        """
+        try:
+            segs = []
+            for i, ((n, a, step_src), r) in enumerate(zip(steps, results)):
+                s = self.speech(Plan(intent=n, args=a, source=step_src,
+                                     utterance=plan.utterance), r)
+                if i > 0:
+                    s = s.removeprefix("好的，")
+                segs.append(s)
+            # v1.5.1（N1 姊妹小修）：某腿回执是裸 {"success":true}（无逐台行）时
+            # speech() 模板退化成裸"好的"——两腿 bare success 拼出「好的，好的」
+            # 复读机（1.5.0 复测回放同分支亲见）。相邻裸"好的"去重，有内容的腿不动。
+            segs2 = []
+            for s in segs:
+                if s in ("好的", "好的。") and segs2 and segs2[-1] in ("好的", "好的。"):
+                    continue
+                segs2.append(s)
+            reply = "，".join(x for x in segs2 if x)
+            if not reply:
+                return ""
+            if not reply.startswith("好的"):
+                reply = "好的，" + reply
+            return reply
+        except Exception:
+            # 话术拼装自身出问题不改成败（各腿都已如实返回 success），但必须留痕：
+            # 这一支会把播报退成笼统的"都办妥了"，2026-09-27 14:04 那条现场签名
+            # 就是从这儿出来的——不留痕则下一次仍然无从归因（同 D2 的教训）。
+            logger.exception("[执行] 复合链逐腿话术拼装异常 → 退笼统回执")
+            return None
+
     @staticmethod
     def _step_say(idx: int, steps: list, reason: str) -> str:
         """整链中断时的定句模板：已经动了几步必须说清（v1.1.15 E2）。

@@ -1086,6 +1086,47 @@ def _tail_window_action(rest_text: str, window_word: str) -> Optional[str]:
     return _scan_window_action(residue) or None
 
 
+def _t1_window_action(text: str) -> Optional[str]:
+    """T1/T1-retry 支的窗动作扫描：先剥净句内**全部**窗名语素（窗型词根∪
+    开窗器族词）再扫（A1 修复批，审计 2026-10-17 发布树实锤入账）。
+
+    病灶（旧裸扫 `_scan_window_action(text)`）：整句上扫，「平开窗」名字里的
+    「开」被当成动作。STT 听岔「关闭→官闭/公式/光闭」时（现网 10-15 有
+    「射灯→设置」同引擎同族实锤；corrector A7 判例明令动词极性听岔形禁入
+    纠错表——所以那条防线永远不会出现），「官闭/公式/光闭平开窗」配不上
+    `关|close` 档，却被名内 `开` 配中 `open` ⇒ 用户要关、窗真开（反极性
+    下发，P0 级）。同族「公式内开内倒」v1.5.6 对照树是 MISS 查无，v1.5.7
+    裸形入表后经 t1 判出 a＝内倒真下发——加重实锤，并证伪 1.5.7 发版说明
+    「此类句由查无/fallback 如实收口」。
+
+    判据与纪律：
+    · 剥离一律复用 `_window_type`/`_opener_word` 既有单点（含帘族短路排除），
+      不建第二张表——表间漂移是 2026-10-08 声学链实锤的老病根；
+    · 迭代剥净全部出现的名语素（「关闭平开窗和推拉窗」两个都剥）；
+      `_window_type` 表序天然长词在前（内开内倒 先于 内开窗/悬窗 族截胡）；
+    · 剥完残余为空＝只报了名没说要做什么，返回 None——调用方按既有
+      「ControlWindow 无动作词」_miss 如实收口。**宁可不接，不许接反**；
+      绝不放行无 action 的窗计划（执行器把空 action 念成「已调节」，
+      集成 action_map 无空键＝下发撞墙）。
+    · 剥后扫描用既有 `_scan_window_action` 原表序：内倒族>暂停>关>开。
+      「打开客厅窗户内倒」剥「窗户」后残「打开客厅内倒」仍由内倒档先命中
+      判 a（v1.1.1 #5 战果保持）；「关闭内开内倒」剥名后残「关闭」判 close
+      （v1.5.7 SOV 族钉口径在 t1 侧同步成立）。
+    """
+    try:
+        resid = str(text or "")
+        while True:
+            w = _window_type(resid) or _opener_word(resid)
+            if not w:
+                break
+            resid = resid.replace(w, "")  # replace 只删不增，循环必然收敛
+        if not resid.strip():
+            return None
+        return _scan_window_action(resid) or None
+    except Exception:  # noqa: BLE001 —— 判据异常绝不造动作（保守=交查无）
+        return None
+
+
 # v1.0.40 修复（D3）：T1 的标签集里只有 OpenCover、**没有 CloseCover**（见 _T1_MAP），
 # 于是"拉上/合上/收起窗帘"这类关闭向说法被模型判成 OpenCover(0.86~0.97) 后原样
 # 映射 TurnDeviceOn → **反向执行**（用户要关、设备去开）。按方向词就地纠正：
@@ -1877,7 +1918,7 @@ class FastPath:
                 source = "t1"
                 # T1 命中补参：动作/数值扫描 + 前缀拆分（v1.5 L462-479 语义扩展）
                 if intent == "ControlWindow" and "action" not in extra_args:
-                    act = _scan_window_action(text)
+                    act = _t1_window_action(text)   # A1 修复：剥名再扫，禁裸扫整句
                     if act:
                         extra_args["action"] = act
                     else:
@@ -1933,18 +1974,24 @@ class FastPath:
                         t1_intent = _cover_intent(text, t1_intent)
                     retry_extra = dict(seed2)
                     if t1_intent == "ControlWindow" and "action" not in retry_extra:
-                        act2 = _scan_window_action(text)
+                        act2 = _t1_window_action(text)   # A1 修复：与 t1 主支同闸
                         if act2:
                             retry_extra["action"] = act2
+                        else:
+                            # 同主支纪律：剥名后扫不出动作＝不接管（旧形这里即便
+                            # 无 action 也照建计划，执行器把空 action 念成「已调节」、
+                            # 集成 action_map 无空键＝撞墙；宁可不接不许接反）。
+                            t1_intent = None
                     if t1_intent == "AdjustDeviceAttribute":
                         scanned2 = _scan_delta(text, retry_extra.get("attribute", ""))
                         if scanned2:
                             retry_extra["delta"] = scanned2[0]
-                    trace.append(f"T1-retry={label2}({prob2:.2f})")
-                    retry_plan = self._build_plan(t1_intent, text, retry_extra, text,
-                                                  "t1", trace)
-                    if retry_plan is not None:
-                        plan = retry_plan
+                    if t1_intent:
+                        trace.append(f"T1-retry={label2}({prob2:.2f})")
+                        retry_plan = self._build_plan(t1_intent, text, retry_extra,
+                                                      text, "t1", trace)
+                        if retry_plan is not None:
+                            plan = retry_plan
         if plan is None:
             # 构造失败（守卫/提取质量低/复合残余）→ 触发词兜底：前缀形态仍算用户
             # 说了触发词（"打开空调吧"被 ① 吃成 rest="空调吧" 后判 miss）。命中才
