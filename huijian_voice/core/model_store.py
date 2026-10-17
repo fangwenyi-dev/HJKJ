@@ -75,6 +75,18 @@ class ModelStore:
         self.abort = threading.Event()
         # M12：构造即清扫上次运行（含 SIGKILL/断电）遗留的 .part.* 孤儿。
         self.sweep_orphans()
+        # v1.6.3（刀1）：构造即复核附属字节（matcha vocos 案——文件名对字节错可
+        # 在 is_ready 的存在性闸下永久隐身，女声被降八度播成"男声"）。只动
+        # "已就绪"的 key（未就绪本就无哈希成本），坏字节摘除后交给既有
+        # pend→ensure 链自动重取。异常绝不阻断构造（就绪闸与状态循环优先）。
+        try:
+            flagged = self.verify_all_extras()
+            if flagged:
+                logger.warning("[模型] 启动附属复核点名 %s（坏字节已摘除，走重取）",
+                               "、".join(flagged))
+        except Exception:  # noqa: BLE001
+            logger.exception("[模型] 启动附属复核异常（跳过，不影响构造）")
+
 
     def _key_lock(self, key: str) -> threading.Lock:
         with self._locks_guard:
@@ -167,6 +179,45 @@ class ModelStore:
                  if ef.get("file")}
         return [rf for rf in entry.get("required_files", []) if rf not in extra]
 
+    def _main_body_ok(self, key: str, entry: dict) -> bool:
+        """主包本体（required_files 剔除附属后的部分）在场且完成章与 lock 身份
+        一致。v1.6.3 刀1 收口：is_ready=False 但主包体在 ⇒ 缺的只可能是附属，
+        ensure 该直走附属二跳，而不是被主包下载/解包分支短路（离线+import/ 只
+        放附属救急包＝用户按启动复核提示自救的形制，旧码在 not-auto 闸直接
+        return False，逃生门成摆设；在线态也会白白重下整只主包）。"""
+        if not (self.models_dir / key / ".extracted_ok").is_file():
+            return False
+        stamp = self._read_stamp(key)
+        if stamp is not None and stamp != "dev-migration":
+            exp_tarball = entry.get("tarball", "")
+            exp_sha = entry.get("sha256", "")
+            name_part, _, sha_part = stamp.partition("|")
+            if name_part != exp_tarball or (sha_part and sha_part != exp_sha):
+                return False          # 章与 lock 身份不符＝整包须重取
+        top = entry.get("top_dir", "")
+        try:
+            for cand in (p for p in ((self.models_dir / key / top if top else None),
+                                     self.models_dir / key) if p):
+                if cand.is_dir() and self._files_ok(
+                        cand, self._tarball_required(entry)):
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def _all_extras_imported(self, entry: dict) -> bool:
+        """该 key 的每个附属在 import/ 都有同名救急包（v1.6.3 刀1 收口的
+        离线支路闸——auto_download 关时只放得下救急包才准走附属二跳，
+        免得借道触发二跳尾部的 urls 补下＝绕过出门下载的门）。"""
+        extras = entry.get("extra_files") or []
+        if not extras:
+            return False
+        try:
+            return all((self.import_dir / (ef.get("file") or "\x00")).exists()
+                       for ef in extras)
+        except OSError:
+            return False
+
     def _read_stamp(self, key: str) -> Optional[str]:
         try:
             raw = (self.models_dir / key / ".extracted_ok").read_text(
@@ -177,6 +228,108 @@ class ModelStore:
 
     def is_ready(self, key: str) -> bool:
         return self.model_dir_for(key) is not None
+
+    # ── v1.6.3（刀1·附属启动复核）──────────────────────────────────
+    # 病灶（现网 Matcha"男声"事故根因链，2026-10-17 频谱+时域双实锤）：附属文件
+    # （matcha 的 vocos 声码器）的 sha256 校验只活在 _ensure_extra_files 里，而它
+    # 只在 ensure() 真走到时才被调——stamp 在 ⇒ _ensure_locked 首行 is_ready 即真
+    # 直接 return。**文件名正确、字节陈旧的 vocos（早期手动投放/换包窗口遗留）
+    # 可永久隐身**：引擎加载照常"成功"，吐出的音频却是另一份声码器的（实测 32k
+    # 产物被按 16k 标称＝整整低一个八度，女声 Matcha 变"男声"）。
+    # 修法＝启动期显式复核一次（verify_extras），坏字节**摘除文件**——此后
+    # is_ready 因缺失转 False，main 既有 pend→ensure 链自动走 import/→多源重取，
+    # 全链零新状态机。纪律：绝不塞进 is_ready（5s 状态循环+healthz+每次加载判
+    # 都吃它，54MB 哈希会烧穿数据盘——tests/test_v163 热路径钉把这条钉死）。
+    def _auto_download_on(self) -> bool:
+        """自动下载门的单一事实源（v1.6.3 正向臂抓出的第二洞）：settings 三态
+        （None=未设→True）AND env 门 `HUIJIAN_OPT_MODEL_AUTO_DOWNLOAD`。
+        判"敢不敢摘/走不走下载"必须与 `_ensure_locked` 的 auto 算式逐字同源——
+        分头读会漂移：旧 `_refetch_possible` 只读 settings 漏了 env 门，env 关 +
+        settings 未落盘的现网形制下会把唯一副本摘了却无人重取（违 M11）。"""
+        auto = self.settings.get("power.auto_download", None)
+        if auto is None:
+            auto = True
+        return bool(auto) and str(os.environ.get(
+            "HUIJIAN_OPT_MODEL_AUTO_DOWNLOAD", "true")).lower() != "false"
+
+    def _refetch_possible(self, ef: dict, name: str) -> bool:
+        """坏附属敢不敢摘：只有**确有重取来源**才摘（M11 家规——判据动作不得把
+        现场弄得更糟：离线+关自动下载时摘掉唯一副本＝从"音高不对"恶化成"彻底哑"）。"""
+        try:
+            if (self.import_dir / name).exists():
+                return True
+            # urls 只有配了才够——auto_download 关时下载链被门（ensure 走 manual
+            # 支），摘了也没人取回来；import/ 是唯一被允许绕过该门的通道。
+            return self._auto_download_on() and bool(ef.get("urls"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def verify_extras(self, key: str) -> bool:
+        """附属文件逐一复核（尺寸快判→sha256）。
+
+        坏字节：有重取来源 ⇒ 摘除（此后 is_ready 因缺失转 False，main 既有
+        pend→ensure 链自动走 import/→多源重取）；无重取来源 ⇒ **保留文件只点名**
+        （坏副本可能是在场唯一副本，离线现场删它＝自毁唯一逃生通道）。
+        缺失 ⇒ False 点名（就绪闸本就兜住）。返回 True＝无附属或全部字节一致。
+        永不抛：读盘异常一律按"不可信"处理并走同一分支。"""
+        entry = self._manifest.get(key) or {}
+        extras = entry.get("extra_files") or []
+        if not extras:
+            return True
+        base = self._resolved_dir(key, entry)
+        ok = True
+        for ef in extras:
+            name = ef.get("file") or ""
+            if not name:
+                continue
+            dest = base / name
+            if not dest.exists():
+                ok = False            # 缺失由 _files_ok 兜住不就绪，这里只点名
+                logger.warning("[模型] %s 附属 %s 缺失（启动复核点名）", key, name)
+                continue
+            expected = str(ef.get("sha256") or "")
+            good = True
+            if not expected:
+                good = True           # 无登记哈希＝无从判（纪律同 _ensure_extra_files）
+            else:
+                size_mb = ef.get("size_mb") or 0
+                try:
+                    # 单位口径＝十进制 MB（×1e6），与 _download_any 字节上限同源
+                    # （正向臂实锤：vocos 登记 54、真身 53,882,848B——按 MiB 折
+                    # 56,623,104 差 2.7MB>容差，**好字节会被快判误杀**：在线每次
+                    # 重启重下 54MB，离线直接哑。sha 才是权威，快判只做李鬼截断）。
+                    if size_mb and abs(dest.stat().st_size
+                                        - int(float(size_mb) * 1e6)) > 1024 * 1024:
+                        good = False  # 尺寸快判（±1MB 容差），免读 54MB 秒断李鬼
+                    elif not self._sha_ok(dest, expected):
+                        good = False
+                except (OSError, ValueError):
+                    good = False
+            if good:
+                continue
+            ok = False
+            if self._refetch_possible(ef, name):
+                try:
+                    dest.unlink(missing_ok=True)
+                    logger.warning("[模型] %s 附属 %s 字节与登记不符 → 已摘除，"
+                                   "将走导入/多源重取（启动复核，v1.6.3）", key, name)
+                except OSError as e:
+                    logger.warning("[模型] %s 附属 %s 判坏但摘除失败: %s（下次启动重试）",
+                                   key, name, e)
+            else:
+                logger.warning("[模型] %s 附属 %s 字节与登记不符，但无重取来源"
+                               "（离线且关自动下载）——保留在场唯一副本仅点名；"
+                               "请面板开启自动下载重取，或放 import/%s 后重启",
+                               key, name, name)
+        return ok
+
+
+    def verify_all_extras(self) -> list[str]:
+        """启动钩子：逐 key 复核，返回被点名的 key 列表（main 日志/观测用）。"""
+        flagged = [k for k in self._manifest
+                   if (self._manifest[k].get("extra_files") and self.is_ready(k))
+                   and not self.verify_extras(k)]
+        return flagged
 
     # ── 状态外泄 ────────────────────────────────────────────────
     def snapshot(self) -> dict:
@@ -280,10 +433,7 @@ class ModelStore:
         self._set_status(key, state="checking", pct=0, detail="检查导入/下载")
         # 1) 导入口
         imported = self.import_dir / entry["tarball"]
-        auto = self.settings.get("power.auto_download", None)
-        if auto is None:
-            auto = True
-        auto = auto and str(os.environ.get("HUIJIAN_OPT_MODEL_AUTO_DOWNLOAD", "true")).lower() != "false"
+        auto = self._auto_download_on()
         if force:
             # M11：先删旧树再重取（旧树不清，新解包与旧文件混栈、_files_ok
             # 照过=「下载」按钮对就绪错版包彻底 no-op 的第二根因）。但清树
@@ -297,6 +447,15 @@ class ModelStore:
         if imported.exists():
             if self._extract(key, imported, entry):
                 return self._ensure_extra_files(key, entry)
+        # 1.5) v1.6.3 刀1 收口：主包体完好、缺的只可能是附属（启动复核摘除
+        # 坏字节后的形制）⇒ 直走附属二跳，不被主包下载分支短路。旧码在
+        # 离线+import/ 只放附属救急包时于 not-auto 闸直接 return False＝用户
+        # 按复核提示自救的逃生门成摆设。守门：auto_download 关时只有
+        # **每个附属都有 import/ 救急包**才放行——二跳尾部的 urls 补下不吃
+        # 该门（既有解包链行为），此支不得给它开后门。
+        if not imported.exists() and self._main_body_ok(key, entry) \
+                and (auto or self._all_extras_imported(entry)):
+            return self._ensure_extra_files(key, entry)
         # 2) 三级 URL 下载
         if not auto:
             self._set_status(key, state="manual", pct=0, detail="自动下载关闭；放包到 import/ 或开开关")

@@ -696,6 +696,42 @@ class _CloudOpusStream:
         return out
 
 
+def _hf_ratio_excess(x, sr: int):
+    """v1.6.3（刀2·频谱哨兵的判据核）：float 样本序列 → >4.1kHz 能量占比。
+
+    分窗 2048（128ms@16k）hann、只取有声窗（rms>0.0015），rfft 功率谱按全带
+    能量归一后取 (4.1kHz, 0.49·sr) 段占比——上限避 Nyquist 边缘毛刺。
+    标定（**以本函数形制为准**，10-17 发布臂复测）：归档现网坏样四段
+    25–30% / 好 matcha 真引擎 0.5–0.9% / melo 真重采样链 0.6% ⇒ 阈值 2%
+    对坏样裕度 ≥12×、对好嗓 ≥2.2×（早期取证另记 7.2%＝另一测法，不可复算，
+    方向一致）。返回 None＝样本不足或全静音（不装判，调用方跳过）。
+    纯函数、无状态、永不抛（np 异常折叠为 None）。"""
+    try:
+        a = np.asarray(x, dtype=np.float64).ravel()
+        sr = int(sr or 0)
+        if sr < 8000 or len(a) < 2048 * 2:
+            return None
+        win = np.hanning(2048)
+        n_seg = (len(a) - 2048) // 2048 + 1
+        psum = None
+        tot = 0.0
+        hf_lo = int(round(2048 * 4100.0 / sr))
+        hf_hi = int(round(2048 * 0.49))
+        acc = np.zeros(hf_hi - hf_lo)
+        for i in range(n_seg):
+            s = a[2048 * i:2048 * i + 2048]
+            if np.sqrt(np.mean(s * s)) < 0.0015:
+                continue
+            sp = np.abs(np.fft.rfft((s - s.mean()) * win)) ** 2
+            tot += float(sp.sum())
+            acc += sp[hf_lo:hf_hi]
+        if tot <= 0:
+            return None
+        return float(acc.sum() / tot)
+    except Exception:  # noqa: BLE001 —— 观测件永不成为新故障面
+        return None
+
+
 class TtsEngine:
     def __init__(self, settings, model_store):
         self.settings = settings
@@ -1061,11 +1097,73 @@ class TtsEngine:
             with self._load_gate:
                 self._loading = False
         if ok:
+            # v1.6.3（刀2·合成金句自测率）：嗓音频谱哨兵。**必须放锁外**——
+            # _synth 要拿引擎 `_lock`，而 _ensure_loaded_inner 的加载体在
+            # `with self._lock:` 里（放里面＝自死锁）。冷载一次性成本（1 句
+            # 短合成），按 provider 时间预算节流（_voice_selftest 内建）。
+            self._voice_selftest()
             # 深审 R2 #7：加载态是指纹的隐性输入（自定义表注入/复核改 sid），
             # 首载完成若不重算推送，welcome 的冷值（c0h0/sid 回落 28）会一直
             # 骑到下一次 save/重连——同键先后两种嗓=缓存在嗓上漂移。
             self._notify_fp_change()
         return ok
+
+    # ── v1.6.3 刀2：嗓音频谱哨兵（合成金句自测率）────────────────────
+    # 病灶（现网 Matcha"男声"事故，2026-10-17 取证）：声码器/重采样链产出被
+    # 半速率播放（32k 内容按 16k 标称＝时长×2、音高÷2、女声拉成"男声"）——
+    # 刀1 的字节复核挡住"文件错"，但挡不住"文件对、产物错"（sherpa 版本行为、
+    # 上游打包错位等）。哨兵在**每次真加载后**合成固定金句量 >4.1kHz 能量占比：
+    # 真值标定（**出货判据本形制**，归档现网坏样复测）＝坏样四段 25–30% /
+    # 好 matcha 真引擎 0.5–0.9% / melo 真重采样链 0.6% ⇒ 阈值 2%：坏样裕度
+    # ≥12×、好嗓 ≥2.2×（早期取证记 7.2%＝另一测法，不可复算，同方向）。
+    # kokoro 未标定但哨兵只点名不改行为，误报代价=一行日志。
+    # 这病从此不靠用户耳朵发现。永不抛：哨兵任何异常都不许连累播报链。
+    def _voice_selftest(self) -> None:
+        """按 provider 节流（默认 1h 预算）跑一次嗓音自测；只 WARN/ERROR 点名。
+
+        预算而非"每进程一次"：省电档卸载→重载会反复走到这里，首次抓到坏
+        声码器即摘除重取后，下一载就该重新判一次（长期静默会把自愈后的
+        好状态也盲掉）；1h 粒度在 4C8G 上成本可忽略。"""
+        try:
+            prov = self.active_provider()
+            now = time.time()
+            budget = float(self.settings.get("tts.selftest_interval_s", 3600.0) or 0)
+            last = getattr(self, "_selftest_at", None)
+            if last is None:
+                last = self._selftest_at = {}
+            if budget > 0 and now - last.get(prov, 0.0) < budget:
+                return
+            last[prov] = now
+            self._self_test_voice()
+        except Exception:  # noqa: BLE001 —— 观测件绝不成为新故障面
+            logger.debug("[TTS] 嗓音自测异常（忽略）", exc_info=True)
+
+    def _self_test_voice(self) -> None:
+        """合成金句并量频谱。命名与 test_v163 接线钉对齐，永不抛。"""
+        try:
+            tts = self._tts
+            if tts is None:
+                return
+            prov = self.active_provider()
+            sid = int(self.settings.get("tts.sid", _default_sid_for(prov)) or 0)
+            speed = float(self.settings.get("tts.speed", 1.05) or 1.05)
+            audio = tts.generate("好的，已经帮你执行了", sid=sid, speed=speed)
+            x = np.asarray(audio.samples, dtype=np.float64)
+            sr = int(getattr(audio, "sample_rate", 0) or 16000)
+            r = _hf_ratio_excess(x, sr)
+            if r is None:
+                return
+            if r >= 0.02:
+                logger.error("[TTS] 嗓音自测点名：金句 >4.1kHz 能量占比 %.1f%%"
+                             "（阈值 2%%，现网八度降调事故存档样本形制实测 25–30%%）——"
+                             "疑似半速率/八度降调产物（档=%s，引擎自报 sr=%d）。"
+                             "处置：模型页对 %s 重新下载（启动复核会验声码器字节），"
+                             "或切档对照试听。", r * 100, prov, sr,
+                             PROVIDER_MODEL_KEYS.get(prov, "?"))
+            else:
+                logger.info("[TTS] 嗓音自测通过（档=%s 占比 %.2f%%）", prov, r * 100)
+        except Exception:  # noqa: BLE001
+            logger.debug("[TTS] 嗓音自测执行异常（忽略）", exc_info=True)
 
     def _ensure_loaded_inner(self) -> bool:
         # v1.0.65（深审 F3）：store.ensure 的冷下载（kokoro 包 348MB、分钟级）
