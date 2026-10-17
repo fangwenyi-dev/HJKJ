@@ -437,7 +437,7 @@ def test_satellites_view_registered_and_authed():
     src = HTTP_PY.read_text(encoding="utf-8")
     assert "register_view(HuijianSatellitesView)" in src
     i = src.index("class HuijianSatellitesView")
-    block = src[i:i + 2600]
+    block = src[i:i + 3600]   # v1.1.40：三级回退（握手实时）撑长类体，窗口随宽；断言不减
     assert "requires_auth = True" in block, "卫星台账含内网拓扑，必须 HA 令牌"
     assert '/api/huijian-ai/satellites"' in block
     assert "available" in block and "fw_version" in block
@@ -457,10 +457,29 @@ def test_ledger_fw_version_chain(tmp_path):
     assert '"noise_psk"' not in setup_block.split("Setup qrcode")[1][:200] \
         or "if k != " in setup_block, "setup_data 整包日志必须剔除 noise_psk（凭据面）"
     j = src.index("class HuijianSatellitesView")
-    view_block = src[j:j + 4200]
+    view_block = src[j:j + 5200]   # v1.1.40：类体撑长随宽（三级回退注释占位）
     assert "satellite_ledger_by_speakid" in view_block and \
-        'entry.data.get("fw_version"' in view_block, "视图必须两级回退（入驻→建账）"
+        'entry.data.get("fw_version"' in view_block, "视图必须三级回退（握手实时→入驻→建账）"
     assert '"fw_source"' in view_block, "陈旧版本必须如实标源，面板不作假"
+    # v1.1.40（用户令「取消入驻时版本，改为当前版本」）：实时源＝API 握手 device_info
+    # .project_version（entry_data.async_on_connect 每次连接/重连现读）。旧形态只有
+    # 入驻台账→建账快照两级：USB 直烧/OTA 升级后不重新入驻 ⇒ 10-17 实锤板上 2.2.9、
+    # 面板恒挂 2.2.6「可升级」。
+    # ⚠ 发版前补强（10-17 变异实测）：首版这两条判据写的是裸 "project_version" 与
+    # index 序——docstring 注释里也出现这个词，摘掉取值行/倒置分支两种变异都**照样绿**
+    # （G1/G2 实测 GREEN＝判据空转，作者注释里"删掉取值行当场红"的宣称不成立）。
+    # 现改判**取值行的代码形状**（getattr 精确串，注释里没有）与**分支次序**
+    # （if fw_handshake 早于 sid_ledger.get；倒置签名 if fw_live / elif fw_handshake 禁在）。
+    assert 'getattr(di, "project_version"' in view_block, \
+        "固件版本必须优先取 API 握手实时值（否则升级后面板永远挂入驻快照）"
+    assert view_block.index('getattr(di, "project_version"') < \
+        view_block.index("sid_ledger.get(speak_id"), \
+        "三级顺序钉：握手实时取值必须早于入驻台账读取"
+    assert "if fw_handshake:" in view_block and \
+        view_block.index("if fw_handshake:") < view_block.index("elif fw_live:"), \
+        "分支次序钉：握手实时必须排在台账档之前（三级回退不可倒序）"
+    assert "elif fw_handshake" not in view_block, \
+        "倒置签名禁令：台账档凌驾握手实时档的 elif fw_handshake 形不得出现"
     cf = (HTTP_PY.parents[1] / "config_flow.py").read_text(encoding="utf-8")
     assert '"fw_version":' in cf, "config_flow 建账时持久化 fw_version"
 

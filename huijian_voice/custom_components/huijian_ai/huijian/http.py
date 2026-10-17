@@ -151,11 +151,12 @@ class HuijianSatellitesView(HuijianHttpView):
 
     每行=一个已加载的卫星 config entry：身份(mac/speak_id/host:port)、展示名
     与区域（device registry 单一事实源）、在线态（RuntimeEntryData.available，
-    API 连接真源）、固件版本（两级回退：speak_id 台账（CMD20 入驻
-    POST，本运行期）→entry.data（建账时版本，可能陈旧，fw_source 标「入驻时」）
-    全缺=""=未上报）、以及设备端 OTA 接收口探测（entry_data.services 里带 ota
-    字样的 user service——现网 v2.1.35 恒空，固件 Phase 1 落地后自动点亮，面板
-    据此在「近场代发」与「远程下发」两态间切换，无需再改集成）。
+    API 连接真源）、固件版本（三级回退：API 握手实时值（device_info.project_version，
+    每次连接/重连现读）→ speak_id 台账（CMD20 入驻 POST，本运行期）→ entry.data
+    （建账时版本，可能陈旧，fw_source 标「入驻时」）全缺=""=未上报）、以及设备端 OTA
+    接收口探测（entry_data.services 里带 ota 字样的 user service——现网 v2.1.35 恒空，
+    固件 Phase 1 落地后自动点亮，面板据此在「近场代发」与「远程下发」两态间切换，
+    无需再改集成）。
 
     安全：requires_auth=True——含内网拓扑；加载项 ha_client 已持 HA 长期令牌，
     经 rest_get 调用（同 /api/huijian-ai/manage 系列数据面口径）。
@@ -192,15 +193,26 @@ class HuijianSatellitesView(HuijianHttpView):
                     if dev.area_id and (a := areas.async_get_area(dev.area_id)):
                         area_name = a.name or ""
             speak_id = str(entry.data.get("speak_id", "") or "")
-            # 固件版本两级回退（v1.0.65·契约 F-02）：speak_id 台账（CMD20 入驻
-            # POST，本运行期实时）→ entry.data（建账时持久化，跨重启可显但可能
-            # 陈旧，如实标源）。原 mac 台账（speakname 口）随死改名链一并移除。
+            # 固件版本三级回退（v1.1.40：用户令「取消入驻时版本，改为当前版本」）：
+            #  ①API 握手实时值——每次连接/重连 device_info.project_version 都从设备现读
+            #    （entry_data.async_on_connect 刷新），OTA/USB 重刷后 HA 一重连即更新；
+            #  ②speak_id 台账（CMD20 入驻 POST，本运行期）；
+            #  ③entry.data（建账时持久化，可能陈旧，如实标「入驻时」）。
+            # 旧形态只有②→③：USB 直烧/OTA 升级后不重新入驻 ⇒ 面板永远挂入驻快照
+            # （10-17 实锤：板上 boot 自证 2.2.9，面板仍显示 2.2.6「可升级」）。
+            fw_handshake = ""
+            if rd is not None:
+                di = getattr(rd, "device_info", None)
+                fw_handshake = str(getattr(di, "project_version", "") or "").strip()
             rec = sid_ledger.get(speak_id, {})
             fw_live = str(rec.get("fw_version", "") or "")
-            fw_source = "实时" if fw_live else ""
-            fw = fw_live or str(entry.data.get("fw_version", "") or "")
-            if fw and not fw_source:
-                fw_source = "入驻时"
+            if fw_handshake:
+                fw, fw_source = fw_handshake, "实时"
+            elif fw_live:
+                fw, fw_source = fw_live, "实时"
+            else:
+                fw = str(entry.data.get("fw_version", "") or "")
+                fw_source = "入驻时" if fw else ""
             out.append({
                 "entry_id": entry.entry_id,
                 "name": entry.title or entry.data.get("device_name", ""),
