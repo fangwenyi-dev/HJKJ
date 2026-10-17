@@ -252,6 +252,30 @@ def _readiness(ctx) -> dict:
     }
     if not out["asr_ready"]:
         out["asr_reason"] = str(getattr(asr, "last_reason", "") or "") or "引擎未加载（懒加载或补下载中）"
+    # ── v1.6.4 嗓音定案面（远程只读，免凭据）──────────────────────
+    # 起因：现网 Matcha 八度降调（女声变男声）复验时，1.6.3 的哨兵只进日志，而
+    # hassio 日志口对 HA REST 令牌 401、SSH 无该主机私钥 —— 外部完全无法定案，
+    # 只能反复问用户"给我一行日志"。把同一次自测结果与运行时身份放进本就免鉴权
+    # 的 /healthz（既有面，watchdog 在用），一次 GET 即可在
+    #   · 声码器字节与登记不符（重下载/import 可修）
+    #   · 字节一致但产物坏（库行为，须按平台/版本定位，重下载无用）
+    # 之间铁证分开。零新增端口、零凭据外泄（不含 token；sha 只出前 12 位）。
+    try:
+        tts = getattr(ctx, "tts", None)
+        vd = tts.voice_diag() if hasattr(tts, "voice_diag") else {}
+        if vd:
+            out["voice_diag"] = vd
+    except Exception:  # noqa: BLE001 观测面不得把健康探针弄成 500
+        logger.debug("[WS] voice_diag 读取失败", exc_info=True)
+    try:
+        import platform
+        import sherpa_onnx
+        out["runtime"] = {
+            "machine": platform.machine(),
+            "sherpa_onnx": getattr(sherpa_onnx, "__version__", "?"),
+        }
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 

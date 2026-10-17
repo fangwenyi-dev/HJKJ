@@ -331,6 +331,43 @@ class ModelStore:
                    and not self.verify_extras(k)]
         return flagged
 
+    def extras_diag(self, key: str) -> list[dict]:
+        """附属文件诊断（v1.6.4，远程定案面用；由嗓音自测低频触发，非热路径）：
+        逐一回 {file, expected, actual, size, match}。actual 只回 sha 前 12 位
+        （够判别不泄全串）。缺失→actual=None。永不抛：读盘异常 actual="err"。
+        这把「设备那份字节是否＝登记值」的问号，从只有容器内能看，变成一次
+        /healthz GET 就能定案——正是现网拿不到日志（hassio 口对 REST 令牌 401）
+        时缺的那把尺。"""
+        entry = self._manifest.get(key) or {}
+        out = []
+        for ef in (entry.get("extra_files") or []):
+            name = ef.get("file") or ""
+            if not name:
+                continue
+            expected = str(ef.get("sha256") or "")
+            rec = {"file": name, "expected": expected[:12] if expected else "",
+                   "actual": None, "size": None, "match": False}
+            try:
+                dest = self._resolved_dir(key, entry) / name
+                if dest.exists():
+                    rec["size"] = dest.stat().st_size
+                    if expected:
+                        import hashlib
+                        h = hashlib.sha256()
+                        with open(dest, "rb") as f:
+                            for blk in iter(lambda: f.read(1 << 20), b""):
+                                h.update(blk)
+                        digest = h.hexdigest()
+                        rec["actual"] = digest[:12]
+                        rec["match"] = digest == expected
+                    else:
+                        rec["actual"] = "no-expected"
+                        rec["match"] = True      # 无登记哈希＝无从判，视同放行不制造假红
+            except Exception:  # noqa: BLE001 —— 诊断件永不抛
+                rec["actual"] = "err"
+            out.append(rec)
+        return out
+
     # ── 状态外泄 ────────────────────────────────────────────────
     def snapshot(self) -> dict:
         with _STATUS_LOCK:

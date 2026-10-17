@@ -200,8 +200,17 @@ class HuijianSatellitesView(HuijianHttpView):
             #  ③entry.data（建账时持久化，可能陈旧，如实标「入驻时」）。
             # 旧形态只有②→③：USB 直烧/OTA 升级后不重新入驻 ⇒ 面板永远挂入驻快照
             # （10-17 实锤：板上 boot 自证 2.2.9，面板仍显示 2.2.6「可升级」）。
+            # v1.6.4 诚实闸（10-17 现网实锤「两台 online=False 却标实时」）：握手档
+            # device_info 是 async_on_connect 现读的真值，但集成/HA **重启窗口**里
+            # async_load_from_store 会把上次持久化的 device_info 快照灌回 rd（loaded
+            # ≠已连接），而 async_on_disconnect 只置 available=False、不清 device_info
+            # ⇒ 断连期间此快照仍是"上次在线值"，若设备这期间被 USB 重烧/OTA，面板会
+            # 拿陈旧快照谎标「实时」（旧两级回退此场景台账空、如实落「入驻时」，档位
+            # 在本改动上倒退）。只有 rd.available=True（本轮真连上过、握手值可信）才
+            # 认「实时」；否则落台账/入驻档如实标源。
+            fw_available = bool(getattr(rd, "available", False))
             fw_handshake = ""
-            if rd is not None:
+            if rd is not None and fw_available:
                 di = getattr(rd, "device_info", None)
                 fw_handshake = str(getattr(di, "project_version", "") or "").strip()
             rec = sid_ledger.get(speak_id, {})

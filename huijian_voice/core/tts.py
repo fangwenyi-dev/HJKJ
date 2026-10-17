@@ -762,6 +762,11 @@ class TtsEngine:
         self._cloud_voice_warned = False   # 云音色缺省告警只打一次
         # v1.0.55：上次云失败时刻（monotonic）；0=健康。见 _CLOUD_PIN_S 注释。
         self._cloud_fail_ts = 0.0
+        # v1.6.4：嗓音自测的结构化诊断（远程可读，见 voice_diag）。哨兵早已在测
+        # reported_sr/dur/hf，但只进日志——hassio 日志口对 REST 令牌 401 时现网
+        # 无法定案。这里把同一次测量落成字段，经 /healthz 暴露：一个 GET 即可在
+        # 「坏字节」与「库谎报采样率」间铁证分开。缺省 {}＝本进程未跑过自测。
+        self._voice_diag: dict = {}
         self._custom_sids: dict[str, int] = {}   # 加载时注入的自定义音色名→sid
         # 深审 R2 #6：模型加载/下载引擎级单飞门（后来者即返，不排队占线程）。
         self._load_gate = threading.Lock()
@@ -1139,31 +1144,75 @@ class TtsEngine:
             logger.debug("[TTS] 嗓音自测异常（忽略）", exc_info=True)
 
     def _self_test_voice(self) -> None:
-        """合成金句并量频谱。命名与 test_v163 接线钉对齐，永不抛。"""
+        """合成金句并量频谱 + 落定案诊断。命名与 test_v163 接线钉对齐，永不抛。
+
+        v1.6.4：除日志点名外，把**同一次测量**的结构化结果落进 self._voice_diag
+        （provider/reported_sr/dur_s/hf_pct/extras/verdict），经 /healthz 远程可读。
+        现网 hassio 日志口对 REST 令牌 401，此前只能靠用户翻日志；现在一个 GET
+        /healthz 就能在「声码器字节坏」与「字节对但库谎报采样率」间铁证分开：
+        extras[].match 全真却 dur≈2× → 非重下载可修（库行为）；有 match 假 → 刀1
+        离线无重取来源，指回"放 import/ 或开自动下载"。"""
+        diag: dict = {"provider": None, "reported_sr": None, "dur_s": None,
+                      "hf_pct": None, "verdict": "skipped", "extras": None,
+                      "ts": time.time()}
         try:
             tts = self._tts
             if tts is None:
+                self._voice_diag = diag
                 return
             prov = self.active_provider()
+            diag["provider"] = prov
             sid = int(self.settings.get("tts.sid", _default_sid_for(prov)) or 0)
             speed = float(self.settings.get("tts.speed", 1.05) or 1.05)
             audio = tts.generate("好的，已经帮你执行了", sid=sid, speed=speed)
             x = np.asarray(audio.samples, dtype=np.float64)
             sr = int(getattr(audio, "sample_rate", 0) or 16000)
+            diag["reported_sr"] = sr
+            diag["dur_s"] = round(len(x) / sr, 3) if sr else None
             r = _hf_ratio_excess(x, sr)
+            diag["hf_pct"] = None if r is None else round(r * 100, 2)
             if r is None:
+                self._voice_diag = diag
                 return
+            # 附属字节诊断（低频触发，非热路径；拿不到就 None 不影响判定）
+            try:
+                key = PROVIDER_MODEL_KEYS.get(prov)
+                ed = self.store.extras_diag(key) if key and getattr(self, "store", None) else None
+                diag["extras"] = ed
+                bad_bytes = bool(ed) and any((not e.get("match")) for e in ed)
+            except Exception:  # noqa: BLE001
+                bad_bytes = False
+                diag["extras"] = "err"
             if r >= 0.02:
-                logger.error("[TTS] 嗓音自测点名：金句 >4.1kHz 能量占比 %.1f%%"
-                             "（阈值 2%%，现网八度降调事故存档样本形制实测 25–30%%）——"
-                             "疑似半速率/八度降调产物（档=%s，引擎自报 sr=%d）。"
-                             "处置：模型页对 %s 重新下载（启动复核会验声码器字节），"
-                             "或切档对照试听。", r * 100, prov, sr,
-                             PROVIDER_MODEL_KEYS.get(prov, "?"))
+                diag["verdict"] = "bytes-mismatch" if bad_bytes else "octave-lib-suspect"
+                if bad_bytes:
+                    logger.error("[TTS] 嗓音自测点名：金句 >4.1kHz 能量占比 %.1f%%"
+                                 "（阈值 2%%）且声码器字节与登记不符——%s 离线无重取"
+                                 "来源？放 import/vocos 或面板开自动下载后重启（档=%s，"
+                                 "自报 sr=%d）", r * 100, key, prov, sr)
+                else:
+                    logger.error("[TTS] 嗓音自测点名：金句 >4.1kHz 能量占比 %.1f%%"
+                                 "（阈值 2%%，现网八度降调事故存档样本形制实测 25–30%%）"
+                                 "但声码器字节与登记一致——疑似半速率/八度降调产物非"
+                                 "重下载可修（档=%s，引擎自报 sr=%d，dur=%s）；本仓已"
+                                 "记待查，建议先切 Melo 档对照（已知好嗓默认）。",
+                                 r * 100, prov, sr, diag["dur_s"])
             else:
+                diag["verdict"] = "ok"
                 logger.info("[TTS] 嗓音自测通过（档=%s 占比 %.2f%%）", prov, r * 100)
         except Exception:  # noqa: BLE001
             logger.debug("[TTS] 嗓音自测执行异常（忽略）", exc_info=True)
+        finally:
+            self._voice_diag = diag
+
+    def voice_diag(self) -> dict:
+        """v1.6.4：最近一次嗓音自测的结构化诊断（供 /healthz 远程定案）。
+        纯读；本进程未跑过自测回 {}。永不抛。"""
+        try:
+            d = getattr(self, "_voice_diag", None)
+            return dict(d) if isinstance(d, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _ensure_loaded_inner(self) -> bool:
         # v1.0.65（深审 F3）：store.ensure 的冷下载（kokoro 包 348MB、分钟级）
