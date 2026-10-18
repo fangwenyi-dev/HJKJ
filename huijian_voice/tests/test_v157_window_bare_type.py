@@ -121,12 +121,37 @@ def test_bare_form_lands_in_all_synced_tables():
 
 
 def test_integration_tables_have_bare_form_long_first():
-    """集成侧无 HA 环境＝按本仓惯例钉源文本（test_multi_device_and_opener:376 同风格）。"""
-    const = (HERE / "custom_components" / "huijian_ai" /
-             "intent_window_const.py").read_text(encoding="utf-8")
-    mapping = const[const.index("WINDOW_NAME_MAPPING = {"):const.index("WINDOW_ALL_NAMES")]
-    assert '"内开内倒"' in mapping, "WINDOW_NAME_MAPPING 缺裸形（设备名段认不出）"
-    assert mapping.index('"内开内倒窗"') < mapping.index('"内开内倒"'), "长词键必须在前"
-    shared = (HERE / "custom_components" / "huijian_ai" /
-              "intent_device_shared.py").read_text(encoding="utf-8")
-    assert '"内开内倒"' in shared, "WINDOW_KEYWORDS 缺裸形"
+    """集成侧无 HA 环境＝按本仓惯例钉源文本（test_multi_device_and_opener:376 同风格）。
+
+    v1.6.5（刀5-c）：旧形是**子串文本钉**——`'"内开内倒"' in mapping` 只证明这串字
+    在文件里出现过。两种变异都躲得过去（工单在册）：①把裸形键挪进别的 EXCLUDE
+    表、mapping 里留个注释性字符串；②值改成泛称（"内开内倒": "窗"），键子串仍在、
+    语义已坏，133/242 全不红。改 **ast 判据**：解析真字面量——mapping 收为 dict、
+    键序取插入序、键→值**全等**核；WINDOW_KEYWORDS 收为 list 的**元素级成员**核。
+    注释与别的表里的同名串从此不算数。"""
+    import ast
+    from pathlib import Path
+    const_src = (HERE / "custom_components" / "huijian_ai" /
+                 "intent_window_const.py").read_text(encoding="utf-8")
+
+    def _literal(name, src_text):
+        tree = ast.parse(src_text)
+        for node in tree.body:
+            if (isinstance(node, (ast.Assign, ast.AnnAssign))
+                    and getattr(node, "targets", [None])[0] is not None):
+                tgt = node.targets[0] if isinstance(node, ast.Assign) else node.target
+                if isinstance(tgt, ast.Name) and tgt.id == name and node.value is not None:
+                    return ast.literal_eval(node.value)
+        raise AssertionError(f"源里找不到字面量 {name}（整表被搬走也红）")
+
+    mapping = _literal("WINDOW_NAME_MAPPING", const_src)
+    assert isinstance(mapping, dict) and mapping.get("内开内倒") == "内开内倒", \
+        f"裸形键缺失或值被改成泛称（假绿在册变异②）：{mapping.get('内开内倒')!r}"
+    keys = list(mapping)
+    assert keys.index("内开内倒窗") < keys.index("内开内倒"), "长词键必须在前（截胡纪律）"
+
+    shared_src = (HERE / "custom_components" / "huijian_ai" /
+                  "intent_device_shared.py").read_text(encoding="utf-8")
+    kws = _literal("WINDOW_KEYWORDS", shared_src)
+    assert isinstance(kws, list) and "内开内倒" in kws, \
+        "WINDOW_KEYWORDS 缺裸形元素（成员级判据，注释串不作数）"

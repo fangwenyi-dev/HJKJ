@@ -149,8 +149,28 @@ _STRIP_TAGS = re.compile(r"<\|[^<>|]*\|>")
 # 12:30:44 一条 <unk>SPK<unk>→fallback）。HomePod 遇静音是安静收轮；这里剥干净后纯静音轮塌成 ""，
 # 落回**既有、已测**的空转写静默契约（stt.text="" 带分因 → assist/固件空轮闸安静收轮）。
 # ⚠ 现网那条是 <unk>SPK<unk>：只剥尖括号会残留**裸 SPK**（非空）照样播「我不会」，
-# 所以裸大写控制词（SIL/SPK/UNK/PAD/BOS/EOS/CTC，AED 词表里的非语音标记、真人语音不会出现）也要一并剥。
-_STRIP_CTRL = re.compile(r"</?[a-zA-Z_][a-zA-Z0-9_-]*>|\b(?:SIL|SPK|UNK|PAD|BOS|EOS)\b")
+# 所以裸大写控制词（SIL/SPK/UNK/PAD/BOS/EOS，AED 词表里的非语音标记、真人语音不会出现）也要一并剥。
+# v1.6.5（刀4·B5 残余根修）：旧界 `\b` 在 Python(unicode) 下把 CJK 也算 `\w` ⇒
+# 「SPK嗯」「嗯SPK」这类控制词紧贴汉字的转写**根本不剥**（K 与 嗯 都是 \w，无边界），
+# 塌不成空、照样 fallback 播「这句话我还不会」＝1.5.4 那症状在 CJK 相邻形上复发。
+# 改判「左右不得粘连 ASCII 字母/数字」为界：CJK/标点/串首尾都算合法分离 ⇒ 该剥；
+# 但 `BOSE音箱` 里的 `BOS` 右邻 `E` 是 ASCII 字母 ⇒ 负向前瞻挡住不误剥（反向钉守住）。
+_STRIP_CTRL = re.compile(
+    r"</?[a-zA-Z_][a-zA-Z0-9_-]*>"
+    r"|(?<![A-Za-z0-9])(?:SIL|SPK|UNK|PAD|BOS|EOS)(?![A-Za-z0-9])")
+
+
+def _clean_transcript_text(raw: str) -> str:
+    """v1.5.4 转写出口**单点**：竖线形标签 + AED 控制符两级剥壳、全角空格与首尾空白。
+
+    刀5-c（v1.6.5）从 `_local_transcribe` 里抽出：旧形把两级 sub 摊在转写函数体内，
+    测试复刻 `_clean` 语义 ⇒ 测的是**复刻**、生产的接线变异（剥完不返回）测不出＝
+    假绿（10-08 五轮复核在册）。语义钉现在直接调本函数，接线钉仍钉
+    "调用在取 result.text 之后"——两半合起来才咬得住。永不抛。
+    """
+    t = _STRIP_TAGS.sub("", raw or "")
+    t = _STRIP_CTRL.sub("", t)
+    return t.replace("　", "").strip()
 
 # ── 云 STT 整包超时（N8）────────────────────────────────────────
 _CLOUD_TIMEOUT_DEFAULT_S = 12.0
@@ -558,18 +578,19 @@ class AsrEngine:
                 stream = rec.create_stream()
                 stream.accept_waveform(const.SAMPLE_RATE, samples)
                 rec.decode_stream(stream)
-                text = _STRIP_TAGS.sub("", stream.result.text or "")
-                # v1.5.4：再剥 AED 尖括号控制符（<sil>/<unk>/</s>/<pad>/<SPK>…）。纯静音轮剥完即塌成 ""，
-                # 落回**既有**空转写静默契约（stt.text="" 带分因，assist/固件空轮闸安静收轮），
-                # 不再作为非空文本越过判据、被 cascade 成「这句话我还不会」对空气播报。
-                text = _STRIP_CTRL.sub("", text)
+                # v1.5.4：控制 token 剥壳（纯静音轮剥完塌成 ""，落回**既有**空转写
+                # 静默契约——stt.text="" 带分因，assist/固件空轮闸安静收轮，不再
+                # 被 cascade 成「这句话我还不会」对空气播报）。
+                # v1.6.5（刀5-c）：两级 sub + 全角空格 + strip 收进单点
+                # _clean_transcript_text（语义钉直调真函数，不再测复刻——假绿在册）。
+                text = _clean_transcript_text(stream.result.text or "")
                 # 复位？1.13.7 的 OfflineRecognizer 根本没有那个方法（实测 dir()），
                 # 旧形那一行每轮抛 AttributeError 被吞——它从未做任何复位，而且离线
                 # 形态本来就每轮新建 stream。
                 # 并发安全不靠它：真依据是 DecodeStream 全程 const＋decoder 无实例态
                 # ＋ORT Session::Run 线程安全，代价上限由上面的准入位管。
                 self.last_used = time.time()
-                return text.replace("　", "").strip()
+                return text
             finally:
                 self._decode_gate.release()
         except Exception:

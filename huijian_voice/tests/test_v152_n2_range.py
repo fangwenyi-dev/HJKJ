@@ -67,10 +67,15 @@ def test_150_and_101_rejected_100_ok():
 
 
 def test_relative_and_special_and_gear_still_pass():
-    """不误拦（判据只吃裸绝对值）：+20/-20 相对档、max、"3档" 全部照常下发。"""
+    """不误拦（判据只吃裸绝对值）：+20/-20 相对档、max、"3档" 全部照常下发。
+
+    v1.6.5（刀5-c）：旧形 `ok is not None` 对 bool **恒真**＝放行侧根本没断言
+    （闸整个摘掉也绿）。改真判据：放行＝**必须真下发**（ha.calls 非空）且回执
+    成功（ok is True）——量程闸被摘/被改成一律放行时，本钉与主案仍各自咬得住。"""
     for delta in ("+20", "-20", "max", "min", "3档", "50"):
         ha, ok, reply = _run(_adj(delta))
-        assert ha.calls and ok is not None, (delta, reply)
+        assert ha.calls, (delta, "应下发却零调用")
+        assert ok is True, (delta, ok, reply)
         assert "0 到 100" not in reply, (delta, reply)
 
 

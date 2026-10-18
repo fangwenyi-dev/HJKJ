@@ -1110,6 +1110,12 @@ class Pipeline:
         # v1.5.8 时间语音批：相对延时排程袋（内存调度）。task 强引用防 GC；
         # 上限 DELAY_MAX_PENDING 防堆积。重启即清（不谎称持久）。
         self._delay_tasks: set[asyncio.Task] = set()
+        # v1.6.5（刀5-b）语音撤单：task → 预约账 {body, sec, origin, ts}。
+        # 按 **origin 分桶**语义＝撤单只撤本发起源的预约（一颗卫星说「取消预约」
+        # 不得吞掉另一台设备挂的单；工单低危残留"全局袋不按 origin 分桶，一颗
+        # 卫星可占满 16 格"同族收口）。与 _delay_tasks 并存：袋管上限/停机，
+        # 账管可点名撤单。done 的 task 由撤单扫描顺手剪枝。
+        self._delay_booking: "OrderedDict[asyncio.Task, dict]" = OrderedDict()
         # v1.1.20（去重分桶的消费侧）：命中判定同样按 (origin, text)——见下方 _dedup_gate
     # v1.0.62 P0-1/P0-2：漏斗指标 + 兜底语料回流（观测件，永不干预主链；
         # 测试用 __new__ 构造的 Pipeline 无此属性，钩子端 getattr 容错）。
@@ -1358,6 +1364,11 @@ class Pipeline:
         # 延时形状的句子在切链前接管：句首前导+干净正文＝排程到点执行；其余（链中
         # 延时/越界）＝如实拒并教分开说。非延时句 has_delay_shape=False 直接放行，
         # 主链逐字不变（既有链族钉零触碰）。
+        # v1.6.5（刀5-b）：撤单专令同闸出口——「取消预约」不是延时形状句，但归宿
+        # 是同一条延时族；放在形状判据**之前**，两形各走各的门。
+        cancel = self._delay_cancel_gate(text, origin)
+        if cancel is not None:
+            return cancel
         dly = self._delay_gate(text, origin)
         if dly is not None:
             return dly
@@ -2591,17 +2602,25 @@ class Pipeline:
             return Reply("这条定时指令我先不排，换个简单的说法再试。",
                          "delay", ok=False, trace=["延时拒排:判据异常"])
 
-    def _delay_gate(self, text: str, origin: str) -> Optional[Reply]:
-        """延时形状句的当场处置；非延时句返回 None（放行主链）。永不抛。"""
+    def _delay_verdict(self, text: str):
+        """延时形状句的**纯裁决**（零副作用，v1.6.5 刀5-a 从 _delay_gate 抽出单点）。
+
+        返回 `(kind, say, body, sec)`：
+          · ("pass", None, "", 0)      非延时形状 ⇒ 主链照常；
+          · ("nosched", say, "", 0)    形状对但这批不排（链中延时/越界…）；
+          · ("refuse", say, "", 0)     正文不可无人值守（风险族/指代）；
+          · ("schedule", "", body, sec) 可排程。
+        异常语义与 _delay_gate 逐字同源：判据故障＝pass（保守到不发虚），
+        正文拒层故障＝refuse（拒层本身保守）。**话术只在这里生成一份**——
+        真流量（_delay_gate）与调试面板（dry_run）必须说同一句话，A12 那条
+        "面板展示真实裁决"的自立规矩同样管延时腿（旧 dry_run 不含本闸 ⇒
+        面板说「立即执行」，真流量 source=delay 排到了未来＝工单 C 组实锤）。
+        """
         try:
             if not delay.has_delay_shape(text):
-                return None
+                return ("pass", None, "", 0)
             parsed = delay.parse_leading(text)
             if parsed is None:
-                # ②/③：认得出是延时句，但这批形状不排（链中延时/正文再含延时/越界）。
-                # 话术分两档：明显是"多件事带时间"（连接词/逗号串）→ 教**分开说**；
-                # 其它时间安排形（如「七点十分后开灯」）→ 只说不把握、给标准样例，
-                # **绝不**猜一个时刻去执行。
                 combo = bool(re.search(r"然后|接着|顺便|并且|同时|[，,、]", text))
                 if delay.DELAY_MIN_S <= (delay.delay_seconds(text) or 0) <= delay.DELAY_MAX_S:
                     if combo:
@@ -2613,14 +2632,32 @@ class Pipeline:
                 else:
                     say = ("这个等待时长超出我的支持范围（最长 1 小时），"
                            "可以先用「当…就…」建个语音自动化，或换个短点的等待")
-                logger.info("[级联] 延时形状接管→不排程不谎报: %r", text)
-                return Reply(say, "delay", ok=False, trace=[f"延时不排:{text}"])
+                return ("nosched", say, "", 0)
             sec, body, _phrase = parsed
-            # v1.6.2（刀3·A3 排程拒层）：不可无人值守的正文当场拒排（docstring 详）
             refuse = self._delay_body_refusal(body)
             if refuse is not None:
+                return ("refuse", refuse.text, body, sec)
+            return ("schedule", "", body, sec)
+        except Exception:  # noqa: BLE001 —— 本闸任何意外＝放行主链（保守到不发虚）
+            logger.exception("[级联] 延时裁决异常 → 放行主链")
+            return ("pass", None, "", 0)
+
+    def _delay_gate(self, text: str, origin: str) -> Optional[Reply]:
+        """延时形状句的当场处置；非延时句返回 None（放行主链）。永不抛。
+
+        v1.6.5（刀5-a）：裁决抽到 _delay_verdict（与 dry_run 面板同源），本函数
+        只保留**落袋动作**（上限闸、create_task、预约回执话术）。"""
+        try:
+            kind, say, body, sec = self._delay_verdict(text)
+            if kind == "pass":
+                return None
+            if kind == "nosched":
+                logger.info("[级联] 延时形状接管→不排程不谎报: %r", text)
+                return Reply(say, "delay", ok=False, trace=[f"延时不排:{text}"])
+            if kind == "refuse":
                 logger.info("[级联] 延时正文拒排: %r（原话:%r）", body, text)
-                return refuse
+                return Reply(say, "delay", ok=False,
+                             trace=[f"延时拒排:{body}"])
             tasks = getattr(self, "_delay_tasks", None)
             if tasks is None:                 # __new__ 手搓夹具无此袋 → 不排（保守）
                 return Reply("稍后再试", "delay", ok=False, trace=["延时袋缺席"])
@@ -2631,12 +2668,73 @@ class Pipeline:
             t = asyncio.create_task(self._fire_delay(body, sec, origin))
             tasks.add(t)
             t.add_done_callback(tasks.discard)
+            # v1.6.5（刀5-b）：记账（撤单闸的判据源）。done_callback 只管 _delay_tasks
+            # 的袋，账目由剪枝维护——两条腿独立，任何一边漏剪都不过是内存里
+            # 一条已完约，不碰行为。
+            booking = getattr(self, "_delay_booking", None)
+            if booking is not None:
+                booking[t] = {"body": body, "sec": sec, "origin": origin,
+                              "ts": time.time()}
             logger.info("[级联] 相对延时已排程 %ds: %r（原话:%r）", sec, body, text)
             # 回执＝预约确认（将来时），绝不"已做完"。
             return Reply(f"好的，「{body}」我记下了，{self._secs_desc(sec)}后执行",
                          "delay", ok=True, trace=[f"延时排程:{sec}s->{body}"])
         except Exception:  # noqa: BLE001 —— 本闸任何意外＝放行主链（保守到不发虚）
             logger.exception("[级联] 延时闸异常 → 放行主链")
+            return None
+
+    # v1.6.5（刀5-b）撤单词汇（**专令词表，绝不复用裸「取消」**）：
+    # 裸「取消」是确认环应答词（_CONFIRM_NO），无环时它今天走 fallback；把它的
+    # 全局语义改成"撤掉所有预约"＝一次跨族行为变更（审计 F 族"判据被别处同名
+    # 喂饱"同型坑——量具课第 N 次点名）。只认带预约宾语的整句等值形。
+    _DELAY_CANCEL_WORDS = frozenset({
+        "取消预约", "撤销预约", "取消定时", "撤销定时", "取消定时指令",
+        "取消所有预约", "取消所有定时", "撤掉预约", "撤掉定时", "取消刚才的预约",
+    })
+
+    def _delay_cancel_gate(self, text: str, origin: str) -> Optional[Reply]:
+        """语音撤单（v1.6.5 刀5-b）。专令整句命中 ⇒ 撤**本 origin** 的在途预约。
+
+        判据面三条纪律：
+          · 按 **origin 分桶**：一台卫星的撤单不吞别的发起源的预约（工单在册
+            "低危残留：全局袋不按 origin 分桶"同族收口）；面板 origin="panel"
+            同规则（面板挂的单归面板撤）。
+          · 延时轮隔离旗内不响应（_delay_turn_isolated）：到期重入的正文撞进
+            词表＝自己撤自己同源的预约，A3 同律。
+          · 无在途预约 ⇒ 如实播"没有待执行的定时指令"（零假成功）。
+        永不抛；异常＝返回 None 放行主链。"""
+        try:
+            if _delay_turn_isolated():
+                return None
+            token = _strip_punct(text or "")
+            if token not in self._DELAY_CANCEL_WORDS:
+                return None
+            booking = getattr(self, "_delay_booking", None)
+            tasks = getattr(self, "_delay_tasks", None) or set()
+            if booking is None:               # __new__ 手搓夹具无账 → 不谎报撤了
+                return Reply("没有待执行的定时指令。", "delay", ok=True,
+                             trace=["延时撤单:无账(夹具)"])
+            # 剪枝：done 的 task 不再可撤（顺带回收账目内存）
+            for t in [t for t, b in booking.items() if t.done()]:
+                booking.pop(t, None)
+            mine = [(t, b) for t, b in booking.items()
+                    if (b.get("origin") or "panel") == (origin or "panel")]
+            if not mine:
+                return Reply("没有待执行的定时指令。", "delay", ok=True,
+                             trace=["延时撤单:本源无约"])
+            for t, _b in mine:
+                t.cancel()
+                booking.pop(t, None)
+                tasks.discard(t)
+            logger.info("[级联] 语音撤单 %d 条（origin=%r: %s）", len(mine), origin,
+                        "、".join(f"「{b.get('body')}」" for _t, b in mine))
+            n = len(mine)
+            say = (f"已取消{self._secs_desc(mine[0][1].get('sec') or 0)}后"
+                   f"「{mine[0][1].get('body')}」的定时指令"
+                   if n == 1 else f"已取消 {n} 条定时指令")
+            return Reply(say, "delay", ok=True, trace=[f"延时撤单:{n}"])
+        except Exception:  # noqa: BLE001 撤单闸故障＝放行主链（绝不吞句）
+            logger.exception("[级联] 延时撤单异常 → 放行主链")
             return None
 
     async def _fire_delay(self, body: str, sec: int, origin: str) -> None:
@@ -2656,10 +2754,12 @@ class Pipeline:
             reply = await self.handle(body, origin)
             logger.info("[延时] 到期执行 %r → ok=%s reply=%r", body, reply.ok, reply.text)
         except asyncio.CancelledError:
-            # v1.6.2：撤单出口如实——当前唯一取消路径是**停机**（main.shutdown）；
-            # "主动撤单"（按 origin 存 booking 的语音撤单）尚未实现＝刀5 在册，
-            # 旧注释把它写成已具备能力＝对用户不实（本仓红线：注释不得宣称未做的）。
-            logger.info("[延时] 预约被取消（停机）: %r", body)
+            # v1.6.2 记下：当时唯一取消路径是**停机**（main.shutdown），"主动撤单"
+            # 未实现＝刀5 在册（旧注释把它写成已具备能力＝对用户不实，本仓红线）。
+            # v1.6.5（刀5-b）**已实现**：_delay_cancel_gate 按 origin 撤本发起源的
+            # 预约 ⇒ 现在两条取消路径（停机全撤 / 语音专令按源撤）都走这里。
+            # 到期重入的正文撞进撤单表已被 _delay_turn_isolated 挡住，不会自撤。
+            logger.info("[延时] 预约被取消（停机或语音撤单）: %r", body)
             raise
         except Exception:  # noqa: BLE001
             logger.exception("[延时] 到期执行异常（不影响主链）")
@@ -3482,9 +3582,75 @@ class Pipeline:
             logger.exception("[级联] 歧义收敛异常（按不收敛处理）")
             return None
 
+    def _ambiguity_device_view(self, pool) -> list:
+        """把候选池折叠到**设备级**、返回代表名（v1.6.5 刀4·B2）。
+
+        归堆判据＝注册表 `device_id`（ha_client._entity_device，executor 批量播报
+        "台"口径同源）；**没挂上注册表的实体一律按 entity_id 单独保留、绝不按名字
+        归堆**——同名孪生（两台 light 都叫「射灯」）确实是两台设备，按名字折叠会把
+        "2 台"念成"1 台"＝v1.1.28 金标 #17 钉过的不实陈述反向复发。宁可对没表的
+        零件多报（＝旧形行为），不可对真设备少报。
+        代表名**优先取可动作域那条**（域不在 capability.UNTOGGLEABLE_DOMAINS
+        单点表里）：「平开窗 ① 开启」不得顶替「平开窗 开窗器」当整台设备的
+        名字——旧 clarify 列名里混进按钮名，正是工单"教用户去打开一个按钮"
+        的病灶。
+        **只用于对外话术**——三级证据/收窄/挂环的安全判据一律不动（那是
+        执行侧"宁漏勿错"的领域，报数侧是"诚实陈述"的领域，判据不同源）。
+        永不抛：拿不到表 ⇒ 退实体级计数（不会比旧形更离谱）。
+        """
+        try:
+            dev_map = getattr(self.ha, "_entity_device", None) or {}
+        except Exception:  # noqa: BLE001
+            dev_map = {}
+        buckets: dict = {}          # key → (可动作优先标志, 代表名)
+        for c in (pool or []):
+            if not isinstance(c, dict):
+                continue
+            eid = str(c.get("entity_id") or "")
+            nm = self._cand_name(c) or eid
+            if not nm:
+                continue
+            key = dev_map.get(eid) or f"eid:{eid or nm}"
+            dom = eid.split(".", 1)[0] if eid else ""
+            actionable = 0 if dom in capability.UNTOGGLEABLE_DOMAINS else 1
+            prev = buckets.get(key)
+            if prev is None or actionable > prev[0]:
+                buckets[key] = (actionable, nm)
+        return [v[1] for v in buckets.values()]
+
+    # 示例句动词表（v1.6.5 B2）：话术里的例子必须与用户**本条口令的意图**同向，
+    # 不再恒「打开」（旧形教用户去「打开」一个他要关的东西）。保守回落「打开」
+    # ＝旧文案，映射不到不新造。
+    _AMB_CN_ACTIONS = {"open": "打开", "close": "关闭", "stop": "暂停",
+                       "vent": "内倒", "tilt": "内倒"}
+
+    @classmethod
+    def _ambiguity_verb(cls, intent: str, args: dict) -> str:
+        try:
+            act = str((args or {}).get("action") or "").strip().lower()
+            if act in cls._AMB_CN_ACTIONS:
+                return cls._AMB_CN_ACTIONS[act]
+            intent = str(intent or "")
+            if intent in ("TurnDeviceOff", "HassTurnOff"):
+                return "关闭"
+            if intent == "AdjustDeviceAttribute":
+                return "调整"
+            if intent == "SetDeviceMode":
+                return "设置"
+            if intent == "HassLock":
+                return "锁上"
+            if intent == "HassUnlock":
+                return "解锁"
+            if intent == "PauseDevice":
+                return "暂停"
+            return "打开"
+        except Exception:  # noqa: BLE001 话术映射故障＝回落旧文案
+            return "打开"
+
     @staticmethod
     def _ambiguity_clarify_say(names: list, n_entities: int = 0,
-                               area: str = "") -> str:
+                               area: str = "", verb: str = "打开",
+                               example_area: str = "") -> str:
         """收不住候选时的话术：列出来让用户说清，绝不替他挑一台（v1.1.28）。
 
         n_entities＝候选**实体**台数（同名孪生时 distinct 只有一个名字，但确实是两台
@@ -3497,20 +3663,32 @@ class Pipeline:
           · **给照做得到的下一步**——用户**已经带了房间名**时，"带上房间名再说一次"
             是死循环（照着做还是死循环）。area 在句里 ⇒ 直接列出候选真名让用户挑
             名字；无 area ⇒ 才引导补房间名，且示例用真实候选名而非硬编码「办公室
-            的射灯」（那句在客厅场景是指错地方）。"""
+            的射灯」（那句在客厅场景是指错地方）。
+
+        v1.6.5（刀4·B2 根修）：上面那条"示例用真名"只做了一半——
+          · 无 area 分支的示例**房间**仍硬编码「客厅」（候选真在卧室时指错地方，
+            与本函数自己批评的射灯例同罪）；
+          · 动词**恒「打开」**（用户说「关闭」撞上歧义，我们教他去「打开」）。
+        修：example_area/verb 一律由调用点按**候选真形制**传入；example_area 确证
+        不了（候选没挂区域）时示例不再虚构任何房间，改说"先说它所在的房间"。
+        默认参保持旧文案形，既有一字钉（v1.5.5 套件）不受扰动。"""
         nm: list = [str(n) for n in (names or []) if str(n)]
         others = "、".join(nm[:3]) + ("…" if len(nm) > 3 else "")
         n = max(int(n_entities or 0), len(nm))
         lead = (f"家里有 {n} 台设备名字相近（{others}），我没法确定你要哪一台，"
                 f"这次先不动。")
+        verb = str(verb or "打开")
         if area:
             if nm:
                 return (lead + "你说的是哪一台？下次直接带上它的名字"
-                        f"（比如「打开{area}的{nm[0]}」）。")
+                        f"（比如「{verb}{area}的{nm[0]}」）。")
             return lead + "下次直接带上设备名字再说一次。"
         if nm:
-            return (lead + "带上房间名再说一次"
-                    f"（比如「打开客厅的{nm[0]}」）。")
+            ea = str(example_area or "").strip()
+            if ea:
+                return (lead + f"带上房间名再说一次（比如「{verb}{ea}的{nm[0]}」）。")
+            return (lead + f"带上房间名再说一次（先说它所在的房间，"
+                    f"再说「{verb}{nm[0]}」）。")
         return lead + "带上房间名或设备名字再说一次。"
 
     @staticmethod
@@ -3621,15 +3799,36 @@ class Pipeline:
                 # 用全候选池，同一台窗的按钮/数值/传感器兄弟被数成"名字相近的设备"，
                 # 2 台窗播成"9 台设备"＝不实陈述。用户已带区域时引导也换成挑名字，
                 # 不再让他重复一个已经说过的东西。
-                pool_names = list(dict.fromkeys(
+                # v1.6.5（刀4·B2）：主域收窄只在域证据命中时发生；主域为空/主域本身
+                # 是 button/number（t0 泛窗落成 button+cover+number 时 main 走
+                # attribute_domain_target 缺席形）/候选里没主域 ⇒ pool is cands，
+                # 同机零件仍被数成"独立设备"（工单实测 6 台/2 台）。话术分母改**设备级
+                # 折叠视图**（注册表 device_id 归堆，与批量播报"台"口径同源）：域证据
+                # 缺不缺，一台设备的零件都只数一台。示例动词/房间也换成真形制——
+                # 旧形恒「打开」＋硬编码「客厅」：说「关闭」撞上歧义被教去「打开」，
+                # 候选在卧室示例却是客厅＝指错地方。
+                pool_names = self._ambiguity_device_view(pool) or list(dict.fromkeys(
                     [self._cand_name(c) for c in pool if self._cand_name(c)]))
                 said_area = ""
                 for sl in tgt:
                     if isinstance(sl, dict) and str(sl.get("area") or "").strip():
                         said_area = str(sl.get("area") or "").strip()
                         break
-                text = self._ambiguity_clarify_say(pool_names, len(pool),
-                                                   area=said_area)
+                # 示例房间：用户没带区域时，取候选**真挂着的区域**（entity_area 表），
+                # 取不到 ⇒ 空串，让话术函数走"不虚构房间"的保守支。
+                example_area = ""
+                if not said_area:
+                    for c in pool:
+                        ea_name = str((entity_area or {}).get(
+                            str(c.get("entity_id") or ""), "") or "").strip()
+                        if ea_name:
+                            example_area = ea_name
+                            break
+                text = self._ambiguity_clarify_say(pool_names, len(pool_names),
+                                                   area=said_area,
+                                                   verb=self._ambiguity_verb(
+                                                       plan.intent, args),
+                                                   example_area=example_area)
                 logger.info("[级联] 歧义目标 全池%d台/主域池%d台（%s）→ 无收敛证据，"
                             "列出让用户说清", len(cands), len(pool),
                             "、".join(pool_names[:3]))
@@ -3640,8 +3839,11 @@ class Pipeline:
             self._narrow_target(args, pick, domain_note)
             # 1.5.5 同律：确认环那句也按**主域收窄池**报台数/列名（旧形同 clarify
             # 一样拿全池 distinct，把一台窗的按钮/传感器数成"名字相近的设备"）。
-            conf_names = list(dict.fromkeys(
-                [self._cand_name(c) for c in pool if self._cand_name(c)]) or distinct)
+            # v1.6.5（刀4·B2）：同 clarify——主域证据缺席时收窄不发生，分母改
+            # **设备级折叠视图**（一台设备的零件只数一台，列名优先可动作域那条）。
+            # `pick` 的选取判据（三级证据）**一字不动**——那是执行侧安全语义。
+            conf_names = self._ambiguity_device_view(pool) or (list(dict.fromkeys(
+                [self._cand_name(c) for c in pool if self._cand_name(c)])) or distinct)
             others = "、".join(conf_names[:3]) + ("…" if len(conf_names) > 3 else "")
             text = (f"家里有 {len(conf_names)} 台设备名字相近（{others}）。"
                     f"我先对「{pick}」执行，说「确认」就这么办，说「取消」先不动。")
@@ -3753,6 +3955,38 @@ class Pipeline:
         # 优先于单发（_cascade 里 _try_compound 在 _match_pair 之前），旧 dry_run
         # 不含它 ⇒ 面板说「未命中」而设备其实已按链执行。复用同一条逐腿裁决
         # （零执行、零记账；origin 固定 "panel"）。
+        # v1.6.5（刀5-a/b）：同一条规矩管延时腿——真流量里 _delay_gate 跑在级联
+        # **之前**（handle :1361），旧 dry_run 不含它 ⇒ 面板对「十秒后关灯」类
+        # 句子展示"立即执行"的 plan，真流量却 source=delay 排到了未来（或拒排）
+        # ＝面板与线上两套裁决（工单 C 组在册）。裁决走 _delay_verdict 单点
+        # （与真流量同一份话术、同一判据），面板**零落袋**——只报"会排程/会拒"，
+        # 绝不 create_task。
+        # v1.6.5（刀5-b）同律：撤单专令面板也必须报「会撤几条」，**零 cancel**
+        # ——调试不该动生产预约。
+        if (_strip_punct(text or "") in self._DELAY_CANCEL_WORDS
+                and not _delay_turn_isolated()):
+            booking = getattr(self, "_delay_booking", None) or {}
+            live = [b for _t, b in booking.items() if not _t.done()]
+            out = {"nlu_enabled": True, "plan": None, "fast_path": None,
+                   "klar": None, "delay": True, "delay_action": "cancel"}
+            out["final"] = (f"（面板预演，不会真撤）这句会撤掉你当前挂的 "
+                            f"{len(live)} 条定时指令" if live else
+                            "（面板预演）这句会如实答「没有待执行的定时指令」")
+            return out
+        d_kind, d_say, d_body, d_sec = self._delay_verdict(text)
+        if d_kind != "pass":
+            out = {"nlu_enabled": True, "plan": None, "fast_path": None,
+                   "klar": None, "delay": True}
+            if d_kind == "schedule":
+                out["delay_action"] = "schedule"
+                out["delay_seconds"] = d_sec
+                out["delay_body"] = d_body
+                out["final"] = (f"（面板预演，不会真排）将排程：{self._secs_desc(d_sec)}"
+                               f"后执行「{d_body}」")
+            else:
+                out["delay_action"] = d_kind   # nosched / refuse
+                out["final"] = d_say
+            return out
         chain_reply, chain_plan, _chain_legs, _chain_end = await self._chain_decide(
             text, "panel")
         fp_plan, kl_plan = await self._match_pair(text, "panel")   # 与真流量同构（并行）

@@ -1110,7 +1110,20 @@ class Executor:
             return segs
         return segs
 
-    def _adjust_range_refuse(self, name: str, args: dict) -> Optional[str]:
+    # v1.6.5（刀4·B4）：非百分比族的量程来源单点表——
+    # (domain, attribute) → (min 键, max 键, 集成侧缺省 min, 缺省 max)。
+    # climate 行那两个缺省**逐字取自**集成 `intent_adjust_attribute
+    # .adjust_climate_temperature` 的 `.get(ATTR_MIN_TEMP, 10)/.get(ATTR_MAX_TEMP, 30)`：
+    # 实体没上报属性时集成仍会按 10~30 钳位并回成功——core 闸不同口径就对不上
+    # 真行为，「温度调到200度」被钳成 30 度执行、播「已设为30度」＝工单点名的谎报族。
+    # number/value 行只判实体**显式上报**的 min/max（缺省=None＝造不出缺省就不判）；
+    # color_temperature（K）等其余族来源不明＝不判（v1.1.15 判不准就不判）。
+    _RANGE_SOURCES = {
+        ("climate", "temperature"): ("min_temp", "max_temp", 10.0, 30.0),
+        ("number", "value"): ("min", "max", None, None),
+    }
+
+    async def _adjust_range_refuse(self, name: str, args: dict) -> Optional[str]:
         """v1.5.2（N2，1.5.1 现网实锤 21:47/21:48）：百分比族 Adjust 的**越界绝对值**
         在分发前如实拦下。现网形：「把亮度调到200」→ 表规则 :207 裸数直收（v1.1.27
         量程闸只拦 4 位裸数，3 位的 150/200 漏网）→ 集成把 200 当量程顶钳位执行，
@@ -1120,26 +1133,84 @@ class Executor:
         clamp（那是合法"调高20"），max/min/中文数词已在上游换算，都不是本闸射程。
         射程＝百分比语义族：brightness/position/fan_speed/humidity/volume/opacity；
         temperature（℃）与 color_temperature（K）有各自量程，value（number 域量程
-        逐实体不同）一概不判——判不准就不判（v1.1.15 纪律），绝不把合法句拦死。"""
+        逐实体不同）一概不判——判不准就不判（v1.1.15 纪律），绝不把合法句拦死。
+
+        v1.6.5 刀4两改（本会话，1.5.9 深审工单 B3/B4）：
+          · B4：非百分比族不再一律放行——按 `_RANGE_SOURCES` 读**目标实体注册表
+            量程**判越界，与集成钳位同口径（缺省值同源自集成代码）；候选里出现
+            来源不明的实体＝整条不判（宁漏勿错）。多台时只要有一台量程够就放行
+            （集成按台处理，拦死全部＝误伤合法句）。
+          · B3：调用闸位后移到能力预裁/可用态**之后**（见 run 循环）——不支持
+            亮度的灯说「亮度调到200」，先播"这台不支持亮度"（真因），不再先播
+            "只有0到100"（换个数照样不行＝误导）。本函数逻辑与闸位无关，两处
+            各自独立成立。"""
         try:
             if name != "AdjustDeviceAttribute":
                 return None
             attr = str((args or {}).get("attribute") or "").strip()
-            if attr not in self._PERCENT_ATTRS:
-                return None
             raw = str((args or {}).get("delta") or "").strip().rstrip("%％")
             if not raw or raw in ("max", "min") or raw[0] in "+-":
                 return None
+            if attr in self._PERCENT_ATTRS:
+                try:
+                    val = float(raw)
+                except ValueError:
+                    return None
+                if not 0.0 <= val <= 100.0:
+                    zh = ATTR_CN.get(attr, attr)
+                    return (f"抱歉，{zh}只有 0 到 100，「{raw}」这个数我做不到")
+                return None
+            # ── B4：非百分比族按实体注册表量程判 ──
+            tgt = (args or {}).get("target")
+            has_tgt = isinstance(tgt, list) and bool(tgt)
+            raw_eid = (args or {}).get("entity_id")
+            eids = ([raw_eid] if isinstance(raw_eid, str) and "." in raw_eid
+                    else [e for e in (raw_eid or [])
+                          if isinstance(e, str) and "." in e])
+            if not has_tgt and not eids:
+                return None                    # 无目标=批量/全屋语义，不判
+            states = await self.ha.states()
+            if not states:
+                return None                    # 状态读空=放行（与能力预裁同纪律）
+            if has_tgt:
+                cands = capability.resolve_candidates(
+                    states, getattr(self.ha, "_entity_area", {}) or {}, tgt)
+            else:
+                cands = [states[e] for e in eids if e in states]
+            if not cands:
+                return None
+            ranges: list = []
+            for c in cands:
+                eid = str((c or {}).get("entity_id") or "")
+                src = self._RANGE_SOURCES.get((eid.split(".", 1)[0], attr))
+                if src is None:
+                    return None                # 一台来源不明=整条不判（宁漏勿错）
+                lo_k, hi_k, d_lo, d_hi = src
+                a = (c.get("attributes") or {})
+                lo, hi = a.get(lo_k, d_lo), a.get(hi_k, d_hi)
+                try:
+                    lo, hi = float(lo), float(hi)
+                except (TypeError, ValueError):
+                    return None
+                ranges.append((lo, hi))
+            if not ranges:
+                return None
+            val_s = raw.rstrip("度")
             try:
-                val = float(raw)
+                val = float(val_s)
             except ValueError:
                 return None
-            if not 0.0 <= val <= 100.0:
-                zh = ATTR_CN.get(attr, attr)
-                return (f"抱歉，{zh}只有 0 到 100，「{raw}」这个数我做不到")
-            return None
+            if any(lo <= val <= hi for lo, hi in ranges):
+                return None                    # 有台做得到=照常下发（集成逐台判）
+            lo, hi = ranges[0]
+
+            def _fmt(x: float) -> str:
+                return str(int(x)) if float(x).is_integer() else str(x)
+            zh = ATTR_CN.get(attr, attr)
+            return (f"抱歉，{zh}的量程只有 {_fmt(lo)} 到 {_fmt(hi)}，"
+                    f"「{val_s}」这个数我做不到")
         except Exception:  # noqa: BLE001 判据故障=放行（由集成兜量纲，绝不误拦合法句）
-            logger.exception("[执行] 百分比量程闸判据异常（放行）")
+            logger.exception("[执行] 量程闸判据异常（放行）")
             return None
 
     async def run(self, plan: Plan) -> tuple[bool, str]:
@@ -1189,17 +1260,11 @@ class Executor:
                                  + self._accum_notes(missing, noops, no_receipt,
                                                      offline, lock_notes, anon_missing,
                                                      skip_note))
-            # v1.5.2（N2）：百分比族越界绝对值分发前如实拦下（见 _adjust_range_refuse）
-            rng = self._adjust_range_refuse(name, args)
-            if rng is not None:
-                self.last_run = {"steps": len(steps), "applied": len(results),
-                                 "indeterminate": False}
-                logger.info("[执行] %s %s → 百分比量程闸拦下（防越界谎报）| %s",
-                            name, args, rng)
-                return self._named(False, self._step_say(idx, steps, rng)
-                                 + self._accum_notes(missing, noops, no_receipt,
-                                                     offline, lock_notes, anon_missing,
-                                                     skip_note))
+            # v1.6.5（刀4·B3）：量程闸原闸位在能力预裁/可用态**之前**——不支持亮度
+            # 的灯说「亮度调到200」先播"只有0到100"，把"这台根本不支持"的真因盖掉，
+            # 用户换个数再试还是不行＝"换个数再试"式误导（工单 B3 实测）。
+            # 真因先报：闸位后移到 cap/avail 两道之后（判据逻辑不变，见
+            # _adjust_range_refuse）。
             cap = await self._capability_refuse(name, args)
             if cap is not None:
                 # v1.1.3：网关侧按本家实体真实能力当场如实回话（带可选档位），
@@ -1220,6 +1285,18 @@ class Executor:
                 logger.info("[执行] %s %s → 目标不可用闸拦下（防谎报成功）| %s",
                             name, args, avail)
                 return self._named(False, self._step_say(idx, steps, avail)
+                                 + self._accum_notes(missing, noops, no_receipt,
+                                                     offline, lock_notes, anon_missing,
+                                                     skip_note))
+            # v1.5.2（N2）＋v1.6.5（B3/B4）：越界绝对值分发前如实拦下——闸位经 B3
+            # 从 gate 之后移到此处（真因先报：能力→可用性→量程）。
+            rng = await self._adjust_range_refuse(name, args)
+            if rng is not None:
+                self.last_run = {"steps": len(steps), "applied": len(results),
+                                 "indeterminate": False}
+                logger.info("[执行] %s %s → 量程闸拦下（防越界谎报）| %s",
+                            name, args, rng)
+                return self._named(False, self._step_say(idx, steps, rng)
                                  + self._accum_notes(missing, noops, no_receipt,
                                                      offline, lock_notes, anon_missing,
                                                      skip_note))
@@ -1908,7 +1985,18 @@ class Executor:
             amap = getattr(self.ha, "_entity_alias", None) or {}
             if any(str(a).strip() == word for a in (amap.get(eid) or [])):
                 return ""
-            stem = (fn.replace(area, "", 1).strip() if area else fn).split(" ")[0] or fn
+            # v1.6.5（刀4·B1 根修）：旧取法 `core.split(" ")[0]` 在现网真形制上两头都错——
+            # ①「客厅 吸顶灯」这类区域前缀名取到**区域段**（播「客厅开了」）；②「新 麦克风
+            # 开关」父设备+子功能名取到**父设备首段**（播「新」），英文型号尾（办公室空调
+            # Indicator Light）也会整段留场。现网 34 台里 32 台含空格名，9 条旧钉夹具全是
+            # 不带空格名＝零覆盖（C 组假绿同族）。改取**最后一个含中文段**：区域/型号/英文
+            # 尾天然被"最后+含中文"双判据滤掉，与 query.say_name 剥尾同族但更强；单段名
+            # （「办公室射灯」）与剥区域后剩单段的旧行为逐字等价（stem=core），不引入漂移。
+            core = fn.replace(area, "", 1).strip() if area else fn
+            segs = [s for s in core.split(" ") if s]
+            cn_segs = [s for s in segs
+                       if any("一" <= c <= "鿿" for c in s)]
+            stem = (cn_segs[-1] if cn_segs else core) or fn
             if stem and (stem in word or word in stem):
                 return ""
             # ② 不相容：改播真名；真名不含区域时把区域补回（信息不减），含则不叠加
