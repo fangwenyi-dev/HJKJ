@@ -2,6 +2,18 @@
   "_doc": "ESP32 卫星固件发布锁（OTA 方案 Phase 2）。releases 每条=一个可下发版本：version(x.y.z)/file(public 目录内落盘名)/urls(按容灾顺序 gh-proxy 代理→GitHub 直连→Gitee 兜底，私有仓须内嵌一次性访问串)/sha256(64hex 必填，缺=拒下载)/size/notes_zh(对外话术，受内部文档禁发约束)/min_compatible。镜像内置文件之外，/data/firmware/firmware.lock.json 同名整文件优先（现场热修不重打镜像）。版本值以固件仓 release 实测为准，禁止凭记忆填写。",
   "releases": [
     {
+      "version": "2.3.4",
+      "file": "huijian-s3-2.3.4.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/HJKJ/releases/download/vo-1.6.6/huijian-s3-2.3.4.bin",
+        "https://github.com/fangwenyi-dev/HJKJ/releases/download/vo-1.6.6/huijian-s3-2.3.4.bin",
+        "https://gitee.com/fangwenyi-dev/HJKJ/releases/download/vo-1.6.6/huijian-s3-2.3.4.bin"
+      ],
+      "sha256": "03ea8858a839aad2ac8b0a25d4776a66978ecfec58a1e3a1b42b83daad038963",
+      "size": 2605664,
+      "notes_zh": "卫星固件 v2.3.4：①上行环 1s→5s ＋ 非消费期不再占用环——修「话有时候第一个字被吃掉／整句只识别到半截」这类远场与连续对话下的识别问题；②开机多一行唤醒模型档自证（匹配打 `[WN-MODEL] assets match build`，不匹配当场点名 `ASSET-MISMATCH`）。⚠ 升级口径：v2.2.9 起唤醒模型随 assets 分区走，而 **OTA 只更新 app 槽**——从 ≤v2.2.8 升上来必须 USB 双段刷 app＋assets（两枚 bin 同挂在同一 Release 与 Gitee 附件），只走 OTA 会把唤醒灵敏度留在旧档。开机自证认 `version 2.3.4` ＋ `uplink ring ready: 80000 samples`。"
+    },
+    {
       "version": "2.2.9",
       "file": "huijian-s3-2.2.9.bin",
       "urls": [
