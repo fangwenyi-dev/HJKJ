@@ -32,7 +32,12 @@ _UNIT = r"(?:秒|分钟|分|小时)"
 # 单位与"后"之间允许口语量名"钟"与"之/以"：十秒钟后 / 一分钟之后 / 半小时后(不匹配半小时)
 _MID = r"\s*(?:钟)?\s*(?:之?以?后|后)"
 # 任意位置的相对延时形状（不要求吃正文）：链腿里"十秒后关Y"也算。
-_ANY = re.compile(rf"(?P<n>{_NUM})\s*(?:个)?\s*(?P<unit>{_UNIT}){_MID}")
+# v1.6.6 刀4 钟点语境负向前视：数字紧跟在「点/時/时」后面时，它是**时刻**的一部分
+# 而不是时长——「每天下午6点30分后打开客厅灯」的 "30分后" 不是"等 30 分钟"。
+# 旧形无此闸 ⇒ 该句被当相对延时接管、整句拒排（用户说的"每天"被吞），
+# 10-19 复核实测 `has_delay_shape(...)=True`，是 1.6.2 刀3-② 引入的能力回退。
+_CLOCK_PREV = r"(?<![点時时])"
+_ANY = re.compile(rf"{_CLOCK_PREV}(?P<n>{_NUM})\s*(?:个)?\s*(?P<unit>{_UNIT}){_MID}")
 # 句首前导延时（可排程唯一入口）：整句以延时开头，正文≥2字。
 _LEADING = re.compile(
     rf"^(?P<n>{_NUM})\s*(?:个)?\s*(?P<unit>{_UNIT}){_MID}\s*(?P<body>.{{2,}})$")
@@ -64,6 +69,24 @@ def has_delay_shape(text: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return False
+
+
+# 绝对时刻/周期形（v1.6.6 刀4）：钟点 或 每…/睡前 这类"按时刻触发"的说法。
+# 它**不是**相对延时（不归本模块排程），但链切分必须先认识它——旧形只有延时形状
+# 会被拦在链外，绝对时刻的复合句落到 split_compound 后时间被剥掉、当场执行＝
+# v1.5.8 立的"剥词→立即跑→谎报"红线在绝对时刻侧的复发面。
+_SCHEDULE = re.compile(
+    r"(?:每天|每晚|每早|每晨|每周|每月|每年|每逢|每个?工作日|工作日)"
+    r"|(?:\d{1,2}|[一二两三四五六七八九十]{1,3})\s*点"
+    r"|(?:睡觉前|睡前|起床后|下班回?家)")
+
+
+def has_schedule_shape(text: str) -> bool:
+    """句子是否在说"某个时刻/周期"（不是"等多久"）。永不抛。"""
+    try:
+        return bool(_SCHEDULE.search(text or ""))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def delay_seconds(text: str):

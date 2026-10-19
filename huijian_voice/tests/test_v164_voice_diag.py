@@ -10,6 +10,7 @@
 import hashlib
 import json
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -133,6 +134,12 @@ def _make_engine(prov, extras_ret):
     e = TtsEngine.__new__(TtsEngine)
     e._tts = _Tts(bad=(extras_ret is not None and extras_ret
                        and not extras_ret[0].get("match")))
+    # v1.6.6 刀2：夹具补生产同款并发件（_lock/_gen_lock/_busy）。哨兵自 刀2 起走
+    # `generate_for_selftest` 的受锁路径，夹具缺件会被外层 except 吞成 skipped，
+    # 这三条三态分离钉就变成"钉不出东西也算过"的假绿。
+    e._lock = threading.Lock()
+    e._gen_lock = threading.Lock()
+    e._busy = 0
     e.store = _Store()
     e.settings = _S({"tts.provider": prov, "tts.sid": 0, "tts.speed": 1.05})
     e._loaded_prov = prov
@@ -252,3 +259,23 @@ def test_fw_handshake_gated_on_available():
         "三级回退次序不得倒置（v1.1.40 契约仍成立）"
     assert '"实时"' in block and '"入驻时"' in block, \
         "两档如实标签都必须在（诚实语义不丢）"
+
+
+def test_fw_ledger_tier_also_gated_on_available():
+    """v1.6.6 刀X：1.6.4 的在线门只套在握手档，**台账档漏了**。speak_id 台账是本运行期
+    CMD20 入驻 POST 的真值，但"入驻时在线、此刻已断"的窗口里它不再是现读值，照旧标
+    「实时」＝断连期谎标只剩半条（加载项据此还能把陈旧值算成「已最新/可升级」）。
+    钉形制：台账档的标签必须是 fw_available 的三元式，且 ungated 的旧写法不得复活。
+    """
+    src = (HERE / "custom_components" / "huijian_ai" / "huijian" / "http.py").read_text(
+        encoding="utf-8")
+    i = src.index("class HuijianSatellitesView")
+    block = src[i:i + 6200]
+    assert 'fw, fw_source = fw_live, ("实时" if fw_available else "台账")' in block, \
+        "台账档没吃在线门（断连期仍可谎标实时）"
+    assert 'fw, fw_source = fw_live, "实时"' not in block, \
+        "ungated 的旧写法回来了（1.6.4 半条修复的原形）"
+    assert block.index("if fw_handshake:") < block.index("elif fw_live:"), \
+        "三级次序不得倒置（v1.1.40 契约）"
+    # 诚实≠藏起来：离线时版本号照显示，只是来源如实落「台账」，不得清空或退回入驻快照
+    assert 'else "台账"' in block, "离线档必须如实命名来源"

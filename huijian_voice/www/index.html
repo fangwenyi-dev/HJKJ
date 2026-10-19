@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.6.5">
-<link rel="stylesheet" href="css/voice.css?v=1.6.5">
+<link rel="stylesheet" href="css/huijian.css?v=1.6.6">
+<link rel="stylesheet" href="css/voice.css?v=1.6.6">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -320,7 +320,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.6.5";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.6.6";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -828,6 +828,18 @@ let _otaLatest = "";
 // 面板不复装（F-OTA-04 纪律：一种文案不背两种锅）。
 const CONT_LABELS = {on:"开启中", off:"已关闭", no_entity:"需固件≥2.1.46",
                      disabled:"实体被禁用", offline:"设备离线", pending:"待就绪"};
+// v1.6.6 刀A：升级徽章照抄加载项算好的 fw_state（判据单点在 ota_api._devices，
+// 面板不再自己判一次——两处各判就是 1.6.4「显示层加了在线门、pill 照旧吃陈旧快照」的成因）。
+// 「版本待证」＝这台设备的 fw_version 出处不是本轮实时读数（离线窗口 / 入驻快照 / 集成没给
+// fw_source）：既不能播「已最新」，也不摆「可升级」（点了只会拿陈旧值再排一遍同一版本）。
+// 字段缺席一律落这一档＝不可判就不断言，不在前端留第二份判据。
+function fwBadge(d, remote){
+  const s = d.fw_state;
+  if(s === "updatable") return pill("可升级→"+_otaLatest,"warn");
+  if(s === "up-to-date") return pill(remote?"已最新·可远程":"已最新","ok");
+  if(s === "no-package") return pill("无可升级包","mut");
+  return pill(d.fw_version?("版本待证·读数"+d.fw_version+"非实时"):"未上报","mut");
+}
 async function loadOta(){
   let dv={devices:[]}, fw={items:[]};
   try { dv = await api("/api/devices"); } catch(e){ dv={devices:[],error:e.message}; }
@@ -843,9 +855,8 @@ async function loadOta(){
   for(const d of devs){
     const tr=document.createElement("tr");
     const remote=(d.ota_services||[]).length>0;
-    const badge = d.updatable ? pill("可升级→"+_otaLatest,"warn")
-                : (d.fw_version ? (_otaLatest ? pill(remote?"已最新·可远程":"已最新","ok") : pill("无可升级包","mut")) : pill("未上报","mut"));   // v1.1.27：无在架包时不得说「已最新」
-    const fv=d.fw_version?`${esc0(d.fw_version)}${d.fw_source==="入驻时"?' <span class="mut">（入驻时）</span>':""}`:"未上报";
+    const badge = fwBadge(d, remote);   // v1.6.6 刀A：判据源=服务端 fw_state（见 fwBadge 注）
+    const fv=d.fw_version?`${esc0(d.fw_version)}${d.fw_source&&d.fw_source!=="实时"?' <span class="mut">（'+esc0(d.fw_source)+'）</span>':""}`:"未上报";   // 非实时来源一律如实标注（v1.6.6 刀X：台账档也要吃在线门）
     tr.innerHTML = `<td>${esc0(d.name||d.mac||d.speak_id)}<br><span class="mut code">${esc0(d.mac||"")}</span></td>
       <td>${esc0(d.area||"-")}</td>
       <td>${pill(d.online?"在线":"离线", d.online?"ok":"bad")}</td>
@@ -966,6 +977,35 @@ async function loadFunnel(){
   }catch(e){ $("#funnelBox").innerHTML='<span style="color:var(--red)">读取失败：'+esc0(e.message)+"</span>"; }   // v1.1.27：错误串进 innerHTML 必须先转义
 }
 $("#funnelBtn").onclick = loadFunnel;
+// v1.6.6 刀B：延时族的四种归宿各自一句话，判据来自内核单点 `_delay_verdict` 的出参
+// （1.6.5 只把 delay/delay_action 发进 JSON、前端零消费点 ⇒ 延时句被贴「将播固定兜底」，
+// 「面板与线上同一裁决」只走完了一半）。本函数不自己判形状，只翻译后端已算好的那一档。
+function delayVerdictLine(c){
+  if(!c || !c.delay) return "";
+  const act = {
+    schedule: "会排程：到点重入正常流程（歧义/风险/离线/区域四道闸照过），当场不落袋",
+    nosched:  "不排程：整句如实拒并教你分开说（链中含延时或超出 1s..1h）",
+    refuse:   "拒排：正文属不可逆（删除/锁族）或没点名的代词",
+    cancel:   "撤单专令：只撤本源（面板）在途预约，不吞别的设备挂的单"
+  }[c.delay_action] || ("延时族·未登记档位 "+String(c.delay_action||""));
+  let s = "延时裁决（与线上同一单点）：" + act + "\n";
+  if(c.delay_seconds) s += `  时长 ${c.delay_seconds}s → 正文「${c.delay_body||""}」\n`;
+  return s + `  线上会播：${c.final||"（内核没给话术）"}\n`;
+}
+// v1.6.6 刀B：延时族排在最前——它和复合链一样是"真流量会先吃掉这句"的腿，
+// 排在 `c.plan`/兜底之后就会说出反话（1.6.5 实锤：内核报 will-schedule，面板念「将播固定兜底」）。
+function cascadeDebugLines(c){
+  const dl = delayVerdictLine(c);
+  if (dl) return dl;
+  if (c.plan) return `命中快速通道 → ${c.plan.intent}\n参数：${JSON.stringify(c.plan.args)}\n来源：${c.plan.source}\n级联轨迹：\n  ${(c.plan.trace||[]).join("\n  ")}\n`;
+  let s = "快速通道未命中。\n";
+  if (c.query_answer) s += `本地查询作答：${c.query_answer}\n`;
+  s += c.llm_enabled ? "→ 将交 LLM 兜底（已启用）\n" : `→ 将播固定兜底：${c.final||""}\n`;
+  if (c.compound) s += c.blocked
+    ? `复合链被闸拦下（真实裁决）：${c.blocked}\n`
+    : "该句会走复合链：按逐腿执行（参数/轨迹见上）\n";
+  return s;
+}
 $("#dbgBtn").onclick = async ()=>{
   const t = $("#dbgText").value.trim(); if(!t){ toast("输入一句话"); return; }
   $("#dbgOut").textContent = "…";
@@ -974,15 +1014,7 @@ $("#dbgBtn").onclick = async ()=>{
     const c = r.cascade||{}; let out = "";
     out += `输入：${r.input}\nT1 分类器：${r.textcnn?.available?"可用":"缺资产（上传 nlu_data 后重启）"}\n`;
     if (c.nlu_enabled === false) out += "本地理解已在设置里关闭：不跑正则/分类器/查询族/场景自动化本地承接。\n";
-    if (c.plan) out += `命中快速通道 → ${c.plan.intent}\n参数：${JSON.stringify(c.plan.args)}\n来源：${c.plan.source}\n级联轨迹：\n  ${(c.plan.trace||[]).join("\n  ")}\n`;
-    else {
-      out += "快速通道未命中。\n";
-      if (c.query_answer) out += `本地查询作答：${c.query_answer}\n`;
-      out += c.llm_enabled ? "→ 将交 LLM 兜底（已启用）\n" : `→ 将播固定兜底：${c.final||""}\n`;
-    if (c.compound) out += c.blocked
-      ? `复合链被闸拦下（真实裁决）：${c.blocked}\n`
-      : "该句会走复合链：按逐腿执行（参数/轨迹见上）\n";
-    }
+    out += cascadeDebugLines(c);   // v1.6.6 刀B：裁决展示收成单点函数（判据仍全在内核，本函数只翻译）
     if (r.executed) out += `\n【真执行】${r.executed.ok?"成功":"失败"}（走 ${r.executed.source}）：${r.executed.speech}` + (r.executed.trace?.length ? `\n执行轨迹：\n  ${r.executed.trace.join("\n  ")}` : "");
     $("#dbgOut").textContent = out;
   } catch(e){ $("#dbgOut").textContent="失败："+e.message; }
@@ -1120,6 +1152,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.6.5"></script>
+<script src="js/starsky.js?v=1.6.6"></script>
 </body>
 </html>

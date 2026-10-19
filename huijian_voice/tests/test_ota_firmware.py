@@ -308,11 +308,20 @@ def _admin_ctx(store, ha_rest=None, host="10.0.0.9"):
 def _sat_ledger():
     return {"/api/huijian-ai/satellites": {"devices": [
         {"mac": "aa", "name": "展厅东", "area": "展厅", "online": True,
-         "fw_version": "2.9.6", "ota_services": []},
+         "fw_version": "2.9.6", "fw_source": "实时", "ota_services": []},
         {"mac": "bb", "name": "展厅西", "area": "展厅", "online": False,
-         "fw_version": "2.9.7", "ota_services": []},
+         "fw_version": "2.9.7", "fw_source": "实时", "ota_services": []},
         {"mac": "cc", "name": "新店", "area": "", "online": True,
-         "fw_version": "", "ota_services": []},
+         "fw_version": "", "fw_source": "", "ota_services": []},
+        # v1.6.6 刀A 两形（1.6.4 只修了显示标签、下游照旧谎报的载体）：断连窗口的
+        # 陈旧快照与非"实时"档读数不得再被算成「已最新」，也不得给「可升级」按钮。
+        {"mac": "dd", "name": "重烧未重连", "area": "展厅", "online": False,
+         "fw_version": "2.9.7", "fw_source": "入驻时", "ota_services": []},
+        {"mac": "ee", "name": "旧集成无源", "area": "展厅", "online": True,
+         "fw_version": "2.9.7", "ota_services": []},
+        # v1.6.6 刀X：入驻时在线、此刻已断——台账值真但非现读，同样不得当可信读数
+        {"mac": "ff", "name": "断连后的台账值", "area": "展厅", "online": False,
+         "fw_version": "2.9.6", "fw_source": "台账", "ota_services": []},
     ]}}
 
 
@@ -326,6 +335,29 @@ def test_devices_endpoint_annotations(store):
     assert d["aa"]["updatable"] is True      # 2.9.6 < 2.9.7
     assert d["bb"]["updatable"] is False     # 已最新
     assert d["cc"]["updatable"] is False     # 未上报不瞎判
+    assert d["aa"]["fw_state"] == "updatable"
+    assert d["bb"]["fw_state"] == "up-to-date"
+    assert d["cc"]["fw_state"] == "unverified"
+    # 刀A 本体：断连窗口的「入驻时」读数、以及集成根本没给 fw_source 的两形，
+    # 判据不可信 ⇒ 既不 updatable 也不 up-to-date（旧实现两条都判成「已最新」）。
+    assert d["dd"]["fw_state"] == "unverified", d["dd"]
+    assert d["dd"]["updatable"] is False
+    assert d["ee"]["fw_state"] == "unverified", d["ee"]
+    # 刀X 下游半条：集成把台账档如实降成「台账」后，加载项也不得拿它断言版本关系
+    # （旧形只看 fw_version 非空 ⇒ 2.9.6 < 2.9.7 直接给「可升级→2.9.7」按钮）。
+    assert d["ff"]["fw_state"] == "unverified", d["ff"]
+    assert d["ff"]["updatable"] is False
+
+
+def test_devices_no_package_state_not_latest(store):
+    """在架包缺席 ⇒ 全表落 no-package，任何一台都不得渲染成「已最新」（v1.1.27 同律）。"""
+    ctx = _admin_ctx(store, _sat_ledger())
+    srv = _serve(make_admin_app(ctx)); port = next(srv)
+    st, j = _jget(port, "/api/devices")
+    assert st == 200 and j["latest"] == ""
+    for x in j["devices"]:
+        assert x["fw_state"] == "no-package", x
+        assert x["updatable"] is False
 
 
 def test_devices_endpoint_fail_closed(store):

@@ -185,6 +185,9 @@ _SPEED_MIN = 0.5
 # 等待本身成为"第 4/5 轮播报不完整"的放大器（2026-09-18 真机签名）。30s 是
 # 折中：合法突发（长句排队尾）仍放行，真堵死时早 20s 认输、余句还有救。
 _GEN_WAIT_S = 30.0
+# v1.6.6 刀2：嗓音自测等锁上限——必须显著短于播报侧 _GEN_WAIT_S（诊断件不得
+# 给播报链加尾延），拿不到锁就本轮不判、退还预算。做成模块常量是为了让行为钉能改小它。
+_SELFTEST_GEN_WAIT_S = 5.0
 # 2026-09-27 深审 R2 #4：采样率合理域单点闸。fmt rate 是外部字节（F13 同一
 # 威胁模型：坏端点/中间盒），rate=1 → ratio=16000 → 单块 8KB 触发 6.5×10⁷ 点
 # np.arange ≈1.5GB 峰值分配 = 一条响应打死容器。8k–192k 覆盖全部现实 TTS 输出。
@@ -1033,8 +1036,22 @@ class TtsEngine:
         # HA 盘缓存（无 TTL）模板句永久 v1 嗓。c{len}+h{hash8}：数量与内容双钉。
         cfp = getattr(self, "_custom_fp", "")
         ch = hashlib.sha1(cfp.encode("utf-8")).hexdigest()[:8] if cfp else "0"
+        # v1.6.6 刀11：附属（声码器）身份进键。旧键 `m{主包sha8}` 只钉主包——
+        # 1.6.3 摘除坏 vocos 并重取后主包 sha 不变 ⇒ HA 无 TTL 消息盘缓存**同键命中**，
+        # 修完嗓仍偶听旧男声、只能靠面板手动清缓存（那条就写在 1.6.3 的"如实边界"里）。
+        # 身份取 `extras_stamp`（stat 的 size/mtime，零哈希——本仓有"附属哈希不进
+        # 热路径"钉）。**无附属的档（kokoro）后缀恒空 ⇒ 键逐字不变**，与 v1.0.65
+        # "Kokoro 保持 local: 不轮换存量盘缓存"同规；matcha/melo 因本刀轮换一次。
+        xtag = ""
+        try:
+            stamp = (self.store.extras_stamp(PROVIDER_MODEL_KEYS[prov])
+                     if self.store else "")
+            if stamp:
+                xtag = "+x" + hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:6]
+        except Exception:  # noqa: BLE001 假件 store/异常形制：不加后缀，键照旧
+            xtag = ""
         return (f"{prefix}:sid{self.resolve_sid()}+c{len(self._custom_sids)}h{ch}"
-                f"+{speed_s}+m{tag}")
+                f"+{speed_s}+m{tag}{xtag}")
 
     def reset_cloud_pin(self, reason: str = "") -> None:
         """v1.0.55（定案⑤）：云失败钉扎的复位开关=云配置热变更。
@@ -1138,13 +1155,47 @@ class TtsEngine:
                 last = self._selftest_at = {}
             if budget > 0 and now - last.get(prov, 0.0) < budget:
                 return
-            last[prov] = now
-            self._self_test_voice()
+            if self._self_test_voice():
+                last[prov] = now       # v1.6.6 刀2：没判成不许烧预算（旧形先记账后判）
         except Exception:  # noqa: BLE001 —— 观测件绝不成为新故障面
             logger.debug("[TTS] 嗓音自测异常（忽略）", exc_info=True)
 
-    def _self_test_voice(self) -> None:
+    def generate_for_selftest(self, sent: str, sid: int, speed: float):
+        """v1.6.6 刀2：自测专用的一次**受锁**合成，返回引擎原始 audio 对象（要读 sample_rate）。
+
+        旧形 `self._tts.generate(...)` 裸调，与本仓专门为此加的两条并发纪律擦肩而过：
+          ① `_gen_lock`——__init__ 注写明"sherpa 前端持共享可变状态，同代并发 generate
+             轻则两路音频互踩、重则 C++ 层崩溃打死整个容器（播报+STT+LLM 全断）"。
+             哨兵恰跑在"刚加载完、本轮播报正在飞"的窗口里，而 try/except **挡不住
+             C++ abort** ⇒ 1.6.3 写的"永不抛、不连累播报"在这条路径上本就不成立；
+          ② `_busy`——卸载避让的在飞计数（1231/1250/1428 三处读它），旧形不计数 ⇒
+             省电档 reaper 可在自测合成在飞时卸掉当代引擎（跨代析构，F1 原案同型）。
+        等待必须**短**于播报侧 _GEN_WAIT_S：诊断件不得给播报链加尾延，拿不到锁就
+        返回 None 由调用方如实记 skipped。永不抛由外层兜。
+        """
+        with self._lock:
+            tts = self._tts
+            if tts is None:
+                return None
+            self._busy += 1
+        try:
+            if not self._gen_lock.acquire(timeout=_SELFTEST_GEN_WAIT_S):
+                logger.info("[TTS] 嗓音自测让路：合成锁被在飞播报占用，本轮不判")
+                return None
+            try:
+                return tts.generate(sent, sid=sid, speed=speed)
+            finally:
+                self._gen_lock.release()
+        finally:
+            with self._lock:
+                self._busy -= 1
+
+    def _self_test_voice(self) -> bool:
         """合成金句并量频谱 + 落定案诊断。命名与 test_v163 接线钉对齐，永不抛。
+
+        返回值＝**本轮是否真判过**（v1.6.6 刀2）：True 才消耗按 provider 的 1h 预算，
+        False（锁被占/引擎不在/量不出）退还预算，下次重载即重试——把"没测"记成
+        "测过且没问题"是诊断件的自杀式谎报。
 
         v1.6.4：除日志点名外，把**同一次测量**的结构化结果落进 self._voice_diag
         （provider/reported_sr/dur_s/hf_pct/extras/verdict），经 /healthz 远程可读。
@@ -1159,12 +1210,18 @@ class TtsEngine:
             tts = self._tts
             if tts is None:
                 self._voice_diag = diag
-                return
+                return False
             prov = self.active_provider()
             diag["provider"] = prov
             sid = int(self.settings.get("tts.sid", _default_sid_for(prov)) or 0)
             speed = float(self.settings.get("tts.speed", 1.05) or 1.05)
-            audio = tts.generate("好的，已经帮你执行了", sid=sid, speed=speed)
+            audio = self.generate_for_selftest("好的，已经帮你执行了",
+                                               sid=sid, speed=speed)
+            if audio is None:
+                # 锁被占/引擎不在＝本轮**不判**（不是判好）：verdict 留在 skipped，
+                # 由调用方退还预算，下一次重载再试（刀2：诊断件不得给播报链加尾延，
+                # 也不得把"没测"记成"测过且没问题"）。
+                return False
             x = np.asarray(audio.samples, dtype=np.float64)
             sr = int(getattr(audio, "sample_rate", 0) or 16000)
             diag["reported_sr"] = sr
@@ -1173,7 +1230,7 @@ class TtsEngine:
             diag["hf_pct"] = None if r is None else round(r * 100, 2)
             if r is None:
                 self._voice_diag = diag
-                return
+                return False
             # 附属字节诊断（低频触发，非热路径；拿不到就 None 不影响判定）
             try:
                 key = PROVIDER_MODEL_KEYS.get(prov)
@@ -1204,6 +1261,7 @@ class TtsEngine:
             logger.debug("[TTS] 嗓音自测执行异常（忽略）", exc_info=True)
         finally:
             self._voice_diag = diag
+        return True
 
     def voice_diag(self) -> dict:
         """v1.6.4：最近一次嗓音自测的结构化诊断（供 /healthz 远程定案）。

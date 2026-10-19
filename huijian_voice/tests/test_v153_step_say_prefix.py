@@ -54,15 +54,54 @@ def test_all_front_gates_share_the_template():
     改判据：**逐闸核**——四道闸各自的裁决变量（gate/rng/cap/avail）都必须作为
     `_step_say(...)` 的实参出现，且该闸的早退 return 走 `self._named(False, ...)`。
     摘掉任一闸的接线（把 rng 换成裸拼串、或整块删除）本钉当场红，无余量可躲。"""
+    # v1.6.6 刀12：全文 substring/regex 换成 **ast 判据**——旧形两种躲法都在：
+    #   ① 在同文件注释里留一串 `gate = self._turn_gate`／`_step_say(idx, steps, rng)`
+    #      就把断言喂绿（本仓「治假绿的钉会被它描述的那个 bug 的注释满足」实发同族）；
+    #   ② 只核"接了线"不核**闸序**——刀3·B3 修的就是量程闸必须排在能力/可用态**之后**
+    #      （真因先报），把 rng 挪回最前，旧钉照样全绿而谎报复发。
+    # 现在：真赋值节点 → 真调用实参 → 四道闸的行号次序，三件一起核。
+    import ast as _ast
     from pathlib import Path
-    import re
     ROOT = Path(__file__).resolve().parent.parent
     src = (ROOT / "core" / "executor.py").read_text(encoding="utf-8")
-    # 逐闸：裁决赋值 → 同名变量喂给 _step_say → _named(False 早退，三件套齐在
-    for var, assign in (("gate", "gate = self._turn_gate"),
-                        ("rng", "rng = await self._adjust_range_refuse"),
-                        ("cap", "cap = await self._capability_refuse"),
-                        ("avail", "avail = await self._availability_refuse")):
-        assert assign in src, f"{var}：闸的裁决调用没了（{assign!r}）"
-        wired = re.search(rf"_step_say\(idx, steps, {var}\)", src)
+    tree = _ast.parse(src)
+
+    def _gate_line(attr: str):
+        """找 `x = [await] self.<attr>(…)` 的赋值，返回 (变量名, 行号)。"""
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Assign) or len(node.targets) != 1:
+                continue
+            tgt = node.targets[0]
+            if not isinstance(tgt, _ast.Name):
+                continue
+            val = node.value
+            if isinstance(val, _ast.Await):
+                val = val.value
+            fn = getattr(val, "func", None)
+            if (isinstance(fn, _ast.Attribute) and fn.attr == attr
+                    and isinstance(fn.value, _ast.Name) and fn.value.id == "self"):
+                return tgt.id, node.lineno
+        raise AssertionError(f"{attr}：源里找不到它的裁决赋值节点（整道闸没了？）")
+
+    order = [("gate", "_turn_gate"), ("cap", "_capability_refuse"),
+             ("avail", "_availability_refuse"), ("rng", "_adjust_range_refuse")]
+    got = {}
+    for var, attr in order:
+        name, line = _gate_line(attr)
+        assert name == var, f"{attr} 的裁决变量改名了（{name}≠{var}，本钉需同步）"
+        got[var] = line
+
+    # ① 接线：每道闸的裁决变量必须作为某次 _step_say(...) 的实参出现（真节点）
+    for var in got:
+        wired = False
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Call)
+                    and (getattr(node.func, "id", None)
+                         or getattr(node.func, "attr", None)) == "_step_say"
+                    and any(isinstance(a, _ast.Name) and a.id == var for a in node.args)):
+                wired = True
+                assert node.lineno > got[var],                     f"{var}：_step_say 调用在裁决之前（先念话术后裁决＝空转）"
         assert wired, f"{var}：闸话术没走 _step_say 模板（绕过＝字头叠字回归可复发）"
+
+    # ② 闸序（刀3·B3 承重）：能力/可用态两道必须排在量程闸之前——真因先报
+    assert got["cap"] < got["rng"] and got["avail"] < got["rng"],         f"量程闸又跑到能力/可用态之前了（{got}）＝「不支持亮度的灯」被念成「只有0到100」"

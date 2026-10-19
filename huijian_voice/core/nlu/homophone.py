@@ -51,6 +51,16 @@ _ASP = frozenset(frozenset(p) for p in
                  (("b", "p"), ("d", "t"), ("g", "k"), ("z", "c"), ("zh", "ch"),
                   ("j", "q"), ("n", "l")))
 
+# v1.6.6 刀3：方言声母互换（n↔l）比送气对的**误纠代价高一档**——送气对在低 SNR
+# 下是"同一个字的特征丢了"，n↔l 是"两个都成立、语义不同的字"（南/蓝、六/牛、铃/宁）。
+# 落前那轮回扫只造了"在册名的伪错形"，从不测"不在册的常用词"，所以短名那一族是盲区：
+# 2026-10-19 用生产 `rewrite` 当场复现 `打开南窗`→`打开蓝窗`、`按门宁`→`按门铃`、
+# `打开牛号灯`→`打开六号灯`——本家恰有邻名时，用户没说过的设备被静默点走（1.5.6 前
+# 这类形落查无）。送气对不受此限（它是同字异特征，红线①的射程）。
+# 代价如实：两音节名的 n/l 听岔形从此不救（回落查无/fallback），三音节及以上战果
+# （推拉窗↔推拿窗、内开内倒↔内开累倒）逐字不动——宁漏不误纠。
+_MIN_SYLLABLES_BY_PAIR = {frozenset(("n", "l")): 3}
+
 
 def _syl(word: str):
     """词 → 音节串 tuple；非"一字一音节"或拼音库不可用 → None（不参与比对）。"""
@@ -164,8 +174,10 @@ def _confusable(a: str, b: str) -> bool:
     v1.5.6 起另容一类**方言声母互换**：④ 鼻音↔边音 n↔l（`内开累倒`↔`内开内倒`、
       `推拿窗`↔`推拉窗`——湘/闽/川渝大片同址异读，进表须配②③同韵母约束才折）。
       这一类不是"低 SNR 丢特征"而是"发音习惯互换"，射程不同、代价同规：**必须同韵母
-      、恰一位差、唯一命中**才改，红线四条一字未动；落前用当前现网全清单做过逐音节
-      伪错形回扫（净增误纠 0 才进，见 _goldtest/_f9_nl_ambiguity_recheck_1013.py）。
+      、恰一位差、唯一命中**才改，红线四条一字未动；另加 v1.6.6 刀3 的
+      `_MIN_SYLLABLES_BY_PAIR` 门槛（n↔l 仅 ≥3 音节名可折，短名两字多为异义实词）；
+      落前用当前现网全清单做过逐音节伪错形回扫（净增误纠 0 才进，
+      见 _goldtest/_f9_nl_ambiguity_recheck_1013.py）。
     **跨发音部位不算**（`平台窗` 的 tai↔kai 是部位差＝另一个词），韵母主体不同也不算
     （`旋称`cheng vs `悬窗`chuang 差的不止一个特征）。方向＝宁漏改不多改。
     """
@@ -220,8 +232,17 @@ def _near_one(names_vecs, key):
         if len(wkey) != len(key):
             continue
         diff = [i for i in range(len(key)) if key[i] != wkey[i]]
-        if len(diff) == 1 and _confusable(key[diff[0]], wkey[diff[0]]):
-            hit.append(w)
+        if len(diff) != 1 or not _confusable(key[diff[0]], wkey[diff[0]]):
+            continue
+        # 刀3 门槛：比的是**声母对**（`_split`），不是整音节——第一版拿整音节去查
+        # 表，frozenset({'nan','lan'}) 永不等于 frozenset({'n','l'})，门槛静默空转。
+        # 判"语义不同字"的方言互换 ⇒ 名字太短一律不折。
+        ia, _fa = _split(key[diff[0]])
+        ib, _fb = _split(wkey[diff[0]])
+        need = _MIN_SYLLABLES_BY_PAIR.get(frozenset((ia, ib)), 0)
+        if len(key) < need:
+            continue
+        hit.append(w)
     return hit
 
 

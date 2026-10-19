@@ -145,3 +145,97 @@ def test_tier2_n_l_never_fabricates_absent_target():
     prior = ("内开窗", "平开窗")
     out, pairs = homophone.rewrite("打开内开累倒", prior)
     assert out == "打开内开累倒" and pairs == [], (out, pairs)
+
+
+# ── v1.6.6 刀3：方言 n↔l 的短名门槛（类守卫，例子是生成的不是手写的）──────
+# 审计复现（2026-10-19，生产 `rewrite` 当场跑）：本家有邻名时，两字名的 n/l 听岔
+# 会把用户没说过的设备静默点走——`打开南窗`→`打开蓝窗`、`按门宁`→`按门铃`、
+# `打开蓝阳台`→`打开南阳台`（1.5.6 前这些形落查无）。送气对没这个问题：那是
+# "同一个字丢特征"，n/l 是"两个都成立、语义不同的字"。
+def test_nl_short_name_class_never_folds():
+    """任意**两字**名，只要与另一字的差只在 n↔l 声母（韵母同）⇒ 一律不得折。
+
+    候选对由汉字池**生成后过滤**（`_syl`+`_split` 判声母/韵母），不是手写例子——
+    手写清单正是 1.5.6 那轮回扫的盲区（只造在册名的伪形，从不测不在册常用词）。
+    宇宙塌缩（找不到一对）＝量具失效，当场红。
+    """
+    from core.nlu import homophone as hp
+
+    pool = ("南蓝宁铃楼牛磊内窗台梯灯门明分风飞非芳黄航黑河红"
+            "花华水谁书树数路六绿李梨理里手收首走租组做作")
+    syl = {}
+    for ch in pool:
+        s = hp._syl(ch)
+        if s:
+            syl[ch] = s[0]
+    pairs = []
+    for a, sa in syl.items():
+        for b, sb in syl.items():
+            if a >= b:
+                continue
+            ia, fa = hp._split(sa)
+            ib, fb = hp._split(sb)
+            if frozenset((ia, ib)) == frozenset(("n", "l")) and fa == fb:
+                pairs.append((a, b))
+    assert pairs, "n/l 同韵母汉字对为空＝本钉扫描面失效（先修量具再谈结论）"
+
+    for a, b in pairs:
+        # 尾巴一律单字 ⇒ 生成的名字恒为**两音节**（门槛线在 3，三字名是另一档，
+        # 由 test_nl_gate_boundary_is_declared_not_accidental 显式钉住意图）。
+        for tail in ("窗", "灯", "台", "门", "花"):
+            spoken, other = a + tail, b + tail
+            if spoken == other:
+                continue
+            prior = (other,)                      # 本家只有"另一个"名字
+            out, changed = hp.rewrite("打开" + spoken, prior)
+            assert changed == [], (
+                f"两字名 {spoken!r} 被 n↔l 折到 {other!r}＝静默改目标（门槛失守）")
+
+
+def test_nl_gate_keeps_long_name_wins_and_blocks_short_ones():
+    """点名四形（审计证据）＋ 三音节及以上战果逐字不动（门槛不许顺手少接正主）。"""
+    from core.nlu import homophone as hp
+
+    prior = ("蓝窗", "门铃", "内开内倒", "推拉窗", "平开窗", "六号灯")
+    blocked = ("打开南窗", "按门宁")                        # 两字名：不折
+    rescued = (("把内开累倒关上", "把内开内倒关上"),
+               ("打开推拿窗", "打开推拉窗"),
+               ("关闭凭开窗", "关闭平开窗"))                # ≥3 音节：照旧救
+    for text in blocked:
+        out, changed = hp.rewrite(text, prior)
+        assert out == text and changed == [], (text, out, changed)
+    for said, want in rescued:
+        out, _ = hp.rewrite(said, prior)
+        assert out == want, (said, out, want)
+
+
+def test_gate_table_is_wired_into_the_decision_point():
+    """接线钉：门槛表必须真被 `_near_one`（生产判定单点）消费——只加表不接线＝空转。"""
+    import ast
+    import inspect
+    from core.nlu import homophone as hp
+    body = inspect.getsource(hp._near_one)
+    assert "_MIN_SYLLABLES_BY_PAIR" in body, "判定单点没接门槛表（门槛形同虚设）"
+    src = ast.parse(inspect.getsource(hp))
+    names = {n.targets[0].id for n in src.body
+             if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)}
+    assert "_MIN_SYLLABLES_BY_PAIR" in names
+    table = hp._MIN_SYLLABLES_BY_PAIR
+    assert table.get(frozenset(("n", "l"))) == 3, \
+        f"n↔l 门槛档不对（射程变了要同步本注与 _confusable 文档）：{table}"
+
+def test_nl_gate_boundary_is_declared_not_accidental():
+    """门槛线（3 音节）两侧各钉一条，把"这是刻意射程"钉成判据而不是巧合。
+
+    为什么是 3：本批两个战果都在 3~4 音节（推拿窗↔推拉窗、内开累倒↔内开内倒），
+    而语义不同字的短名危险族集中在 2 音节（南/蓝窗、门/宁铃）。把线画在 3 是
+    "疗效保留、误纠清零"的最低位置——挪线必须同时改本注与 `_MIN_SYLLABLES_BY_PAIR`。
+    """
+    from core.nlu import homophone as hp
+    prior = ("蓝阳台",)
+    out, changed = hp.rewrite("打开南阳台", prior)      # 3 音节：折（射程内）
+    assert out == "打开蓝阳台" and changed == [("南阳台", "蓝阳台")], (out, changed)
+    prior2 = ("蓝窗",)
+    out2, changed2 = hp.rewrite("打开南窗", prior2)      # 2 音节：不折（门槛外）
+    assert out2 == "打开南窗" and changed2 == [], (out2, changed2)
+

@@ -35,6 +35,9 @@ _KNOWN_DEVICES_TAIL = ["提升窗", "平开窗", "推拉窗", "平推窗", "天�
                        # valid window names 认这套，设备词表此前缺一半——「内开内倒窗」
                        # 这类长词落不进子串扫描，尾置动作句整体失配）
                        "内开窗", "外开窗", "推拉门", "智能窗", "内开内倒窗", "内开内倒", "单内倒窗", "外装平开窗",
+                       # v1.6.6 刀1：平开/外开内倒窗（复合窗型名，旧六表全缺；剥名剥到 内倒窗 就停 ⇒
+                       # 残余名内「开」字被当动作，听岔关闭句反向开窗）。长词必须排在 内倒窗 之前。
+                       "平开内倒窗", "外开内倒窗",
                        "内倒窗",
                        # 2026-09 开窗器名称洞（用户令优化「开窗器名称识别」）：
                        # 「关闭开窗器」此前被剥成 name="窗" 残渣、意图错判 Turn*——
@@ -92,6 +95,7 @@ KNOWN_DEVICES_PREFIX = ["空调", "风扇", "加湿器", "净化器", "热水器
                         # X关闭）此前全部够不到，落给 klar 产歧义目标再被过宽闸 clarify。
                         # 词表与 fast_path._WINDOW_TYPES/集成 valid names 同集合，守卫测试钉。
                         "平开窗", "平推窗", "内开内倒窗", "内开内倒", "单内倒窗", "外装平开窗", "内开窗",
+                        "平开内倒窗", "外开内倒窗",   # v1.6.6 刀1 复合窗型名（长词在 内倒窗 前）
                         "内倒窗",
                         "外开窗", "推拉窗", "推拉门", "智能窗", "天窗", "飘窗",
                         # 开窗器/开合器/推窗器 同进前缀表：「开窗器关闭/开窗器打开」
@@ -767,6 +771,19 @@ _GENERIC_FAMILIES = {"窗": {"cover", "button", "number"},
                      "门": {"lock", "cover"}}
 
 
+# 泛称→域**一对一**的那几个泛称字（由上表派生，不另立第二张泛称表）。窗/门各自跨
+# ControlWindow 与 lock 车道，把它们的泛称折成域过滤会从既有车道手里抢走句子
+# （金标 4 号「打开办公室的窗」的歧义 clarify 口径），故折域只认唯一域泛称（现网＝灯）。
+_UNIQUE_DOMAIN_GENERIC = tuple(sorted(
+    g for g, fam in _GENERIC_FAMILIES.items() if len(fam) == 1))
+
+
+def _bare_generic(tail: str) -> str:
+    """区域名之后的残段是不是「(的|里)?+唯一域泛称字」；是→泛称字，否→空串。"""
+    t = re.sub(r"^[的地里得]+", "", (tail or "").strip())
+    return t if t in _UNIQUE_DOMAIN_GENERIC else ""
+
+
 def _generic_rescue(pre: str, generic: str):
     """泛称字前的残段 pre → 应顶替「pre+泛称」整段的表内标准词；None=不救。"""
     try:
@@ -910,6 +927,15 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
             # 空调」由 sync_vocab 入表后长词优先命中），拆成 area+裸空调会让「实体
             # 名带房间、但没挂 area」的现场 miss（test_nlu_llm_boundary 钉）。
             if idx and _area_split_wins(stripped, idx, len(d)):
+                continue
+            # 注册表会把**区域名本身**派生成设备词（friendly_name「办公室 All
+            # Thermostats」的 token「办公室」），⑥ 贪心于是把句首区域吃成设备名：
+            # 区域整段丢失、句尾泛称连域一起没了——现网金标 14 号「打开办公室的灯」
+            # 折到两台空调、灯一盏没开（发布版 1.6.5 在册）。与上一条护栏同机制
+            # （continue 交单字泛称车道承接，不新建表、不凭空造目标）：只在整串＝
+            # 「区域名 +(的|里)?+ 唯一域泛称字」时让位，具名设备（办公室射灯）由更长
+            # 的在册词先命中，走不到这里。
+            if not idx and _area_like(d) and _bare_generic(stripped[len(d):]):
                 continue
             candidates.append((_area_of_prefix(stripped[:idx]), d, 5))
             _hit_dev = True

@@ -94,6 +94,12 @@ def _loadota_block(h: str) -> str:
     return h[i:h.index("/* ── 调试 ── */", i)]
 
 
+def _fw_badge_block(h: str) -> str:
+    """fwBadge 整块（v1.6.6 刀A：徽章判据搬到这里，已不在 loadOta 切片内）。"""
+    i = h.index("function fwBadge")
+    return h[i:h.index("\n}\n", i) + 2]
+
+
 def _www() -> str:
     return WWW.read_text(encoding="utf-8")
 
@@ -665,12 +671,29 @@ def test_www_ota_latest_strict_source_not_overridden_by_lax():
 
 
 def test_www_no_package_is_not_reported_up_to_date():
-    blk = _loadota_block(_www())
+    """v1.1.27 不变量：无在架包时不得说「已最新」。v1.6.6 刀A 把这条判据从面板表达式
+    搬到加载项服务端（fw_state 状态机），锚点随迁——**钉不变量，不钉旧形状**：
+      ① 服务端 `not latest` 分支必须排在版本比较**之前**：顺序错了会把"无包"设备
+         算成 up-to-date，面板照旧播已最新（原事故形制）；
+      ② 面板 fwBadge 只剩照抄档位：「已最新」那一支再也拿不到无包情形，
+         「无可升级包」由 no-package 档独立成句；严格源非空的守卫已上移，
+         面板不得再判一次（两处判据＝两种口径，正是 1.6.4 谎标的成因）。
+    """
+    api = (Path(__file__).resolve().parents[1] / "core" / "ota_api.py").read_text(
+        encoding="utf-8")
+    i_none = api.index("if not latest:")
+    i_cmp = api.index('vkey(cur) < vkey(latest["version"])')
+    assert i_none < i_cmp, "无在架包分支必须在版本比较之前（否则无包被算成 up-to-date）"
+    blk = _fw_badge_block(_www())
     assert "无可升级包" in blk, "无在架包时设备行显示「已最新」=假话"
     i_new = blk.index("已最新")
-    assert "_otaLatest ?" in blk[i_new - 140:i_new], "「已最新」必须以严格源非空为守卫"
-    i_none = blk.index("无可升级包")
-    assert "_otaLatest" in blk[i_none - 200:i_none], "「无可升级包」须由 _otaLatest 为空触发"
+    assert 'if(s === "up-to-date")' in blk[:i_new], \
+        "「已最新」只能由服务端 up-to-date 档产到（面板不许自己判）"
+    i_none_js = blk.index("无可升级包")
+    assert 'if(s === "no-package")' in blk[:i_none_js], \
+        "「无可升级包」须由 no-package 档触发"
+    assert "_otaLatest ?" not in blk, \
+        "严格源守卫已上移到服务端，面板不得再判一次（两处判据=两种口径）"
 
 
 def test_www_status_poll_has_inflight_latch_and_gray_card():

@@ -218,7 +218,11 @@ class HuijianSatellitesView(HuijianHttpView):
             if fw_handshake:
                 fw, fw_source = fw_handshake, "实时"
             elif fw_live:
-                fw, fw_source = fw_live, "实时"
+                # v1.6.6 刀X：台账档同样要过在线门。speak_id 台账是**本运行期** CMD20
+                # 入驻 POST 上来的，值真，但"入驻时在线、此刻已断"的窗口里它已经不是
+                # 现读值（设备这期间被 USB 重烧就挂旧版）——1.6.4 只给握手档补了门，
+                # 这档漏了，于是断连期仍能谎标「实时」并被加载项当成可信读数。
+                fw, fw_source = fw_live, ("实时" if fw_available else "台账")
             else:
                 fw = str(entry.data.get("fw_version", "") or "")
                 fw_source = "入驻时" if fw else ""

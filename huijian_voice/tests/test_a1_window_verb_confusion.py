@@ -97,6 +97,13 @@ A1_CASES = [
     "官闭内开内倒",
     "公式内开内倒",    # v1.5.7 加重形：旧形 action=a 内倒真下发（1.5.6 树此形 MISS）
     "光闭内开内倒",
+    # v1.6.6 刀1（2026-10-19 复核当场用发布函数复现）：复合窗型名「平开内倒窗/
+    # 外开内倒窗」六表全缺，剥名剥到子串 内倒窗 就停 ⇒ 残余「官闭平开」里的名内
+    # 「开」字被当动作，旧码 `_t1_window_action('官闭平开内倒窗')=='open'`＝要关却开。
+    "官闭平开内倒窗",
+    "公式平开内倒窗",
+    "光闭外开内倒窗",
+    "官闭平开内倒",
 ]
 
 
@@ -121,6 +128,9 @@ KEEP_CASES = [
     ("打开推那窗", "open"),
     ("打开客厅窗户内倒", "a"),       # v1.1.1 #5 尾位内倒战果
     ("关闭开窗器", "close"),
+    ("打开平开内倒窗", "open"),      # v1.6.6 刀1 新增名（反向保护：新名不得吃掉正动词）
+    ("关闭外开内倒窗", "close"),
+    ("把平开内倒窗关上", "close"),   # SOV 形在新名上同样成立
 ]
 
 
@@ -177,3 +187,32 @@ def test_retry_branch_refuses_actionless_window():
     j = next(n for n, l in enumerate(lines) if 'trace.append(f"T1-retry' in l)
     assert any(re.match(r"^\s*if t1_intent:\s*$", l) for l in lines[i:j + 1]), \
         "retry 接管未被 if t1_intent: 守卫（None 会穿透建计划）"
+
+
+# ── v1.6.6 刀1：类守卫（判据来自表本身，不靠手写例子） ─────────────────
+_MISHEARD_CLOSE = ("官闭", "公式", "光闭")   # corrector A7 明令禁入纠错表的听岔形
+
+
+def test_class_guard_no_window_name_yields_open_under_misheard_close():
+    """任何窗名（含**表外超集形**）前挂听岔关闭词，一律不得判成 open。
+
+    名字宇宙是派生的、不是手写的：母表全词 ∪ 机型词 ∪ {名内词根 × 常见尾}。
+    1.5.7『裸形』与 1.6.0『官闭平开窗』两批都只靠手写例子守，第三形
+    （平开内倒窗）就漏过去并当场可复现——本钉把"下一形"一起守住。
+    宇宙为空＝扫描面失效，先响亮红。
+    """
+    from core.nlu import fast_path as fp
+
+    names = set(fp._WINDOW_TYPES) | set(fp._WINDOW_OPENER_WORDS)
+    for root in fp._WINDOW_NAME_POLARITY_ROOTS:
+        for tail in ("内倒窗", "窗", "开窗器", "内倒"):
+            names.add(root + tail)
+    assert len(names) >= 20, f"窗名宇宙塌缩（扫描面失效）：{sorted(names)}"
+
+    bad = [f"{p}{n}" for p in _MISHEARD_CLOSE for n in sorted(names)
+           if fp._t1_window_action(p + n) == "open"]
+    assert not bad, f"听岔关闭句被判成 open＝反极性真下发：{bad}"
+    # 同一宇宙：剥名后只剩名字的句必须整句查无（绝不凭空造动作）
+    only_names = [n for n in sorted(names) if n in fp._WINDOW_TYPES]
+    silent = [n for n in only_names if fp._t1_window_action(n) not in (None,)]
+    assert not silent, f"只报了名没说要做什么，却凭空造出动作：{silent}"

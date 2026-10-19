@@ -1074,16 +1074,42 @@ def _scan_window_action(text: str) -> Optional[str]:
     return None
 
 
-def _tail_window_action(rest_text: str, window_word: str) -> Optional[str]:
-    """剥掉窗型词根后再扫动作（v1.1.1 #5：内倒语序可达性）。
+def _strip_window_name_morphemes(text: str) -> str:
+    """剥净句内**全部窗名语素**后的残余（v1.6.6 刀1 单点；调用方两处同闸）。
+
+    三层剥离，缺一不可：
+      ① 表内窗型词根（`_window_type`，长词在前天然截胡）；
+      ② 开窗器/开合器/推窗器机型词（`_opener_word`）；
+      ③ 名内方向词根 `_WINDOW_NAME_POLARITY_ROOTS`（平开/外开/内开）——
+        表外超集形（如旧表没有的「平开内倒窗」）剥到 内倒窗 就停，残余里剩下的
+        「开」字是**名字的一截**而不是用户动词；不剥这层，听岔「官闭」句会被判成
+        open＝用户要关、窗真开（2026-10-19 发布函数实测复现的 P0 同族）。
+    ③ 只动名内词根，不动动词：打开/关闭/关上/内倒/暂停 一律不受影响，
+    本表里没有以 平开/外开/内开 为用户动词的形制（意图数据集与 corrector 同径）。
+    """
+    resid = str(text or "")
+    while True:
+        w = _window_type(resid) or _opener_word(resid)
+        if not w:
+            break
+        resid = resid.replace(w, "")  # replace 只删不增，循环必然收敛
+    for root in _WINDOW_NAME_POLARITY_ROOTS:
+        resid = resid.replace(root, "")
+    return resid
+
+
+def _tail_window_action(text: str) -> Optional[str]:
+    """剥净窗名语素后再扫动作（v1.1.1 #5：内倒语序可达性；v1.6.6 刀1 共用单点剥离）。
 
     「打开客厅窗户内倒」的 内倒 是**动作**，而「打开客厅的内开内倒窗」的
-    内倒 是**窗型词根**——同一子串两种身份，不先抹掉 _window_type 命中的整词
-    就无法区分，且后者被 _WINDOW_ACTION_SCAN 排在最前会截胡（数据集实锤该句
-    action=open，扫成 a=反向误执行）。返回 None 时交回动词头原判据。
+    内倒 是**窗型词根**——同一子串两种身份，不先抹掉窗名语素就无法区分，且后者被
+    _WINDOW_ACTION_SCAN 排在最前会截胡（数据集实锤该句 action=open，扫成 a=反向误执行）。
+    旧形只 replace 传进来的那一个词根，表外超集形（「平开内倒窗」之于旧表）剥到
+    内倒窗 就停 ⇒ 残余留名内「开」字被当动作。现改吃 `_strip_window_name_morphemes`
+    单点（三层剥离，含名内方向词根）。返回 None 时交回动词头原判据（分类器方向），
+    **不**由名字造动作。
     """
-    residue = (rest_text or "").replace(window_word or "", "")
-    return _scan_window_action(residue) or None
+    return _scan_window_action(_strip_window_name_morphemes(text)) or None
 
 
 def _t1_window_action(text: str) -> Optional[str]:
@@ -1114,12 +1140,7 @@ def _t1_window_action(text: str) -> Optional[str]:
       （v1.5.7 SOV 族钉口径在 t1 侧同步成立）。
     """
     try:
-        resid = str(text or "")
-        while True:
-            w = _window_type(resid) or _opener_word(resid)
-            if not w:
-                break
-            resid = resid.replace(w, "")  # replace 只删不增，循环必然收敛
+        resid = _strip_window_name_morphemes(text)
         if not resid.strip():
             return None
         return _scan_window_action(resid) or None
@@ -2285,7 +2306,7 @@ class FastPath:
                 trace.append(f"窗型纠正:{name}→ControlWindow")
                 intent = "ControlWindow"
                 extra = {**extra, "action": extra.get("action")
-                         or _tail_window_action(rest_text, wt)
+                         or _tail_window_action(rest_text)
                          or ("open" if _was_on else "close")}
             else:
                 # 2026-09 开窗器名称纠正（用户令优化第①项）：「关闭开窗器」
@@ -2311,7 +2332,7 @@ class FastPath:
                     trace.append(f"开窗器纠正:{name}→ControlWindow")
                     intent = "ControlWindow"
                     extra = {**extra, "action": extra.get("action")
-                             or _tail_window_action(rest_text, op)
+                             or _tail_window_action(rest_text)
                              or ("open" if _was_on else "close")}
                 elif name in ("窗", "窗户"):
                     # 2026-09-14 现场日志（2026-09-27 修复批）：「打开办公室平
@@ -2343,8 +2364,7 @@ class FastPath:
                     trace.append(f"泛窗纠正:{name}→ControlWindow")
                     intent = "ControlWindow"
                     extra = {**extra, "action": extra.get("action")
-                             or _tail_window_action(full or rest_text,
-                                                   _window_type(full or "") or "")
+                             or _tail_window_action(full or rest_text)
                              or ("open" if _was_on else "close")}
         # 音乐泛词守卫（2026-09-12 零改动过渡带）：Turn* 车道若把泛音乐词
         # ("关掉音乐/关音乐")吃成设备名，会错关同名实体或空转失败。放行 None，
@@ -2448,7 +2468,8 @@ class FastPath:
 
 # 12 窗型 + 泛称「窗户」（与 custom_components/huijian_ai WINDOW_ACTION_MAPPING 对齐，
 # 长词在前防短词截胡）；窗帘/纱窗=标准 cover，不在此表。
-_WINDOW_TYPES = ("内开内倒窗", "内开内倒", "外装平开窗", "单内倒窗", "内倒窗", "平推窗", "平开窗",
+_WINDOW_TYPES = ("内开内倒窗", "内开内倒", "外装平开窗", "平开内倒窗", "外开内倒窗",
+                 "单内倒窗", "内倒窗", "平推窗", "平开窗",
                  "推拉窗", "内开窗", "外开窗", "推拉门", "智能窗", "天窗",
                  "飘窗", "窗户",
                  # 2026-09 悬窗族 + 提升窗（用户点名「区域+窗户」机型）。_window_type
@@ -2458,6 +2479,13 @@ _WINDOW_TYPES = ("内开内倒窗", "内开内倒", "外装平开窗", "单内�
                   # 2026-09-30 数据集对账补口：电动窗（意图数据集窗型实测 x10，
                   # 六表从未收；与 targets 两表/集成两表三方同步，守卫钉）。
                   "电动窗")
+
+# 窗名内部的方向词根（v1.6.6 刀1）：平开/外开/内开 **只出现在窗型名里**，
+# 本产品的动词表用的是 打开/关闭/关上/内倒/暂停——没有任何用户动词以这三串出现。
+# 用途：`_t1_window_action` 剥完表内名语素后，残余里剩下的「开」字若是这些词根的
+# 尾巴（「平开内倒窗」表外超集形剥到 内倒窗 就停 ⇒ 残「官闭平开」），一律先剥掉再扫。
+# 缺这层的后果＝用户要关、窗真开（发布树实测复现，2026-10-19 复核点名）。
+_WINDOW_NAME_POLARITY_ROOTS = ("平开", "外开", "内开")
 
 # 帘族字（与 _POS_CURTAIN_WORDS 同集合）：窗型判定短路专用——「电动窗帘」
 # 含窗型词根 电动窗，字面扫描必截胡；帘=cover 设备，误判成窗型即按窗钮

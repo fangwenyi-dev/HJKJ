@@ -25,6 +25,8 @@ auto_download 开）→ 摘除交既有 pend→ensure 链重取；无重取来�
 import hashlib
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -76,8 +78,14 @@ def _mk(tmp_path, *, vocos=GOOD, size_mb=None, drop=False):
 
 
 # ── ① 红基线：陈旧字节附属必须判不就绪（启动复核摘除） ───────────────
-def test_stale_extra_file_must_not_pass_readiness(tmp_path):
+def test_stale_extra_file_must_not_pass_readiness(tmp_path, monkeypatch):
     models, lock, d = _mk(tmp_path, vocos=BAD)     # 名字对、字节错（八度案现场形制）
+    # v1.6.6 刀Y 随迁：本条钉的是"在线现场坏字节必须摘掉重取"，所以要模拟探活通过。
+    # 必须**类级**patch——ModelStore 的 ctor 自己就跑启动复核，实例级 patch 晚了一步
+    # （第一版栽在这：构造时按真 URL 探网失败 ⇒ 副本被保留 ⇒ is_ready 仍 True）。
+    # 不摘的那一半由 test_unreachable_source_keeps_the_only_copy 钉，两侧合起来才
+    # 是 M11「不得把现场弄得更糟」。
+    monkeypatch.setattr(ModelStore, "_net_reachable", lambda self, ef: True)
     st = ModelStore(_S(), lock_path=lock, models_dir=models,
                     status_file=tmp_path / "status.json")
     # 修复前的洞：stamp+存在性全过 ⇒ 判就绪（本断言在未接复核的树上必红）
@@ -232,6 +240,12 @@ def test_voice_sentinel_warns_on_live_engine():
 
     e = TtsEngine.__new__(TtsEngine)
     e._tts = _Tts()
+    # v1.6.6 刀2：夹具补生产同款并发件——旧夹具没有 _lock/_gen_lock/_busy，是因为
+    # 哨兵当年裸调 generate 根本不碰它们；现在走受锁路径，夹具缺件＝AttributeError
+    # 被外层 except 吞掉 ⇒ 本条测试会在"没点名"的情况下误判（假绿的新形态）。
+    e._lock = threading.Lock()
+    e._gen_lock = threading.Lock()
+    e._busy = 0
     e.settings = _S({"tts.provider": "local_matcha", "tts.sid": 0, "tts.speed": 1.05})
     e._loaded_prov = "local_matcha"
     warns = []
@@ -249,3 +263,183 @@ def test_voice_sentinel_warns_on_live_engine():
         logger.removeHandler(h)
     assert any(("八度" in m or "半速率" in m or "4.1kHz" in m) for m in warns), \
         f"降调引擎加载后哨兵未点名 WARN：{warns}"
+
+
+# ══ v1.6.6 刀2：哨兵必须走与生产同一把并发闸（行为钉，不是字面钉）══════
+def _eng(tts_obj, busy=0):
+    from core.tts import TtsEngine
+    e = TtsEngine.__new__(TtsEngine)
+    e._tts = tts_obj
+    e._lock = threading.Lock()
+    e._gen_lock = threading.Lock()
+    e._busy = busy
+    e.settings = _S({})
+    return e
+
+
+class _GoodAudio:
+    samples = property(lambda self: __import__("numpy").zeros(1600, dtype="float32"))
+    sample_rate = 16000
+
+
+def test_selftest_generate_holds_gen_lock_and_counts_busy():
+    """核心指控：旧形 `self._tts.generate(...)` 裸调——同代并发 generate 本仓明载
+    "重则 C++ 层崩溃打死整个容器"，而 try/except 挡不住 C++ abort；且不计 _busy ⇒
+    省电档 reaper 会在自测在飞时卸掉当代引擎。本钉在 generate 内部**当场取证**：
+    锁必须已被本线程持有、_busy 必须已计入。"""
+    seen = {}
+
+    class _Tts:
+        def generate(self, text, sid=0, speed=1.0):
+            # 锁此刻不可再次获取＝本线程正持有（生产口径）
+            seen["lock_held"] = not e._gen_lock.acquire(blocking=False)
+            if not seen["lock_held"]:
+                e._gen_lock.release()
+            seen["busy"] = e._busy
+            return _GoodAudio()
+
+    e = _eng(_Tts())
+    got = e.generate_for_selftest("金句", sid=0, speed=1.05)
+    assert got is not None
+    assert seen.get("lock_held") is True, "自测合成没持 _gen_lock＝与播报并发，C++ 崩面 reopen"
+    assert seen.get("busy", 0) >= 1, "自测没计 _busy＝卸载避让对它失明（F1 跨代析构）"
+    assert e._busy == 0, "收束后必须归还计数（否则永不被卸载=内存钉死）"
+    assert e._gen_lock.acquire(blocking=False), "收束后必须释放锁"
+
+
+def test_selftest_yields_rather_than_stalling_announce(monkeypatch):
+    """播报在飞时自测**让路**：等锁上限必须远短于播报侧 _GEN_WAIT_S，且拿不到锁
+    ＝本轮不判（返回 None），绝不把"没测"记成"测过且没问题"。"""
+    from core import tts as ttsmod
+    monkeypatch.setattr(ttsmod, "_SELFTEST_GEN_WAIT_S", 0.05)
+    monkeypatch.setattr(ttsmod, "_GEN_WAIT_S", 30.0)
+    e = _eng(object())
+    assert e._gen_lock.acquire(blocking=True)      # 模拟前手播报占锁
+    t0 = time.monotonic()
+    try:
+        assert e.generate_for_selftest("金句", sid=0, speed=1.0) is None
+    finally:
+        e._gen_lock.release()
+    waited = time.monotonic() - t0
+    assert waited < 1.0, f"自测陪等播报锁 {waited:.2f}s＝诊断件给播报链加了尾延"
+    assert e._busy == 0
+
+
+def test_selftest_skipped_does_not_burn_provider_budget(monkeypatch):
+    """判不成⇒不退预算（旧形先记账后判：一次锁忙＝此后 1h 不再自测，把自己盲掉）。"""
+    from core import tts as ttsmod
+    monkeypatch.setattr(ttsmod, "_SELFTEST_GEN_WAIT_S", 0.01)
+    e = _eng(object())
+    e._selftest_at = {}
+    e.active_provider = lambda: "local_matcha"
+    e._gen_lock.acquire(blocking=True)             # 锁被占＝本轮判不成
+    try:
+        e._voice_selftest()
+    finally:
+        e._gen_lock.release()
+    assert e._selftest_at.get("local_matcha") is None, \
+        "没判成却烧了预算＝接下来 1h 哨兵失明（诊断件的谎报形态）"
+    # 反向：真判成必须记账（省电档反复重载不许反复烧合成）
+    e._selftest_at = {}
+    monkeypatch.setattr(e, "_self_test_voice", lambda: True)
+    e._voice_selftest()
+    assert "local_matcha" in e._selftest_at, "判成了不记账＝每次重载都重烧一次合成"
+
+
+def test_selftest_no_bare_generate_call_left():
+    """反向结构钉：判据异常/裸调都不得回到 _self_test_voice 里（单点=受锁那条）。"""
+    import inspect
+    from core.tts import TtsEngine
+    body = inspect.getsource(TtsEngine._self_test_voice)
+    assert "self._tts.generate(" not in body, "自测里又出现裸 generate＝并发闸被绕过"
+    assert "generate_for_selftest(" in body, "自测没接在受锁单点上"
+    guarded = inspect.getsource(TtsEngine.generate_for_selftest)
+    assert "_gen_lock.acquire" in guarded and "_busy += 1" in guarded, \
+        "受锁单点自身缺任一半（锁或计数）都等于没修"
+
+
+# ══ v1.6.6 刀Y：配置有源 ≠ 现场真取得到（摘唯一副本前先探活）════════
+def test_unreachable_source_keeps_the_only_copy(tmp_path, monkeypatch):
+    """现网形制：自动下载开着（配置有源）而此刻断网/DNS 不通。旧形照样摘掉在场
+    唯一副本，随后重取全失败 ⇒ 从"音高不对"恶化成"彻底哑"（M11 禁止的自毁）。"""
+    models, lock, d = _mk(tmp_path, vocos=BAD)
+    monkeypatch.setattr(ModelStore, "_probe_host", lambda self, host, port: False)
+    st = ModelStore(_S(), lock_path=lock, models_dir=models,
+                    status_file=tmp_path / "status.json")
+    assert st.verify_extras("tts_x") is False, "坏字节仍须点名"
+    assert (d / "vocos-16khz-univ.onnx").exists(), \
+        "够不到替代件却照摘＝把唯一逃生通道砸了"
+
+
+def test_reachable_source_removes_for_refetch(tmp_path, monkeypatch):
+    """对照面：探活通过 ⇒ 仍按 1.6.3 的设计摘除让路给重取（新门不得变成永不修）。"""
+    models, lock, d = _mk(tmp_path, vocos=BAD)
+    monkeypatch.setattr(ModelStore, "_net_reachable", lambda self, ef: True)
+    st = ModelStore(_S(), lock_path=lock, models_dir=models,
+                    status_file=tmp_path / "status.json")
+    assert st.verify_extras("tts_x") is False
+    assert not (d / "vocos-16khz-univ.onnx").exists(), "在线现场坏字节必须被摘除重取"
+
+
+def test_local_rescue_skips_the_probe(tmp_path, monkeypatch):
+    """import/ 有好包＝本地就有来源，不必探网（离线自救这条路不能被新门挡回去）。"""
+    models, lock, d = _mk(tmp_path, vocos=BAD)
+    st = ModelStore(_S({"power.auto_download": False}), lock_path=lock,
+                    models_dir=models, status_file=tmp_path / "status.json")
+    (models / "import").mkdir(exist_ok=True)
+    (st.import_dir / "vocos-16khz-univ.onnx").write_bytes(GOOD)
+    calls = []
+    monkeypatch.setattr(st, "_probe_host",
+                        lambda host, port: calls.append(host) or False)
+    assert st.verify_extras("tts_x") is False
+    assert not (d / "vocos-16khz-univ.onnx").exists(), "有救急包时不摘＝坏字节永久隐身"
+    assert calls == [], "本地来源齐了还去探网＝给启动白加一次外网连接"
+
+
+def test_probe_runs_once_per_startup(tmp_path, monkeypatch):
+    """一次启动只探一轮：多附属/多 key 共用一个结果（探活跑在 ctor 同步路径上）。
+
+    ctor 自己就跑了复核并把结果缓存，所以先把缓存清成"未探"再验缓存语义——
+    否则本钉测的是"缓存已被填过"，不是"会缓存"。
+    """
+    models, lock, d = _mk(tmp_path, vocos=BAD)
+    calls = []
+    monkeypatch.setattr(ModelStore, "_probe_host",
+                        lambda self, host, port: calls.append(host) or False)
+    st = ModelStore(_S(), lock_path=lock, models_dir=models,
+                    status_file=tmp_path / "status.json")
+    st._net_ok = None
+    before = len(calls)          # ctor 已消耗一轮（host 'x'），本钉要核的是"再探也只一轮"
+    ef = {"urls": ["https://a.example/x.bin", "https://b.example/x.bin"]}
+    assert st._net_reachable(ef) is False
+    assert st._net_reachable(ef) is False
+    assert st._net_reachable(ef) is False
+    assert len(calls) - before == 2, \
+        f"探测次数失控（三个 url 该探到 b 即停、且整体只一轮）：{calls[before:]}"
+
+
+def test_probe_error_counts_as_unreachable(tmp_path, monkeypatch):
+    """判据件不得成为新故障面：探测抛异常＝不可达（保守＝不摘），且 verify 不抛。"""
+    models, lock, d = _mk(tmp_path, vocos=BAD)
+
+    def _boom(self, host, port):
+        raise RuntimeError("探测件坏了")
+
+    monkeypatch.setattr(ModelStore, "_probe_host", _boom)
+    st = ModelStore(_S(), lock_path=lock, models_dir=models,
+                    status_file=tmp_path / "status.json")
+    assert st.verify_extras("tts_x") is False
+    assert (d / "vocos-16khz-univ.onnx").exists()
+
+
+def test_probe_timeout_is_bounded_and_wired():
+    """接线与预算钉：探活必须有短上限，且真被摘除分支消费（只加常量不接线＝空转）。"""
+    import inspect
+    from core import model_store as ms
+    assert ms._NET_PROBE_TIMEOUT_S <= 2.0, \
+        f"探活上限 {ms._NET_PROBE_TIMEOUT_S}s 太长——它跑在启动同步路径上"
+    body = inspect.getsource(ms.ModelStore.verify_extras)
+    assert "_net_reachable" in body and "local_rescue" in body, \
+        "摘除分支没吃探活/本地救急包两个条件"
+    assert "socket.create_connection" in inspect.getsource(ms.ModelStore._probe_host), \
+        "探活必须是真连接，不是 DNS 名字解析"

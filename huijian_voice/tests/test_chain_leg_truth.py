@@ -35,10 +35,11 @@ def _tgt(nm, dom="light", area="办公室"):
 
 
 def _run(states, steps, source="t0", results=None, entity_area=None, log=None):
-    # A2 量具真形修正（审计 2026-10-17）：旧默认 source="chain" 在 core 里**永不产生**
-    # （Plan.source 字面量枚举＝t0/t1/klar/llm/scene/creation，链合并取首腿
-    # source=pipeline:2446），钉在非生产值上＝假绿。默认改 t0（字面表首腿真形），
-    # klar 支由 test_n1 参数化显式覆盖。
+    # A2 量具真形修正（审计 2026-10-17；v1.6.6 刀C 订正理由）：本夹具的 source= 喂的是
+    # **Plan.source**（枚举＝t0/klar/scene/creation/t0_end，ast 扫得），旧默认 "chain"
+    # 不在这一宇宙里 ⇒ 钉在非生产值上＝假绿，默认改 t0（字面表首腿真形），klar 支由
+    # test_n1 参数化显式覆盖。原注那句"chain 在 core 里永不产生"是错的：
+    # Reply.source 宇宙真产它（pipeline.py:2525 位参形），由 test_a2_source_chain_… 分宇宙钉住。
     ha = FakeHAClient(results=results if results is not None else
                       {"HassTurnOn": {"success": True}, "HassTurnOff": {"success": True}},
                       states=states, entity_area=entity_area or {})
@@ -156,7 +157,7 @@ class _FlapClient(FakeHAClient):
 
 
 def _flap_run(steps, source="t0"):
-    # A2 量具真形修正：同 _run——"chain" 在 core 永不产生；首腿档位真形=t0/klar。
+    # A2 量具真形修正：同 _run——"chain" 不在 Plan.source 宇宙（Reply 宇宙才有）；首腿真形=t0/klar。
     ha = _FlapClient(
         results={"HassTurnOn": {"success": True},
                  "AdjustDeviceAttribute": {"success": True}},
@@ -186,8 +187,11 @@ def test_n1_chain_post_send_flap_appends_not_overwrites():
 # v1.5.1 的 N1 拼接条件 `not reply.startswith("好的，都办妥")` 恰好把
 # **klar 首腿链**踢回覆写支：:1389 先产笼统"都办妥了"⇒ 证伪句整句覆写 ⇒
 # 首腿已完成事实被嘴上否认（现网 18:48:47 原案在 klar 档位仍未修）。
-# 且旧三钉钉的是 core **永不产生**的 source="chain"（Plan.source 枚举＝
-# t0/t1/klar/llm/scene/creation；链合并取首腿 pipeline:2446）＝量具假绿。
+# 且旧三钉钉的夹具默认值 source="chain" 混用了两套宇宙（v1.6.6 刀C 订正本注原句
+# "core 永不产生该值"——那句是错的：pipeline.py:2525 的 `Reply(speech, …, "chain", …)`
+# 位参形天天在产它，旧正则 `source="chain"` 看不见位参形才让它躲过了钉）。
+# 正确说法：夹具的 source= 喂的是 **Plan.source**（枚举＝t0/klar/scene/creation/…），
+# "chain" 只存在于 **Reply.source** 宇宙 ⇒ 默认值该改（1.6.0 改了，结论对、理由错）。
 # 现网级联日志（部署版 1.5.9，.91，pipeline:850 注释逐字在案）：
 #   [级联] '打开办公室射灯' → [klar] '办公室射灯开了'
 # ——标准开关句恒让 klar 胜（select_primary_plan 对非慧尖独有/非窗族 return kl）。
@@ -217,28 +221,64 @@ def test_a2_klar_chain_noop_leg_still_named():
     assert "都办妥了" not in reply, reply
 
 
-def test_a2_source_chain_never_produced_in_core():
-    """契约钉（防量具假绿回潮，N3 变异实测驱动）。
+def test_a2_source_chain_contract_scanned_not_assumed():
+    """契约钉（防量具假绿回潮，N3 变异实测驱动；v1.6.6 刀C 换成 ast 双宇宙）。
 
-    两半缺一不可（第一版只核了前半，变异 N3 实测 GREEN＝有洞）：
-    ① core 生产端不得出现 source="chain" 字面量（该值永不产生：链合并取首腿
-       pipeline:2446，枚举＝t0/t1/klar/llm/scene/creation）；
-    ② 本文件的 fixture 默认值必须 ∈ 生产枚举——"chain" 与 "t0" 都落 executor
-       else 支、**行为完全相同**，所以只钉行为的话，有人把默认值改回 "chain"
-       时全部行为钉照绿，而klar 档覆盖（_flap_run(source="klar")）仍在，
-       假绿悄悄回来。接线面得自己钉（v1.54 同款双保险）。
+    1.6.0 原版用正则 `source="chain"` 扫 core，并据此写下"core 永不产生该值"——
+    **那句宣称当时就是假的**：pipeline.py:2525 以**位参形** `Reply(speech, …,
+    "chain", …)` 天天在产它（链成功支）。正则漏掉位参形＝判据空转，而散文把空转
+    说成了结论。真实情形是两套宇宙被混成一件事：
+      · `Plan.source`（夹具的 source= 喂的是它）＝t0/t1/klar/scene/creation/…；
+      · `Reply.source`（对外话术档位）＝上面那套 + chain/delay/clarify/… 由执行侧写入。
+    "chain" 在 Reply 宇宙里合法、在 Plan 宇宙里不合法——所以夹具默认值该改（改了
+    也对），但理由不是"core 永不产生"。
+
+    现在两个宇宙各自 ast 扫出来当判据源（不再抄手写字面集合），并留正向对照：
+    扫不到 "chain" 就响亮失败——扫描面失效＝假绿的起点（同 1.54/1.6.3 教训）。
     """
+    import ast as _ast
     import re as _re
     core = Path(__file__).resolve().parents[1] / "core"
-    hits = [p.name for p in core.rglob("*.py")
-            if _re.search(r'source="chain"', p.read_text(encoding="utf-8"))]
-    assert not hits, f'core 出现生产端 source="chain" 字面量：{hits}'
-    PROD = {"t0", "t1", "klar", "llm", "scene", "creation", "t0_end"}
+
+    def _consts(node):
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            yield node.value
+        elif isinstance(node, _ast.IfExp):
+            yield from _consts(node.body)
+            yield from _consts(node.orelse)
+
+    def _scan(cls_name: str, source_arg_index: int) -> dict:
+        got: dict = {}
+        for p in sorted(core.rglob("*.py")):
+            tree = _ast.parse(p.read_text(encoding="utf-8"))
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Call):
+                    continue
+                fn = node.func
+                if (getattr(fn, "id", None) or getattr(fn, "attr", None)) != cls_name:
+                    continue
+                args = []
+                if len(node.args) > source_arg_index:
+                    args.append(node.args[source_arg_index])
+                args += [kw.value for kw in node.keywords if kw.arg == "source"]
+                for a in args:
+                    for c in _consts(a):
+                        got.setdefault(c, []).append(f"{p.name}:{node.lineno}")
+        return got
+
+    reply_src = _scan("Reply", 1)
+    plan_src = _scan("Plan", 1)
+    assert reply_src and plan_src, "ast 一个 source 常量都没扫到＝扫描面失效（假绿）"
+    # 正向对照：位参形的 chain 必须在（旧正则看不见它，本钉必须看见）
+    assert "chain" in reply_src, \
+        "Reply 的 chain 档不在了——上游变了，先核 pipeline 合并支再动本钉"
+    assert "chain" not in plan_src, "Plan 宇宙冒出 chain＝两套宇宙又被混用（夹具会自欺）"
+
     here = Path(__file__).read_text(encoding="utf-8")
     defaults = _re.findall(r'def _(?:flap_)?run\([^)]*?source="([a-z0-9_]+)"', here)
     assert defaults, "fixture 默认值判据失效（签名形变了，先修本钉再改量具）"
-    bad = [d for d in defaults if d not in PROD]
-    assert not bad, f'fixture 默认值不在生产枚举：{bad}（假绿温床）'
+    bad = [d for d in defaults if d not in plan_src]
+    assert not bad, f'fixture 默认值不在 Plan 生产宇宙：{bad}（假绿温床）'
 
 
 def test_n1_single_step_bits_still_overwrites():

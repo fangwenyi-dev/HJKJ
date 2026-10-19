@@ -28,6 +28,9 @@ logger = logging.getLogger("huijian.models")
 # 下载字节闸（第四轮审计 P2 ⑥）：按声明体积上浮 1.5x 即拒；lock 缺声明时走
 # 绝对兜底（不设地板——小包声明 1MB 就该按 1.5MB 卡）。
 _DL_ABS_MAX_BYTES = 3 << 30       # 3GB
+# v1.6.6 刀Y：启动复核摘坏附属前的"下载源够不够得到"探活上限（TCP 层，一次启动
+# 只探一轮）。设短是硬约束——它跑在 ctor 同步路径上，探活本身不得变成启动瓶颈。
+_NET_PROBE_TIMEOUT_S = 1.0
 # v1.1.39（审查 §3[P2]）：**总时限**。`urlopen(timeout=60)` 只管单次 socket 读、
 # `_cap` 只管字节 ⇒ 滴流源（每 60s 内吐一点、永不 EOF）能让 `while True` 永不结束，
 # 后续 url 一个都不试；而本函数跑在 `ensure()` 的 `self._key_lock(key)` 里，
@@ -264,6 +267,46 @@ class ModelStore:
         except Exception:  # noqa: BLE001
             return False
 
+    def _probe_host(self, host: str, port: int) -> bool:
+        import socket
+        try:
+            with socket.create_connection((host, port), timeout=_NET_PROBE_TIMEOUT_S):
+                return True
+        except OSError:
+            return False
+
+    def _net_reachable(self, ef: dict) -> bool:
+        """摘在场唯一副本前的「真取得到」探活（v1.6.6 刀Y）。
+
+        `_refetch_possible` 答的是**配置**上有没有来源；配置有源 ≠ 现场够得到：
+        自动下载开着而此刻恰好断网/无 DNS 时，旧形照样摘掉在场唯一副本，随后
+        重取全失败 ⇒ 从"音高不对"恶化成"彻底哑"，正是 M11 家规禁止的那种自毁
+        （10-19 复核定格的在册洞）。够不到就保留 + 如实点名，让用户自己决定切档
+        或放 import/ 救急包，而不是替他砸掉唯一逃生通道。
+
+        一次启动只探一轮（结果缓存在实例上，附属复核只在 ctor 跑）；只到 TCP 层
+        为止——要分辨的是"这台机器现在出不出得去"，不是证书与内容。任何异常＝
+        不可达（保守＝不摘）。
+        """
+        cached = getattr(self, "_net_ok", None)
+        if cached is not None:
+            return bool(cached)
+        import urllib.parse
+        ok = False
+        for url in (ef.get("urls") or []):
+            try:
+                u = urllib.parse.urlsplit(str(url))
+                host = u.hostname
+                if not host:
+                    continue
+                if self._probe_host(host, u.port or (443 if u.scheme == "https" else 80)):
+                    ok = True
+                    break
+            except Exception:  # noqa: BLE001 判据件不得成为新故障面
+                continue
+        self._net_ok = ok
+        return ok
+
     def verify_extras(self, key: str) -> bool:
         """附属文件逐一复核（尺寸快判→sha256）。
 
@@ -308,7 +351,11 @@ class ModelStore:
             if good:
                 continue
             ok = False
-            if self._refetch_possible(ef, name):
+            try:
+                local_rescue = (self.import_dir / name).exists()
+            except OSError:
+                local_rescue = False
+            if self._refetch_possible(ef, name) and (local_rescue or self._net_reachable(ef)):
                 try:
                     dest.unlink(missing_ok=True)
                     logger.warning("[模型] %s 附属 %s 字节与登记不符 → 已摘除，"
@@ -316,10 +363,14 @@ class ModelStore:
                 except OSError as e:
                     logger.warning("[模型] %s 附属 %s 判坏但摘除失败: %s（下次启动重试）",
                                    key, name, e)
+            elif local_rescue:
+                logger.warning("[模型] %s 附属 %s 判坏但下载门未开——import/ 有救急包，"
+                               "请放置后重启（v1.6.3 二跳）", key, name)
             else:
-                logger.warning("[模型] %s 附属 %s 字节与登记不符，但无重取来源"
-                               "（离线且关自动下载）——保留在场唯一副本仅点名；"
-                               "请面板开启自动下载重取，或放 import/%s 后重启",
+                logger.warning("[模型] %s 附属 %s 字节与登记不符，但当场取不到替代件"
+                               "（无 import/ 救急包，且到下载源的连接不通）——"
+                               "保留在场唯一副本仅点名；恢复网络后重启即自愈，"
+                               "或放 import/%s 后重启（v1.6.6 刀Y 前此形会被摘成彻底哑）",
                                key, name, name)
         return ok
 
@@ -330,6 +381,31 @@ class ModelStore:
                    if (self._manifest[k].get("extra_files") and self.is_ready(k))
                    and not self.verify_extras(k)]
         return flagged
+
+    def extras_stamp(self, key: str) -> str:
+        """附属文件的**身份串**（v1.6.6 刀11）：`文件名:size:mtime` 逐条拼接。
+
+        只 stat、不读内容——本仓有钉：附属哈希绝不进热路径（5s 状态循环/healthz/
+        播报指纹都是高频面，54MB vocos 逐轮哈希会烧穿数据盘）。取 mtime 而非 sha
+        的代价＝"同尺寸同分钟的原地替换"分辨不出；换文件（摘除→重取→新文件）必然
+        换 mtime，正是播报缓存键要的那件事。永不抛：任何异常回 ""（调用方按无附属处理）。
+        """
+        try:
+            entry = self._manifest.get(key) or {}
+            bits = []
+            for ef in (entry.get("extra_files") or []):
+                name = ef.get("file") or ""
+                if not name:
+                    continue
+                try:
+                    dest = self._resolved_dir(key, entry) / name
+                    st = dest.stat()
+                    bits.append(f"{name}:{st.st_size}:{int(st.st_mtime)}")
+                except Exception:  # noqa: BLE001 文件不在/权限：记名不记时
+                    bits.append(f"{name}:-")
+            return "|".join(bits)
+        except Exception:  # noqa: BLE001
+            return ""
 
     def extras_diag(self, key: str) -> list[dict]:
         """附属文件诊断（v1.6.4，远程定案面用；由嗓音自测低频触发，非热路径）：

@@ -92,7 +92,23 @@ def setup(app, ctx):
                 "error": err})
         for d in devices:
             cur = str(d.get("fw_version") or "")
-            d["updatable"] = bool(latest and cur and vkey(cur) < vkey(latest["version"]))
+            # v1.6.6 刀A：徽章判据收在本服务端单点（面板不复装，F-OTA-04 同律）。
+            # 「实时」＝本轮真连上过设备读到的握手值/本运行期台账值；其余档（未上报、
+            # 集成旧版根本没有 fw_source、或落「入驻时」持久快照）都不得断言版本关系
+            # ——1.6.1 的 USB 重烧挂旧值、1.6.4 的断连窗口谎标「实时」两次实锤，载体
+            # 都是"拿不可信的 fw_version 去比 latest"，而那正是 1.6.4 只修了显示标签、
+            # 没修这里的 `updatable` 与面板「已最新」pill 留下的后半截。
+            src = str(d.get("fw_source") or "")
+            if not latest:
+                state = "no-package"
+            elif not cur or src != "实时":
+                state = "unverified"
+            elif vkey(cur) < vkey(latest["version"]):
+                state = "updatable"
+            else:
+                state = "up-to-date"
+            d["fw_state"] = state
+            d["updatable"] = state == "updatable"
         return web.json_response({
             "devices": devices,
             "latest": (latest or {}).get("version", "") if latest else ""})

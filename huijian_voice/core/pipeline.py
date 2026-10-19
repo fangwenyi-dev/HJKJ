@@ -2514,6 +2514,27 @@ class Pipeline:
 
     async def _try_compound(self, text: str, origin: str) -> Optional[Reply]:
         """复合句：分句全命中才链发（P2-12）。裁决在 _chain_decide，执行在本函数。"""
+        # v1.6.6 刀4+刀7：链**执行**入口的时间形复核（与创建支 :1799 同构的独立判据）。
+        # 两道必要性，缺一都会把 1.5.8 立的"延时先于链切分"架空：
+        #   ① 延时闸自身异常时 `_delay_verdict` 返回 pass、`_delay_gate` 返回 None
+        #      （fail-open 保"不发虚"），句就这样直落本函数 ⇒ 链腿剥掉时间词当场执行
+        #      还播「都办妥了」＝老病灶在异常路径上复发；
+        #   ② 绝对时刻形（「打开灯然后每天6点30分关掉阳台灯」）自刀4 起不再算相对延时，
+        #      不再被延时闸接管，但它同样"不能合并当场执行"——时刻归时刻、链归链。
+        # 判据取自 delay 模块本体（不复制词表）。本闸出错＝交回原链判定，不吞句。
+        try:
+            # 只对**真会被拆成多腿**的句子生效：单发的时段状语（「睡觉前把灯关掉」
+            # 「出门前把灯关了」）是 v1.1.38 明确收宽过的合法形，误拦＝把那条修复打回去
+            # （本刀第一版就栽在整句判形上，被该批端到端钉当场抓红）。
+            legs = [x for x in (split_compound(text) or []) if str(x).strip()]
+            if len(legs) > 1 and any(delay.has_delay_shape(l) or delay.has_schedule_shape(l)
+                                     for l in legs):
+                return Reply("这句里的时间安排我不替你合并执行——请一次只说一件；"
+                             "要按时刻办的，可以说「当…就…」建个语音自动化。",
+                             "delay", ok=False,
+                             trace=[f"链前时间形复核:{'|'.join(legs)}"])
+        except Exception:  # noqa: BLE001 —— 复核故障＝不新增拦截面，交回原链
+            logger.exception("[级联] 链前时间形复核异常（交回原链）")
         reply, merged, plans, end_in_chain = await self._chain_decide(text, origin)
         if reply is not None or merged is None:
             return reply
@@ -2591,8 +2612,16 @@ class Pipeline:
                              "delay", ok=False, trace=[f"延时拒排:风险族:{b}"])
             # ②指代正文：只拦**零描述性**代词（它/们/裸代词句/代词+动作尾），
             #   不拦「那个射灯」这类带真名的指示词——那能正常解析，误杀＝过度拒排。
+            # v1.6.6 刀6：旧形是裸子串 `"它" in b or "们" in b`，把最日常的说法一起
+            # 误杀——「十秒后打开我们家的灯」「打开其他的灯」都不再能定时（用户得换
+            # 措辞，且听不懂为什么）。收窄成"代词当目标"那几形：
+            #   · 复数只认 它们/他们/她们（「我们家的」是区域修饰语，不是目标代词）；
+            #   · 单数先摘掉 其他/其它（"其它灯"里的它不是代词），再认 它。
+            # 裸代词句与"代词+动作尾"两形仍由 is_pronoun/_PRON_ACT_TAIL 管（不动）。
+            bb = b.replace("其他", "").replace("其它", "")
             if (is_pronoun(b) or _PRON_ACT_TAIL.match(b)
-                    or "它" in b or "们" in b):
+                    or any(w in b for w in ("它们", "他们", "她们"))
+                    or "它" in bb):
                 return Reply("定时指令里请把要操作的设备点名——过一会儿设备可能不止"
                              "一个，我怕替你关错东西。说成「十秒后打开办公室射灯」这样就行。",
                              "delay", ok=False, trace=[f"延时拒排:指代:{b}"])
@@ -2667,7 +2696,13 @@ class Pipeline:
                              ok=False, trace=[f"延时上限:{len(tasks)}"])
             t = asyncio.create_task(self._fire_delay(body, sec, origin))
             tasks.add(t)
+            # v1.6.6 刀8：账与袋同一条 done 回调收（旧形袋靠回调、账只在撤单时剪
+            # ⇒ 长跑下 _delay_booking 单调增，注释写的"漏剪不过是内存里一条已完约"
+            # 是真，但"永远是 0 条"才叫收口。判据源仍是 _delay_live 的 not done()。
             t.add_done_callback(tasks.discard)
+            _bk = getattr(self, "_delay_booking", None)
+            if _bk is not None:
+                t.add_done_callback(lambda _f, _t=t: _bk.pop(_t, None))
             # v1.6.5（刀5-b）：记账（撤单闸的判据源）。done_callback 只管 _delay_tasks
             # 的袋，账目由剪枝维护——两条腿独立，任何一边漏剪都不过是内存里
             # 一条已完约，不碰行为。
@@ -2677,7 +2712,12 @@ class Pipeline:
                               "ts": time.time()}
             logger.info("[级联] 相对延时已排程 %ds: %r（原话:%r）", sec, body, text)
             # 回执＝预约确认（将来时），绝不"已做完"。
-            return Reply(f"好的，「{body}」我记下了，{self._secs_desc(sec)}后执行",
+            # v1.6.6 刀10：排程回执不再许"必然办成"——到点若被四道闸拒或失败，
+            # 按 v1.5.4 静音纪律**不主动播报**（对着空气说话是刚收口的缺陷），
+            # 于是旧形回执＝"许完诺就无声违约"。本刀只把话说真（知情），
+            # "下次开口补一句"属新能力、待签字，不自行实现。
+            return Reply(f"好的，「{body}」我记下了，{self._secs_desc(sec)}后执行；"
+                         "到点要是做不成我不会再提，要改请现在说",
                          "delay", ok=True, trace=[f"延时排程:{sec}s->{body}"])
         except Exception:  # noqa: BLE001 —— 本闸任何意外＝放行主链（保守到不发虚）
             logger.exception("[级联] 延时闸异常 → 放行主链")
@@ -2691,6 +2731,16 @@ class Pipeline:
         "取消预约", "撤销预约", "取消定时", "撤销定时", "取消定时指令",
         "取消所有预约", "取消所有定时", "撤掉预约", "撤掉定时", "取消刚才的预约",
     })
+
+    def _delay_live(self, booking, origin) -> list:
+        """在途（未 done）且属**本发起源**的预约。v1.6.6 刀B 提成单点：真流量撤单
+        （_delay_cancel_gate）与面板预演（dry_run）旧形各写一份——面板取全部 live
+        条数、线上按 origin 折 ⇒ 别源挂单时面板报「会撤 N 条」比线上实际多，正是
+        「面板与线上同一裁决」没走完的另一半。origin 空＝面板档（与两侧同律）。
+        """
+        want = origin or "panel"
+        return [(t, b) for t, b in (booking or {}).items()
+                if not t.done() and (b.get("origin") or "panel") == want]
 
     def _delay_cancel_gate(self, text: str, origin: str) -> Optional[Reply]:
         """语音撤单（v1.6.5 刀5-b）。专令整句命中 ⇒ 撤**本 origin** 的在途预约。
@@ -2717,8 +2767,7 @@ class Pipeline:
             # 剪枝：done 的 task 不再可撤（顺带回收账目内存）
             for t in [t for t, b in booking.items() if t.done()]:
                 booking.pop(t, None)
-            mine = [(t, b) for t, b in booking.items()
-                    if (b.get("origin") or "panel") == (origin or "panel")]
+            mine = self._delay_live(booking, origin)
             if not mine:
                 return Reply("没有待执行的定时指令。", "delay", ok=True,
                              trace=["延时撤单:本源无约"])
@@ -3326,6 +3375,19 @@ class Pipeline:
             states = getattr(self.ha, "_states", None) or {}
             if not states:
                 return False
+            # v1.6.6 刀9：陈旧快照不得当"家里真没锁"的凭据。仓内早有具名新鲜度尺
+            # `states_stale()`（查询族/executor 都在用），本闸旧形直读 _states ⇒
+            # 读失败或 90s+ 未更新时仍判"零锁"，于是播「家里没找到能解锁的锁」把
+            # 真锁说没＝谎报清单 + 拒真（10-19 复核在册活缺陷）。判据方向照旧保守：
+            # 不可判＝False＝照旧挂环，绝不因判据故障放松风险闸。
+            why = ""
+            try:
+                why = self.ha.states_stale() if hasattr(self.ha, "states_stale") else ""
+            except Exception:  # noqa: BLE001 尺本身故障＝不可判
+                why = "新鲜度判据异常"
+            if why:
+                logger.info("[环] 锁族存在性不可判（%s）→ 照旧挂环", why)
+                return False
             return not any(str(k).startswith("lock.") for k in states)
         except Exception:  # noqa: BLE001 判据故障＝不可判＝照旧挂环
             logger.exception("[环] 锁族存在性判据异常（按不可判处理）")
@@ -3673,7 +3735,15 @@ class Pipeline:
         不了（候选没挂区域）时示例不再虚构任何房间，改说"先说它所在的房间"。
         默认参保持旧文案形，既有一字钉（v1.5.5 套件）不受扰动。"""
         nm: list = [str(n) for n in (names or []) if str(n)]
-        others = "、".join(nm[:3]) + ("…" if len(nm) > 3 else "")
+        # v1.6.6 刀5：真多台同名（注册表 device_id 不同）时旧形直接拼列表 ⇒
+        # 播「2 台设备名字相近（射灯、射灯）」——台数对、列名像坏了，且把"同名"
+        # 说成"名字相近"也不实。改成按名字计数标 ×N：**台数照设备数、列名去重**。
+        # 名字全不重复时逐字等于旧形（既有一字钉不受扰动，1.5.5 套件口径不动）。
+        _uniq = list(dict.fromkeys(nm))
+        _dup = any(nm.count(x) > 1 for x in _uniq)
+        _shown = ([f"{x}×{nm.count(x)}" if nm.count(x) > 1 else x for x in _uniq]
+                  if _dup else nm)
+        others = "、".join(_shown[:3]) + ("…" if len(_shown) > 3 else "")
         n = max(int(n_entities or 0), len(nm))
         lead = (f"家里有 {n} 台设备名字相近（{others}），我没法确定你要哪一台，"
                 f"这次先不动。")
@@ -3966,12 +4036,16 @@ class Pipeline:
         if (_strip_punct(text or "") in self._DELAY_CANCEL_WORDS
                 and not _delay_turn_isolated()):
             booking = getattr(self, "_delay_booking", None) or {}
-            live = [b for _t, b in booking.items() if not _t.done()]
+            # v1.6.6 刀B：与线上撤单闸共用 `_delay_live`（面板这一腿 origin=panel）。
+            # 旧形这里取**全部** live 条数，线上却按 origin 折 ⇒ 别源挂单时面板报
+            # 「会撤 N 条」比线上实际撤的多＝同一句两套裁决的另一半。
+            mine = self._delay_live(booking, "panel")
             out = {"nlu_enabled": True, "plan": None, "fast_path": None,
                    "klar": None, "delay": True, "delay_action": "cancel"}
-            out["final"] = (f"（面板预演，不会真撤）这句会撤掉你当前挂的 "
-                            f"{len(live)} 条定时指令" if live else
-                            "（面板预演）这句会如实答「没有待执行的定时指令」")
+            out["final"] = (f"（面板预演，不会真撤）这句会撤掉面板源在途的 "
+                            f"{len(mine)} 条定时指令" if mine else
+                            "（面板预演）这句在面板源没有可撤的预约——线上会如实答"
+                            "「没有待执行的定时指令」（别的卫星挂的单归它们自己撤）")
             return out
         d_kind, d_say, d_body, d_sec = self._delay_verdict(text)
         if d_kind != "pass":

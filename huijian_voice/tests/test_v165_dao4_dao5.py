@@ -436,3 +436,42 @@ def test_d5c_clean_is_single_export_point():
     assert "_STRIP_CTRL.sub(" not in tl and "_STRIP_TAGS.sub(" not in tl, \
         "转写函数里又出现摊开的剥壳＝复刻第二份（假绿回潮起点）"
     assert "_clean_transcript_text(" in tl, "单点没接在转写出口上"
+
+
+# ══ v1.6.6 刀B：面板撤单预演与线上同一 origin 口径（后端那半条）══════
+class _FakeTask:
+    def __init__(self, done=False):
+        self._d = done
+
+    def done(self):
+        return self._d
+
+    def cancel(self):
+        self._d = True
+
+
+def test_d5a_panel_cancel_preview_folds_origin_like_real_flow():
+    """旧形＝面板取**全部** live 条数、线上按 origin 折 ⇒ 别源挂单时面板报「会撤 2 条」
+    而线上只撤 1 条＝同一句两套裁决（「面板与线上同一裁决」没走完的另一半）。
+    现在两侧共用 `_delay_live`，本条钉的是**它俩同折**这件事本身。"""
+    p = _pipe({}, {}, {})
+    p._delay_booking = {
+        _FakeTask(): {"body": "关办公室射灯", "sec": 10, "origin": "panel"},
+        _FakeTask(): {"body": "开窗", "sec": 20, "origin": "satA"},
+        _FakeTask(done=True): {"body": "已跑完的旧单", "sec": 5, "origin": "panel"},
+    }
+    out = asyncio.run(p.dry_run("取消预约"))
+    assert out.get("delay_action") == "cancel", out
+    assert "面板源在途的 1 条" in out["final"], out["final"]
+    assert "2 条" not in out["final"], "面板还在报跨源的总条数＝比线上多报"
+    # 线上同一批数据撤的也必须正好是那一条（两侧同判据＝同结果）
+    g = p._delay_cancel_gate("取消预约", "panel")
+    assert g is not None and "已取消10秒后" in g.text, g
+    assert len(p._delay_booking) == 1, p._delay_booking   # 只剩 satA 那条
+
+    # 反向：面板源零在途时不得含糊说"没有待执行的定时指令"了事——别人的单要点名不吞
+    p2 = _pipe({}, {}, {})
+    p2._delay_booking = {_FakeTask(): {"body": "开窗", "sec": 20, "origin": "satA"}}
+    out2 = asyncio.run(p2.dry_run("取消预约"))
+    assert "面板源没有可撤的预约" in out2["final"], out2["final"]
+    assert len(p2._delay_booking) == 1, "面板预演落了袋＝动了别人的预约"
