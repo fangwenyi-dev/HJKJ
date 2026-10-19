@@ -222,3 +222,59 @@ def test_resolve_candidates_keeps_unknown_ordering():
     got = resolve_candidates(states, {}, [{"area": "", "devices": [
         {"name": "射灯", "domains": ["light"]}]}])
     assert [e["entity_id"] for e in got] == ["light.x", "light.y", "light.z"], got
+
+
+# ── v1.6.8 刀13（现网 1.6.6/1.6.7 实锤）：跨区不得改指 ────────────────────
+# 现场：「打开客厅灯」被 klar 落到离线的 light.she_deng（展厅），唯一同名可用台是
+# light.ban_gong_shi_she_deng（办公室）⇒ 旧判据三条全满足 ⇒ 客厅的话点亮办公室。
+# 新口径：两侧区域**都已知且不同** ⇒ 不改指（宁可如实说离线）；区域未知沿用旧口径。
+OFFLINE_TWIN_TING = _ent("light.she_deng", "unavailable", "射灯")
+GOOD_LAMP_BGS = _ent("light.ban_gong_shi_she_deng", "off", "射灯")
+
+
+def test_cross_area_twin_is_not_repointed():
+    """现网原形：离线台在展厅、可用同名台在办公室 ⇒ 一台都不许多动。"""
+    ha = Ha(states={"light.she_deng": OFFLINE_TWIN_TING,
+                    "light.ban_gong_shi_she_deng": GOOD_LAMP_BGS},
+            entity_area={"light.she_deng": "展厅",
+                         "light.ban_gong_shi_she_deng": "办公室"})
+    ok, msg = _run(ha, _klar("HassTurnOn", {"entity_id": "light.she_deng"}, "打开客厅灯"))
+    assert "ban_gong_shi" not in _sent(ha), f"跨区改指仍然发生了：{_sent(ha)}"
+    assert ok is False and ("离线" in msg or "不可用" in msg), msg
+    assert "办妥" not in msg and "开了" not in msg, msg
+
+
+def test_same_area_twin_still_repointed():
+    """v1.1.15 的价值面不许被本刀顺手砍掉：同区域唯一同名可用台照旧改指并真执行。"""
+    ha = Ha(states={"light.she_deng": OFFLINE_TWIN_TING,
+                    "light.ban_gong_shi_she_deng": GOOD_LAMP_BGS},
+            entity_area={"light.she_deng": "办公室",
+                         "light.ban_gong_shi_she_deng": "办公室"})
+    ok, msg = _run(ha, _klar("HassTurnOn", {"entity_id": "light.she_deng"}, "打开办公室的射灯"))
+    assert ok is True, msg
+    assert _targets_ok(ha, "light.ban_gong_shi_she_deng", "light.she_deng"), _sent(ha)
+    assert "已改指" in msg, msg
+
+
+def test_unknown_area_keeps_legacy_repoint():
+    """区域表缺席（未同步/该台没注册区域）⇒ 不参与判断，沿用旧口径改指。"""
+    ha = Ha(states={"light.she_deng": OFFLINE_TWIN_TING,
+                    "light.ban_gong_shi_she_deng": GOOD_LAMP_BGS},
+            entity_area={"light.she_deng": "办公室"})   # 候选台区域未知
+    ok, msg = _run(ha, _klar("HassTurnOn", {"entity_id": "light.she_deng"}, "打开射灯"))
+    assert ok is True and "已改指" in msg, msg
+    assert "light.ban_gong_shi_she_deng" in _sent(ha), _sent(ha)
+
+
+def test_two_twins_repoints_only_the_same_area_one():
+    """两台同名可用：一台同区一台跨区 ⇒ 筛后恰好一台，改指同区那台（不是猜，是区域定的）。"""
+    ha = Ha(states={"light.she_deng": OFFLINE_TWIN_TING,
+                    "light.ban_gong_shi_she_deng": GOOD_LAMP_BGS,
+                    "light.other": _ent("light.other", "off", "射灯")},
+            entity_area={"light.she_deng": "办公室",
+                         "light.ban_gong_shi_she_deng": "办公室",
+                         "light.other": "展厅"})
+    ok, msg = _run(ha, _klar("HassTurnOn", {"entity_id": "light.she_deng"}, "打开办公室的射灯"))
+    assert ok is True, msg
+    blob = _sent(ha)
+    assert "light.ban_gong_shi_she_deng" in blob and "light.other" not in blob, blob

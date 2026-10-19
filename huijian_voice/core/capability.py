@@ -141,8 +141,24 @@ def resolve_candidates(states: dict, entity_area: dict, target: list) -> list:
                     if not isinstance(e, dict):
                         continue
                     fn = str(((e.get("attributes") or {}).get("friendly_name")) or "")
-                    if area and (entity_area or {}).get(eid) != area and area not in fn:
-                        continue
+                    # v1.6.8 刀14（与刀13 同族，本函数是全仓"按区域挑台"的唯一底层）：
+                    # 旧形 `!= area and area not in fn` 给区域闸留了个逃生口——**注册在
+                    # 别的房间、只是 friendly_name 里带了这个房间词**的台也会被放行，
+                    # 于是"打开客厅的灯带"能把办公室那台一起捞进候选（本机复现：
+                    # light.a 注册办公室/名字「客厅 灯带」→ 查客厅时命中 [a, b]）。
+                    # 新口径：注册表认得的台以**注册区域**为准（与窗控侧
+                    # `intent_window_const._candidate_area_tier` 的"确凿别区永不放行"同律）；
+                    # 只有该台**没有注册区域**时，才退回"名字里含该房间词"的兜底——
+                    # 现网 32/34 台是「客厅 吸顶灯」这种名字带房间词的真形制，不能砍。
+                    # 现网清单实测（542 实体/143 带区域/5 房间）：名字含别区词且自身有
+                    # 注册区域的台 = 0 ⇒ 本条收紧在现网零附带改动。
+                    if area:
+                        reg = str((entity_area or {}).get(eid) or "").strip()
+                        if reg:
+                            if reg != area:
+                                continue
+                        elif area not in fn:
+                            continue
                     if nm and nm not in str(eid) and nm not in fn:
                         continue
                     e = dict(e)

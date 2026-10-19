@@ -3613,9 +3613,17 @@ class Pipeline:
                     return want
             # ② 同区域（区域继承补好后这一层才真的有数据）
             if areas:
-                same = [c for c in pool
-                        if str((entity_area or {}).get(
-                            str(c.get("entity_id") or ""), "") or "") in areas]
+                # v1.6.8 刀14（与刀13 同律）：旧形只在 `same` 非空时收窄，`same` 为空就
+                # 静默放弃区域这一维、直接拿整池往 ③ 走 ⇒ 用户点了名说「客厅」，
+                # 却可以把**注册在别的房间**的同名台收敛成唯一答案并真执行。
+                # 新口径：先把"确凿别区"的候选剔掉（区域未知的不剔＝沿用旧口径，
+                # 与 `_repoint_offline_twin` 一致），剔空了就按不收敛处理。
+                def _a_of(c):
+                    return str((entity_area or {}).get(
+                        str(c.get("entity_id") or ""), "") or "")
+
+                pool = [c for c in pool if _a_of(c) in ("", *areas)]
+                same = [c for c in pool if _a_of(c) in areas]
                 if len(same) == 1:
                     return cls._cand_name(same[0])
                 if same:

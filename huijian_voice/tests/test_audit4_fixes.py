@@ -601,7 +601,11 @@ def test_p1_executor_repoint_notes_are_per_run():
     }
     ha = FakeHAClient(states=states,
                       entity_area={"light.she_deng": "客厅",
-                                   "light.bg_she_deng": "办公室",
+                                   # v1.6.8 刀13 夹具订正：本钉判的是**并发桶隔离**（A 轮不得
+                                   # 串入 B 轮的改指注），与区域无关；旧夹具把孪生放在不同区域，
+                                   # 而"跨区不改指"正是刀13 新禁的形状 ⇒ 会先被新规则拦掉、
+                                   # 根本走不到桶隔离那一步。改成同区＝本钉原意一字不动。
+                                   "light.bg_she_deng": "客厅",
                                    "light.tai_deng": "客厅"})
     ex = _Gated(ha, None)
     plan_a = Plan("TurnDeviceOn", {"entity_id": "light.tai_deng"}, "t0",

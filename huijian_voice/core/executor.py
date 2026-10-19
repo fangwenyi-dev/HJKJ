@@ -604,6 +604,16 @@ class Executor:
         判据保守到不发虚：只认 `friendly_name` **全等** + 同域 + **恰好一台**可用；
         两台以上同名、名字缺失、快照里没有可用台 → 一律不动，交回闸如实说。
         永不抛、永不阻断（异常=原样继续）。
+
+        v1.6.8 刀13（现网 1.6.6/1.6.7 实锤）：**两侧区域都已知而不同 ⇒ 不改指**。
+        现场：「打开客厅灯」被 klar 落到离线的 `light.she_deng`（展厅），而唯一同名
+        可用台是 `light.ban_gong_shi_she_deng`（办公室）⇒ 旧判据三条全满足，于是
+        **客厅的话点亮了办公室的灯**（回执带"已改指…在办公室"，话是真话，动的是别间）。
+        v1.1.15 立这条时的现场同样是"客厅的灯→办公室那台"，当时把它当"救回一次执行"，
+        代价是用户以为动的是自己说的那间——与本仓"宁可如实失败，绝不 area 扇出/谎报成功"
+        （见 run() 里能力闸那条注）相反，故收成同区才换。
+        区域**未知**（任一侧不在区域表里，如表未同步/该台没注册区域）沿用旧口径照改：
+        那不是猜台（同名全等＋同域＋恰好一台仍是硬条件），而跨区才是确证的错。
         """
         try:
             raw = (args or {}).get("entity_id")
@@ -614,6 +624,7 @@ class Executor:
             states = await self.ha.states()
             if not states:
                 return
+            area_map = getattr(self.ha, "_entity_area", {}) or {}
             fixed = {}
             for eid in eids:
                 ent = states.get(eid)
@@ -630,11 +641,16 @@ class Executor:
                          if isinstance(oe, dict) and o != eid and o.startswith(dom + ".")
                          and str(oe.get("state")) not in ("unavailable", "unknown")
                          and str(((oe.get("attributes") or {}).get("friendly_name")) or "").strip() == nm]
+                # 刀13：只在"两侧区域都已知"时施加同区约束——未知区域不参与判断（不因此改判），
+                # 已知跨区则剔除该候选；筛后仍"恰好一台"才改指（两台同名依旧不猜）。
+                a_old = str(area_map.get(eid) or "").strip()
+                if a_old:
+                    cands = [c for c in cands
+                             if (a_new := str(area_map.get(c) or "").strip()) in ("", a_old)]
                 if len(cands) == 1:
                     fixed[eid] = (cands[0], nm)
             if not fixed:
                 return
-            area_map = getattr(self.ha, "_entity_area", {}) or {}
             for old, (new, nm) in fixed.items():
                 if isinstance(raw, str):
                     args["entity_id"] = new
