@@ -52,7 +52,13 @@ _COLOR_ALT = "|".join(sorted(_COLOR_HEX, key=len, reverse=True))
 # 泛设备词「灯」进那张表会污染 parse_target 评分与窗族守卫（targets 侧表另有
 # 用途，不改），而「灯光」既不在表内也非 KNOWN_DEVICE——数据集原形「把灯调成
 # 红色」「把灯光调成白色」两条路都够不到，只在本层动作表重扫时补这两个头。
-_BARE_DEV_HEADS = ("灯光", "灯")
+# v1.6.10 刀P0-2 补「窗」：裸窗句在**尾动词形**（「窗关上」「窗打开」，状态定语
+# 剥离后的正常残形）此前两头都够不到——① 的 ^关上 系列不吃名词起头、③ 需要
+# 区域前缀，于是「把窗关上」「把没关紧的窗关上」整句落 MISS 听成"这句话我还不会"，
+# 而这条产品卖的就是开窗器。补进本层（与「灯」同权、同样只在此层），产物形态由
+# 既有 `泛窗纠正` 决定：name=窗 无区域 ⇒ 走集成既有的全窗道（与已上线的
+# 「把所有窗关上」同一条语义，不新增作用面）。
+_BARE_DEV_HEADS = ("灯光", "灯", "窗")
 
 
 def _strip_heads() -> tuple:
@@ -170,8 +176,16 @@ _ACTION_PATTERNS: list[tuple[re.Pattern, str, Any]] = [
     # "帘"、且语义也从"开窗帘"错成"开窗"）；命中不了即落到下方通用 `^(打开|…)`。
     # 2026-09 开窗器护栏：`开窗(?!帘)` 会把「开窗器关闭」的 开窗 咬成动词、
     # 残出「器关闭」，(?!帘|器) 让整词进 ② 前缀剥离/窗族纠正车道。
-    (re.compile(r"^(打开窗户|开窗户|打开窗(?!帘)|开窗(?!帘|器)|窗户打开)"), "ControlWindow", "open"),
-    (re.compile(r"^(关闭窗户|关窗户|关闭窗(?!帘)|关窗(?!帘|器)|窗户关闭)"), "ControlWindow", "close"),
+    # v1.6.10 刀P1-2：补 「窗子」形。_COVER_HEAD(:1191) 的 SOV/SVO 语序归一表里
+    # 一直有 窗子，而归一产物写成「关闭窗子」——本表只认 窗户/窗，于是
+    # 「把窗子关上」→ 归一 →「关闭窗子」→ 被 `关闭窗(?!帘)` 咬掉三字、残出「子」，
+    # 目标名成单字残渣 ⇒ 整句落 MISS（用户口吻：说窗子不如说窗户）。两张表认到的
+    # 名词必须在本表也认得（同「模式动词条三缺一」型漂移）。长形排前，负向预查
+    # 补 户|子 防短形截胡。
+    (re.compile(r"^(打开窗户|打开窗子|开窗户|开窗子|窗户打开|窗子打开"
+                r"|打开窗(?!帘)|开窗(?!帘|器|户|子))"), "ControlWindow", "open"),
+    (re.compile(r"^(关闭窗户|关闭窗子|关窗户|关窗子|窗户关闭|窗子关闭"
+                r"|关闭窗(?!帘)|关窗(?!帘|器|户|子))"), "ControlWindow", "close"),
     (re.compile(rf"^({_alt(_NEI_DAO_FAMILY)})"), "ControlWindow", "A"),
     # 音乐带（2026-09-12）：后接音乐补语（播放/音乐/歌）时让位——"停止播放"
     # 是播控令不是窗帘暂停；裸"暂停/停"与"暂停窗帘"仍走窗户语义。
@@ -293,7 +307,12 @@ _ACTION_PATTERNS: list[tuple[re.Pattern, str, Any]] = [
     # 补 关 进负向预查：开后面紧跟 关 的一律不是本表的裸开，让位给尾动词道
     # （关掉/关闭/关上在句尾才是真动词）。护栏与 窗器/合器 同一条纪律、同一形状。
     (re.compile(r"^(打开|开启|开一下|开了|开(?!窗器|合器|关))"), "TurnDeviceOn", None),
-    (re.compile(r"^(关闭|关掉|关了|关一下|关)"), "TurnDeviceOff", None),
+    # v1.6.10 刀P1-1：补 「关上」——上方 A1 那条注释自己就写着「关掉/关闭/关上在句尾
+    # 才是真动词」，可动词头表只收了 关闭/关掉/关了/关一下，**关上三缺一**。后果是
+    # 「关上没关紧的窗」被裸 关 咬掉一字、残出「上窗」，而 `窗名抗折叠` 见它"以窗
+    # 收尾的 X窗 形"就整词保留 ⇒ 拿一个不存在的设备名去查（金标 #6 次生观察同族）。
+    # 排在裸 关 之前、与 关闭 同级，长形先命中。
+    (re.compile(r"^(关闭|关上|关掉|关了|关一下|关)"), "TurnDeviceOff", None),
     (re.compile(r"^(open (?:the )?window)(?:\s+|$)", re.I), "ControlWindow", "open"),
     (re.compile(r"^(close (?:the )?window)(?:\s+|$)", re.I), "ControlWindow", "close"),
     (re.compile(r"^(open|turn on|switch on|power on)(?:\s+|$)", re.I), "TurnDeviceOn", None),
@@ -1215,6 +1234,63 @@ def _cover_wordorder(text: str) -> Optional[str]:
     return None
 
 
+# 状态定语（设备"现在是什么样"的描述，不是要做的动作）。只列**带体标记**的形：
+# V着 / 没V补语 / 未V / 半V / 虚掩——裸 开|关 一律不入（入表会把「关掉开关」这类
+# 动词自身吃掉）。补语单字收 紧|严|好|上|完|闭|启，与 v1.1.27-r2 那条"0~2 字内
+# 出现的定语"同覆盖面。
+_STATE_ATTR_RE = re.compile(
+    r"(?:还|仍|仍然|依旧|依然)?(?:"
+    r"(?:开|关|亮|灭|空)着(?:窗子|窗户|窗|门|灯)?(?:呢)?"
+    r"|半开着?|虚掩着(?:呢)?"
+    r"|没(?:关|开|锁|打开)(?:紧|严|好|上|完|闭|启|到底)?"
+    r"|未(?:关|开|锁|关闭)(?:闭|紧|严|上)?"
+    r")(?:的|呢)?")
+# 剥完状态词之后必须还剩一个真动作词，才认为这句确有命令（否则不改写）。
+_TAIL_ACTION_AFTER_STATE = re.compile(
+    r"(?:关上|关掉|关闭|关了|开了|打开|开启|开一下|拉开|拉上|合上|闭合|收起|收拢|"
+    r"放下|降下|停一下|暂停|停止|内倒|调|设|锁上|解锁|继续)")
+
+
+def _split_state_attributive(text: str) -> Optional[str]:
+    """剥掉句中**状态定语**（开着/关着/没关紧/未关…），仅在残句另有动作动词时改写。
+
+    病灶（v1.6.9 离线复现，本机跑生产码路）：「把开着的灯关掉」剥把字后残句以
+    `开` 起头，① 动作表把**状态词的动词字**当成了命令动词——
+
+      ·「把开着的灯关掉」    → TurnDeviceOn(灯)      用户要关，灯真开
+      ·「把开着的窗关上」    → ControlWindow open     同上（窗）
+      ·「把客厅开着的窗关上」→ TurnDeviceOn(设备名=客厅) 区域名被当设备名＋反向
+      ·「窗户开着呢关上」    → ControlWindow open
+      ·「把没关紧的窗关上」  → name='没关紧的窗'（金标 #6 次生观察：真机查无）
+      ·「关上没关紧的窗」    → name='上没关紧的窗'（否定词后掠出补语残渣）
+
+    这一族与 v1.1.27「别开灯」真开灯、v1.6.6 刀1「官闭平开窗」判 open 同属
+    **反极性下发**（用户说 A、设备做 B），是该红线在"状态定语"形态上的第三个复现：
+    前两道各补了否定祈使与窗名语素，都不覆盖 `V着`/`没V补语` 这类**描述设备当前
+    状态**的修饰语素。名字里的方向词根由 `_strip_window_name_morphemes` 管，本道管
+    句中的状态短语，两张表对象不重叠（一个剥名字、一个剥状态从句）。
+
+    判据（宁欠勿过）：
+      1. 只剥表内**状态短语形**，不动裸 开/关（「关掉开着的…」的 关掉 是动词，留）；
+      2. 剥完必须**仍有动作动词**（`_TAIL_ACTION_AFTER_STATE`）才改写——「把灯开着」
+         剥完只剩「灯」，无尾动词 ⇒ 不改写，保住 v1.2.11 A2 那条刻意弃权；
+      3. 剥完残句 <2 字 ⇒ 不改写（只剩个词根的句子本道不裁决）；
+      4. 改写只写进 trace 留痕，产物仍走原车道（①②③/窗型纠正/歧义闸一律不变），
+         本函数永不抛——判据故障=不剥=逐字等于旧行为。
+    """
+    try:
+        t = (text or "").strip()
+        if not t or not _STATE_ATTR_RE.search(t):
+            return None
+        cand = _STATE_ATTR_RE.sub("", t)
+        cand = re.sub(r"[的得]{2,}", "的", cand).strip(" 的地得")
+        if cand == t or len(cand) < 2 or not _TAIL_ACTION_AFTER_STATE.search(cand):
+            return None
+        return cand
+    except Exception:  # noqa: BLE001 —— 判据自身故障不得拦正常句
+        return None
+
+
 class FastPath:
     def __init__(self, scenes, textcnn, settings, areas_of=None):
         self.scenes = scenes
@@ -1833,6 +1909,22 @@ class FastPath:
         if pp is not None:
             return pp
 
+        # v1.6.10 刀P0-1：句中**状态定语**的动词字不得当命令动词（反极性下发根修，
+        # 见 _split_state_attributive）。位置选在安全闸（否定/疑问/连排）与场景等值
+        # 之后、①②③ 动作表之前：三道闸吃的仍是原话，场景触发词按原话等值，改写
+        # 只影响目标与动词的取法。
+        _sa = _split_state_attributive(text)
+        if _sa:
+            trace.append(f"状态定语剥离→{_sa}")
+            text = _sa
+            # 剥完必须**重过语序归一**：本道位置在 `_cover_wordorder` 之后，残句
+            # 「窗户拉上」若不再归一，①②③ 三张表都够不到 拉上 这个尾动词（实测
+            # 「把没关严窗户拉上」v1.6.9 靠 T1 侥幸出计划，剥完反而 None＝倒退）。
+            _cov2 = _cover_wordorder(text)
+            if _cov2 and not is_negation_imperative(_sa, self._areas()):
+                trace.append(f"帘窗语序(剥后)→{_cov2}")
+                text = _cov2
+
         matched_intent: Optional[str] = None
         extra_args: dict[str, Any] = {}
         rest_text = text
@@ -2296,7 +2388,14 @@ class FastPath:
             zh_area = T.en_area_zh(area) if area else None
             if zh_area:
                 area = zh_area
-        if intent in ("TurnDeviceOn", "TurnDeviceOff") and name:
+        # v1.6.10 刀P0-4：三处窗族纠正（窗型/开窗器/泛窗）**共一道方位闸**——
+        # 名字或残段是「参照物+方位+的+中心语」形时，窗/器词在**参照物位**，
+        # 把它纠成 ControlWindow 就是"说开灯、窗真开"（P0）。判据单源在
+        # targets.locative_center_wins（方位表也单源在那边），本处一次盖三处，
+        # 不留"同类洞只修一边"的下一次。
+        _landmark = (T.locative_center_wins(name if isinstance(name, str) else "")
+                     or T.locative_center_wins(rest_text or ""))
+        if intent in ("TurnDeviceOn", "TurnDeviceOff") and name and not _landmark:
             wt = _window_type(name)
             if not wt and _window_type(rest_text):
                 # parse_target 把窗型词切碎（「推拉门」的推/拉被当残留动词
@@ -2450,6 +2549,15 @@ class FastPath:
             # 英文目标桥（见 targets.bilingual_targets）：英文 area/name 追加
             # 中文等价目标并集；纯中文句原样返回（零扰动）。
             args["target"] = T.bilingual_targets([entry] if entry else [])
+        elif intent == "ControlWindow":
+            # v1.6.10 刀P1-3：裸窗句（「关窗」「打开窗户」「窗户关上」）此前产出
+            # **无 target** 的 ControlWindow——集成端 `intent_window_control.py:430`
+            # 那条 "No target specified" 是 2026-10-08 P1 立的"如实失败"，于是客户
+            # 说这个产品最主的动词听到的是失败。补泛称目标即走集成**既有**全窗道
+            # （同一批窗型表、与已上线的「把所有窗关上」逐字同语义）：本刀不新增
+            # 任何作用面，只是把裸窗句接回那条已经存在的路。
+            args["target"] = [{"devices": [{"name": "窗", "domains": []}]}]
+            trace.append("裸窗补泛称目标→集成全窗道")
         if "action" in extra:
             args["action"] = str(extra["action"]).lower()
         for k in ("attribute", "delta", "mode", "position", "speed", "strength"):

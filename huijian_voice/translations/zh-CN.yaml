@@ -7,7 +7,8 @@ configuration:
     description: >-
       开启后，首次启动自动从网络下载语音模型：STT · FireRedASR2-AED（约 800 MB，
       解包 1.23 GB）＋ TTS · MeloTTS 中英（约 160 MB）——下载面约 1 GB、占盘约
-      1.4 GB；国内镜像优先，三级源自动回退。下载期间即可试用已就绪的部分。
+      1.4 GB；国内加速镜像（gh-proxy）优先，失败回落 GitHub 直连——**两腿**，
+      两腿都不通时请关闭本项并手工放置模型。下载期间即可试用已就绪的部分。
       关闭后需把解包好的模型目录放入 /data/models/import/ 并重启加载项——完全
       离线环境选这个。
   auto_install_integration:

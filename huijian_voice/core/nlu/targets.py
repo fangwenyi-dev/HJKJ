@@ -848,6 +848,101 @@ def _area_split_wins(stripped: str, idx: int, dev_len: int) -> bool:
     return False
 
 
+# 方位/关系词（v1.6.10 刀P0-4）：只收**空间关系**形，动词（打开/关闭/调/设）一律
+# 不入表——入了会把「关掉电视打开着」这种中心语让掉。长形排在短形前（re 交替最左
+# 优先，「上方」必须先于「上」类），单字 上/下/里 不进表（「台灯下面的床」这种
+# 名内字会误伤，双字以上才有判别力）。
+_POS_REL_WORDS = ("旁边", "边上", "附近", "对面", "前面", "后面", "左边", "右边",
+                  "左侧", "右侧", "上面", "下面", "里面", "外面", "中间", "上方",
+                  "下方", "前方", "后方", "桌上", "柜上", "床头", "地上", "墙上",
+                  "门上", "窗台", "底下", "上头", "下头", "里头", "屋里", "门口")
+_POS_REL_SCAN_RE = re.compile(
+    "|".join(sorted(_POS_REL_WORDS, key=len, reverse=True)))
+
+
+def _rel_hit_is_landmark(stripped: str, idx: int, d: str) -> bool:
+    """⑥ 命中的词若只是**参照物**（后面还有「方位词 + 另一个设备词」）⇒ 让位。
+
+    病灶（v1.6.9 离线逐字复算，基线树同码复现）：本层 ⑥ 用 `find` 取**第一个**
+    ≥2 字设备词即 `break`，`_SINGLE_GENERIC` 单字泛称车道只在它一无所获时才走
+    （`if not _hit_dev`），于是"方位短语的中心语"永远输给前面的参照物——
+
+      「把窗户旁边的灯打开」  → ControlWindow open(窗户)   灯没动、**窗真开**
+      「把窗帘旁边的灯打开」  → TurnDeviceOn(窗帘 cover)   要开灯、帘动了
+      「关掉电视柜上方的灯带」→ TurnDeviceOff(电视)        灯带没动、**电视真关**
+      「关掉洗衣机上面的灯」  → TurnDeviceOff(洗衣机)      灯没关、洗衣机被切
+
+    定级依据本仓自陈口径：说 A 动 B＝P0（2026-10-08「别开客厅的灯」真开灯、
+    1.6.8 刀13 跨区误动同族），且这四条都在**静态表**内（`clear_vocab()` 后零
+    HA 数据仍复现），不是降级态特有。英文侧早就有 `in` 后置方位形（:866），
+    中文方位短语一直没车道=同洞只修一边。
+
+    判据与既有两道护栏同机制、同纪律：**只 continue 让位，不新建目标**——让位后
+    由同一函数的后续命中或单字泛称车道承接中心语；认不出中心语就照旧命中，
+    行为不劣于旧版。方位表只收**空间关系词**，动词（打开/关闭/调）一律不入，
+    否则「关掉电视打开着」这类会被自己让掉。永不抛（判据故障=按旧行为命中）。
+    """
+    try:
+        tail = stripped[idx + len(d):]
+        if not tail:
+            return False
+        m = _POS_REL_SCAN_RE.search(tail)
+        if not m:
+            return False
+        rest = tail[m.end():].lstrip("的得")
+        if not rest:
+            return False
+        if any(w in rest for w in _ALL_MIN2):
+            return True
+        return any(w in rest for w in _SINGLE_GENERIC)
+    except Exception:  # noqa: BLE001 —— 判据故障不得改判
+        return False
+
+
+def locative_center_wins(phrase: str) -> bool:
+    """短语是「参照物 + 方位词(+的) + 中心语」形，且中心语认得出是设备 ⇒ True。
+
+    给上层（fast_path 的窗型/开窗器/泛窗三处纠正）用的单点判据：窗词出现在
+    **参照物位**时不是目标——「窗户旁边的灯」要动的是灯，把窗型扫出来纠成
+    ControlWindow 就是"说开灯、窗真开"（P0，同 2026-10-08「别开客厅的灯」判级）。
+    判据只在**方位词在场**且**方位之后还剩一个设备词/泛称**时成立，两者缺一
+    即回 False=照旧（行为不劣于旧版）。永不抛。
+    """
+    try:
+        p = (phrase or "").strip()
+        m = _POS_REL_SCAN_RE.search(p)
+        if not m:
+            return False
+        head = p[m.end():].lstrip("的得")
+        if not head:
+            return False
+        return (any(w in head for w in _ALL_MIN2)
+                or any(w in head for w in _SINGLE_GENERIC))
+    except Exception:  # noqa: BLE001 —— 判据故障=不改判
+        return False
+
+
+def _area_of_prefix_exact(pre: str) -> str | None:
+    """只认**在册整名**的区域前缀（参照物短语专用，绝不回捞单字残段）。
+
+    `_area_of_prefix` 的第三层"二次前缀扫描回捞"是为「办公室吊灯」这种未知复合词
+    设计的（残段→办公室），但方位短语的参照物段（「洗衣机上面的」）尾字 机 正好
+    落在它的尾字启发式上 ⇒ 家用电器被升格成房间名，计划带着不存在的 area 下发
+    （=查无，比反向执行轻，但仍是坏目标）。本函数只做 `BASE_AREAS ∪ 动态区表`
+    的整名精确命中——客厅/主卧 留得住，洗衣机 留不住。
+    """
+    try:
+        p = re.sub(r"[的里得]+$", "", (pre or "").strip())
+        if not p:
+            return None
+        for a in sorted(set(BASE_AREAS) | set(_dyn_areas), key=len, reverse=True):
+            if p == a or p.startswith(a):
+                return a
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def parse_target(raw: str) -> tuple[str | None, str | None, int]:
     """候选五法 + 质量评分（v1.5 并行提取段移植）。
     返回 (area, name, score)；解析失败时 area=None、name=清洗后的 raw。
@@ -937,7 +1032,15 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
             # 的在册词先命中，走不到这里。
             if not idx and _area_like(d) and _bare_generic(stripped[len(d):]):
                 continue
-            candidates.append((_area_of_prefix(stripped[:idx]), d, 5))
+            # v1.6.10 刀P0-4：命中词若是**方位短语的参照物**（「窗户旁边的灯」里的
+            # 窗户），让位给中心语——否则说开灯、窗真开（P0，判据见该函数）。
+            if _rel_hit_is_landmark(stripped, idx, d):
+                continue
+            pre = stripped[:idx]
+            # 参照物段不许被当成房间名（判据见 _area_of_prefix_exact）
+            area_pre = (_area_of_prefix_exact(pre) if _POS_REL_SCAN_RE.search(pre)
+                        else _area_of_prefix(pre))
+            candidates.append((area_pre, d, 5))
             _hit_dev = True
             break
     if not _hit_dev:
@@ -946,14 +1049,18 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
             if idx >= 0:
                 if d == "窗" and stripped[idx + 1:idx + 2] == "帘":
                     continue              # 同上帘字防吞（泛称档）
+                pre_g = stripped[:idx]
+                area_pre_g = (_area_of_prefix_exact(pre_g)
+                              if _POS_REL_SCAN_RE.search(pre_g)
+                              else _area_of_prefix(pre_g))
                 # 泛称折叠救援（见 _generic_rescue 头注）：单字泛称前带 2~3 字
                 # 纯汉字修饰段时先试音节级近音整词；不中才退泛称原车道。
-                wd = _generic_rescue(stripped[:idx], d)
+                wd = _generic_rescue(pre_g, d)
                 if wd is not None:
-                    candidates.append((_area_of_prefix(stripped[:idx]), wd, 5))
+                    candidates.append((area_pre_g, wd, 5))
                     _hit_dev = True
                     break
-                candidates.append((_area_of_prefix(stripped[:idx]), d, 4))
+                candidates.append((area_pre_g, d, 4))
                 _hit_dev = True
                 break
     # ⑦ 拼音模糊（v1.5 两缺陷修正：a) 首个 ≤5 即 break 会让「空调 kongtiao」被

@@ -356,8 +356,20 @@ def test_guard_wired_into_device_substring_lane():
     guard = lines[i]
     assert "if" in guard and "if False" not in guard, f"护栏被常量式失效：{guard}"
     assert "continue" in "".join(lines[i + 1:i + 3]), f"护栏没有让位：{lines[i:i + 3]}"
-    append = next(n for n in range(i, i + 8)
-                  if "candidates.append((_area_of_prefix(stripped[:idx]), d, 5))" in lines[n])
+    # v1.6.10 刀P0-4（方位参照物让位）把 ⑥ 取区域那一步换成"方位段只认在册整名"
+    # 的两分支（area_pre），旧钉按字面找 `_area_of_prefix(stripped[:idx])` 因而红。
+    # 判据本体（护栏在 append 之前 + 恰一处 _bare_generic + 必查 _area_like）一字
+    # 未动，只把"被接线的那一行"的形状改成盘上真实交付形状（两条合法出口都算接线）。
+    import re as _re
+    append_pat = _re.compile(
+        r"candidates\.append\(\((?:area_pre|_area_of_prefix\(stripped\[:idx\]\)), d, 5\)\)")
+    hits_app = [n for n in range(i, i + 20) if append_pat.search(lines[n])]
+    assert hits_app, f"⑥ 命中支的 append 找不到（护栏后 20 行内）:{lines[i:i + 20]}"
+    append = hits_app[0]
     assert "_area_like(d)" in guard, "护栏没查区域判据（会吞掉真具名设备）"
     # 必须在 ⑥ 的 append **之前**（append 之后 = 死代码，形同没修）
     assert i < append
+    # 反向臂（v1.6.10 补）：⑥ 循环体内护栏**之前**不许出现该 append 的另一种写法，
+    # 否则"加了护栏但命中支早走了"——本钉原本只查顺序，没查前面有没有出口。
+    earlier = [n for n in range(max(0, i - 14), i) if append_pat.search(lines[n])]
+    assert not earlier, f"append 出现在护栏之前（护栏成死码）:{earlier}"
