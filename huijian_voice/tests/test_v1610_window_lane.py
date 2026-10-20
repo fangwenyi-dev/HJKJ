@@ -356,3 +356,47 @@ def test_named_window_type_never_gets_satellite_area():
     assert p is not None
     got = (p.args or {}).get("target") or [{}]
     assert not got[0].get("area"), f"具名窗型被收窄改写:{got}"
+
+
+# ── 刀P1-6 尾动词表「关上」三缺一 ＋ 刀P1-7 裸空调只收窄 ────────────
+def test_wholehouse_tail_verb_has_guanshang():
+    """`_WH_TRAIL_RE` 必须与 _ACTION_PATTERNS 同一套尾动词（本批两处都缺 关上）。"""
+    from core.nlu.fast_path import _WH_TRAIL_RE
+    assert _WH_TRAIL_RE.search("所有灯都关上"), "全屋尾动词表仍缺「关上」"
+    assert _WH_TRAIL_RE.search("所有窗都关上")
+    assert not _WH_TRAIL_RE.search("所有灯都开着吗"), "疑问尾仍不得算命令（F13 红线）"
+
+
+def test_bulk_close_with_guanshang_executes(fp):
+    """正向臂：「所有灯都关上」必须出计划（缺 关上 时整句无计划＝听成不会）。"""
+    p = _m(fp, "所有灯都关上")
+    assert p is not None and p.intent == "TurnDeviceOff", p
+    assert getattr(p, "whole_house", False) is True, "批量句必须标 whole_house"
+
+
+def _sat_case(text, mapping, origin="10.0.0.7"):
+    fp = _fp_with({"spatial.satellite_areas": mapping} if mapping else {})
+    return asyncio.run(fp.match(text, origin=origin))
+
+
+@pytest.mark.parametrize("text,intent", [
+    ("打开空调", "TurnDeviceOn"), ("关空调", "TurnDeviceOff"), ("关闭空调", "TurnDeviceOff"),
+])
+def test_bare_climate_narrows_to_satellite_room(text, intent):
+    """裸空调：有卫星房间登记 ⇒ 收窄到本区域（不是放宽，是本来整句无计划）。"""
+    p = _sat_case(text, {"10.0.0.7": "客厅"})
+    assert p is not None, f"{text!r} 仍无计划"
+    assert p.intent == intent, f"{text!r} → {p.intent}"
+    got = (p.args or {}).get("target") or [{}]
+    assert got[0].get("area") == "客厅", f"未落到卫星房间:{got}"
+
+
+@pytest.mark.parametrize("text", ["打开空调", "关空调", "关闭空调"])
+def test_bare_climate_never_widens_without_mapping(text):
+    """反向臂（红线）：没登记卫星房间 ⇒ 照旧拒不接管——绝不冒然全屋动 climate。"""
+    assert _sat_case(text, {}) is None, f"{text!r} 在无映射时被放宽了"
+
+
+def test_bare_climate_unregistered_satellite_area_still_refuses():
+    """反向臂：映射里那间房本家没有 ⇒ 不写区域、照旧拒（换查无不算修）。"""
+    assert _sat_case("打开空调", {"10.0.0.7": "阁楼"}) is None

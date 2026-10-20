@@ -2061,7 +2061,8 @@ class FastPath:
             return self._miss(trace, "PlayMusic 不接管(模式B)")
 
         trace.append(f"{source}:{matched_intent} rest={rest_text!r} extra={extra_args}")
-        plan = self._build_plan(matched_intent, rest_text, extra_args, text, source, trace)
+        plan = self._build_plan(matched_intent, rest_text, extra_args, text, source,
+                                trace, origin)
         # v1.6.10 刀P1-4：裸窗句**无区域**时把作用面**收窄**到"说话这台卫星所在房间"
         # （`spatial.satellite_areas`，面板可配）。集成端对无区域的泛称一律如实失败
         # （`intent_window_control` 的 `is_generic_window_name` 闸——"开一扇变开一排"
@@ -2109,7 +2110,7 @@ class FastPath:
                     if t1_intent:
                         trace.append(f"T1-retry={label2}({prob2:.2f})")
                         retry_plan = self._build_plan(t1_intent, text, retry_extra,
-                                                      text, "t1", trace)
+                                                      text, "t1", trace, origin)
                         if retry_plan is not None:
                             plan = retry_plan
         if plan is None:
@@ -2207,6 +2208,23 @@ class FastPath:
         return Plan(intent="HassTriggerVoiceScene", args={"trigger_phrase": phrase},
                     source="scene", utterance=text, trace=trace)
 
+    def _satellite_area(self, origin: str) -> str:
+        """说话这台卫星登记过的房间（`spatial.satellite_areas`），**在册才回**。
+
+        与区域批量道同判据（`_area_registered`）：映射里写了本家没有的区名 ⇒ 回空串。
+        本函数只用于**收窄**作用面，绝不用来放宽：拿不到 ⇒ 调用方按原样处置。
+        """
+        try:
+            if not origin:
+                return ""
+            area = str(((self.settings.get("spatial.satellite_areas") or {})
+                        .get(origin) or "")).strip()
+            if not area or not self._area_registered(area):
+                return ""
+            return area
+        except Exception:  # noqa: BLE001 —— 观测面故障不得改变裁决
+            return ""
+
     def _narrow_bare_window_to_satellite(self, plan, origin: str):
         """裸窗/泛称 ControlWindow 且**无区域** ⇒ 贴上说话卫星的区域（只收窄）。
 
@@ -2224,9 +2242,8 @@ class FastPath:
             devs = tgt[0].get("devices") or [{}]
             if {str(d.get("name") or "") for d in devs} - {"窗", "窗户", ""}:
                 return plan
-            area = str(((self.settings.get("spatial.satellite_areas") or {})
-                        .get(origin) or "")).strip()
-            if not area or not self._area_registered(area):
+            area = self._satellite_area(origin)
+            if not area:
                 return plan
             tgt[0]["area"] = area
             plan.args["target"] = tgt
@@ -2237,7 +2254,7 @@ class FastPath:
             return plan
 
     def _build_plan(self, intent: str, rest_text: str, extra: dict, text: str,
-                    source: str, trace: list[str]) -> Optional[Plan]:
+                    source: str, trace: list[str], origin: str = "") -> Optional[Plan]:
         """args 构造（v1.5 L529-712 的 MCP-free 版）。"""
         # 收编修复五（移植期新发现的原缺陷）：delta/语气残渣（"亮度调到60%"→"%"、
         # "亮度调暗一点" 去 "暗一点" 后→"亮度调"）不构成设备目标，归零为全屋调节。
@@ -2524,7 +2541,17 @@ class FastPath:
             # 事故形态，保留）；模式/参数设定=全屋同向语义一致（数据集期望
             # target 恒 {domains:[climate]} 无区域，单空调户是唯一 sane 解）。
             if not area and not _ac_name_qualified(name):
-                return self._miss(trace, "空调缺区域信息")
+                # v1.6.10 刀P1-7：本支今天的结果是**整句无计划**（数据集三条原形
+                # 「打开空调」「关闭空调」「关空调」实测 MISS＝听成"这句话我还不会"）。
+                # 守卫的设计动机是"裸空调不带区域＝可能去动别人家的空调"（2026-09 跨
+                # 房间实害），这条红线保留；但**说话这台卫星登记过房间**时，作用面
+                # 反而被收窄到本区域——把"不敢动"变成"只动这间房"，零放宽。拿不到
+                # 卫星区域 ⇒ 逐字维持原样拒（绝不冒然全屋扇 climate）。
+                sat = self._satellite_area(origin)
+                if not sat:
+                    return self._miss(trace, "空调缺区域信息")
+                area = sat
+                trace.append(f"裸空调收窄→卫星区域{sat}")
         args: dict[str, Any] = {}
         # v1.1.1 #3/#4：@绝对值哨兵与色词原词在**目标域已定**之后才落最终形态。
         # 只看设备名域提示、不看区域：区域句（"书房开到50"）属性二义=猜，按
@@ -2650,8 +2677,11 @@ _WHOLEHOUSE_RE = re.compile(r"所有|全部|全屋|整屋|整个家|家里|全�
 # v1.0.41（F13）：全屋句的**句尾**控制动词（$ 锚死——「家里灯都开着吗」的 吗、
 # 「所有灯现在什么状态」的名词尾都不落位；裁决：「都」只作可选前缀、句尾只容
 # 完成态助词 了/啦——「所有灯都关啦」是命令，疑问字仍不豁免）。长形态排前。
+# v1.6.10 刀P1-6 补「关上」：本表收了 关闭/关掉/关了 却漏 关上（与同批 _ACTION_PATTERNS
+# 那处「三缺一」同一个字的第二次复现）⇒「所有窗都关上」`WH_TRAIL=False` 整句无计划，
+# 而同形同义的「所有灯都关掉」能出计划——两套尾动词口径。
 _WH_TRAIL_RE = re.compile(r"(?:全都|全部|都|全)?"
-                          r"(关闭|关掉|关了|打开|开了|开启|开一下|开|关)(?:了|啦)?$")
+                          r"(关闭|关上|关掉|关了|打开|开了|开启|开一下|开|关)(?:了|啦)?$")
 # 全屋句的合法句首（守卫与尾动分支共用）：句首即全屋标记才算全屋句。
 _WH_HEAD_RE = re.compile(r"^(所有|全部|全屋|整屋|整个家|家里|全家|各个|每个)")
 
