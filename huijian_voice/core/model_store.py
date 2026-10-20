@@ -2,7 +2,9 @@
 
 纪律来源（网关工程模板 §偏离点4 + v3 定案不变）：
 - 大模型不进镜像；解包落 /data/models/（Supervisor 持久卷，升级不丢、卸载即清）；
-- 下载三级 URL 回退（gh-proxy 国内→官方→hf-mirror），sha256 校验；
+- 下载腿按 `models.lock.json` 的 urls **逐条回退**（现每档两腿：gh-proxy 国内加速
+  →GitHub 官方；头注旧写"三级/含 hf-mirror"与本仓数据不符，v1.6.10 订正——
+  腿数由锁文件决定，`test_asr_firered_ctc` 钉 len==2，改表要同批改文案），sha256 校验；
 - tmp + os.replace 原子落盘；进度写事实文件 models_status.json（nginx try_files 暴露）；
 - model_auto_download=false 或全失败 → 手动导入口 /data/models/import/ 放 tarball 即用。
 """
@@ -569,7 +571,7 @@ class ModelStore:
         if not imported.exists() and self._main_body_ok(key, entry) \
                 and (auto or self._all_extras_imported(entry)):
             return self._ensure_extra_files(key, entry)
-        # 2) 三级 URL 下载
+        # 2) 按锁文件 urls 逐腿回退下载（现两腿）
         if not auto:
             self._set_status(key, state="manual", pct=0, detail="自动下载关闭；放包到 import/ 或开开关")
             return self.is_ready(key)

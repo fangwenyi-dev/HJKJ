@@ -56,8 +56,9 @@ _COLOR_ALT = "|".join(sorted(_COLOR_HEX, key=len, reverse=True))
 # 剥离后的正常残形）此前两头都够不到——① 的 ^关上 系列不吃名词起头、③ 需要
 # 区域前缀，于是「把窗关上」「把没关紧的窗关上」整句落 MISS 听成"这句话我还不会"，
 # 而这条产品卖的就是开窗器。补进本层（与「灯」同权、同样只在此层），产物形态由
-# 既有 `泛窗纠正` 决定：name=窗 无区域 ⇒ 走集成既有的全窗道（与已上线的
-# 「把所有窗关上」同一条语义，不新增作用面）。
+# 既有 `泛窗纠正` 决定：残句只剩裸「窗」时产 ControlWindow+泛称名；**能否真按到窗
+# 由集成端泛称闸裁**（无区域仍如实失败——见 _build_plan 刀P1-3 的如实边界注），
+# 接通它靠刀P1-4 的卫星区域收窄，有映射才收、无映射绝不擅自全屋扇按。
 _BARE_DEV_HEADS = ("灯光", "灯", "窗")
 
 
@@ -2061,6 +2062,12 @@ class FastPath:
 
         trace.append(f"{source}:{matched_intent} rest={rest_text!r} extra={extra_args}")
         plan = self._build_plan(matched_intent, rest_text, extra_args, text, source, trace)
+        # v1.6.10 刀P1-4：裸窗句**无区域**时把作用面**收窄**到"说话这台卫星所在房间"
+        # （`spatial.satellite_areas`，面板可配）。集成端对无区域的泛称一律如实失败
+        # （`intent_window_control` 的 `is_generic_window_name` 闸——"开一扇变开一排"
+        # 是它明令防的），所以补上区域才可能落到该区域全窗道；本刀**只缩不扩**：
+        # 映射为空（出厂默认）时行为与上一刀逐字相同，绝不无中生有地全屋扇按。
+        plan = self._narrow_bare_window_to_satellite(plan, origin)
         # v1.0.40 修复（A1 后半）：T0 命中了动作、但**目标提取质量不足**时，旧实现直接落空
         # 进兜底话术——而 T1 往往判得对（实测「打开窗户」旧正则残留「户」时 T1 判
         # ControlWindow 0.9+）。给 T1 一次接管机会。
@@ -2199,6 +2206,35 @@ class FastPath:
         trace.append(f"场景触发={phrase}")
         return Plan(intent="HassTriggerVoiceScene", args={"trigger_phrase": phrase},
                     source="scene", utterance=text, trace=trace)
+
+    def _narrow_bare_window_to_satellite(self, plan, origin: str):
+        """裸窗/泛称 ControlWindow 且**无区域** ⇒ 贴上说话卫星的区域（只收窄）。
+
+        判据（缺一即原样返回，永不抛）：意图是 ControlWindow；target 恰一条且
+        没有 area；设备名是裸泛称（窗/窗户/空）；origin 在 `satellite_areas` 里
+        且那个区名**在本台注册表在册**（`_area_registered`，与区域批量道同判据——
+        不认的区名不写进去，免得把一个查无换成另一个查无）。
+        """
+        try:
+            if plan is None or plan.intent != "ControlWindow" or not origin:
+                return plan
+            tgt = list((plan.args or {}).get("target") or [])
+            if len(tgt) != 1 or tgt[0].get("area"):
+                return plan
+            devs = tgt[0].get("devices") or [{}]
+            if {str(d.get("name") or "") for d in devs} - {"窗", "窗户", ""}:
+                return plan
+            area = str(((self.settings.get("spatial.satellite_areas") or {})
+                        .get(origin) or "")).strip()
+            if not area or not self._area_registered(area):
+                return plan
+            tgt[0]["area"] = area
+            plan.args["target"] = tgt
+            if isinstance(getattr(plan, "trace", None), list):
+                plan.trace.append(f"裸窗收窄→卫星区域{area}")
+            return plan
+        except Exception:  # noqa: BLE001 —— 收窄失败=按原计划走
+            return plan
 
     def _build_plan(self, intent: str, rest_text: str, extra: dict, text: str,
                     source: str, trace: list[str]) -> Optional[Plan]:
@@ -2551,13 +2587,17 @@ class FastPath:
             args["target"] = T.bilingual_targets([entry] if entry else [])
         elif intent == "ControlWindow":
             # v1.6.10 刀P1-3：裸窗句（「关窗」「打开窗户」「窗户关上」）此前产出
-            # **无 target** 的 ControlWindow——集成端 `intent_window_control.py:430`
+            # **无 target** 的 ControlWindow——集成端 `intent_window_control.py`
             # 那条 "No target specified" 是 2026-10-08 P1 立的"如实失败"，于是客户
-            # 说这个产品最主的动词听到的是失败。补泛称目标即走集成**既有**全窗道
-            # （同一批窗型表、与已上线的「把所有窗关上」逐字同语义）：本刀不新增
-            # 任何作用面，只是把裸窗句接回那条已经存在的路。
+            # 说这个产品最主的动词听到的是失败。补泛称目标＝把这句接回集成**既有**
+            # 的泛称裁决（同一批窗型表；与已上线的「把所有窗关上」同一道门），
+            # 本刀不新增作用面。⚠ 如实边界（集成码路实证，非推测）：**无区域**时
+            # 泛称仍过不了 `is_generic_window_name`+`area_name` 那对闸（"开一扇变
+            # 开一排"是它明令防的），产物由"没给目标"变成"该泛称查无/需带房间"——
+            # 话术更可操作，但没接通；真正接通靠刀P1-4 的卫星区域收窄（有映射才收，
+            # 无映射一律保持本形态，绝不擅自全屋扇按）。
             args["target"] = [{"devices": [{"name": "窗", "domains": []}]}]
-            trace.append("裸窗补泛称目标→集成全窗道")
+            trace.append("裸窗补泛称目标(作用面仍由集成泛称闸裁)")
         if "action" in extra:
             args["action"] = str(extra["action"]).lower()
         for k in ("attribute", "delta", "mode", "position", "speed", "strength"):

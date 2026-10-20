@@ -71,8 +71,9 @@ options:
   log_level: info
 
 schema:
-  # 模型首启自动下载（modelscope→hf-mirror→GitHub 三级回退；关闭后需在
-  # models.lock.json 所列 URL 手动放置到 /data/models/import/）
+  # 模型首启自动下载（腿数由 models.lock.json 的 urls 决定，现每档**两腿**：
+  # gh-proxy 国内加速→GitHub 官方；无 modelscope/hf-mirror 腿——旧注写"三级"与本仓
+  # 数据不符，v1.6.10 订正。关闭后需把解包好的模型目录放入 /data/models/import/）
   model_auto_download: bool
   # 自动把随镜像分发的 huijian_ai 集成落盘到 HA custom_components
   auto_install_integration: bool

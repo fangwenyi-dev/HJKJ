@@ -287,3 +287,72 @@ def test_locative_table_single_source_and_shape():
     assert T.locative_center_wins("窗户") is False        # 无方位词=照旧
     assert T.locative_center_wins("窗户旁边的") is False   # 方位后无中心语=照旧
     assert T.locative_center_wins("灯") is False
+
+
+# ── 刀P1-4：裸窗句只**收窄**到说话卫星所在房间（不扩作用面）────────
+def _fp_with(settings_over, areas=AREAS):
+    T.sync_areas(list(areas))
+    tc_ = _tc_singleton()
+    over = copy.deepcopy(DEFAULTS)
+    for k, v in settings_over.items():
+        cur = over
+        parts = k.split(".")
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = v
+
+    class _SO:
+        def get(self, dotted, default=None):
+            cur = copy.deepcopy(over)
+            for kk in dotted.split("."):
+                if not isinstance(cur, dict) or kk not in cur:
+                    return default
+                cur = cur[kk]
+            return cur
+
+    return FastPath(_Scenes(), tc_, _SO(), areas_of=lambda: tuple(areas))
+
+
+def _tc_singleton():
+    global _TC
+    if _TC is None:
+        _TC = TextCNN(os.environ["HUIJIAN_NLU_DATA"])
+        _TC._ensure()
+    return _TC
+
+
+def test_satellite_area_narrows_bare_window():
+    """配了卫星区域 ⇒ 裸窗句作用面收到那间房（集成对无区域泛称是如实失败）。"""
+    fp = _fp_with({"spatial.satellite_areas": {"10.0.0.7": "展厅"}})
+    p = asyncio.run(fp.match("关窗", origin="10.0.0.7"))
+    assert p is not None and p.intent == "ControlWindow"
+    got = (p.args or {}).get("target") or [{}]
+    assert got[0].get("area") == "展厅", f"未收窄:{got}"
+    assert str(p.args.get("action")) == "close"
+
+
+def test_no_mapping_never_invents_area():
+    """反向臂（关键）：映射为空＝出厂默认，绝不无中生有造区域、更不全屋扇按。"""
+    fp = _fp_with({})
+    for text in ("关窗", "把窗关上", "窗户关上"):
+        p = asyncio.run(fp.match(text, origin="10.0.0.9"))
+        assert p is not None, text
+        got = (p.args or {}).get("target") or [{}]
+        assert not got[0].get("area"), f"{text!r} 被塞了臆造区域:{got}"
+
+
+def test_unregistered_satellite_area_is_not_attached():
+    """反向臂：映射里那个区名**不在本台注册表**时不写（把一个查无换成另一个查无＝没修）。"""
+    fp = _fp_with({"spatial.satellite_areas": {"10.0.0.7": "阁楼"}})
+    p = asyncio.run(fp.match("关窗", origin="10.0.0.7"))
+    got = (p.args or {}).get("target") or [{}]
+    assert not got[0].get("area"), f"未在册区名被写入:{got}"
+
+
+def test_named_window_type_never_gets_satellite_area():
+    """反向臂：具名窗型（平开窗）走具名道，本刀一律不伸手（具名不扩大）。"""
+    fp = _fp_with({"spatial.satellite_areas": {"10.0.0.7": "展厅"}})
+    p = asyncio.run(fp.match("关闭平开窗", origin="10.0.0.7"))
+    assert p is not None
+    got = (p.args or {}).get("target") or [{}]
+    assert not got[0].get("area"), f"具名窗型被收窄改写:{got}"
