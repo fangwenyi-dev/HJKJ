@@ -19,6 +19,7 @@
 import asyncio
 import pathlib
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -535,6 +536,40 @@ def test_bulk_pick_does_not_depend_on_registry_order():
     """
     rev = list(reversed(list(_OFFICE_ROWS)))
     assert sorted(_integ_pick(_OFFICE_ROWS, order=rev)) == _BULK_KEEP
+
+
+def _ha_stub_keys():
+    # `cut1125` 打头的都算：包名、`cut1125.intent_helper`，还有装载缓存哨兵 `cut1125_ok`
+    # （第一版漏了哨兵 ⇒ pop 掉 intent_helper 却没 pop 哨兵 ⇒ _load_helper 直接
+    # KeyError，这条钉先红在自己的夹具上）
+    return [k for k in sys.modules
+            if k == "homeassistant" or k.startswith("homeassistant.")
+            or k.startswith("cut1125")]
+
+
+def test_integ_harness_stubs_are_self_sufficient():
+    """隔离钉：集成侧那批钉不许靠"隔壁测试文件先把 HA 替身装进了 sys.modules"才跑得动。
+
+    判据＝把 `homeassistant*` / `cut1125*` 全摘干净后**再跑一次** _integ_pick，装载链
+    必须自己把替身装齐（含 `intent_window_const` 延迟导入要的
+    `homeassistant.components.button.const` 与 `input_button` 的 DOMAIN），产物与在位时
+    逐字相同；跑完把摘下的原物放回（别的文件抓的是模块对象本身，不受影响）。
+
+    写这条钉时的事实：单跑本文件红 6 条、全量 3332 绿——绿色来自 test_audit4_fixes
+    早一步装的权威替身，不是本链自带。修在 `_load_helper`（先调
+    test_window_speed_behavior._install_ha_stubs），本钉钉的是"以后别再靠蹭"。
+    """
+    saved = {k: sys.modules.pop(k) for k in _ha_stub_keys()}
+    assert saved, "sys.modules 里没有 HA 替身可摘——本钉失去对象（装载链变了要同步改这里）"
+    try:
+        assert sorted(_integ_pick(_OFFICE_ROWS)) == _BULK_KEEP
+        assert "homeassistant.components.button.const" in sys.modules, \
+            "延迟导入要的那两个 components 替身必须自带，不是别人漏下来的"
+    finally:
+        for k in _ha_stub_keys():
+            del sys.modules[k]
+        sys.modules.update(saved)
+    assert set(_ha_stub_keys()) == set(saved), "复原不彻底——残留会污染后面的文件"
 
 
 def test_bulk_entities_without_device_id_are_not_merged():

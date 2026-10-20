@@ -31,6 +31,16 @@ class _AnyMod(types.ModuleType):
 def _load_helper():
     if "cut1125_ok" in sys.modules:
         return sys.modules["cut1125.intent_helper"]
+    # 先装仓内**权威** HA 替身（test_window_speed_behavior._install_ha_stubs，含
+    # homeassistant.components.button.const / input_button 这些 DOMAIN）。
+    # 本文件自己的 _AnyMod 表只覆盖 helpers/util，**没有 components.\***：
+    # `intent_helper._build_entities_for_item` 里那句 `from .intent_window_const import`
+    # 是延迟导入，走到就会去找 `homeassistant.components` ⇒ 单跑消费方
+    # test_v1210_area_bulk.py 时 `TypeError: 'function' object is not iterable` 红 6 条。
+    # 全量绿只是因为 test_audit4_fixes 早一步把权威替身装进了 sys.modules——
+    # 那叫跨文件全局态，不叫钉有牙。
+    import test_window_speed_behavior as _bench
+    _bench._install_ha_stubs()
     mods = {
         "homeassistant": {},
         "homeassistant.core": {"HomeAssistant": object, "State": object},

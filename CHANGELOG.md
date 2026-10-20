@@ -3552,6 +3552,40 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
      ═══════════════════════════════════════════════════════════════════════ -->
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x）
+## [1.6.9] - 2026-10-20 · 正文数字订正（自量换掉搬来的）＋ 刀15 量具自洽（六条钉"全量绿、单跑红"）
+
+> 本批**零产品代码改动**：发版后自审出的两处文本／量具缺陷，按"发现即修"走一个正常版本号。控制链、话术、下发面与 1.6.8 逐字相同。
+
+### 一、订正 1.6.8 §二 A1 里那组"现网台数"
+
+- 1.6.8 正文写「现网 34 台里 32 台是"客厅 吸顶灯"这种名字带房间词的真形制，那一档必须留」——**这组数字是从上一版正文搬来的，发版前我没自己量过**。本版用新落仓的只读探针 `huijian_voice/tools/area_shape_probe.py` 复量（WS `config/entity_registry/list` ＋设备级区域继承；区域取**区域名**，与 `ha_client._entity_area` 同口径——注册表里存的是 `area_id`，拿中文房间词去比会全判"不一致"）：现网 **288 个 state／542 条注册表项／143 条带区域／7 个区域名**；可控域（域不在 `capability.UNTOGGLEABLE_DOMAINS`）**76 台**，其中名字含房间词 **39 台**（36 台以房间词开头）、有注册区域 **50 台**、无任何注册区域 **26 台**、"名字里的房间词与自身注册区域不一致" **0 台**。两次独立跑逐字相同。
+- 因此两处改口：① 「那一档必须留」的**理由不是现网承重**——"带房间词却无注册区域"的台今天**一台都没有**；真身物理灯是 `light.she_deng`（注册区域=客厅、友好名只叫「射灯」），它的区域完全来自注册表而非名字。留兜底的真实理由＝"没进区域表的台"（现网 26 台）一旦按房间词起名就靠这条通道，**这是形状判断、不是实测**，当时被我写成了实测。② 「5 房间」复量＝**7 个区域名**。
+- 不受影响、本次再确认的两条：A1 的"零附带影响"同口径复量仍为 **0**；刀13 的病灶地形与本次读数一致（`light.she_deng`=客厅、`light.ban_gong_shi_she_deng`=办公室、两台同名「射灯」）。
+- **A1 的代码一字未动**：那次收紧本身成立（逃生口 `area not in fn` 能把注册在别间的台捞进候选，本机可复现），错的只是给它配的宣称。
+- 处置口径：1.6.8 已发布的 GitHub／Gitee 正文按"发出去的不撤不盖"保持原样；**仓内 1.6.8 段也已逐字回退成发布时那 36 行**（不出现"仓里对、商店页错"的第三态），更正的落点就是本版这段。
+
+### 二、刀15 [P2 量具] 六条集成侧钉"全量绿、单跑红"
+
+- 实锤：`test_v1210_area_bulk.py` 的 **6 条集成侧钉单跑必红、全量 3332 却绿**——绿色来自 `test_audit4_fixes` 早一步装进 `sys.modules` 的 HA 权威替身，不是这条链自带。根因：`test_v1125_contains_name_fallback._load_helper` 的替身表只覆盖 `homeassistant.helpers/util`，**没有 `homeassistant.components.*`**；而 `intent_helper._build_entities_for_item` 里 `from .intent_window_const import` 是**延迟导入**，一走到就要 `homeassistant.components.button.const` ⇒ 宽容替身的 `__getattr__("__path__")` 返回 lambda ⇒ `TypeError: 'function' object is not iterable`。这类缺陷 CI 永远看不见：全量按字母序跑，顺序一换集体红，而红相读起来像实现坏了。
+- 修＝装载链自带权威替身：`_load_helper` 先调仓内既有的 `test_window_speed_behavior._install_ha_stubs()`（本就覆盖 `components.button.const`／`input_button` 的 DOMAIN，第 96–113 行），再叠本文件自己的宽容层（`setdefault` 语义不变）。
+- 新钉 `test_integ_harness_stubs_are_self_sufficient`：把 `sys.modules` 里 `homeassistant*`／`cut1125*` **全摘掉**后再跑一次 `_integ_pick`，产物必须与在位时逐字相同，且 `homeassistant.components.button.const` 须由本链自己装出来；跑完逐键复原。摘清单要连**缓存哨兵 `cut1125_ok`** 一起摘（第一版只摘包名与子模块名 ⇒ `_load_helper` 直接 KeyError，钉先红在自己的夹具上）。
+- 变异两臂（字节级备份＋md5 对账还原，两臂均"还原后逐字节相同"）：① 只把 `_install_ha_stubs()` 包进 `if False:` ⇒ **仅新钉红**，因为留下的 `import` 在**模块级**就调同一个装载器——这一臂测的不是"没修"；② import 与调用**两行整体**摘掉＝真·未修态 ⇒ **7 红／37 绿**（6 条集成侧钉＋新隔离钉），其余仍绿＝判据有区分度。
+- 按类扫描：新增仓内工具 `huijian_voice/tools/test_isolation_sweep.py`（逐个 `test_*.py` **单跑**，串行——并行会让计时型钉互相干扰；缺 opus 真库时用 `HUIJIAN_OPUS_DLL_DIR` 透传，否则会以"Could not find Opus library"崩在收集期、把环境性红误判成隔离缺陷）。**199 个文件单跑 199/199 OK、红 0** ⇒ 这一族在本仓已收口。两个工具都不在 Dockerfile 的 COPY 面 ⇒ **不进镜像**。
+- 边界（如实）：新隔离钉只覆盖 `intent_helper`／`intent_window_const` 这一条延迟导入链；体检工具是**人跑**的，CI 没挂（挂上＝每次 push 再起 199 个 pytest 进程，本机串行十几分钟起，收益不抵成本）。
+
+### 三、门禁
+
+- 全量 **3333 passed / 8 skipped / 0 failed**（1.6.8 基线 3332 ＋ 本批新隔离钉 1）；七源一致性 **28 passed**；ruff（网关同参 `F,E9,B`；语音 Lint 门本身不跑 ruff，如实标注）／`py_compile`／新工具单跑全绿。
+- 金标 dry 臂 **22 PASS / 0 FAIL / 免检 0**（本批零产品代码，dry 判的是解析面）。
+- 版本位七源＝1.6.9 字节级替换（config.yaml／core/const.py 兜底／vendored `manifest.json`／`www/version.json` 双键／`www/index.html` CURRENT_VERSION＋缓存位），CHANGELOG 语音区本版段 33 行 < `head -120`。
+
+### 四、不在本版
+
+- **刀13／刀14 的现网复验仍未做**：办公 `.91` 的 `:8000/discover` 现在报 **1.6.7**，量到的是升级前的行为。本版装上后要跑「打开客厅灯」——期望**不亮办公室那台射灯**（如实报离线／查无、零下发），这是那两刀唯一的活体判据。
+- 面板像素级渲染与 dry 口仍未验（`:8002` 只绑回环、`:8001` LAN 403、ingress 会话对长期令牌 401、内置浏览器穿不透 HA shadow DOM，四条死路原样在）；固件"点下载"仍是 UI 动作。
+- 两条设计线我没自行拍（都不是代码缺陷，都要往客户实例里写东西或替用户开口）：**预约持久化**（`pipeline.py:2569` 的在册方向＝HA automation；自建 store 会让加载项重启后补一个用户没等的动作）、**到点结果补播**（v1.5.4 静音纪律的对立面，"下次开口补一句"属新能力）。
+- 未注册成 HA 区域的房间词（"阳台／岛台"类）仍会丢区域；1.6.6／1.6.7 在册项原样在；现网在线设备已上报 **2.3.5** 而固件仓查无该 release（无构件）⇒ 仍按"不空登记"不追。
+
 ## [1.6.8] - 2026-10-19 · 跨区误动族收口（刀13 同名改指 / 刀14 区域闸与收敛）＋ 金标首次全判定
 
 > 触发方式：1.6.7 部署后现网实测抓到「打开客厅灯」把**办公室**那台射灯点亮（回执带"已改指…在办公室"，话是真话、动的是别间）。本批按"同类扫描、不按处修"把这一族一次收口。
