@@ -271,8 +271,10 @@ _ANAPHORA_WORDS = ("它", "这", "那", "该", "刚才", "之前", "上面")
 # ⚠ 本串一份**同时**喂正则与 DP（`_TAIL_TOKEN_TUPLE = _TAIL_TOKENS.split("|")`），
 # 所以只能平铺词元：塞 `(?:…)` 分组会让 DP 拿到 `"(?:里"`、`"面)"` 这种字面元，
 # test_v1210_audit6 的"DP 与正则等价"属性钉当场红（本批实发过一次）。
-_LOC_ALT = "里|上|下|内|外|旁|边|侧"
-_LOC_PARTICLES = _LOC_ALT.split("|")
+# 单源已上移到 targets（刀R2 起级联与 targets 共吃一份：`contains_locative`、
+# ⑥/⑥b 参照物判据、下面两张剥词表都是它），此处只按同一份派生。
+_LOC_PARTICLES = T._LOC_SINGLE
+_LOC_ALT = "|".join(_LOC_PARTICLES)
 
 _NAME_HEAD_STRIP = re.compile(
     r"^(?:把|将|请|麻烦|帮我|给我|我们|现在|马上|立即|再|还|就|来|去|快|然后|顺便|"

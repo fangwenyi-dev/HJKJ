@@ -856,6 +856,10 @@ _POS_REL_WORDS = ("旁边", "边上", "附近", "对面", "前面", "后面", "�
                   "左侧", "右侧", "上面", "下面", "里面", "外面", "中间", "上方",
                   "下方", "前方", "后方", "桌上", "柜上", "床头", "地上", "墙上",
                   "门上", "窗台", "底下", "上头", "下头", "里头", "屋里", "门口")
+# 单字方位/关系助词（v1.6.10 刀P1-5 的表，**单源在此**：pipeline 的两张剥词表与
+# 本文件的 contains_locative 都吃这一份）。刻意不收 中/面（「中控屏」「智能面板」
+# 真名自带）。
+_LOC_SINGLE = ("里", "上", "下", "内", "外", "旁", "边", "侧")
 _POS_REL_SCAN_RE = re.compile(
     "|".join(sorted(_POS_REL_WORDS, key=len, reverse=True)))
 
@@ -941,6 +945,22 @@ def _area_of_prefix_exact(pre: str) -> str | None:
         return None
     except Exception:  # noqa: BLE001
         return None
+
+
+def bare_window_generic(tail: str) -> str:
+    """区域名之后的残段是不是「(的|里)?+裸窗泛称」——v1.6.10 刀R1。
+
+    与 `_bare_generic` 同形状但**不同表**：`_UNIQUE_DOMAIN_GENERIC` 那张"泛称→域"
+    表**刻意不收 窗/门**（头注写明：折域会从 ControlWindow 与 lock 既有车道手里
+    抢走句子，金标 4 号口径）。本函数不折域、不碰那张表，只回答一件事：
+    "区域名 + 裸窗" 里的区域名**不是设备名**。缺它时现网实锤（v1.7.0 真机补充轮）：
+    注册表把「客厅 All Lights」派生成 token「客厅」进动态词表后，
+    「把客厅开着的窗关上」残段『客厅窗』被 ⑥ 命中成**设备名=客厅**（离线干净词表
+    复现不出＝dyn_vocab 依赖形，本地全绿而过不了真机）。让位后由 ⑥b 泛称车道与
+    `泛窗纠正` 定域，产物逐字等于"客厅不在词表时"的既有形态（同形状同判据）。
+    """
+    t = re.sub(r"^[的地里得]+", "", (tail or "").strip())
+    return t if t in ("窗", "窗户", "窗子") else ""
 
 
 def parse_target(raw: str) -> tuple[str | None, str | None, int]:
@@ -1031,6 +1051,12 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
             # 「区域名 +(的|里)?+ 唯一域泛称字」时让位，具名设备（办公室射灯）由更长
             # 的在册词先命中，走不到这里。
             if not idx and _area_like(d) and _bare_generic(stripped[len(d):]):
+                continue
+            # v1.6.10 刀R1：尾巴是**裸窗泛称**同样让位（判据与"为什么不折域"见
+            # bare_window_generic）。写成同排第二条护栏而不是并进上一行的条件里——
+            # ⑥ 的接线钉按字面取 `_bare_generic(...)` 那一行当护栏行，合并写法会把
+            # 它自己的 `if` 挤走（真红过一次：钉报"护栏被常量式失效"）。
+            if not idx and _area_like(d) and bare_window_generic(stripped[len(d):]):
                 continue
             # v1.6.10 刀P0-4：命中词若是**方位短语的参照物**（「窗户旁边的灯」里的
             # 窗户），让位给中心语——否则说开灯、窗真开（P0，判据见该函数）。

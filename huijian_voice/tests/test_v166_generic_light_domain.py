@@ -279,12 +279,28 @@ def test_named_device_after_area_unchanged(fp, text, intent, name, doms):
 # 台灯/空调是具名类别词，本来就该按名字找实体。
 # 这四条形制（修复前后逐字相同）仍是"区域名被当成设备名"——同族遗留面，另案在册，
 # 不在本刀范围（本刀只收"灯"这条能被域唯一确定的泛称；判据不达标就宁可不动）。
+# ⚠ v1.6.10 刀R1 收了其中**窗那一形**：真机补充轮实锤「把客厅开着的窗关上」在
+# 注册表把「客厅 All Lights」派生成 token「客厅」时，残段『客厅窗』被 ⑥ 命中成
+# 设备名=客厅（离线干净词表复现不出＝dyn_vocab 依赖形）。新判据 `bare_window_generic`
+# 只让"区域名+裸窗泛称"让位，**不折域、不碰 _UNIQUE_DOMAIN_GENERIC**，故 门/台灯/空调
+# 三条形制逐字不变、仍按下面的在册口径钉着。
 NO_FOLD_CASES = {
-    "打开办公室的窗": ("TurnDeviceOn", "办公室", ["climate"]),
     "关闭办公室的门": ("TurnDeviceOff", "办公室", ["climate"]),
     "打开办公室的台灯": ("TurnDeviceOn", "办公室", ["climate"]),
     "打开办公室的空调": ("TurnDeviceOn", "办公室", ["climate"]),
 }
+
+
+# 刀R1 的新预期（区域名+裸窗 ⇒ 区域归区域、窗归泛称），与"另案在册"逐字分开钉
+@pytest.mark.parametrize("text", ["打开办公室的窗", "关闭办公室的窗"])
+def test_area_plus_bare_window_no_longer_names_the_area(fp, text):
+    p = _route(fp, text)
+    assert p is not None, f"{text!r} 落空"
+    slot = _slot(p)
+    dev = (slot.get("devices") or [{}])[0]
+    assert dev.get("name") in ("窗", "窗户"), f"设备名仍是区域名:{dev}"
+    assert slot.get("area") == "办公室" or "办公室" in str(slot), \
+        f"区域丢了:{slot}"
 
 
 @pytest.mark.parametrize("text,intent,name,doms",
@@ -363,8 +379,8 @@ def test_guard_wired_into_device_substring_lane():
     import re as _re
     append_pat = _re.compile(
         r"candidates\.append\(\((?:area_pre|_area_of_prefix\(stripped\[:idx\]\)), d, 5\)\)")
-    hits_app = [n for n in range(i, i + 20) if append_pat.search(lines[n])]
-    assert hits_app, f"⑥ 命中支的 append 找不到（护栏后 20 行内）:{lines[i:i + 20]}"
+    hits_app = [n for n in range(i, i + 28) if append_pat.search(lines[n])]
+    assert hits_app, f"⑥ 命中支的 append 找不到（护栏后 28 行内）:{lines[i:i + 28]}"
     append = hits_app[0]
     assert "_area_like(d)" in guard, "护栏没查区域判据（会吞掉真具名设备）"
     # 必须在 ⑥ 的 append **之前**（append 之后 = 死代码，形同没修）

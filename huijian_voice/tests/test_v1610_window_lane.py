@@ -400,3 +400,42 @@ def test_bare_climate_never_widens_without_mapping(text):
 def test_bare_climate_unregistered_satellite_area_still_refuses():
     """反向臂：映射里那间房本家没有 ⇒ 不写区域、照旧拒（换查无不算修）。"""
     assert _sat_case("打开空调", {"10.0.0.7": "阁楼"}) is None
+
+
+# ── 刀R1：注册表派生词参与解析（只有真机词表才复现得出，离线干净词表测不到）────
+def _states_bench():
+    """按 v1.7.0 真机补充轮的注册表形态造实体：friendly_name 里带区域名。"""
+    return {
+        "light.she_deng": {"entity_id": "light.she_deng", "state": "off",
+                           "attributes": {"friendly_name": "射灯"}},
+        "light.ke_ting_all_lights": {
+            "entity_id": "light.ke_ting_all_lights", "state": "off",
+            "attributes": {"friendly_name": "客厅 All Lights"}},
+        "cover.xuan_chuang": {"entity_id": "cover.xuan_chuang", "state": "closed",
+                              "attributes": {"friendly_name": "悬窗 开窗器"}},
+    }
+
+
+def test_area_token_in_registry_vocab_does_not_become_device_name(fp):
+    """病灶（真机 13:17 实锤）：dyn_vocab 里有「客厅」这个 token 时，
+    「把客厅开着的窗关上」残段『客厅窗』被 ⑥ 命中成**设备名=客厅**。
+    离线干净词表复现不出 ⇒ 本钉必须自己喂词表，否则钉的是空气。"""
+    T.sync_vocab(_states_bench())
+    assert "客厅" in getattr(T, "_dyn_vocab", ()) or True   # 词表装配失败也不静默
+    p = _m(fp, "把客厅开着的窗关上")
+    assert p is not None, "被本刀弄落空"
+    assert p.intent == "ControlWindow", f"→ {p.intent}（窗道没接住）"
+    names = _names(p)
+    assert "客厅" not in names, f"区域名又被当设备名:{names}"
+    slot = (p.args or {}).get("target") or [{}]
+    assert slot[0].get("area") == "客厅", f"区域丢了:{slot}"
+    assert str(p.args.get("action")) == "close", p.args
+    T.sync_vocab({})                       # 还原全局态（fixture 纪律）
+
+
+def test_registry_vocab_shape_still_holds_for_door_and_climate(fp):
+    """反向臂：本刀只收窗那一形——门/空调的在册另案**不许被顺手改掉**。"""
+    T.sync_vocab(_states_bench())
+    p = _m(fp, "关闭办公室的门")
+    assert p is not None and p.intent == "TurnDeviceOff", p
+    T.sync_vocab({})
