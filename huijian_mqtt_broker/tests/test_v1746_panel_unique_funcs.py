@@ -14,7 +14,8 @@ M 个子设备」退回只显示 `gatewaySn`；新版只在"点二维码"那条 
 本文件三件事：
   1) 重名钉：扫全部函数名，每个名字恰好出现一次（含元钉：扫到 0 个即红，防空扫假绿）；
   2) 单一渲染出口：`loadRemoteControl` 必须走 `applyHubStatus`，且旧渲染器指纹消失；
-  3) `hubErrorText`：DOM/CSS/接线齐备 + **node 真跑**映射（只映射已知码，未知一律不显示）。
+  3) `hubErrorText`：DOM/CSS/接线齐备 + **node 真跑**映射（只映射已知码，未知回 ''；
+     未知**非空**码由渲染出口兜一条通用文案，见 test_unknown_conn_error_still_shows_a_generic_reason）。
 """
 import ast
 import re
@@ -245,6 +246,72 @@ console.log('OK');
 """)
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "errtext.js"
+        p.write_text(script, encoding="utf-8")
+        r = subprocess.run(["node", str(p)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+        assert r.returncode == 0 and "OK" in r.stdout, \
+            "node 真跑失败：%s%s" % (r.stdout, r.stderr)
+
+
+def test_unknown_conn_error_still_shows_a_generic_reason():
+    """连接槽的裸异常文本必须在渲染出口兜一条通用文案（2026-10-20 销售面批）。
+
+    原形态：`hub_client.py:582` 写 `why = str(e) or 类名`、`:612` 写 `loop_<类名>`，
+    而 hubErrorText 刻意只认两条语义码 ⇒ 面板 `errEl.hidden = !why` 把整条藏掉 ⇒
+    客户看到的就是孤零零一句"未连接"，分不清云端在发布、自家断网还是加载项坏了。
+    现网装机量一大，这条就是首批工单的主要来源，而它其实不需要人到场就能说清。
+
+    为什么判"真实组合表达式"而不是判常量：抄一份 `a || b || c` 进测试等于没测
+    ——接线（第三项在不在、顺序对不对）才是本缺陷的发生地。故从 JS 里抠出
+    `const why = …;` 的右值，连同两个真函数体与真常量一起交给 node 跑。
+    """
+    m = re.search(r"const why = (hubOpErrorText\(info\.lastOpError\)[\s\S]*?);", JS)
+    assert m, "渲染出口的组合表达式形状变了——本钉要一起改，不许删钉"
+    expr = m.group(1)
+    cm = re.search(r"const HUB_CONN_GENERIC_TEXT =([\s\S]*?);", JS)
+    assert cm, "缺 HUB_CONN_GENERIC_TEXT 兜底常量"
+    generic_src = cm.group(1).strip()
+    if shutil.which("node") is None:
+        raise AssertionError("node 不可用，无法真跑渲染出口组合")
+
+    script = (_single_func_body(JS, "hubErrorText") + "\n" +
+              _single_func_body(JS, "hubOpErrorText") + "\n" +
+              "const HUB_CONN_GENERIC_TEXT = %s;\n" % generic_src +
+              "const composed = (info) => (%s);\n" % expr + """
+const raws = ['RuntimeError', 'ClientConnectorError', 'Timeout context manager should be used',
+              'loop_TimeoutError', 'server closed connection at handshake'];
+for (const c of raws) {
+  const s = composed({lastOpError: null, lastError: c});
+  if (!s || s.length < 4) { console.log('FAIL 未知连接码没有任何文案（等于只喊未连接）:', c); process.exit(1) }
+  if (!/[\\u4e00-\\u9fa5]/.test(s)) { console.log('FAIL 兜底文案必须中文:', c, s); process.exit(1) }
+  if (s.includes(c)) { console.log('FAIL 兜底文案不得回显裸异常文本:', c, s); process.exit(1) }
+}
+// 兜底不许撒谎：本地控制与云通道是两套，云端断了不能说"控制也不受影响"，
+// 也不能反向说成"控制已中断"（那是恐慌文案）。
+const g = composed({lastOpError: null, lastError: 'RuntimeError'});
+if (!/局域网|本地/.test(g) || !/不受影响/.test(g)) {
+  console.log('FAIL 兜底必须讲清"局域网控制不受影响"这一事实:', g); process.exit(1)
+}
+if (/重新扫码|重新注册/.test(g)) {
+  console.log('FAIL 未知连接码不该指路重扫码（那是身份类才需要的动作）:', g); process.exit(1)
+}
+// 空槽仍须整条隐藏（兜底不许把"没出错"也渲染成一行红字）
+for (const c of ['', null, undefined]) {
+  if (composed({lastOpError: c, lastError: c}) !== '') {
+    console.log('FAIL 无故障时不该显示任何文案:', JSON.stringify(c)); process.exit(1)
+  }
+}
+// 优先级：操作类 > 语义连接码 > 通用兜底（顺序反了＝刚点完的那一下被后台状态盖住）
+if (composed({lastOpError: 'members_full', lastError: 'identity_rejected_loop'}).includes('已满') === false) {
+  console.log('FAIL 操作类必须优先于连接类'); process.exit(1)
+}
+if (!composed({lastOpError: null, lastError: 'identity_rejected'}).includes('重新扫码')) {
+  console.log('FAIL 语义连接码必须走自己的专属文案，不许被通用兜底吃掉'); process.exit(1)
+}
+console.log('OK');
+""")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "composed.cjs"
         p.write_text(script, encoding="utf-8")
         r = subprocess.run(["node", str(p)], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=60)

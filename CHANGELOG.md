@@ -3,6 +3,50 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.8.7] - 2026-10-20 · 销售面批：把"云端断了"从死路改成交代 + 装机者文档 + 逐字取证的许可
+
+⚠️ **本批不改任何集成 Python 行为**：`custom_components` 侧只有 `manifest.json` 的版本字段随版本面齐
+bump 而变 ⇒ 升级后**重启加载项**即可（面板静态资源与文档随镜像走），不强制重启 HA Core。
+对外判决一句：**从这一版起，网关加载项进入可随整机销售的状态。**
+
+### 面板不再把云端断连说成死路
+
+连接槽只有 `identity_rejected` / `identity_rejected_loop` 两条语义码有文案，而 `hub_client.py:582`
+写进槽的是 `why = str(e) or 类名`、`:612` 写 `loop_<类名>` ⇒ 真实故障（超时/DNS/5xx/云端发布中）
+全落 `default: return ''` ⇒ `huijian.js` 的 `errEl.hidden = !why` 把整行藏掉，客户只剩孤零零一句
+"未连接"，分不清是云端在发布、他家断网还是加载项坏了——陌生客户的第一张工单必然落在这。
+现在在**渲染出口**兜一条通用交代（"云端暂时连不上…局域网控制不受影响，本机会自动重试"），
+且不回显裸异常文本。兜底放组合处、不塞进 `hubErrorText`：两个槽互不串味是有钉的不变量。
+
+### 交付面补齐（语音线早有、网关线缺的三件）
+
+- 新建 `huijian_mqtt_broker/DOCS.md`：装机者视角——**前置要求表**（只有 HAOS/Supervised 能装，
+  HA Container / Core 装不了且无等价路径）、3 步安装、按现象排的排障、报障三件套＋渠道、
+  能力与边界诚实清单、端口表。含"小程序设备列表停在昨天但本地能控"＝加载项**故意不上行残缺快照**
+  （交出去会让云端把没看见的设备真删掉），5 分钟保活自动恢复。
+- 新建 `huijian_mqtt_broker/THIRD-PARTY-NOTICES.md`：逐行标取证等级。硬事实一条——
+  **`zeroconf==0.132.0` 是 LGPL-2.1-or-later，不是广为误传的 Apache-2.0**：三源交叉
+  （tag 上 `COPYING` 正文即 LGPL v2.1、`pyproject.toml` 写 `license="LGPL"`、PyPI classifiers 含
+  LGPLv2），上游 LGPL→Apache 的重许可仍在征集同意书且自写明"已发布的版本不换许可"。
+  本机取不到的 4 项一律标 `待核`＋复跑命令，不当结论用。
+- 两份 README 加「前置要求」；客户面的小程序名从「慧尖」订正成微信里的真名 **小慧语音**
+  （面板 `www/index.html` 早就是这个，README 反而是错的——照它搜"慧尖"搜不到东西）；
+  根 README 那句「Matter 网关」入口按定线改「LoRa 网关」。
+
+### 量具：新钉 8 条，另当场抓回 3 条自己写的软钉
+
+`test_audit_2026_10_20_sales_readiness.py` 7 条＋面板行为臂 1 条。两条既有钉按新口径**重写不是删**：
+`test_v1746_panel_render` 场景 5 从"未知码必须不显示"拆成 5a「有值必须给交代且不回显原码」/
+5b「无值必须隐藏」；`_render_script()` 补上渲染出口引用的常量，缺时常响断言（否则 node 崩在
+ReferenceError 上，那是量具坏不是钉红）。
+变异自检 **9/9 全部按预期转红**，每条带阳性对照（未破坏必须 `1 passed`）＋点名到用例＋逐字节还原核
+hash。过程中抓回三条**我自己的软钉**：全文子串判据会被同一文件的散文喂绿（把许可表里 zeroconf 那行
+改掉甚至整行删掉都照绿）⇒ 改成判"承载结论的那一行/那一节"。另记两条量具事故：registry 探针漏
+`/v2/` 会让 ghcr 与两个国内镜像站齐刷刷假 404（源站 303 把这个错掩盖掉，镜像站直接 404）；
+在仓根跑 `pytest <子目录>::test_x` 回 "no tests ran"＋exit≠0，会被误判成"红得对"。
+门：`pytest huijian_mqtt_broker/tests` **1825 passed / 0 failed / 0 skipped**（基线 1817＋8，80s）；
+ruff 按 CI 同参四段路径 All checks passed。
+
 ## [1.8.6] - 2026-10-09 · 10-09 清单收尾（G-9/G-10/G-11）+ 两条"字面量钉守不住控制流洞"的行为补强
 
 ⚠️ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件

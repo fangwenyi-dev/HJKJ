@@ -1,8 +1,17 @@
 # 慧尖 LoRa 网关一体化插件
 
-[![version](https://img.shields.io/badge/version-v1.8.6-blue)](https://github.com/fangwenyi-dev/HJKJ/releases/tag/v1.8.6)
+[![version](https://img.shields.io/badge/version-v1.8.7-blue)](https://github.com/fangwenyi-dev/HJKJ/releases/tag/v1.8.7)
 
 慧尖开窗器 LoRa 网关的 Home Assistant 一体化插件：**内置 Mosquitto Broker（端口 2022）+ mDNS 广播 + 网关集成 + 管理 Web UI + 小程序局域网直连**，装一个插件即可获得全部能力，无需再装官方 MQTT 加载项。
+
+## 前置要求（先看这一条）
+
+本加载项**只能装在 Home Assistant OS（HAOS）或 Supervised 形态**——只有这两种形态有「加载项商店」。
+**Home Assistant Container（Docker／群晖套件／威联通 Container）与 Core（pip 直装）装不了，
+也没有手装的等价路径。** 判断方法：HA 里能看到「加载项商店」菜单就有 Supervisor。
+
+面向装机者的完整说明（安装、排障、报障三件套、能力与边界诚实清单）见
+[DOCS.md](DOCS.md)；第三方组件许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 > ## 【迁仓说明 · 2026-10-06】这里就是唯一商店仓
 >
@@ -109,7 +118,7 @@ broker，单 broker 即全家桶，**无需共存桥**。
 - 若你的 `1883` 端口跑的是其他第三方服务（部分 NAS 套件如此），请保持
   开关关闭，勿开闸——桥会把任何监听 1883 的服务当官方对端。
 
-## 微信「慧尖」小程序直连
+## 「小慧语音」小程序直连
 
 插件内置与 Matter 固件网关 1:1 对等的 WS 网关（`ws://<HA>:9001/ws`，默认
 开启），小程序经 mDNS 发现后局域网直连控制。注意：小程序与固件恒拨固定

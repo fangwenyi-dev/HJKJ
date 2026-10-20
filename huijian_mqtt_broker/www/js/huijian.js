@@ -158,9 +158,22 @@
                 gws.map((g) => g.sn).join('、') + '）';
         }
 
+        /** 连接槽兜底文案。为什么放在渲染处而不是塞进 hubErrorText：
+         *  hub_client 的连接槽除两条语义码外全是裸异常文本
+         *  （hub_client.py:582 `why = str(e) or 类名`、:612 `loop_<类名>`），
+         *  hubErrorText 刻意不映射它们——把类名摆上面板只是噪声，而且两槽互不串味
+         *  是有钉的不变量（test_v1746_panel_unique_funcs）。
+         *  但"什么都不显示"更糟：客户只看到孤零零一句"未连接"，分不清是云端在发布、
+         *  自家断网还是加载项坏了，唯一出口就是报障。故这里按"槽非空"给一条
+         *  通用文案——判据只看有没有值，绝不回显值本身。
+         *  「局域网控制不受影响」是事实：内置 broker 与 :9001 WS 网关不依赖云端。*/
+        const HUB_CONN_GENERIC_TEXT =
+            '云端暂时连不上（多为云端正在发布或本机网络不通）——局域网控制不受影响，本机会自动重试';
+
         /** 云通道**连接类**故障文案（纯函数，便于 node 真跑）。
          *  只映射 hub_client.last_error 的已知取值；未知的一律回 ''（不显示）——
          *  面板是给终端用户看的，把异常类名（RuntimeError 之类）摆上去只是噪声。
+         *  未知非空码的兜底在渲染处（HUB_CONN_GENERIC_TEXT），别加到这里。
          *  换码/成员/踢人这类**操作**故障走 hubOpErrorText（两个槽分开，见下）。*/
         function hubErrorText(lastError) {
             switch (lastError) {
@@ -469,7 +482,8 @@
                 // 有原因就摆出来（哪怕长连是通的）：换码失败这类问题不会断开长连，
                 // 但用户看到的就是一张扫不出来的死码，此前只能去翻 HA 日志。
                 // **操作类优先**：它是用户刚刚那一下的结果，比后台的连接类状态更要紧。
-                const why = hubOpErrorText(info.lastOpError) || hubErrorText(info.lastError);
+                const why = hubOpErrorText(info.lastOpError) || hubErrorText(info.lastError) ||
+                    (info.lastError ? HUB_CONN_GENERIC_TEXT : '');
                 errEl.textContent = why;
                 errEl.hidden = !why;
             }

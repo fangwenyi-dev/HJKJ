@@ -136,13 +136,28 @@ want(els.hubStatus.textContent === '未启用', '未启用态: ' + els.hubStatus
 want(els.hubDot.className.indexOf('dot-unknown') >= 0, '未启用应是 unknown 态: ' + els.hubDot.className);
 want(els.hubError.hidden === true, '未启用时不显示故障原因');
 
-// 场景 5：未知故障码不得摆到面板上（终端用户看到 RuntimeError 只是噪声）
+// 场景 5（2026-10-20 销售面批改判据）：未知**非空**连接码 → 不许摆裸异常类名，
+// 但也不许整行藏掉。原判据是"未知码必须不显示"，那是把"不泄露噪声"和"不给任何
+// 交代"混成了一件事：客户实际看到的是孤零零一句"未连接"，分不清云端在发布、
+// 自家断网还是加载项坏了，只能报障。现判据拆成两条：
+//   5a 有值 ⇒ 显示通用兜底，且文案里不得出现原异常文本（噪声仍被挡住）
+//   5b 无值 ⇒ 整行隐藏（没故障时不许凭空长出一行红字）
 reset();
 applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
                  bindCodeExpired: false, gatewaySn: 'GW1', gateways: [], lastError: 'RuntimeError',
                  members: [], membersMax: 8, membersSupported: true }, false);
+want(els.hubError.hidden === false && els.hubError.textContent.length > 4,
+     '未知连接码必须给一句交代: ' + JSON.stringify(els.hubError.textContent));
+want(els.hubError.textContent.indexOf('RuntimeError') < 0,
+     '兜底文案不得回显裸异常类名: ' + els.hubError.textContent);
+want(/局域网|本地/.test(els.hubError.textContent) && /不受影响/.test(els.hubError.textContent),
+     '兜底要说清"局域网控制不受影响"（否则客户会以为窗也控不了了）: ' + els.hubError.textContent);
+reset();
+applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [], lastError: null,
+                 members: [], membersMax: 8, membersSupported: true }, false);
 want(els.hubError.hidden === true && els.hubError.textContent === '',
-     '未知码必须不显示: ' + JSON.stringify(els.hubError.textContent));
+     '没有故障时错误行必须隐藏: ' + JSON.stringify(els.hubError.textContent));
 
 // 场景 6：老 hub（membersSupported=false）——要说清是云端版本旧，且禁用按钮
 reset();
@@ -231,7 +246,13 @@ def _render_script():
     m = re.search(r"const BIND_PAYLOAD_PREFIX = '([^']+)'", JS)
     assert m, "huijian.js 里找不到 BIND_PAYLOAD_PREFIX 常量（改名了？harness 要跟着改）"
     const = "const BIND_PAYLOAD_PREFIX = '%s';\n" % m.group(1)
-    return (HARNESS_HEAD + const + "\n".join(_body(n) for n in DEPS)
+    # 同理 harness 必须带上渲染出口引用的兜底常量：applyHubStatus 现在引用
+    # HUB_CONN_GENERIC_TEXT，harness 里没有它会让 node 直接 ReferenceError 崩掉
+    # （不是"钉红了"，是量具坏了——所以缺常量时响亮断言，指向该改 harness）。
+    g = re.search(r"const HUB_CONN_GENERIC_TEXT =([\s\S]*?);", JS)
+    assert g, "huijian.js 里找不到 HUB_CONN_GENERIC_TEXT（改名了？harness 要跟着带上）"
+    generic = "const HUB_CONN_GENERIC_TEXT =%s;\n" % g.group(1).strip()
+    return (HARNESS_HEAD + const + generic + "\n".join(_body(n) for n in DEPS)
             + "\n" + _body("applyHubStatus") + "\n" + HARNESS_TAIL)
 
 

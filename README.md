@@ -2,6 +2,14 @@
 
 一个商店仓、两个加载项，各自独立镜像、独立版本号、独立发版链。
 
+## 前置要求（先看这一条）
+
+本加载项**只能装在 Home Assistant OS（HAOS）或 Supervised 形态**——只有这两种形态有「加载项商店」。
+**Home Assistant Container（Docker／群晖套件／威联通 Container）与 Core（pip 直装）装不了，
+也没有手装的等价路径。** 判断方法：HA 里能看到「加载项商店」菜单就有 Supervisor。
+
+完整安装、排障、报障方式与设计边界见 [huijian_mqtt_broker/DOCS.md](huijian_mqtt_broker/DOCS.md)。
+
 ## 可用插件
 
 | 插件 | 版本 | 说明 |
@@ -81,7 +89,7 @@ LoRa 网关 (MQTT 客户端)
 
 ## 小程序局域网直连
 
-微信「慧尖」小程序的「Matter 网关」入口经 mDNS `_mqtt._tcp` 发现本机后，
+微信「小慧语音」小程序的「LoRa 网关」入口经 mDNS `_mqtt._tcp` 发现本机后，
 会固定拨号 `ws://<IP>:9001/ws` 讲 JSON-over-WebSocket。本插件实现了与
 Matter 网关固件（matter-broker `app_ws_gateway.c`）1:1 对等的 WS 协议服务，
 小程序可在局域网**直连 HA**：看到、控制挂在慧尖 LoRa 网关下的全部
