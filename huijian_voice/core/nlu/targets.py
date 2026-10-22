@@ -784,6 +784,30 @@ def _bare_generic(tail: str) -> str:
     return t if t in _UNIQUE_DOMAIN_GENERIC else ""
 
 
+def _named_device_behind_area(tail: str) -> str:
+    """区域名被当成设备词命中后，残句是不是**紧跟一个在册具名设备**；是→返回该词。
+
+    为什么要有这条（v1.7.4 刀#23，2026-10-22 现网真日志）：注册表会把区域名本身派生
+    成设备词（friendly_name「办公室 All Lights」→ token「办公室」），⑥ 长→短于是先命中
+    句首的「办公室」并 break，把句尾真正的设备名丢掉——现网那盏灯的在册名字就叫「射灯」
+    （light.ban_gong_shi_she_deng，friendly_name 里**没有**房间词），所以"具名设备会被更长
+    在册词先命中"这条前提不成立。结果＝'办公室射灯亮度调到百分之十' 报"2 台名字相近
+    （办公室空调 Indicator Light、办公室 All Lights）"，一盏灯都没动。
+
+    判据刻意收窄（放宽就会重开 v1.1.36 的批量误动）：
+      · 只认 `_dyn_set`（**真实体 friendly_name 派生出来的词**），不认静态泛称/属性词；
+      · 必须紧跟区域名（剥掉「的/地/得/里」后**首字即命中**），不做句中任意位置搜索；
+      · 命中词自己不许是区域名（「办公室」不能再让位给「办公室」）。
+    """
+    t = re.sub(r"^[的地里得]+", "", (tail or "").strip())
+    if not t:
+        return ""
+    for w in _ALL_MIN2:                      # 长→短，与 ⑥ 同一确定性判据
+        if w in _dyn_set and t.startswith(w) and not _area_like(w):
+            return w
+    return ""
+
+
 def _generic_rescue(pre: str, generic: str):
     """泛称字前的残段 pre → 应顶替「pre+泛称」整段的表内标准词；None=不救。"""
     try:
@@ -1048,8 +1072,11 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
             # 区域整段丢失、句尾泛称连域一起没了——现网金标 14 号「打开办公室的灯」
             # 折到两台空调、灯一盏没开（发布版 1.6.5 在册）。与上一条护栏同机制
             # （continue 交单字泛称车道承接，不新建表、不凭空造目标）：只在整串＝
-            # 「区域名 +(的|里)?+ 唯一域泛称字」时让位，具名设备（办公室射灯）由更长
-            # 的在册词先命中，走不到这里。
+            # 「区域名 +(的|里)?+ 唯一域泛称字」时让位。
+            # ⚠ 本行原注释写的前提「具名设备（办公室射灯）由更长的在册词先命中，
+            # 走不到这里」是**假的**：现网那盏灯的注册名就叫「射灯」，句首房间词是从
+            # 「办公室 All Lights」派生出来的独立设备词，长→短扫时先命中——见 v1.7.4
+            # 刀#23（tests/test_v174_area_named_device.py，2026-10-22 16:40 真日志）。
             if not idx and _area_like(d) and _bare_generic(stripped[len(d):]):
                 continue
             # v1.6.10 刀R1：尾巴是**裸窗泛称**同样让位（判据与"为什么不折域"见
@@ -1057,6 +1084,10 @@ def parse_target(raw: str) -> tuple[str | None, str | None, int]:
             # ⑥ 的接线钉按字面取 `_bare_generic(...)` 那一行当护栏行，合并写法会把
             # 它自己的 `if` 挤走（真红过一次：钉报"护栏被常量式失效"）。
             if not idx and _area_like(d) and bare_window_generic(stripped[len(d):]):
+                continue
+            # v1.7.4 刀#23：同排第三条护栏——残句紧跟的是**在册具名设备**时同样让位，
+            # 由下一轮以「area=区域名 + 设备=具名设备」承接。写法保持独立 if（同上律）。
+            if not idx and _area_like(d) and _named_device_behind_area(stripped[len(d):]):
                 continue
             # v1.6.10 刀P0-4：命中词若是**方位短语的参照物**（「窗户旁边的灯」里的
             # 窗户），让位给中心语——否则说开灯、窗真开（P0，判据见该函数）。
