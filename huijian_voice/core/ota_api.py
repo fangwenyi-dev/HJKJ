@@ -39,6 +39,25 @@ logger = logging.getLogger("huijian.ota")
 _SATELLITES_PATH = "/api/huijian-ai/satellites"
 
 
+def issue_url(host: str, fname: str, token: str, sha256="") -> str:
+    """一次性领取链接的**唯一装配点**（v2.3.7 起把期望摘要一起带在 query 上）。
+
+    为什么走 URL、不给设备服务加参数：设备的 `ota_upgrade` user service 现在只声明一个
+    参数 `url`，集成侧也只发 `{"url": …}`；参数表一改＝所有未升级的加载项下发当场因
+    参数个数不匹配失败——两侧不能版本硬锁死。URL query 是唯一不需要同版本的通道，
+    且不认这个参数的老固件照旧能用。
+
+    摘要形态不合（非 64 位 hex，含带空格的"看着像"）就**不带**这个参数：宁可不核，
+    也不能把一个被截断/被改写的摘要当真值送去——那会把一次本来正常的升级拒掉。
+    设备侧同口径（取不到即"核验关闭"并响亮报 OFF），两边都不许静默降级。
+    """
+    url = f"http://{host}:{const.WS_PORT}/firmware/{quote(fname)}?t={token}"
+    s = sha256 if isinstance(sha256, str) else ""
+    if len(s) == 64 and all(c in "0123456789abcdefABCDEF" for c in s):
+        url += "&sha256=" + s.lower()
+    return url
+
+
 async def _json_body(request) -> dict:
     try:
         data = await request.json()
@@ -187,12 +206,14 @@ def setup(app, ctx):
                 "success": False,
                 "error": "加载项当前无可路由局域网地址，链接无法供设备领取——"
                          "请确认本机已接入设备所在局域网后重试"}, status=503)
-        url = f"http://{host}:{const.WS_PORT}/firmware/{quote(res['file'])}?t={res['token']}"
+        url = issue_url(host, res["file"], res["token"], res.get("sha256", ""))
         logger.info("[OTA] 生成近场下发链接 v%s mac=%s", res["version"], mac or "-")
         return web.json_response({
             "success": True, "url": url, "sha256": res["sha256"], "size": res["size"],
             "version": res["version"], "expires_in": res["expires_in"],
-            "warn_zh": "v2.1.35 及更早固件不校验哈希/不防降级——请核对版本号后再代发；"
+            "warn_zh": "链接已按 v2.3.7 口径带上期望摘要（&sha256=…）：固件 ≥v2.3.7 会在切槽前逐字节核对，"
+                       "不符即拒刷并留在旧版；v2.3.6 及更早、以及 v2.1.35 及更早固件不校验哈希/不防降级——"
+                       "请核对版本号后再代发；"
                        "链接一次性、10 分钟过期，过期或下载中断请回本页重新签发；"
                        "仅限设备所在局域网内打开；当前小程序尚无 CMD21 代发入口"
                        "（代发能力未上线，链接先用于备存）"})
@@ -249,7 +270,7 @@ def setup(app, ctx):
             return web.json_response({
                 "success": False,
                 "error": "加载项无可路由局域网地址——设备白名单闸只收私网字面 IPv4"}, status=503)
-        url = f"http://{host}:{const.WS_PORT}/firmware/{quote(res['file'])}?t={res['token']}"
+        url = issue_url(host, res["file"], res["token"], res.get("sha256", ""))
         # v1.1.27：可达判据单点 `_bridge_ok`（第四轮审计 P2 起已**前移到签发之前**，
         # 见上方——桥断时不得白签令牌）。
         ack = await ctx.ha.rest_write("POST", "/api/huijian-ai/satellites/ota",

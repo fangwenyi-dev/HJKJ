@@ -9,6 +9,7 @@ test_integration_config_flow 的「源码文本级」先例钉关键形态）。
 """
 import asyncio
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -385,6 +386,39 @@ def test_firmware_issue_endpoint(store, monkeypatch):
     assert st == 400 and not j["success"], "未在盘版本不得发放"
     st, j = _jget(port, "/api/firmware")
     assert st == 200 and j["latest"] == "2.9.7" and "import" in j["import_dir"]
+
+
+def test_firmware_issue_carries_expected_sha256(store, monkeypatch):
+    """v2.3.7 配套（设备侧同一批）：领取链接必须把期望摘要带在 query 上。
+
+    断链的确切形态不是"没实现校验"，而是**校验能力在设备上、值却没送到位**：
+    `issue()` 早就把 sha256 放进返回体，但装配 URL 那两行没带它，而集成中继只转发
+    `{"url": …}` ⇒ 设备侧 `StartUpgradeFromUrl` 第三参缺省成空串，哈希边下边算却从不比对。
+    本条钉"摘要必须跟着链接走"——走 URL 而不是给设备服务加参数，是因为现网集成只发
+    单参数，加参数＝所有老加载项的下发当场失败（两侧不能版本硬锁死）。
+    """
+    monkeypatch.setattr("core.ota_api.local_ip", lambda: "10.0.0.9")
+    ctx = _admin_ctx(store, _sat_ledger())
+    _drop(store, "huijian-s3-2.9.7.bin", b"w" * 9)
+    srv = _serve(make_admin_app(ctx)); port = next(srv)
+    st, j = _jpost(port, "/api/firmware/issue", {"mac": "aa"})
+    assert st == 200 and j["success"], j
+    assert j["url"].endswith(f"&sha256={j['sha256']}"), \
+        f"链接没带期望摘要＝设备侧核验必然关闭：{j['url']}"
+    assert re.search(r"[?&]t=[0-9a-f]{32}&sha256=[0-9a-f]{64}$", j["url"]), \
+        f"参数形态不合（令牌在前、摘要 64hex 在后）：{j['url']}"
+
+
+def test_issue_url_helper_rejects_malformed_sha():
+    """负向：摘要形态不合就**不带**这个参数（宁可不核，也不拿截断值去拒正常固件）。"""
+    from core.ota_api import issue_url
+    good = "0" * 64
+    u_ok = issue_url("10.0.0.9", "huijian-s3-2.9.7.bin", "tk", good)
+    assert u_ok.endswith(f"&sha256={good}"), u_ok
+    for bad in ("", "0" * 63, "z" * 64, None, "  " + good):
+        u = issue_url("10.0.0.9", "a.bin", "tk", bad)
+        assert "sha256=" not in u, f"畸形摘要不该进链接（输入={bad!r}）：{u}"
+        assert "?t=tk" in u, f"摘要不合规也不能把令牌一起弄丢：{u}"
 
 
 def test_firmware_issue_no_routable_host(store, monkeypatch):
