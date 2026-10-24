@@ -3710,7 +3710,23 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 
 ### 五、全套回归
 
-见文末"回归账"（跑完补数字）。
+- **本地（这台 Windows 开发机）**：`python -m pytest tests -q --continue-on-collection-errors`
+  ＝ **21 failed / 3449 passed / 11 skipped ＋ 1 collection error**（103.01s）。21＋1 是**同一条根因**：
+  `core.audio.OpusError: opus 库缺失`——逐条 traceback 收敛到 `core/audio.py:75 OpusPcmEncoder.__init__`
+  （这台机器没装 libopus0，也不静默装系统依赖）；单跑那六份 TTS 文件复现出的正是同一 21 条，
+  与本版修复前的基线**逐条相同** ⇒ 非本批引入。
+- **CI（权威口径，容器里装了 libopus0）**：`ci-voice.yaml` run **40078634234**（ref main@9f77010，
+  触发人＝本次发版）→ **completed / success**，十个 job 全绿：Lint（含 `Python syntax & unit tests`
+  ＋四源版本一致闸）／Prepare（tag 闸：`vo-1.7.5` 指向本次 commit ⇒ 按重跑放行）／Init／
+  Build amd64／Build aarch64／E2E real image／Manifest／Push ACR CN mirror（zstd→gzip 转码＋
+  匿名拉取自证双架构）／Release（等 ACR 镜像就绪 → Create or Update Release → Gitee Release 幂等）。
+- **两侧 Release 与三档下发 URL**：GitHub `422609243`／Gitee `1236459`（target_commitish=9f77010）。
+  逐源**真下载**对账（不是 HEAD 200）：`gh-proxy → github → gitee` 三档 × 两枚 bin 共 6 格，
+  sha256 全部 `2d7b04e1…`／`019eaf22…`、大小 2,617,504／565,034 ⇒ `VERIFY_RED=0`。
+  assets 段与 2.3.4/2.3.7/2.3.9/2.3.10 逐字节 `cmp` 相同 ⇒ 生产口径「v2.2.9 及以上走 OTA 单段」仍成立。
+- **正文归属如实记一笔**：两侧 Release 正文最终是 **CI 从本 CHANGELOG 段生成**的那份（本仓自 v1.6.21
+  起的单一真源口径，`正文自愈` 会在重跑时再覆盖一次）。发版过程中我先手工挂过一次面向客户的文案，
+  已被 CI 覆盖——**不再手工对抗**；要看客户口径请看本节与 §一。
 
 ## [1.7.4] - 2026-10-22 · 语音线：⑥ 车道不许把区域名当设备名（"办公室射灯亮度调到百分之十"根修）＋ 固件 2.3.9 下发登记
 
