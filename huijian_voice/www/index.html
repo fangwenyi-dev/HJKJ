@@ -16,8 +16,8 @@
      v1.0.42 的 #1d1750「过紫」与更早 #030712「过黑」均已作废，勿回潮 -->
 <meta name="theme-color" content="#071426">
 <title>慧尖HA语音插件</title>
-<link rel="stylesheet" href="css/huijian.css?v=1.7.4">
-<link rel="stylesheet" href="css/voice.css?v=1.7.4">
+<link rel="stylesheet" href="css/huijian.css?v=1.7.5">
+<link rel="stylesheet" href="css/voice.css?v=1.7.5">
 </head>
 <body>
 <!-- 「星辰大海」背景层（与网关加载项同一设计标准/同一固定种子＝同一片天）：
@@ -320,7 +320,7 @@
 
 <script>
 "use strict";
-const CURRENT_VERSION = "1.7.4";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
+const CURRENT_VERSION = "1.7.5";           // 与 config.yaml 一致（钉桩测试）；?v= cache-bust 与本行同步 bump
 // 音色表 = kokoro-multi-lang-v1_1 官方 103 sid 全表（k2-fsa docs sid 表实证；
 // 标注=对用户上传试听样本的 CAM++ 声纹溯源榜：v1_1 不含晓晓/云扬，
 // sid18=zf_026 女声最似晓晓(0.454 全场最近)，sid81=zm_055 最似云扬）
@@ -836,6 +836,10 @@ const CONT_LABELS = {on:"开启中", off:"已关闭", no_entity:"需固件≥2.1
 function fwBadge(d, remote){
   const s = d.fw_state;
   if(s === "updatable") return pill("可升级→"+_otaLatest,"warn");
+  // v1.7.5：服务端按锁里 min_compatible 判出的"这台升不了 OTA 单段"档（判据单点仍在
+  // ota_api._devices，面板只渲染）。旧形态没有这一档 ⇒ 2.1.x/2.2.8 被摆成"可升级"，
+  // 点下去设备只换 app 段、assets 留旧代，现场读来是"升级成功但叫不应"。
+  if(s === "incompatible") return pill("低于该版下限·需USB双段重刷","bad");
   if(s === "up-to-date") return pill(remote?"已最新·可远程":"已最新","ok");
   if(s === "no-package") return pill("无可升级包","mut");
   return pill(d.fw_version?("版本待证·读数"+d.fw_version+"非实时"):"未上报","mut");
@@ -1152,6 +1156,6 @@ $("#regenBtn").onclick = async ()=>{
   try { await post("/api/token/regenerate",{}); toast("已重置"); loadEndpoints(); } catch(e){ toast(e.message); }
 };
 </script>
-<script src="js/starsky.js?v=1.7.4"></script>
+<script src="js/starsky.js?v=1.7.5"></script>
 </body>
 </html>

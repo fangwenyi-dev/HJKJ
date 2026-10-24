@@ -325,6 +325,11 @@ class FirmwareStore:
                 "urls_count": len(urls),
                 "urls_hosts": _url_hosts(urls),
                 "notes_zh": str(rel.get("notes_zh", "")),
+                # v1.7.5（登记了却没执行的字段）：`min_compatible` 过去只躺在锁文件里，
+                # 全仓零消费者 ⇒ 2.1.x/2.2.8 的设备会被标"可升级"并收到 2.3.x：设备侧
+                # OTA 只写 app 段，assets/唤醒模型留旧代（2.2.9 起换过 wn9l），现场读来
+                # 是"升级成功但叫不应"。现在它进账目面并被 issue/面板判据消费。
+                "min_compatible": str(rel.get("min_compatible", "") or ""),
             }
             if e:   # 实盘哈希与 lock 声明不符 → 面板标红，绝不默认信任
                 row["sha_mismatch"] = bool(row["sha256"] and row["sha256"] != e.get("sha256"))
@@ -348,11 +353,16 @@ class FirmwareStore:
                     "source": e.get("source", "imported"),
                     "on_disk": (self.public / fn).is_file(),
                     "urls_count": 0, "urls_hosts": [], "notes_zh": "",
+                    # 键必须恒在（面板/判据读它不该关心这行来自锁还是投递口）
+                    "min_compatible": "",
                 }
                 if lock_row is not None:
                     row["urls_count"] = lock_row["urls_count"]
                     row["urls_hosts"] = lock_row["urls_hosts"]
                     row["notes_zh"] = lock_row["notes_zh"]
+                    # 同版不同字节以 lock 的**下限**为准（现场热修不重打镜像时，
+                    # 下限错了会放进本该 USB 双段的旧设备）；投递包不改兼容性下界。
+                    row["min_compatible"] = str(lock_row.get("min_compatible", "") or "")
                     if lock_row["sha256"] and lock_row["sha256"] != e.get("sha256"):
                         row["sha_mismatch"] = True
                 _r2 = ota_capacity_error(v, _to_int(row.get("size"), f"index {fn}")) or                     ota_image_error(self.public / fn)
@@ -498,7 +508,7 @@ class FirmwareStore:
                 self._downloading.discard(version)
 
     # ── 一次性领取令牌 ──────────────────────────────────────────────
-    def ota_block_reason(self, version: str) -> str:
+    def ota_block_reason(self, version: str, device_version: str = "") -> str:
         """该版本**不可下发**的具名真因（"" ＝ 无可指责之处，交调用方按"不在盘"话术）。
         给 API 层出**精确**拒因用（issue() 已自拦，但那里只能回 None，面板会糊成
         「该版本不在盘（投递口放包或先「拉取」）」）。
@@ -528,6 +538,16 @@ class FirmwareStore:
         if len(quote(row["file"])) > _FN_URL_BUDGET:
             return (f"v{version} 文件名 quote 后超 BLE 代发 URL 预算"
                     f"（{_FN_URL_BUDGET}B），不可下发")
+        # v1.7.5：`min_compatible` 从"登记了没人执行"变成真闸（10-24 审出 P1）。
+        # 只在**给了设备读数**时判——近场签发可能拿不到实时版本，那种情况按旧行为
+        # 放行并出 warn_zh（见 ota_api._issue），不把"信息不全"当成"可以下发"的反面教材，
+        # 也不让面板凭空拒掉一条本来合法的运维链接；有读数就硬拒。
+        minv = str(row.get("min_compatible") or "").strip()
+        cur = str(device_version or "").strip()
+        if minv and cur and vkey(cur) < vkey(minv):
+            return (f"v{version} 要求设备现版本 ≥ v{minv}（这台读数 v{cur}）——"
+                    f"更旧的固件走 OTA 只换 app 段、assets 段留旧代（2.2.9 起唤醒模型换代），"
+                    f"现场形态是\"升级成功但叫不应\"；请用烧录工具 USB 双段升级，本次不下发")
         return (ota_capacity_error(version, row.get("size"))
                 or ota_image_error(self.public / row["file"]))
 
@@ -536,7 +556,11 @@ class FirmwareStore:
         语义已扩到全部拒签支路，新代码请直调 `ota_block_reason`。"""
         return self.ota_block_reason(version)
 
-    def issue(self, version: str, mac: str = "") -> dict | None:
+    def issue(self, version: str, mac: str = "", device_version: str = "") -> dict | None:
+        """签发一次性领取令牌。`device_version`＝目标设备的**实时**固件读数（可空）：
+        给了就按锁里的 `min_compatible` 硬拒（v1.7.5），没给则照旧放行并由 API 层出
+        具名提醒——"不知道设备在哪一版"不等于"这版一定能给它升"，但也不该把近场兜底
+        链接这条路堵死。真因一律走 `ota_block_reason`（单一出口）。"""
         row = next((r for r in self.versions() if r["version"] == version and r["on_disk"]
                     and not r.get("sha_mismatch")), None)
         if not row:
@@ -548,7 +572,7 @@ class FirmwareStore:
         # 统一走 `ota_block_reason`——与 API 层/面板拿到的真因逐字同源。旧形态这里
         # 与 capacity_error() 各写一遍（后者还只抄了容量闸），于是"小体积产线合并
         # 镜像被拒"在面板上糊成"该版本不在盘"，加一道闸就再漂一次。
-        why = self.ota_block_reason(version)
+        why = self.ota_block_reason(version, device_version)
         if why:
             logger.warning("[固件] %s", why)
             return None

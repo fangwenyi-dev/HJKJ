@@ -261,6 +261,11 @@ class SttTransport(WsTransport):
                 return None, f"Send failed: {err}"
             _LOGGER.debug("STT 发送完成：%d 帧，等待转录", frames)
             text = None
+            # v1.7.5（空结果静默根修）：服务端在**故障**时才带 reason（真静音按契约回
+            # text:"" 且不带 reason，见 core/session.py::_reply_stt）。过去这个键全仓
+            # 无人消费 ⇒ 模型未就绪/解码失败/超预算都塌成"空转写 SUCCESS"，HA 什么都不播，
+            # 客户读来就是"叫了没反应"。收进本地变量，收口处与 text 一起判。
+            reason = ""
             claimed_gen = getattr(self, "_conn_gen", None)   # 桩缺不判（旧语义）
             try:
                 with anyio.fail_after(timeout):
@@ -283,6 +288,7 @@ class SttTransport(WsTransport):
                                             "累计 %d）", got, rid, self._crossed_total)
                                     continue
                             text = data.text
+                            reason = str(getattr(data, "reason", "") or "")
                             break
                         if claimed_gen is not None and \
                                 getattr(self, "_conn_gen", claimed_gen) != claimed_gen:
@@ -317,6 +323,13 @@ class SttTransport(WsTransport):
                     getattr(self, "_conn_gen", claimed_gen) != claimed_gen:
                 # 换连 break：显式 error（不得 (None,None) 让调用方猜成功）。
                 return None, "Connection replaced mid-round"
+            # v1.7.5（空结果静默根修）：空串**带因**＝故障面（模型未就绪/opus 解码失败/
+            # 识别超预算/服务端异常），按 error 收口让 HA 走它自己的失败话术；
+            # 空串**不带因**＝契约里的真静音，照旧 SUCCESS("")（"啊"一声没说的话不该播道歉）。
+            # 与上面 `text is None → ERROR` 那条同向：这一档补的是"有字面空串、但服务端
+            # 明确说了它不是静音"。截 160 字与 core/session.py::_reply_stt 的 reason 上限同口径。
+            if not text and reason:
+                return None, reason[:160]
             return text, None
 
     async def await_message(self, timeout: int = 60):

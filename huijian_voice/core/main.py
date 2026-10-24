@@ -26,7 +26,7 @@ from .asr import AsrEngine
 from .executor import Executor
 from .firmware_store import FirmwareStore
 from .ha_client import HAClient
-from .mdns import Publisher, local_ip
+from .mdns import Publisher, lan_ip, local_ip
 from .model_store import ModelStore
 from .nlu.klar_client import KlarClient
 from .nlu.query import QueryZone  # noqa: F401  (pipeline 内部实例化，此处仅保证包完整)
@@ -216,6 +216,17 @@ class Service:
             # TextCNN 预热（小模型，镜像内置）
             if self.settings.get("nlu.textcnn_enabled", True):
                 await loop.run_in_executor(None, self.textcnn._ensure)
+        # v1.7.5（DHCP 重绑后端点全体失真）：广播与事实文件跟着真实出口地址走。
+        # 为什么放这条 60s 循环里：`ctx.host`/`self.host` 是启动一次性采样，加项比
+        # 网卡先起、或路由器重派发新 lease 之后，/discover、/api/endpoints、
+        # endpoints.json、mDNS 四处会一直端一个连不上的地址（10-24 审出 P2；
+        # OTA 签发那条 v1.0.65 已实时取址，这是剩下的半截）。
+        # 只在**真的变了**时才重广播＋重写事实文件（无变化零副作用，不给 nginx 添写）。
+        try:
+            if self.mdns.republish_if_changed():
+                self._write_endpoints()
+        except Exception:  # noqa: BLE001 广播/事实文件坏了不该打死保障循环
+            logger.exception("[mDNS] 地址巡检异常（下轮再试）")
         return _MODELS_CHECK_S
 
     async def _loop_models(self) -> None:
@@ -383,7 +394,10 @@ class Service:
 
     def _write_endpoints(self) -> None:
         try:
-            urls = self.settings.endpoint_urls(self.host)
+            # v1.7.5：实时取出口地址——`self.host` 是启动一次性采样，DHCP 重绑或
+            # 加项比网卡先起时，写进 endpoints.json 的就是一个连不上的地址（小程序/
+            # 设备都读这份事实文件）。取不到才回落采样值，保证不写出空串。
+            urls = self.settings.endpoint_urls(lan_ip() or self.host)
             payload = dict(urls)
             payload.update({"token": self.settings.get("security.ws_token", ""),
                             "require_token": bool(self.settings.get("security.require_token")),

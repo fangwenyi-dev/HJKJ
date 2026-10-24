@@ -16,6 +16,7 @@ from typing import Optional
 from aiohttp import web
 
 from . import const
+from .mdns import lan_ip
 from .session import SESSION_BY_CHANNEL
 
 logger = logging.getLogger("huijian.ws")
@@ -180,7 +181,10 @@ async def _discover(request: web.Request) -> web.Response:
     ctx = request.app[CTX_KEY]
     settings = ctx.settings
     require = bool(settings.get("security.require_token", False))
-    host = (ctx.host or request.headers.get("Host", "").split(":")[0] or "")
+    # v1.7.5：实时取出口地址。`ctx.host` 是**启动时一次性采样**，DHCP 重绑或加载项比
+    # 网卡先起（当时回落 127.0.0.1）之后，这里会永远端出一个连不上的地址——设备就是
+    # 从 /discover 拿端点的。取不到才退 Host 头（对方眼中的我们，同样可用），最后 ctx.host。
+    host = (lan_ip() or request.headers.get("Host", "").split(":")[0] or ctx.host or "")
     return web.json_response({
         "ok": True,
         "name": "huijian_voice",

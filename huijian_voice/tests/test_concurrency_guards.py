@@ -401,8 +401,13 @@ def test_credential_file_mode_guard():
     世界可读=容器内 nginx worker(nobody) 可直接读凭据）；/data/run 禁 777
     （唯一读写者是 root 主进程，world-writable=任何低权进程可劫持凭据文件）。"""
     main_src = (_CORE / "main.py").read_text(encoding="utf-8")
-    k = main_src.index("endpoints.json")
-    assert "mode=0o600" in main_src[k:k + 400], "endpoints.json 写点缺 mode=0o600"
+    # 锚点＝**写点那行代码**，不是"文中第一次出现 endpoints.json"（v1.7.5 实发：
+    # 一条解释 DHCP 重绑的注释先提了这个文件名，旧锚点就把 400 字符窗挪到了注释上，
+    # 凭据模式钉红在产品没变的那一侧）。写点前后各取有界窗，绑"同一作用域＋顺序"。
+    k = main_src.index('dst = const.DATA_DIR / "run" / "endpoints.json"')
+    seg = main_src[k:k + 500]
+    assert "mode=0o600" in seg, "endpoints.json 写点缺 mode=0o600"
+    assert "_atomic_write(" in seg, "写点不再经 _atomic_write＝这条兜底路径换了实现，判据要重指"
     boot = (_CORE.parent / "boot.sh").read_text(encoding="utf-8")
     assert "chmod 777 /data/run" not in boot, "/data/run 777 回潮"
 

@@ -82,6 +82,29 @@ def _bridge_ok(ha) -> bool:
         return False
 
 
+async def _live_device_version(ctx, mac: str) -> str:
+    """目标设备的**实时**固件读数（判 `min_compatible` 用）；拿不到就回 ""。
+
+    v1.7.5：判据单点在服务端（面板只渲染 `fw_state`，F-OTA-04 同律）——所以签发/下发
+    都自己回台账读一次，不要求前端把读数带上来。只认 `fw_source=="实时"` 那一档：
+    「入驻时」快照可能是几周前的版本，拿它去拒一次合法下发＝用一个不可信的值做否决，
+    正是 1.6.1/1.6.4 两次实锤后立下的"不可判就不断言"纪律。
+    """
+    try:
+        led = await ctx.ha.rest_get(_SATELLITES_PATH) if ctx.ha else None
+        for row in ((led or {}).get("devices") or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("mac", "")).strip()[:40].lower() != mac.lower():
+                continue
+            if str(row.get("fw_source") or "") != "实时":
+                return ""
+            return str(row.get("fw_version") or "").strip()[:24]
+    except Exception:  # noqa: BLE001 读数失败退回"不判"，绝不因新规多一处 500
+        return ""
+    return ""
+
+
 def setup(app, ctx):
     async def _devices(request):
         store = getattr(ctx, "firmware", None)
@@ -123,7 +146,11 @@ def setup(app, ctx):
             elif not cur or src != "实时":
                 state = "unverified"
             elif vkey(cur) < vkey(latest["version"]):
-                state = "updatable"
+                # v1.7.5：锁里的 min_compatible 从这里开始**真的被消费**（10-24 审出：
+                # 字段登记了但全仓零消费者 ⇒ 2.1.x/2.2.8 会被标"可升级"，而设备侧 OTA
+                # 只换 app 段、assets 段留旧代唤醒模型 ⇒ 现场读来是"升级成功但叫不应"）。
+                minv = str(latest.get("min_compatible") or "").strip()
+                state = ("incompatible" if minv and vkey(cur) < vkey(minv) else "updatable")
             else:
                 state = "up-to-date"
             d["fw_state"] = state
@@ -167,15 +194,20 @@ def setup(app, ctx):
         version = str(body.get("version", "")).strip()
         # mac 仅日志要素，入日志前净化（安全 F4 同族）；空/脏不影响签发
         mac = str(body.get("mac", "")).strip()[:40]
+        # v1.7.5：目标设备的**实时**固件读数（面板按设备行传；缺则不判 min_compatible）。
+        # 判据本体在 firmware_store.ota_block_reason，本层只负责把读数带下去＋把真因说清。
+        dev_ver = str(body.get("device_version", "") or "").strip()[:24]
+        if not dev_ver:
+            dev_ver = await _live_device_version(ctx, mac)
         res = None
         try:   # v1.0.65 F-OTA-04：含 latest 兜底分支整体折叠——违背「永不抛」契约即 500
             if version:
-                res = await asyncio.to_thread(store.issue, version, mac)
+                res = await asyncio.to_thread(store.issue, version, mac, dev_ver)
             else:
                 lat = await asyncio.to_thread(store.latest)
                 if lat:
                     version = lat["version"]
-                    res = await asyncio.to_thread(store.issue, version, mac)
+                    res = await asyncio.to_thread(store.issue, version, mac, dev_ver)
         except Exception as e:  # noqa: BLE001
             logger.warning("[OTA] 签发异常: %s", e)
             res = None
@@ -188,7 +220,7 @@ def setup(app, ctx):
             # :8000 事件循环线程里同步扫盘（import 目录扫描 + 逐包读头）。
             cap = ""
             try:
-                cap = (await asyncio.to_thread(store.ota_block_reason, version)
+                cap = (await asyncio.to_thread(store.ota_block_reason, version, dev_ver)
                        if version else "")
             except Exception:  # noqa: BLE001
                 cap = ""
@@ -233,6 +265,11 @@ def setup(app, ctx):
             return web.json_response(
                 {"success": False, "error": "mac 必填——下发按设备寻址，防发错机"}, status=400)
         res = None
+        # v1.7.5：先建默认值——签发前任何早退/异常都不能让下面 `if not res:` 的拒因分支
+        # 读到未定义名（那条分支同样要拿它判 min_compatible）。
+        dev_ver = str(body.get("device_version", "") or "").strip()[:24]
+        if not dev_ver:
+            dev_ver = await _live_device_version(ctx, mac)
         try:
             if not version:
                 lat = await asyncio.to_thread(store.latest)
@@ -247,7 +284,9 @@ def setup(app, ctx):
                 return web.json_response({
                     "success": False, "error": "HA 桥未连接，无法中继到设备",
                     "version": version}, status=502)
-            res = await asyncio.to_thread(store.issue, version, mac)
+            # v1.7.5：`dev_ver`（判 min_compatible 用）已在进 try 之前经 `_live_device_version`
+            # 解析过——判据只在服务端口径一处，面板不上送读数（F-OTA-04：一种文案不背两种锅）。
+            res = await asyncio.to_thread(store.issue, version, mac, dev_ver)
         except Exception as e:  # noqa: BLE001
             logger.warning("[OTA] dispatch 签发异常: %s", e)
             res = None
@@ -255,7 +294,7 @@ def setup(app, ctx):
             # 同 `_issue`：拒因单一来源（ota_block_reason）且放线程（v1.1.27）。
             cap = ""
             try:
-                cap = (await asyncio.to_thread(store.ota_block_reason, version)
+                cap = (await asyncio.to_thread(store.ota_block_reason, version, dev_ver)
                        if version else "")
             except Exception:  # noqa: BLE001
                 cap = ""

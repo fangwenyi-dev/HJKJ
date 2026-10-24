@@ -271,7 +271,10 @@ def test_issue_and_dispatch_refusal_read_off_event_loop(tmp_path, monkeypatch):
     """
     st = _factory_store(tmp_path)
 
-    def _caps(version):
+    def _caps(version, device_version=""):
+        # v1.7.5：`ota_block_reason` widened 出第二个形参（判 min_compatible 用）。
+        # 替身必须跟生产同口径接两个位置参——旧一元形在新签名下 TypeError 被外层
+        # except 吞成 ""，于是这条"拒因如实回吐"的钉红在产品没变的那一侧（10-24 实发）。
         asyncio.run(asyncio.sleep(0))
         return f"形状闸：v{version} 是产线合并镜像，OTA 只收 app 镜像"
 

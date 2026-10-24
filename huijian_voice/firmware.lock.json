@@ -2,6 +2,19 @@
   "_doc": "ESP32 卫星固件发布锁（OTA 方案 Phase 2）。releases 每条=一个可下发版本：version(x.y.z)/file(public 目录内落盘名)/urls(按容灾顺序 gh-proxy 代理→GitHub 直连→Gitee 兜底，私有仓须内嵌一次性访问串)/sha256(64hex 必填，缺=拒下载)/size/notes_zh(对外话术，受内部文档禁发约束)/min_compatible。镜像内置文件之外，/data/firmware/firmware.lock.json 同名整文件优先（现场热修不重打镜像）。版本值以固件仓 release 实测为准，禁止凭记忆填写。",
   "releases": [
     {
+      "version": "2.3.11",
+      "file": "huijian-s3-2.3.11.bin",
+      "urls": [
+        "https://gh-proxy.com/https://github.com/fangwenyi-dev/HJKJ/releases/download/vo-1.7.5/huijian-s3-2.3.11.bin",
+        "https://github.com/fangwenyi-dev/HJKJ/releases/download/vo-1.7.5/huijian-s3-2.3.11.bin",
+        "https://gitee.com/fangwenyi-dev/HJKJ/releases/download/vo-1.7.5/huijian-s3-2.3.11.bin"
+      ],
+      "sha256": "2d7b04e14bb6c42ca85edce6d5d7b32bbd003d5d1f7378737d29388c602e95b2",
+      "size": 2617504,
+      "notes_zh": "卫星固件 v2.3.11（10-24 逐行审收口批）：①扫码入驻的 HA 地址只认三种形态——局域网字面 IP、homeassistant.local、与已入驻那台同主机；不再把凭据发往近场对端随口指定的任意主机（含公网 https 域名）。⚠ 代价如实记：从未在局域网入驻过的设备，直接用公网 https 域名做**首次**入驻从本版起不再支持，请先在局域网完成一次入驻、再改成同主机名的公网地址。②入驻成功回执改在凭据真正落盘之后发出；落盘失败如实回『本机没存住』并留在配网态供重试，不再出现手机显示成功、设备重启后找不到 HA 的『配过又掉』。③停电后路由器比设备慢 60 秒不再是死局：设备会延时重启自动重拨回正常模式，不必人工重配或拔电。④64 字符 Wi-Fi 密码不再『当场配网成功、重启后连不上』——配网入口与重拨侧改用同一条规则，不合格当场如实失败（64 位十六进制那一档按 raw PSK 放行，属厂商口径、台架无该类热点可构造）。⑤远程升级不再重试已经用过一次的领取链接（那枚令牌一次性，重试只会白等再拿 404），回控制面板重新点一次即可；不带令牌的公开源照旧可重试。⑥升级后的『确认新版本有效』除主循环存活外还要求音频链路真的起来，且 4 分钟内从未健康过会主动回退旧版本，不再留下既不确认也不回滚的悬空态（判据不含任何网络项，家里断网不会被当成镜像坏）。⑦用户说过的话与下发的命令正文不再进常规日志（现场只留类型＋字节数；抬高级别仍可取全文）。⑧下发的动作若撞上主任务队列已满，设备如实回『没收到』并累计计数，不再静默丢弃——现场能分清『设备正忙』与『镜像坏了』；⑨内网地址写作 010.0.0.1 这类带前导零的形时不再被当成本机字面 IP 放行（那种写法在设备协议栈里按八进制解析，会连到另一台机器），改回常规写法即可，日志会点名提示。本版 assets 分区与 2.3.4/2.3.7/2.3.9/2.3.10 逐字节同品 ⇒ v2.2.9 及以上走 OTA 单段即可；≤v2.2.8 仍需 USB 双段刷 app＋assets 两枚。开机自证认 `Project huijian.satellite version 2.3.11`。",
+      "min_compatible": "2.2.9"
+    },
+    {
       "version": "2.3.10",
       "file": "huijian-s3-2.3.10.bin",
       "urls": [

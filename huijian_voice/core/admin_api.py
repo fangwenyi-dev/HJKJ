@@ -15,6 +15,7 @@ import time
 from aiohttp import web
 
 from . import const
+from .mdns import lan_ip
 
 logger = logging.getLogger("huijian.admin")
 
@@ -244,7 +245,9 @@ async def _model_download(request):
 
 async def _endpoints(request):
     ctx = request.app[CTX_KEY]
-    host = ctx.host or "homeassistant.local"
+    # v1.7.5：与 /discover 同口径实时取址（ctx.host 一次性采样会在 DHCP 重绑后失真）；
+    # 取不到才回落 ctx.host / homeassistant.local（面板至少还能看出"这是兜底值"）。
+    host = lan_ip() or ctx.host or "homeassistant.local"
     urls = ctx.settings.endpoint_urls(host)
     tok = ctx.settings.get("security.ws_token", "")
     return web.json_response({

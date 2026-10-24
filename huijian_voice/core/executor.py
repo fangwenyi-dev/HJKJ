@@ -25,6 +25,8 @@ logger = logging.getLogger("huijian.executor")
 # 进程单例，旧形 self._repointed 共享表被并发会话互相复位/串写（A 轮播报带上
 # B 轮的「已改指」注）。contextvars 天然按 asyncio 任务隔离；run() 每轮置新桶。
 _REPOINTED: ContextVar[Optional[list]] = ContextVar("huijian_repointed", default=None)
+# v1.7.5（并发轮互脏·同法第二处）：`last_run` 的执行状态按任务隔离，理由见类内 property。
+_LAST_RUN: ContextVar[Optional[dict]] = ContextVar("huijian_last_run", default=None)
 
 ACT_CN = {"open": "打开", "close": "关闭", "pause": "暂停", "a": "内倒", "tilt": "内倒"}
 # ATTR_CN 已上收到契约单点（core/nlu/schema.py），本模块直接引用。
@@ -343,12 +345,39 @@ class Executor:
         self.settings = settings
         # 最近一次 run 的执行状态（pipeline 复议安全闸读它；永不作为业务返回值，
         # 免得动 run 的 (ok, speech) 契约把既有调用点/测试全推翻）。
-        self.last_run: dict = {"steps": 0, "applied": 0, "indeterminate": False}
+        # v1.7.5：这里**直写实例槽**，不走 property——构造发生在装配任务自己的上下文里，
+        # 经 property 会把这份"零轮"初值种进那条上下文的 ContextVar，此后任何**没在本任务跑过轮**
+        # 的读方（面板/遥测/另一条 asyncio.run 腿）读到的就是这枚初值而不是最近一轮，
+        # 恰好把 getter 的"没写过就回落实例槽"这条兜底路自己堵死（test_audit4_p2 的
+        # indeterminate 钉实发：run_raw 之后从主上下文读到 __init__ 种的零轮桶）。
+        self._last_run_store: dict = {"steps": 0, "applied": 0, "indeterminate": False}
         # 能力预检"整体放行"的分因闩锁（见 _capability_refuse）
         self._gate_blind_warned = False
         # 本轮"代打"留痕（收口批）：目标离线→同名改指过的 (设备名, 改指目标区域)，
         # 按轮复位，由 _named() 落到播报——绝不静默换设备（见 _repoint_offline_twin）。
         self._repointed: list[tuple[str, str]] = []
+
+    @property
+    def last_run(self) -> dict:
+        """v1.7.5（并发轮互脏根修）：本槽过去是**实例级单点**，而 Executor 是进程单例——
+        面板 execute（admin_api）、延时预约到期腿（pipeline._fire_delay 重入 handle）、
+        真人轮三条腿可以并发进 run()，后写覆盖先写；pipeline 在 `await executor.run(plan)`
+        **之后**才读 exec_risk ⇒ 读到的可能是别一轮的状态。后果落在"结果不确定就不许
+        降级重放/LLM 复议"这道闸上（相对量被做第二遍、锁被多解一次），正是 v1.1.x 一族
+        谎报里最贵的那类。与 _REPOINTED 同法按 asyncio 任务隔离：
+          · 写：同时落本任务的 ContextVar 与实例槽；
+          · 读：本任务写过就用本任务的，没写过（面板读"最近一轮"）回落实例槽＝旧语义；构造那一步因此**直写**实例槽（见 __init__），否则"零轮"初值会被种进
+            装配任务自己的上下文，这条兜底路被它自己的构造堵死（v1.7.5 由 test_audit4_p2
+            的 indeterminate 钉实发并修正）
+        零调用点改动（run/run_raw 里那 9 处赋值语义不变）。
+        """
+        v = _LAST_RUN.get()
+        return self._last_run_store if v is None else v
+
+    @last_run.setter
+    def last_run(self, st: dict) -> None:
+        self._last_run_store = st
+        _LAST_RUN.set(st)
 
     async def run_raw(self, plan: Plan) -> tuple[bool, dict]:
         """单步意图执行，返回 (success, 原始 result dict)——供列表类意图
@@ -591,6 +620,138 @@ class Executor:
             logger.exception("[执行] 锁后置确证异常（不判）")
             return []
 
+    def _fanout_scope(self, args: dict):
+        """本步"要在哪一块里展开、按什么挑台" → [(area, mode, domains)]，永不抛。
+
+        10-24 复核 BUG-4：本闸首版只读 `args["area"]`，那是 **Hass 形**的位置；而
+        `_TURN_FAMILY` 里明摆着还有自有开关意图（`TurnDeviceOn/TurnDeviceOff/ToggleDevice`，
+        v1.0.90 因"降级通道不再复检、先拦下又谎报成功"特意补进族），它们的区域在
+        `args["target"][].area`。族里一半成员走不到闸＝判据只覆盖一半——同仓每条同类判据
+        （`_lock_domain_target`／`_bulk_area_prefix`／`_capability_refuse`）都读两个形状。
+
+        mode 三档，**不是一档**（这是被 `test_p1_chain_first_leg_uses_own_clause` 抓出来的：
+        第一版把"没带 domains"一律当成不限域，于是「打开客厅的灯」这种**具名批量**
+        ——`devices:[{name:"灯"}]`、按名称包含回捞——被整区唯一性判据误拒，一条合法句被打死）：
+          · "area"    整区展开（Hass 形；或自有形里既无域名也无域清单的槽）→ 两条判据都成立
+          · "domains" 带域清单（v1.2.10「关闭展厅所有设备」走白名单域）→ 只判"清单自身含不可开关域"
+          · "named"   只带名称约束（集成按同域＋名称包含回捞）→ **不预演**：我们复刻不出
+                      那个匹配器，硬猜就会把合法句拒掉；这条形状的危险面由词法闸＋逐台能力闸守
+        """
+        out = []
+        try:
+            a = str((args or {}).get("area") or "").strip()
+            if a:
+                out.append((a, "area", frozenset()))
+            for slot in ((args or {}).get("target") or []):
+                if not isinstance(slot, dict):
+                    continue
+                sa = str(slot.get("area") or "").strip()
+                if not sa:
+                    continue
+                devs = slot.get("devices")
+                if not isinstance(devs, list) or not devs:
+                    out.append((sa, "area", frozenset()))   # 没有 devices＝整区
+                    continue
+                doms = set()
+                has_name = has_dom = loose = False
+                for d in devs:
+                    if not isinstance(d, dict):
+                        loose = True
+                        continue
+                    nm = str(d.get("name") or "").strip()
+                    dd = d.get("domains") or []
+                    if nm:
+                        has_name = True
+                    if dd:
+                        has_dom = True
+                        doms.update(str(x) for x in dd)
+                    if not nm and not dd:
+                        loose = True               # 既没名字也没域清单＝不限
+                if loose:
+                    out.append((sa, "area", frozenset()))
+                elif has_dom:
+                    out.append((sa, "domains", frozenset(doms)))
+                elif has_name:
+                    out.append((sa, "named", frozenset()))
+                else:
+                    out.append((sa, "area", frozenset()))
+        except Exception:  # noqa: BLE001 取范围失败＝不判（宁漏不误伤）
+            return []
+        return out
+
+    async def _area_fanout_refuse(self, name: str, args: dict) -> str | None:
+        """None=放行；str=必须如实失败的播报正文（与 `_turn_gate` 同一句话，两处不各写一份）。
+
+        v1.7.5（`_turn_gate` 里那条"已知残留缺口"的正解，代码自述"纯词法判据修不了它"）：
+        开关族意图**没有 entity_id** 时 HA core 会把整个区域的 exposed 实体展开逐个 turn_on
+        ⇒ 传感器/按钮/媒体播放器被硬喂成错误风暴、窗没动却播"开了"。词法闸只拦"话里带窗型词"
+        那一类，而 ASR 把「推拉窗」听成「推纱窗」时会被自家"先剔纱窗再找窗"洗成无窗句
+        （现网 10:26 复现过），所以正解只能是**拿状态缓存在扇出前预演一遍**。
+
+        判据按 `_fanout_scope` 的三档形状分别成立（10-24 复核 BUG-4/5 定稿）：
+          · "area"：区域内存在不支持 turn_on/toggle 的域 → 拒；可开关台数不唯一 → 拒。
+          · "domains"：只在**清单自身**含非可开关域时拒；清单内多台是用户明说的批量语义，
+            **不许**用唯一性判据拒（那是 v1.2.10 的合法句）。
+          · "named"：不预演（复刻不出集成的名称匹配器）。
+          · 前两档都保留：该区域在状态缓存里**一个都没匹配上**（matched==0）→ 不拒。
+            10-24 复核 BUG-5：旧实现用 `toggleable == 0` 当"没看见"，于是全传感器区域
+            被当成不认识而放行——那恰是第一条要拒的形态。"没看见"是 matched==0，
+            与可开关台数无关。
+        永不抛（异常=放行＝回到今天的行为，不会因为这道新闸多出故障）。
+        """
+        try:
+            if name not in self._TURN_FAMILY:
+                return None
+            raw = (args or {}).get("entity_id")
+            eids = ([raw] if isinstance(raw, str) and "." in raw else
+                    [e for e in (raw or []) if isinstance(e, str) and "." in e])
+            if eids:
+                return None          # 已点到台：逐台能力闸负责，不在本闸范围
+            scope = self._fanout_scope(args)
+            if not scope:
+                return None
+            area_map = getattr(self.ha, "_entity_area", {}) or {}
+            if not area_map:
+                return None          # 区域表还没同步：看不见就不拒（见 docstring 末条）
+            states = await self.ha.states()
+            if not states:
+                return None
+            for area, mode, doms in scope:
+                if mode == "named":
+                    continue
+                matched = unsupported = toggleable = 0
+                for eid in states:
+                    if not isinstance(eid, str) or "." not in eid:
+                        continue
+                    if str(area_map.get(eid) or "").strip() != area:
+                        continue
+                    dom = eid.split(".", 1)[0]
+                    if doms and dom not in doms:
+                        continue     # 带域清单：清单外的实体不会被这条碰到
+                    matched += 1
+                    if dom in self._UNTOGGLEABLE_DOMAINS:
+                        unsupported += 1
+                    else:
+                        toggleable += 1
+                if matched == 0:
+                    continue         # 真不认识这块（或清单与本区域无交集）：不拒
+                why = None
+                if unsupported:
+                    why = "unsupported"
+                elif mode == "area" and toggleable != 1:
+                    why = "ambiguous"  # 唯一性只判"整区冒按"那一档
+                if why:
+                    logger.info("[执行] 区域扇出预演拦下 area=%s（%s：可见 %d 台、可开关 %d 台、"
+                                "不支持 %d 类、档=%s、域清单=%s）",
+                                area, why, matched, toggleable, unsupported, mode,
+                                "不限" if not doms else "+".join(sorted(doms)))
+                    return ("没有把握找到要开关的设备，不敢把整屋设备冒按；"
+                            "是窗户的话请带上完整窗型名称")
+            return None
+        except Exception:
+            logger.exception("[执行] 区域扇出预演异常（按放行处理，不新增故障面）")
+            return None
+
     async def _repoint_offline_twin(self, args: dict) -> None:
         """v1.1.15（办公 .91 实锤 D4）：目标确证离线时，先改指**同名同域且唯一可用**
         的那一台，而不是直接回「"射灯"现在离线（不可用）」。
@@ -612,8 +773,12 @@ class Executor:
         v1.1.15 立这条时的现场同样是"客厅的灯→办公室那台"，当时把它当"救回一次执行"，
         代价是用户以为动的是自己说的那间——与本仓"宁可如实失败，绝不 area 扇出/谎报成功"
         （见 run() 里能力闸那条注）相反，故收成同区才换。
-        区域**未知**（任一侧不在区域表里，如表未同步/该台没注册区域）沿用旧口径照改：
-        那不是猜台（同名全等＋同域＋恰好一台仍是硬条件），而跨区才是确证的错。
+        区域**未知**那一半 10-24 曾判成"同一缺陷的第二半"并动手收紧，**盘上有反证 ⇒ 已回退**：
+        v1.1.15/v1.1.17 把这条口径写得很明白——"那不是猜台（同名全等＋同域＋恰好一台仍是硬
+        条件），而跨区才是确证的错"，且改指成功时播报**点名改指目标所在区域**（"在办公室"），
+        用户听得到动的是哪一间。收紧之后 `test_repoint_note_names_the_area` 那台离线灯不再被救回、
+        而这正是该功能被造出来的那个现场 ⇒ 这条属**已披露的权衡**，不是谎报族。
+        留这一注是为了下一次再审别再同一处来回改：要动它，得先给出"披露了区域仍被误动"的现场证据。
         """
         try:
             raw = (args or {}).get("entity_id")
@@ -1338,13 +1503,32 @@ class Executor:
             # `HassTriggerVoiceScene` 只认自有场景库（`trigger_phrase` 记账），拿原生场景名
             # 去问它 = 它"成功"而场景什么都没发生——正是一整族假成功里最贵的那一类。
             # 带 entity_id 下发，二次按名字猜的余地都不留。
+            # v1.7.5：区域级开关意图在**扇出之前**预演一次可开关性（词法闸治不了的那一类）。
+            fan = await self._area_fanout_refuse(name, args)
+            if fan is not None:
+                self.last_run = {"steps": len(steps), "applied": len(results),
+                                 "indeterminate": False}
+                logger.info("[执行] %s %s → 区域扇出预演拦下（防整区冒按/谎报成功）| %s",
+                            name, args, fan)
+                return self._named(False, self._step_say(idx, steps, fan)
+                                 + self._accum_notes(missing, noops, no_receipt,
+                                                     offline, lock_notes, anon_missing,
+                                                     skip_note))
+            # v2.3.11/v1.7.5（场景首腿崩溃根修）：`direct` 过去**只在 else 支里赋值**，而循环尾的
+            # 逐腿日志无条件读它 ⇒ 多步链以原生场景为首腿时（"观影场景然后关灯"）第二行
+            # 就 UnboundLocalError：scene.turn_on 已经真执行了、异常被上层兜成"我还不会"、
+            # 后续腿不执行——部分执行被藏起来，且违背本函数"永不抛"的契约。
+            # 修法＝提到循环体顶部初始化，并让场景支**也走同一条 direct 形状**（它本来就是
+            # 服务直调，日志标 intent 是第二处不实）。
+            direct = None
             if name == "TriggerHaScene":
                 _eid = str((args or {}).get("entity_id") or "")
                 if not _eid.startswith("scene."):
                     result = {"success": False, "error": "native scene entity_id missing"}
                 else:
-                    result = await self.ha.call_service("scene", "turn_on",
-                                                       {"entity_id": _eid})
+                    direct = ("scene", "turn_on", {"entity_id": _eid})
+                    domain, service, data = direct
+                    result = await self.ha.call_service(domain, service, data)
             else:
                 # 直调资格=本步来源 klar，或 P5.1 焦点继承旗（FLAG_CTX_RELAY，
                 # pipeline 注入代词继承句时显式落旗）——其余来源逐字走 intent 通道
@@ -1835,6 +2019,16 @@ class Executor:
                 except (TypeError, ValueError):
                     pass                       # 非数值/越界（如已是 0-255）维持原样透传
                 return "light", "turn_on", data
+            if name == "HassClimateSetHumidity":
+                # v1.7.5：`_KLAR_SERVICE` 把这颗意图钉死在 humidifier.set_humidity，
+                # 而 HA 里 `set_humidity` **两个域都有**（climate.set_humidity /
+                # humidifier.set_humidity）。klar 把湿度落到空调上时旧值必败
+                # "Service humidifier.set_humidity does not support entity climate.x"——
+                # 与 HassLightSet 那条"意图说灯、落点不是 light 域"同一个形状的漏判。
+                # 按 grounded 实体的**域**选服务，两域都是官方合法目标。
+                dom = "climate" if edomain == "climate" else "humidifier"
+                return dom, "set_humidity", {
+                    "entity_id": raw, "humidity": args.get("humidity")}
             if name == "HassSetPosition" and edomain == "fan":
                 return "fan", "set_percentage", {
                     "entity_id": raw, "percentage": args.get("position")}
@@ -2219,8 +2413,14 @@ class Executor:
         head = f"{area}的" if area and not str(names).startswith(area) else ""
         args = plan.args
         intent = plan.intent
-        # 锁语义反转（D7 兜底）：目标名含「锁」
-        if any("锁" in (t.get("name") or "") for t in targets):
+        # 锁语义反转（D7 兜底）。v1.7.5：判据与**执行侧**对齐——`_lock_domain_target(args)`
+        # 就是 run() 里判"这一步是不是锁"用的那一个函数，名字含「锁」只留作兜底。
+        # 旧形单靠字面 ⇒ 实体名叫"大门"的锁：动作按 D7 真去 lock/unlock，话却播成
+        # "大门关了/大门打开了"＝与动作相反（用户以为门关上了，实际刚解锁）。
+        # 同一条语义两处两套判据＝本仓反复记过的"两处各写一份就总有一处漏"。
+        lockish = bool(_lock_domain_target(args)) or any(
+            "锁" in (t.get("name") or "") for t in targets)
+        if lockish:
             if intent == "TurnDeviceOn":
                 return f"好的，{head}{names}已上锁"
             if intent == "TurnDeviceOff":

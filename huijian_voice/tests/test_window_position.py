@@ -167,6 +167,9 @@ def test_klar_service_table_names_are_valid():
         ("homeassistant", "toggle"),
         ("lock", "lock"), ("lock", "unlock"),
         ("climate", "set_temperature"),
+        # v1.7.5：set_humidity 在 HA core 里 climate 与 humidifier **两域都有**，
+        # `_klar_direct` 现按 grounded 实体的域选服务 ⇒ 两个落点都得进这张核对表。
+        ("climate", "set_humidity"),
         ("humidifier", "set_humidity"),
         ("cover", "set_cover_position"), ("cover", "open_cover"),
         ("cover", "close_cover"), ("cover", "stop_cover"),

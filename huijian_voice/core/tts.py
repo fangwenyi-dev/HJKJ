@@ -1310,10 +1310,21 @@ class TtsEngine:
                     logger.info("[TTS] 引擎换绑 %s→%s 推迟（备料期间起新轮），下一轮重试",
                                 self.loaded_provider(), prov)
                     return True
-                self._tts = None
+                # v1.7.5（切档失败＝全体静音 根修）：旧形在这里先把 `self._tts = None`
+                # 再去构造新档，而下面所有失败支（模型未就绪/缺声码器/sherpa 构造抛错）
+                # 都只留 `self._tts = None` ⇒ 一旦目标档是坏包（手动导入、半棵树、
+                # 与当前 sherpa 版本不兼容），**旧档已经没了**：从这次切档起整机不再出声，
+                # 直到用户自己想起把档改回去。ASR 侧同类问题早有定案（`_restore_prev`），
+                # TTS 这一路是漏网。修法取更简单的形状：**不清旧档**，成功时 1447 行
+                # 一次性替换；失败时旧档原样留着继续出声（`_loaded_prov` 也只在成功时更新，
+                # 引擎与其 provider 始终自洽，不会出现"新档名＋旧引擎"的混代次）。
+                # 缓存照旧清：跨引擎音频不作废即用这条纪律不变。
+                # （10-24 复核 BUG-6：旧形那句 `self._tts = None` 删掉后这里只剩一个空 `pass`，
+                #  已删——本块的有效语句就是下面两行缓存清零。）
             self._cache.clear()
             self._cache_bytes = 0
-            logger.warning("[TTS] 引擎换绑：%s → %s（句级缓存清空，跨引擎音频不作废即用）",
+            logger.warning("[TTS] 引擎换绑：%s → %s（句级缓存清空，跨引擎音频不作废即用；"
+                           "新档构造失败则本轮保持旧嗓，不再塌成全体静音）",
                            self.loaded_provider(), prov)
         d = self.store.model_dir_for(key)
         if not d:
@@ -1478,7 +1489,11 @@ class TtsEngine:
                 return True
             except Exception as e:
                 logger.error("[TTS] 加载失败: %s", e)
-                self._tts = None
+                # v1.7.5：**不**在这里把引擎清成 None。旧形这一行与换绑段那句
+                # `self._tts = None` 合起来，把"切到一个坏包"变成"这台设备不再出声"；
+                # 现在换绑段不清旧档、这里也不清 ⇒ 失败保持旧嗓继续出声（冷载失败时
+                # _tts 本来就是 None，语义不变）。`self._tts = tts` 只在构造全部成功后
+                # 执行，所以本处永远不会留着一个半成品引擎。
                 return False
 
     def unload(self) -> bool:
