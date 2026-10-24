@@ -3727,6 +3727,14 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 - **正文归属如实记一笔**：两侧 Release 正文最终是 **CI 从本 CHANGELOG 段生成**的那份（本仓自 v1.6.21
   起的单一真源口径，`正文自愈` 会在重跑时再覆盖一次）。发版过程中我先手工挂过一次面向客户的文案，
   已被 CI 覆盖——**不再手工对抗**；要看客户口径请看本节与 §一。
+- ⚠ **一笔没解释清的账挂在这里（不当已定性）**：本地收集 **3481 项**（另有
+  `test_v122_uplink_opus_settings.py` 在导入期因缺 libopus 直接 error，不计入收集），CI 是
+  **3422 passed ＋ 38 skipped ＝ 3460 项**——**差 21 项**。找过 `conftest` 的 `collect_ignore`/平台 skip、
+  `pytest.ini`/`pyproject` 的 markers、以及按平台展开的 parametrize，都没抓到成因；而且两种平台下
+  "可收集宇宙"本就不同（CI 那份 opus 文件收得起来、本地收不起来，方向还相反）⇒ 这 21 项的差异**我没有证据**。
+  已证的只有两件事：CI 侧 **0 failed**；本地那 21 条 failed ＋ 1 条 collection error 逐条 traceback
+  都是 `core.audio.OpusError`。下一位若要把"CI 与本地是同一批判据"写成结论，先补这一步：
+  **两边的 `--collect-only -q` 清单逐文件对一遍**。
 
 ## [1.7.4] - 2026-10-22 · 语音线：⑥ 车道不许把区域名当设备名（"办公室射灯亮度调到百分之十"根修）＋ 固件 2.3.9 下发登记
 
