@@ -3724,9 +3724,16 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
   逐源**真下载**对账（不是 HEAD 200）：`gh-proxy → github → gitee` 三档 × 两枚 bin 共 6 格，
   sha256 全部 `2d7b04e1…`／`019eaf22…`、大小 2,617,504／565,034 ⇒ `VERIFY_RED=0`。
   assets 段与 2.3.4/2.3.7/2.3.9/2.3.10 逐字节 `cmp` 相同 ⇒ 生产口径「v2.2.9 及以上走 OTA 单段」仍成立。
-- **正文归属如实记一笔**：两侧 Release 正文最终是 **CI 从本 CHANGELOG 段生成**的那份（本仓自 v1.6.21
-  起的单一真源口径，`正文自愈` 会在重跑时再覆盖一次）。发版过程中我先手工挂过一次面向客户的文案，
-  已被 CI 覆盖——**不再手工对抗**；要看客户口径请看本节与 §一。
+- **两侧 Release 的正文＝客户口径，不是本段**：按 10-22 定过的那条律（"发完 tag 必须手工换成客户版正文"），
+  两源正文都 PATCH 成 **`huijian_voice/RELEASE_NOTES_v1.7.5.md`**（2,999 字，逐条讲"用户能感知的变化＋代价＋
+  校验值"），标题也换成描述式；两侧各回读一次确认 name/body 同载、Gitee `target_commitish` 仍是 `9f77010`。
+  ⚠ **CI 的"正文自愈"会在任何一次重跑时把它们换回本 CHANGELOG 段**（`Create or Update Release` 用
+  `body_path`、Gitee 侧 PATCH 只发 `body/tag_name/name`）⇒ **重跑 CI 之后必须拿
+  `huijian_voice/RELEASE_NOTES_v1.7.5.md` 再 PATCH 一次两侧正文**（PATCH 的字段要求：GitHub 侧
+  `name`+`body`；Gitee 侧 `tag_name`+`name`+`body` 同载，只发 body 会 400——v1.0.48 CI 实锤），
+  否则商店页悄悄变回内部账。本次用的脚本在仓库根 `_sync_release_notes_vo175.py`——
+  ⚠ 本仓 `.gitignore:80` 的 `/_*` 把根级下划线文件全部忽略 ⇒ **它不在仓里**，只在这台机器上；
+  要长期留档就该把它挪进 `huijian_voice/` 下并入库（本条没替我做这个决定）。
 - ⚠ **一笔没解释清的账挂在这里（不当已定性）**：本地收集 **3481 项**（另有
   `test_v122_uplink_opus_settings.py` 在导入期因缺 libopus 直接 error，不计入收集），CI 是
   **3422 passed ＋ 38 skipped ＝ 3460 项**——**差 21 项**。找过 `conftest` 的 `collect_ignore`/平台 skip、
