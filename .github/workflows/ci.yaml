@@ -314,7 +314,13 @@ jobs:
               !done && $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
               !done && /^## \[/{ if(found) exit }
               !done && found { print }
-            ' CHANGELOG.md | head -50 > "$CHANGELOG_FILE"
+            # 2026-10-26：50→200。体检实锤本链两处载体口径不一——GitHub 侧在此截 50 行，
+            # 而 gitee-release job 自己按半区取**整段不截**（`log[i:i + 1 + j].strip()`），
+            # 正是语音线记过的"Gitee 全文、GitHub 半篇"同一形状：v1.8.7 段 44 行侥幸没露，
+            # 下一版正文一过 50 行就静默少半段。上限由
+            # tests/test_audit_2026_10_26_sales_face.py::test_gateway_release_body_not_truncated
+            # 机器把关（本版整段行数必须 ≤ 此处上限），别再靠"这次正好短"过关。
+            ' CHANGELOG.md | head -200 > "$CHANGELOG_FILE"
           fi
           
           if [ ! -s "$CHANGELOG_FILE" ]; then

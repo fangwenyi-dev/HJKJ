@@ -106,8 +106,8 @@
           "auto_discovery": "Discover devices automatically",
           "debug_logging": "Debug logging",
           "ws_gateway_enabled": "Allow the Huijian miniprogram to connect directly over the LAN (listens on ws://0.0.0.0:port/ws)",
-          "ws_gateway_port": "Miniprogram WS gateway port (default 9001; the miniprogram and firmware always dial 9001, so changing this breaks LAN direct access)",
-          "ws_gateway_token": "Miniprogram handshake token (8-62 chars of [A-Za-z0-9_-]; empty = no authentication)",
+          "ws_gateway_port": "Miniprogram WS gateway port (default 9001; the miniprogram and firmware always dial 9001, so changing this breaks LAN direct access. With several Huijian gateways the runtime adopts only the first enabled entry with direct access switched on - edit that entry or the change will not take effect)",
+          "ws_gateway_token": "Miniprogram handshake token (8-62 chars of [A-Za-z0-9_-]; empty = no authentication). With several Huijian gateways the runtime adopts only the first enabled entry with direct access switched on; this form writes only the entry you edit (it can silently revert after a restart), while changing the token from the miniprogram writes every enabled entry",
           "expose_cover_as_curtain": "Expose window openers as curtains (only use this when bridging to third-party ecosystems like vivo HomeBridge, whose device enumeration only accepts the curtain class; after saving, the entry auto-reloads and takes effect in seconds)"
         }
       },

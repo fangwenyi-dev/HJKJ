@@ -211,8 +211,16 @@ class TestRemoveButtonReResolvesManager:
         assert old_dm.removed == [], "旧（已 cleanup 的）manager 不得再被使用"
 
     @pytest.mark.asyncio
-    async def test_reload_window_refuses_instead_of_noop(self, monkeypatch):
-        """条目仍在、data 未就绪（reload 让出窗）→ 如实拒绝，不得静默 no-op。"""
+    async def test_reload_window_refuses_loudly_instead_of_noop(self, monkeypatch):
+        """条目仍在、data 未就绪（reload 让出窗）→ 如实拒绝，不得静默 no-op。
+
+        2026-10-26 判据升级：旧实装只 `_LOGGER.warning` 后 `return`，
+        `button.press` 照样回 200 ⇒ 面板弹**绿色**「删除命令已发送」，而本地删除一件没做
+        （改令牌/改选项/升级触发条目 reload 的秒级窗口内点「删除」必中）。
+        拒绝写在 HA 日志里＝客户看不见，等于谎报。现在必须抛 HomeAssistantError
+        （HA 转 400＋message，面板渲染出口把真话摆出来）。"""
+        from homeassistant.exceptions import HomeAssistantError
+
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
         old_dm = _RemoveDM()
         entry = SimpleNamespace(entry_id="e1")
@@ -220,7 +228,10 @@ class TestRemoveButtonReResolvesManager:
             data={c.DOMAIN: {}},                       # 让出窗内 data 被清
             config_entries=SimpleNamespace(async_entries=lambda d: [entry]),
         )
-        await _remove_button(hass, old_dm, "e1").async_press()
+        with pytest.raises(HomeAssistantError) as ei:
+            await _remove_button(hass, old_dm, "e1").async_press()
+        assert "重载" in str(ei.value) and "没有执行" in str(ei.value), \
+            f"拒因必须点名『正在重载、删除没做成』，实得 {str(ei.value)!r}"
         assert old_dm.removed == [], "重载窗内不得拿旧引用做删除（幽灵设备燃料）"
 
     @pytest.mark.asyncio

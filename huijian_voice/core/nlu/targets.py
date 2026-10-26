@@ -579,18 +579,51 @@ def split_area_head(text: str) -> tuple:
     return None, t
 
 
+# 属格范围前缀（我家/咱家/我们家/家里…）：**只在段首锚定**，可选带「里/中」与「的」。
+# 不锚段首就会吃掉「智能家居」这类"家"落在词中的设备名前缀（反向钉守着那一格）。
+_POSSESSIVE_HEAD_RE = re.compile(r"^(?:我们|咱们|我|咱)?家(?:里|中)?的?")
+
+
+def _depossessive_area(name: str) -> str:
+    """区域候选里的属格头只在**不是区域表真名**时才剥，且剥完仍须是区域形状。
+    两条道（尾字启发式直接命中、`extract_prefix` 前缀回捞）共用这一份判据——
+    本仓"两处各写一份就总有一处漏"的实锤教训（v1.1.36 复核批记过同名两条）。"""
+    if not name:
+        return name
+    if name in BASE_AREAS or name in _dyn_areas:
+        return name                      # 区域表认得的真名（真有个区域叫「我家客厅」），属格不碰
+    stripped = _POSSESSIVE_HEAD_RE.sub("", name, count=1)
+    if stripped and stripped != name and _area_like(stripped):
+        return stripped
+    return name
+
+
 def _area_of_prefix(pre: str) -> str | None:
     """目标词前缀→区域名（修A）：尾字区域词命中（"办公室"）→ 剥属格「的/里/得」重试
     （"办公室的"）→ 二次前缀扫描回捞（未知复合词 "办公室吊灯" 的单字残段→"办公室"）。
     只回区域不拼设备名，避免拿未知残字重构出臆造名词。
     2026-09-30：判据并 HA 真实区域表（sync_areas）——主卧/次卧/阳台/玄关 等
-    不带区域尾字的高频区名自此可析出（数据集实锤丢失面）。"""
+    不带区域尾字的高频区名自此可析出（数据集实锤丢失面）。
+    2026-10-26（现网活体实抓）：「我家客厅的灯打开」因尾字「厅」被尾字启发式**整体**
+    认成区域名，而现网区域表里没这个名字 ⇒ 整句被判死，用户听到「『我家客厅』这个房间
+    在 Home Assistant 里不存在」。同形另一条道是不带「的」的「咱家卧室关灯」——它走
+    `extract_prefix` 前缀回捞（该函数只看前缀尾字∈室厅房间…，不查表）照样析出「咱家卧室」。
+    新口径：两条道共用 `_depossessive_area`，**区域表精确命中（或静态基准区）才享现状
+    优先**，只靠尾字过闸的先剥属格头部（「我家客厅」→「客厅」）。"""
     pre = re.sub(r"[的里得]+$", "", (pre or "").strip())
     if not pre:
         return None
     if _area_like(pre):
-        return pre
-    return extract_prefix(pre)[0]
+        return _depossessive_area(pre)
+    got = extract_prefix(pre)[0]
+    if got:
+        return _depossessive_area(got)
+    # 「家里阳台」「我家主卧」：区名不带区域尾字，尾字启发式与前缀回捞两条道都够不着，
+    # 而表里认得它 ⇒ 先剥属格头再问一次表（剥完不认得就照旧不回，宁缺不猜）。
+    bare = _POSSESSIVE_HEAD_RE.sub("", pre, count=1)
+    if bare and bare != pre and (bare in BASE_AREAS or bare in _dyn_areas or _area_like(bare)):
+        return bare
+    return None
 
 
 def strip_modal(raw: str) -> str:

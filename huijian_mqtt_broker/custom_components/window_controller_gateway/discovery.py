@@ -195,8 +195,8 @@ async def async_ignore_gateway(hass: HomeAssistant, gateway_sn: str):
 
     # v1.7.12（审计 E-1/CF-F2）：立即落盘——忽略必须跨 HA/加载项重启生效
     try:
-        from .persist import save_persistent_data
-        hass.async_create_task(save_persistent_data(hass))
+        from .persist import schedule_persistent_save
+        schedule_persistent_save(hass)
     except Exception as pe:  # noqa: BLE001
         _LOGGER.warning("忽略列表持久化调度失败（本会话内仍生效）: %s", pe)
     
@@ -242,8 +242,8 @@ async def async_unignore_gateway(hass: HomeAssistant, gateway_sn: str) -> bool:
     discovery.setdefault("announced_gateways", set()).discard(gateway_key)
     # v1.7.12（E-1 配套）：取消忽略同样落盘
     try:
-        from .persist import save_persistent_data
-        hass.async_create_task(save_persistent_data(hass))
+        from .persist import schedule_persistent_save
+        schedule_persistent_save(hass)
     except Exception as pe:  # noqa: BLE001
         _LOGGER.warning("忽略列表持久化调度失败（本会话内已生效）: %s", pe)
     return removed

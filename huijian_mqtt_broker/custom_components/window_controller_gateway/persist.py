@@ -4,6 +4,7 @@ import logging
 import os
 import json
 import asyncio
+from typing import Optional
 from homeassistant.core import HomeAssistant
 
 from .const import (
@@ -25,6 +26,9 @@ SCHEMA_VERSION = 1
 # 不要按 entry 拆分锁：那会允许两个 entry 并发写同一文件，造成数据竞争/文件损坏。
 _save_lock = asyncio.Lock()
 _save_pending = False
+# 最近一次持久化写盘的失败原因（2026-10-26）。写盘失败**不上抛**（四处 await 里有三处在
+# 条目卸载链上），改由这块账交给消费侧点名——`take_last_save_error()` 取走即清空。
+_LAST_SAVE_ERROR = None
 
 
 async def load_persistent_data(hass: HomeAssistant) -> None:
@@ -191,6 +195,25 @@ async def save_persistent_data(hass: HomeAssistant) -> None:
             await _do_save(hass)
 
 
+def schedule_persistent_save(hass: HomeAssistant) -> None:
+    """把保存挂成 task 并**接住失败**（2026-10-26）。
+
+    `save_persistent_data` 现在会把写盘失败上抛；裸 `async_create_task` 会让它变成
+    "未处理的任务异常"（HA 只打一条通用栈，说不出是哪份账没落）。这里统一挂 done_callback，
+    真话进日志，且不二次抛（回调里再抛就是 HA 内部的未处理异常）。"""
+    task = hass.async_create_task(save_persistent_data(hass))
+    if task is None or not hasattr(task, "add_done_callback"):
+        return
+
+    def _log(t):
+        # 写盘失败**不走异常**（见 `_do_save` 里那条"为什么不 raise"），所以这里取记账槽。
+        err = take_last_save_error()
+        if err:
+            _LOGGER.error("持久化保存失败（本次内存变更未落盘）: %s", err)
+
+    task.add_done_callback(_log)
+
+
 async def _do_save(hass: HomeAssistant) -> None:
     """执行实际的文件写入操作"""
     try:
@@ -244,4 +267,22 @@ async def _do_save(hass: HomeAssistant) -> None:
         _LOGGER.debug("已保存持久化数据")
 
     except Exception as e:
-        _LOGGER.error("保存持久化数据失败: %s", e)
+        # 2026-10-26（对抗复核实发）：这里过去吞掉失败后什么都不留，于是
+        # `device_manager._log_save_result`（"本次内存变更未落盘"那条）永远取不到异常＝死码，
+        # 而调用方收到的都是"已保存"——盘满/只读时内存改了、盘上没改，重启后 002 把设备
+        # 建回来＝本仓一直在治的幽灵设备。
+        # ⚠ 为什么不改成 `raise`：`__init__.py:1031/1236/1265/1413` 四处是
+        # **`await save_persistent_data(hass)`**，其中三处在条目卸载/清理链上——
+        # 一抛就把"这次没存住"升级成"这条集成卸不掉"。正解是**记账不上抛**：
+        # 失败留在模块槽里，由消费侧（`take_last_save_error`）点名，日志给真话。
+        _LOGGER.error("保存持久化数据失败（内存已改、盘上未改，重启后可能复活）: %s", e)
+        global _LAST_SAVE_ERROR
+        _LAST_SAVE_ERROR = str(e)
+
+
+def take_last_save_error() -> Optional[str]:
+    """取走（并清空）最近一次持久化写盘的失败原因。None＝没有未交代的失败。"""
+    global _LAST_SAVE_ERROR
+    err = _LAST_SAVE_ERROR
+    _LAST_SAVE_ERROR = None
+    return err

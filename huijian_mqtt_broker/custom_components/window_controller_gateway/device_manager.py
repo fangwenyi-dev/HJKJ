@@ -5,6 +5,7 @@ import time
 from typing import Dict, Any, List, Optional, Callable
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import async_get
 
 
@@ -23,7 +24,7 @@ from .const import (
     GATEWAY_READY_DELAY,
     get_device_display_name,
 )
-from .persist import save_persistent_data
+from .persist import save_persistent_data, take_last_save_error
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,12 +108,13 @@ class WindowControllerDeviceManager:
             return
 
         def _log_save_result(t):
-            try:
-                exc = None if t.cancelled() else t.exception()
-            except Exception:  # noqa: BLE001 - 取异常失败不再二次抛
-                return
-            if exc is not None:
-                _LOGGER.error("持久化保存失败（本次内存变更未落盘）: %s", exc)
+            # 2026-10-26：这条臂过去是**死码**——`persist._do_save` 把失败吞在原地，
+            # task 永远不带异常。现在失败写进记账槽（不上抛：`__init__.py` 有三处
+            # 在条目卸载链上 `await save_persistent_data`，一抛就变成"条目卸不掉"），
+            # 这里取账点名。
+            err = take_last_save_error()
+            if err:
+                _LOGGER.error("持久化保存失败（本次内存变更未落盘）: %s", err)
 
         task.add_done_callback(_log_save_result)
     
@@ -827,7 +829,14 @@ class WindowControllerDeviceManager:
         Returns:
             True——含"彻底不存在"的幂等成功；原恒 None 返回保留给
             调用方向后兼容（调用方只 catch 异常）。
+        Raises:
+            HomeAssistantError——2026-10-26 收口：本函数原先把三类**改了状态**的失败
+            只 `_LOGGER.error` 后照样 `return True`，而两处调用方（移除按钮 / WS unbind）
+            都只 catch 异常、不看返回值 ⇒ 注册表条目还在、移除回调没跑、P0 复活守卫没执行
+            时用户与云端都收到"删除成功"，下一次 002 上报就是幽灵设备复活。
+            现在三类失败逐条记账并在收尾**响亮抛出**（幂等成功照旧回 True，不误伤）。
         """
+        failed: List[str] = []
         device_info = self.devices.get(device_sn) or {}
         device_name = device_info.get("name") or device_sn
         device_type = device_info.get("type") or DEVICE_TYPE_WINDOW_OPENER
@@ -893,8 +902,10 @@ class WindowControllerDeviceManager:
                 _LOGGER.debug("设备在注册表中未找到: %s", device_sn)
         except Exception as e:
             _LOGGER.error("从设备注册表中删除设备失败: %s", e)
+            failed.append(f"HA 设备注册表未删净（{type(e).__name__}）")
         
         # 调用设备移除回调
+        cb_failed: List[Exception] = []
         _LOGGER.info("正在通知设备移除回调，设备: %s", device_sn)
         for callback in self._device_removed_callbacks:
             try:
@@ -902,6 +913,10 @@ class WindowControllerDeviceManager:
                 _LOGGER.info("设备移除回调执行成功")
             except Exception as e:
                 _LOGGER.error("执行设备移除回调失败: %s", e)
+                cb_failed.append(e)
+        if cb_failed:
+            failed.append(f"{len(cb_failed)}/{len(self._device_removed_callbacks)} 个移除回调未执行"
+                          f"（{type(cb_failed[0]).__name__}）")
         
         _LOGGER.info("设备移除流程完成: %s", device_sn)
 
@@ -931,10 +946,16 @@ class WindowControllerDeviceManager:
                         mqtt_handler._clear_bind_ops_for_device(device_sn)
                     # trigger_discovery 现在是空实现，仅记录日志
                     self.hass.async_create_task(mqtt_handler.trigger_discovery())
-        except KeyError as e:
-            _LOGGER.error("访问DOMAIN数据失败: %s", e)
         except Exception as e:
+            # KeyError（DOMAIN 数据在两个 await 之间被摘除）与处理器异常同判，不再各写一支：
+            # 两种落点都是"P0 复活守卫没执行、删除没通知到 MQTT"＝晚到的 003 仍可能按 id
+            # 匹出"绑定"把设备建回来。合成一支同时保证它有测——拆两支时第二支生产形造不出夹具。
             _LOGGER.error("通知MQTT处理器设备删除失败: %s", e)
+            failed.append(f"待处理绑定/解绑记录未清除、删除未通知 MQTT 处理器（{type(e).__name__}）")
+        if failed:
+            raise HomeAssistantError(
+                "设备 %s 的删除未完整做成：%s——设备可能仍出现在列表里，请稍后重试"
+                % (device_sn, "；".join(failed)))
         return True
 
     async def update_device_status(self, device_sn: str, status: str, attributes: Optional[Dict[str, Any]] = None):

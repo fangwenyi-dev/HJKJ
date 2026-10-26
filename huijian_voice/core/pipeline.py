@@ -373,6 +373,28 @@ _VERBISH_CHARS = _NAMELESS_HEAD_VERBS | frozenset(
     "这那为在中和与了地得请帮谢要）")
 _NUM_QUANT_RE = re.compile(r"^[一二两三四五六七八九十几半每][个只盏台部根组]?$")
 
+# 属格范围修饰语（2026-10-20 现网活体实抓，2026-10-26 在 1.7.5 字节上端到端复现）：
+# 用户说「我们家/我家/咱家/家里的灯」时「(我们)家」是**整套房子这一范围**的前缀，
+# 不是一台设备的名字成分。旧形把剥掉动词后的残段「家的灯」整段当点名设备名
+# ⇒ 回「没有找到对应的设备『家的灯』」，把"这句没解析对"说成"家里没这台"。
+# **只管裸类别词尾巴**：属格后还挂着别的修饰语（「我家的会飞的灯」）不改裁决权——
+# v1.1.35 的红线是"没点名的设备任何方向都不动"，放宽这格就会让引擎丢修饰语顶同类别
+# 那台并回显成功（该闸立起来的 .91 实锤案）。
+# ⚠ 头的**顺序不承重**：`lstrip("的里中得")` 把长短头之差抹平了——实测把表倒序、乃至把裸「家」
+# 放最前，15 条量具全绿。真正承重的是"段首锚定 + 剩余必须是裸类别词"那两条，各有专属钉。
+# 长头在前只为可读，别把它当安全不变量依赖（2026-10-26 对抗复核抓到这句是装饰性注释）。
+_POSSESSIVE_HEADS = ("我们家的", "咱们家的", "家里的", "家中的", "我家的", "咱家的",
+                     "我们家", "咱们家", "家里", "家中", "我家", "咱家", "家的", "家")
+
+
+def _seg_is_possessive_scope(seg: str, nouns=()) -> bool:
+    """seg ＝「属格头」(+「的/里/得」) + **裸类别词或 nothing** ⇒ 是范围修饰语，不是名字。"""
+    for head in _POSSESSIVE_HEADS:
+        if seg.startswith(head):
+            rest = seg[len(head):].lstrip("的里得")
+            return not rest or rest in (nouns or ())
+    return False
+
 
 def _phrase_is_not_a_name(seg: str, nouns=()) -> bool:
     """修饰段更像**动词短语/数量短语/状态定语**而不是设备名 ⇒ 本闸不据此裁决。永不抛。
@@ -384,6 +406,11 @@ def _phrase_is_not_a_name(seg: str, nouns=()) -> bool:
         if len(seg) < 2:
             return False                  # 交回原有的"无可判修饰段"分支
         if _NUM_QUANT_RE.match(seg):
+            return True
+        if _seg_is_possessive_scope(seg, nouns):
+            # 2026-10-20 现网实锤（1.7.5 字节端到端复现）：「打开我们家的灯」拼出『家的灯』、
+            # 「我家客厅的灯开一下」拼出『我家的灯』——属格范围前缀不是点名，
+            # 弃权后这句回落到泛称/区域道（歧义闸接手列两台），不再谎报"家里没这台"。
             return True
         if all(ch in _VERBISH_CHARS for ch in seg):
             return True

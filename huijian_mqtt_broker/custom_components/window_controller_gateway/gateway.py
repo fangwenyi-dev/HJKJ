@@ -310,10 +310,15 @@ class GatewayDeviceRemoveButton(ButtonEntity):
             manager_now = data_now["device_manager"]
         elif data_now is None and self._entry_id and _entry_still_configured(
                 self.hass, self._entry_id):
+            # 如实拒绝而不是静默 return：静默 return 时 button.press 仍回 200，
+            # 面板弹绿色「删除命令已发送」，而本地删除一件没做（改令牌/改选项/
+            # 升级触发条目 reload 的秒级窗口内点「删除」必中）。本文件 :201
+            # 「启动配对失败」已立同一条口径：没做成就要响亮失败。
             _LOGGER.warning(
                 "移除按钮：条目 %s 正在重载，设备 %s 的本地删除未执行——请稍后重试",
                 self._entry_id, self.device_sn)
-            return
+            raise HomeAssistantError(
+                "这条网关正在重载，删除没有执行——请等几秒后再点一次")
 
         # 从设备管理器中删除设备（本地操作，不受网关状态影响）
         try:
@@ -321,7 +326,10 @@ class GatewayDeviceRemoveButton(ButtonEntity):
             _LOGGER.info("已从系统中删除设备: %s", self.device_sn)
         except Exception as e:
             _LOGGER.error("从系统中删除设备失败: %s", e)
-            return
+            # 不再静默 return：那会让 button.press 回 200、面板弹绿色「删除命令已发送」，
+            # 而注册表/回调/MQTT 通知里至少有一件没做成（幽灵设备的燃料）。
+            # 拒因原样带上，面板渲染出口会把这句话摆给用户。
+            raise HomeAssistantError(f"删除没有完整做成：{e}") from e
 
         # 从实体注册表中删除自身（删除按钮）
         try:

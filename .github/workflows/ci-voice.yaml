@@ -198,13 +198,16 @@ jobs:
         run: |
           # 将 changelog 写入临时文件，避免 echo -e 破坏中文编码（Gitee 乱码根因）
           #
-          # ⚠ `head -120`（原 50）＝v1.2.1 发版前自复核抓出的**静默截断**：本版正文实提取已远超 50
+          # ⚠ 上限历史 50→120→**200**：50→120 是 v1.2.1 发版前自复核抓出的**静默截断**（本版正文实提取已远超 50
           # 行，50 会让 GitHub Release 悄悄少掉后半段——不报错、不失败，只是客户看到的
           # 正文缺半段；而同文件 gitee-release 那条同形 awk 原用 `head -80`，反而完整，
           # 两处上限各说各话正是这次暴露出来的东西。闸口不变量改由
           # test_release_consistency.py::test_release_body_carries_whole_current_section
           # 机器把关（它实读工作流里的上限与 CHANGELOG 实段行数比较，并钉两处上限不许漂移），
           # 免得"只放宽数字"再过一版就复现。
+          # 2026-10-26 再抬 120→200：v1.7.5 发版后补的两笔回归账（f8b158b/d45cab2）把该段
+          # 从 116 行顶到 147 行，`test_release_body_carries_whole_current_section` 当场拦红
+          # ——闸是有牙的，红的是正文长度不是提取逻辑。抬上限而不是砍账：那 27 行是发版判决账。
           CHANGELOG_FILE="/tmp/changelog.md"
           
           if [ -f CHANGELOG.md ]; then
@@ -215,7 +218,7 @@ jobs:
               $0 ~ "^## \\["ver"]" { found=1; print; next }   # v1.6.26（E-3）：命中行要输出——旧 next 吞掉 "## [x.y.z]" 标题，Release 正文裸开头
               /^## \[/{ if(found) exit }
               found { print }
-            ' CHANGELOG.md | head -120 > "$CHANGELOG_FILE"
+            ' CHANGELOG.md | head -200 > "$CHANGELOG_FILE"
           fi
           
           if [ ! -s "$CHANGELOG_FILE" ]; then
@@ -544,7 +547,7 @@ jobs:
             found { print }
           # 与 prepare 同闸口同值（见 prepare job 里整段正文被 head -50 截断的实发教训）：
           # 两条 awk 是受控重复，那**上限也必须重复一致**，否则 Gitee 全文、GitHub 半篇。
-          ' CHANGELOG.md | head -120 > /tmp/release-body.md
+          ' CHANGELOG.md | head -200 > /tmp/release-body.md
           if [ ! -s /tmp/release-body.md ]; then
             { echo "## v$VER"; echo ""; git log --oneline -10 --format='- %h: %s'; } > /tmp/release-body.md
           fi

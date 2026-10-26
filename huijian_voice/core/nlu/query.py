@@ -12,6 +12,8 @@ import re
 from datetime import datetime
 from typing import Optional
 
+from . import targets
+
 logger = logging.getLogger("huijian.query")
 
 _AREA_SUFFIX = ("室", "厅", "房", "间", "区", "馆", "楼", "卫", "厨")
@@ -392,6 +394,12 @@ class QueryZone:
     def _find_area(self, text: str) -> Optional[str]:
         """区域词提取：剥时间/引导前缀 → 优先注册区域名（ha._areas）→ 后缀启发。"""
         t = self._AREA_PREFIX_NOISE.sub("", text) or text
+        # 2026-10-26：属格范围前缀在**匹配之前**剥（与 fast_path 入口、targets 三条道
+        # 同一份真源 `_POSSESSIVE_HEAD_RE`）。旧形在注册表那一支命中前就带着"我家"进
+        # 启发式，`{1,4}?` 的窗口还会把「我们家办公室」削成「们家办公室」——连"我"都丢，
+        # 抽出一个谁也没说过的区域名。剥完不像区域就不剥（「家里的灯开着吗」= 问全屋，
+        # 该形剥后剩「灯开着吗」→ 无区域 → 按全屋答，正是原意）。
+        t = targets._POSSESSIVE_HEAD_RE.sub("", t, count=1).lstrip("的里中得 ") or t
         names = sorted(set(self.ha._areas.values()), key=len, reverse=True) if self.ha._areas else []
         for n in names:
             if n and (n in t or n in text):

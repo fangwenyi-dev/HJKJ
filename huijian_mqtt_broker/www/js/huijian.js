@@ -762,6 +762,27 @@
             return await fetchT(INGRESS_BASE + 'api/ha/' + path.replace(/^\//, ''), opts);
         }
 
+        /** HA 调用失败时的**一句真话**（公用，2026-10-26）。
+         *  后端"没做成"的统一口径是 raise HomeAssistantError ⇒ HA 回 400 + message；
+         *  过去面板各臂自己写 `throw new Error('HA API ' + r.status)`，把"没做成"显示成
+         *  一句状态码，客户只会以为功能坏了/或多点一次——而同一页 set_position 那臂早就
+         *  在读响应体（另一套 text() 口径），三处三种写法正是本仓记过的"各写一份就总有一处漏"。
+         *  取值次序：JSON `message` → 纯文本体（截 160）→ 退回 `HA API <status>`。
+         *  showToast 走 textContent，无注入面；不回显请求体。*/
+        async function haErrDetail(r) {
+            let detail = 'HA API ' + (r && r.status);
+            try {
+                const body = await (r && r.json ? r.json() : null);
+                const msg = body && (body.message || (body.error && body.error.message));
+                if (msg) return String(msg);
+            } catch (e) { /* 不是 JSON，落到纯文本 */ }
+            try {
+                const txt = await (r && r.text ? r.text() : '');
+                if (txt) detail = txt.length > 160 ? txt.slice(0, 160) : txt;
+            } catch (e) { /* 读不到体就用状态码 */ }
+            return detail;
+        }
+
         // ========== 加载网关列表 ==========
         async function loadGateways() {
             const container = document.getElementById('gatewayContainer');
@@ -1457,7 +1478,7 @@
                         else if (command === 'close') service = 'close_cover';
                         else if (command === 'stop') service = 'stop_cover';
                         const r = await haApi('/services/cover/' + service, 'POST', { entity_id: coverEntity.entity_id });
-                        if (!r.ok) throw new Error('HA API ' + r.status);
+                        if (!r.ok) throw new Error(await haErrDetail(r));
                         showToast('命令已发送: ' + command, 'ok');
                     }
                 } else if (command === 'a') {
@@ -1465,7 +1486,7 @@
                     const btnEntity = findEntityByUniqueId(dev, 'button', 'a');
                     if (btnEntity) {
                         const r = await haApi('/services/button/press', 'POST', { entity_id: btnEntity.entity_id });
-                        if (!r.ok) throw new Error('HA API ' + r.status);
+                        if (!r.ok) throw new Error(await haErrDetail(r));
                         showToast('内倒命令已发送', 'ok');
                     } else {
                         showToast('未找到内倒按钮实体', 'warn');
@@ -1475,7 +1496,7 @@
                     const btnEntity = findEntityByUniqueId(dev, 'button', btnSuffix);
                     if (btnEntity) {
                         const r = await haApi('/services/button/press', 'POST', { entity_id: btnEntity.entity_id });
-                        if (!r.ok) throw new Error('HA API ' + r.status);
+                        if (!r.ok) throw new Error(await haErrDetail(r));
                         showToast('模式切换: ' + (command === 'wind_lock_tilt' ? '内倒' : '平开'), 'ok');
                     } else {
                         showToast('未找到模式按钮实体', 'warn');
@@ -1487,7 +1508,7 @@
                         const numVal = parseFloat(value);
                         if (isNaN(numVal)) throw new Error('无效数值: ' + value);
                         const r = await haApi('/services/number/set_value', 'POST', { entity_id: numEntity.entity_id, value: numVal });
-                        if (!r.ok) throw new Error('HA API ' + r.status);
+                        if (!r.ok) throw new Error(await haErrDetail(r));
                         showToast((command === 'set_speed' ? '速度' : '力度') + '设置: ' + value, 'ok');
                     } else {
                         showToast('未找到' + (command === 'set_speed' ? '速度' : '力度') + '实体', 'warn');
@@ -1498,7 +1519,7 @@
                     const btnEntity = findRemoveButtonEntity(dev, devices);
                     if (btnEntity) {
                         const r = await haApi('/services/button/press', 'POST', { entity_id: btnEntity.entity_id });
-                        if (!r.ok) throw new Error('HA API ' + r.status);
+                        if (!r.ok) throw new Error(await haErrDetail(r));
                         showToast('删除命令已发送', 'ok');
                     } else {
                         showToast('未找到删除按钮实体', 'warn');
@@ -1552,14 +1573,10 @@
                         device_id: deviceId, position: pos
                     });
                     if (!r.ok) {
-                        // v1.7.33：失败时带出服务端原因（如"机型不支持百分比
-                        // 定位"），不再只回裸状态码。showToast 走 textContent，无注入面。
-                        let detail = 'HA API ' + r.status;
-                        try {
-                            const body = await r.text();
-                            if (body) detail = body.length > 160 ? body.slice(0, 160) : body;
-                        } catch (readErr) { /* 读不到体则退回状态码 */ }
-                        throw new Error(detail);
+                        // v1.7.33 立的是"失败要带出服务端原因"这条纪律；2026-10-26 把它
+                        // 收进公用 `haErrDetail`（原先这臂吃 text()、控制类各臂只报状态码，
+                        // 三处三种口径——纪律没错，错在每处各写一份）。
+                        throw new Error(await haErrDetail(r));
                     }
                     showToast('位置设置: ' + pos + '%', 'ok');
                 } else {

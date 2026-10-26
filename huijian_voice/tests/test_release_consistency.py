@@ -386,8 +386,11 @@ def _ci_body_caps():
 
 def test_release_body_carries_whole_current_section():
     """行为钉：本版 CHANGELOG 整段必须落在**最小**闸口上限之内。
-    变异自证：把 ci-voice.yaml 任一 `head -120` 调回 `head -50` ⇒ 本钉转红；
-    整段缺失（正文回落成 git log 流水）同样红。"""
+    变异自证：把 ci-voice.yaml 任一 `head -200` 调回 `head -50` ⇒ 本钉转红；
+    整段缺失（正文回落成 git log 流水）同样红。
+    2026-10-26 实发过一次真拦停：v1.7.5 发版后补的回归账把该段从 116 行顶到 147 行，
+    而当时上限 120 ⇒ 本钉红（且没有任何自动 CI 会跑到它——ci-voice 只 workflow_dispatch，
+    ci.yaml 只跑网关 tests）。上限随之抬到 200；再涨就压正文，别悄悄少半段。"""
     ver = _config()["version"]
     section = _extract_voice_section(ver)
     assert section, (

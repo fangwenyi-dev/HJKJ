@@ -450,8 +450,14 @@ class TestIgnorePersistence:
         assert src.count("GLOBAL_IGNORED_GATEWAYS") >= 3, \
             "E-1：discovery 未与全局持久键共享 set（import+两处 setdefault）"
         # ignore/unignore 都必须调度落盘
-        assert src.count("save_persistent_data(hass)") >= 2, \
-            "E-1：忽略/取消忽略未触发持久化"
+        # ignore/unignore 都必须调度落盘。2026-10-26：两处收进公用入口
+        # `persist.schedule_persistent_save(hass)`（裸 create_task 会让"没存住"这条账
+        # 没人接），所以判据钉**意图**（两种调度形制之和），不钉某一种字样——
+        # 只钉字样的话，把两处合并成更好的形状反而会被本钉判成回归。
+        scheduled = (src.count("save_persistent_data(hass)")
+                     + src.count("schedule_persistent_save(hass)"))
+        assert scheduled >= 2, \
+            "E-1：忽略/取消忽略未触发持久化（实见 %d 处调度）" % scheduled
         assert "async_update_entry(entry" not in src, \
             "v1.7.62：静默填充（步骤 3.5）已整体移除——首台网关也走发现卡"
         cf_src = _read(PKG / "config_flow.py")

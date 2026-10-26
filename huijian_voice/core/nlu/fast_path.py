@@ -1706,6 +1706,21 @@ class FastPath:
             return None
         text = text.strip()
         text = re.sub(r"^[把将]\s*", "", text)   # 处置介词核心化："把灯打开"→"灯打开"
+        # 2026-10-26 属格范围前缀族的**入口归一**（同类三处共用这一道，不在每条道各抄一份）：
+        # ①「家里阳台的窗帘拉上」过去落到下面 `全屋显式` 那一支，被 `_wholehouse_word`
+        #   剥成"阳台窗帘"→domains=[cover]、**area 静默丢弃 ⇒ 全家窗帘一起拉**＝跨区误动。
+        #   （v1.0.41 审查 S12 只挡了"区域在标记之前"的语序，"标记在区域之前"这半没挡。）
+        # ②「咱家卧室关灯」则把"咱家卧室"整段当点名设备名（`t0_prefix` 支）。
+        # 归一规则：句首属格头 **且** 剩余部分以**本台注册表在册**的区域名开头 ⇒ 剥头，
+        # 等价于用户没说"我家"；剩余不是在册区域就一律不剥——「家里的灯打开」照旧按
+        # 全屋意图走（那正是它的语义），宁缺不猜房间。
+        m_pos = T._POSSESSIVE_HEAD_RE.match(text)
+        if m_pos:
+            tail = text[m_pos.end():].lstrip("的里中得 ")
+            area_guess = T.split_area_head(tail)[0] if tail else None
+            if area_guess and self._area_registered(area_guess):
+                trace.append(f"属格头→{tail}")
+                text = tail
         # v1.2.11 A2：状态疑问判据要用**剥礼貌尾之前**的句子——`normalize_polite`
         # 会把 呢/吧/？ 一起剥掉（实测「客厅的灯开着呢？」剥成「客厅的灯开着」），
         # 剥完就看不出这是问句了。留着原形只给那一道闸用，其余判据照旧吃改写后的
