@@ -3723,6 +3723,8 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 | 旧钉重指 | `test_runtime_data_guards.py::test_source_pin_conversation_timeout_sync_cm` | 由散文满足改为 AST 满足，四格各自点名 |
 | 语音线全量 | `pytest huijian_voice/tests -q --continue-on-collection-errors` | **3474 passed / 21 failed / 11 skipped / 1 error**；与 1.7.6 出厂前基线（3464 passed，同 21 条）**失败用例 id 逐条相同**（`diff` 两个 FAILED 清单 = 空），+10 即本批新钉；21 条全部是 opus/TTS 相关的**本机环境失败**，CI（装 libopus0）无此组 |
 | 网关线全量 | `pytest huijian_mqtt_broker/tests -q` | **1837 passed**（本批对网关零改动，跑它是为证明没被连带碰红） |
+| CI 权威数（run 40477172731，job Lint 日志逐字读回） | `All checks passed!`（本批新装的 lint 步在 CI 真跑）＋ **3437 passed / 39 skipped / 0 failed**（上一版 1.7.6 是 3437/38） | 整条流水线 10 具 job 全 success（Lint/Prepare/Init/Build×2/E2E/Manifest/Release/Push ACR/Gitee Release）。**但那一格 "+1 skipped" 里藏着一条本批必须点名的账**：见下行 |
+| ⚠ 本批新钉在 CI 是**整模块跳过**，不是真跑 | `huijian_voice/requirements.txt` 里**没有 anyio**，而 CI 只装 `requirements.txt + pytest + pyyaml`——凡 `pytest.importorskip("anyio")` 的文件在 CI 一律整模块 skip（本地装了真 anyio，所以本地是真跑）。这类文件共 **7 具**：本批的 `test_v177_scope_shells_lint.py` ＋ 既有 6 具（`test_tts_transport_scope`／`test_v1045_tts_stream_integrity`／`test_v1065_tts_review`／`test_v1083_playback_budget_round_guard`／`test_v1092_stt_round_id`／`test_v1127_transport_creds_ui`） | 所以：**类级 AST 扫描、两处壳的跨任务行为臂、超时/流关闭语义臂＝只在本机真跑过**。把 anyio 加进 CI 是一行改动，但它会让那 6 具既有量具第一次在 CI 真跑（可能当场翻红），属于"要重看一遍门禁"的独立决策，不在本批顺手做——记在这里，谁做就从这行接。**没有把这条写成"CI 也绿了所以量具生效"** |
 | lint 闸 | `ruff check --select F821,E9 huijian_voice/` | **All checks passed**（修前 2 条） |
 | 金标（加载项侧） | `_goldtest/gold_retest.py --phase dry`（现网装的是 1.7.6） | **23/23 PASS、0 FAIL**；#23「我家办公室的射灯打开」`source=t0_prefix_strip` → 目标 `light.ban_gong_shi_she_deng`、话术『好的，办公室的射灯打开了』 |
 
@@ -3731,6 +3733,8 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
 - 不声称客户可见行为有改善——本批没有任何一条改判据／改正确率。
 - 不声称真机播报臂跑过：Kokoro TTS 模型在本机仍未就绪（金标播报腿自证 `合成 0 条 / 播出 0 条`）。
 - 不声称语音线 lint 已干净：宽口径存量 173 条另立一批（见 §三）。
+- **不声称本批新钉在 CI 真跑**：CI 环境没装 anyio，含本批新具在内的 7 具 anyio 量具在 CI 是
+  **整模块跳过**（§四 那行点名了），真跑证据只在本机。这一格是"没跑"，不是"跑过并通过"。
 - CI 权威数以 `ci-voice` 那次 run 的产物为准，本段不预填我本地数字。
 
 ## [1.7.6] - 2026-10-26 · 属格范围前缀族根修（「我家客厅的灯打开」这类正常说法必被拒）＋ Release 正文截断闸收口
