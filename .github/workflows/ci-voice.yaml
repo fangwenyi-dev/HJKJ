@@ -85,6 +85,14 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq libopus0 > /dev/null 2>&1 || true
           pip install -q -r huijian_voice/requirements.txt pytest pyyaml
           python3 -m compileall -q huijian_voice/core huijian_voice/tests
+          # v1.7.7（外部报告 BUG-2 复现）：本线此前**一个 lint 步都没有**，于是
+          # core/main.py 用了没 import 的 Optional（ruff F821 真阳）照样出厂——运行
+          # 时不炸**仅因为**该文件顶部有 `from __future__ import annotations`（注解
+          # 不求值）。先上窄闸：只纳管 undefined-name(F821) 与语法错误(E9)，本批
+          # 修完全仓 0 条。网关线那套 F,E9,B 宽口径在语音线还有 173 条存量（90 F401
+          # ／32 F841／18 F811…），那是另一批审计的账，本步不假装已经清零。
+          pip install -q ruff
+          ruff check --select F821,E9 huijian_voice/
           python3 -m pytest huijian_voice/tests -q
 
       - name: Verify version consistency (四源)

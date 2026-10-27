@@ -12,6 +12,7 @@ setup 失败的条目同样从未 set 过该属性（类级 annotation 无缺省
 entry 对象直调——即实发故障的最小复现；另附源码级钉桩防回退。
 """
 
+import ast
 import importlib.util
 import sys
 import types
@@ -151,12 +152,57 @@ def test_source_pin_auto_ensure_no_latch():
 
 
 def test_source_pin_conversation_timeout_sync_cm():
-    """conversation.py 超时守卫必须 `with anyio.fail_after`——anyio 的
-    fail_after 是同步上下文管理器，写成 async with 时 huijian_agent 每次
-    意图识别必抛 TypeError（2026-09-08 台架实发，agent 全瘫）。"""
+    """conversation.py 超时守卫必须用 anyio 的**同步**上下文管理器——fail_after /
+    move_on_after 都是同步 CM，写成 async with 时 huijian_agent 每次意图识别必抛
+    TypeError（2026-09-08 台架实发，agent 全瘫）。
+
+    v1.7.7 重指（外部报告复核抓出的"钉被注释喂绿"）：旧钉正向格是
+    `"with anyio.fail_after(timeout)" in conv`，而 v1.1.27 把整轮收口改成"单调
+    deadline + 逐条 move_on_after"后代码里已无此串——子串只活在函数 docstring
+    引的"旧实现"里，于是这条钉从此靠散文满足＝拔钉。改为 AST 取**真函数体**判定：
+    原不变量（同步 CM、绝不 async with）照守，并补上"scope 不许横跨 yield"，
+    且落点/宇宙两格缺任何一格都点名，不再可能被注释或空宇宙喂绿。
+    """
     conv = _src("conversation.py")
-    assert "async with anyio.fail_after" not in conv
-    assert "with anyio.fail_after(timeout)" in conv
+    assert "async with anyio." not in conv
+    tree = ast.parse(conv)
+
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.AsyncFunctionDef)
+               and n.name == "_await_message_with_timeout"), None)
+    assert fn is not None, "找不到 _await_message_with_timeout（钉失去落点＝假绿）"
+    assert not [n for n in ast.walk(fn) if isinstance(n, ast.AsyncWith)], \
+        "_await_message_with_timeout 体内出现 AsyncWith——anyio 同步 CM 写成 " \
+        "async with 时每次意图识别必抛 TypeError（2026-09-08 台架实发）"
+
+    def _yields_in(body):
+        stack = list(body)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                              ast.Lambda)):
+                continue
+            if isinstance(n, (ast.Yield, ast.YieldFrom)):
+                return True
+            stack.extend(ast.iter_child_nodes(n))
+        return False
+
+    assert _yields_in(fn.body), \
+        "_await_message_with_timeout 体内已无 yield——本钉在守空气（落点换代要重指）"
+    scopes = [w for w in ast.walk(fn) if isinstance(w, ast.With)
+              and any(_is_anyio_cm(it.context_expr) for it in w.items)]
+    assert scopes, "体内没有 anyio 超时 CM 的 With 节点（守卫被整条撤掉）"
+    bad = [w.lineno for w in scopes if _yields_in(w.body)]
+    assert not bad, ("超时 scope 横跨 yield（第 %s 行）：跨任务收口必炸 "
+                     "'cancel scope in a different task'" % bad)
+
+
+def _is_anyio_cm(expr):
+    """anyio.fail_after(...) / anyio.move_on_after(...) 形态判定。"""
+    return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id == "anyio"
+            and expr.func.attr in ("fail_after", "move_on_after"))
 
 
 def test_source_pin_text_tts_nonblocking_import():

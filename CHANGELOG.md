@@ -3685,6 +3685,54 @@ config flow 在 `ensure_mqtt_connection` 之后**立即同步**检查 `hass.data
      ═══════════════════════════════════════════════════════════════════════ -->
 
 # 慧尖HA语音插件 变更日志（版本号线 1.2.x 起，现 1.7.x）
+## [1.7.7] - 2026-10-27 · 外部报告逐条复现批：两处 F821 出厂面 / 两处同类未修壳 / 一条被自己注释喂绿的旧钉
+
+对外判决一句：**本版不改变任何客户可见行为**——它修的是"形状能出厂"的那道闸（语音线此前
+一个 lint 步都没有），以及同一缺陷族里剩下两份没修的壳。上一版（1.7.6）的属格前缀根修与
+播报面一字未动。
+
+### 一、报告五条的判决（详版凭据见固件仓 `wt2159yuanma/CHANGELOG.md` v2.3.12 段）
+
+| 报告条目 | 盘上判决 | 落点 |
+|---|---|---|
+| BUG-2 `core/main.py:98` 用了没 import 的 `Optional` | **真**（ruff `F821 Undefined name 'Optional'` 本地就报），运行时不炸**仅因为**文件顶部 `from __future__ import annotations` 让注解不求值 | 补 `from typing import Optional`；并给语音线装上 lint 闸（见 §三） |
+| P-3 `stt_transport.await_message` 的 anyio scope 横跨 yield | **形状真、定性需更正**：该函数是兼容壳（`stt_transport.py:7` 自述"新链路一律走 recognize"，全仓无生产调用者）；`recognize` 里那个 `fail_after`（:271）包的是普通协程、**中间没有 yield**，不存在跨任务收口问题 | 按"同类不许留第三份形状"收口，不按"现网故障"排 |
+| （报告未列，本批按类扫出）同形状第⑥处 `ws_transport.py:546` | 基类同款未修壳，同样无生产调用者 | 与 stt 壳同口径收口 |
+| （报告未列）`custom_llm_api.py:414` 的 `er` F821 | 第二处真阳，但该文件 :1-7 已把"future 行是可导入性前提"记账在案（v1.1.27 复查实证） | 补 `TYPE_CHECKING` 块让静态检查可见，**不动运行时**（懒载纪律原样保留），并把两条事实都写进注释 |
+| （报告未列，量具洞）`test_runtime_data_guards.py:159` | 该钉断言 `"with anyio.fail_after(timeout)" in conv`，而 v1.1.27 把代码改成"单调 deadline + 逐条 `move_on_after`"后**代码里已无此串**——子串只活在 conversation.py:79 那段"旧实现"引文里 ⇒ 这条钉被自己的注释喂绿 | 升级为 AST 取真函数体判定：落点/体内有 yield/存在 anyio 同步 CM/scope 不横跨 yield 四格分别点名 |
+| P-1（BLE CMD21 饿死 NimBLE host）/ BUG-1（发版账自相矛盾） | 属固件线；P-1 落点判错（v2.1.74 已根修），BUG-1 真 | 见固件 v2.3.12 |
+
+### 二、改了什么（逐处）
+
+1. `core/main.py` 补 `from typing import Optional`（唯一一处运行时可见的缺名）。
+2. `custom_components/huijian_ai/custom_llm_api.py` 加 `if TYPE_CHECKING: from homeassistant.helpers import entity_registry as er`，并在文件头注释里把两条事实分开写清楚：**行 8 的 future 仍是运行时前提**，TYPE_CHECKING 只是让静态检查不再假阳。
+3. `huijian/stt_transport.py::await_message` 与 `huijian/ws_transport.py::await_message` 按 **tts v1.0.69 / llm v1.1.27-r2 已定案口径**收口：单调 deadline + scope 只包单条 `__anext__` + yield 点零存活 scope。语义逐条对齐旧形（超时→error 帧；流先关→安静收口；stt 只认 `['stt','tts']` 两型且交付一帧即收口），异常面**不顺手加固**——旧形往上抛的，新形照样抛。
+4. `tests/test_runtime_data_guards.py` 那条旧钉重指为 AST 判定（禁只弱化）。
+5. `.github/workflows/ci-voice.yaml` 新增 lint 步：`ruff check --select F821,E9 huijian_voice/`。
+
+### 三、为什么只上窄闸，不照抄网关那套宽口径
+
+网关线 `ci.yaml` 跑的是 `--select F,E9,B`。同一命令扫语音线今天回 **173 条**（90 F401 未用导入／32 F841 未用变量／18 F811 重定义／…）。那是另一批审计的账，**不在本批判决范围内**，本批不假装已清——所以窄闸只纳管 undefined-name(F821) 与语法错误(E9)：本批修完全仓 **0 条**，闸门今天就能真拦，而不是装一个永远红或永远跳过的门。存量清单已写进本节，谁做那批账就从这里接。
+
+### 四、守卫与验证
+
+| 项 | 内容 | 结果 |
+|---|---|---|
+| 新守卫 | `tests/test_v177_scope_shells_lint.py`：类级 AST 扫描（生产宇宙 `custom_components/**` + `core/**`，异步生成器内 scope 不许横跨 yield）＋ 从**真源码**摘出两处壳做跨任务收口行为验证 ＋ 超时/流关闭语义两臂 ＋ lint 闸存在性/宇宙/与 pytest 同步步 ＋ 两条名绑定的形状钉 | 本文件 **10 钉**；扫描宇宙元自检＝文件数≥105、异步生成器≥17（修后 0 命中）；正向对照喂旧形状必须被抓到 |
+| 变异自证 | `_audit1027/run_v177_mutations.py` 九臂：两处 F821 各摘一行、两处壳退回"scope 横跨 yield"、消费侧旧钉重新包住 yield、把 CI 那道 lint 步**注释掉**、把扫描宇宙收窄成一个目录，另加两条 ruff 真闸阳性对照 | **9/9 臂红得其所**；且头一轮就抓出**本批量具自己的两个盲点**——①stt 那条行为臂只判"异常没逃出生成器"，而该文件正好有一句 `except RuntimeError` 会把现场报错**吞成一条日志**（注入缺陷后照样绿）；现同时判"没炸"与"没被吞"。②CI 闸存在性用子串匹配，`# ruff check …` 这种**注释掉的哑门**会被读成"闸在"；现只认执行行。两处都是修量具、不动产品 |
+| 旧钉重指 | `test_runtime_data_guards.py::test_source_pin_conversation_timeout_sync_cm` | 由散文满足改为 AST 满足，四格各自点名 |
+| 语音线全量 | `pytest huijian_voice/tests -q --continue-on-collection-errors` | **3474 passed / 21 failed / 11 skipped / 1 error**；与 1.7.6 出厂前基线（3464 passed，同 21 条）**失败用例 id 逐条相同**（`diff` 两个 FAILED 清单 = 空），+10 即本批新钉；21 条全部是 opus/TTS 相关的**本机环境失败**，CI（装 libopus0）无此组 |
+| 网关线全量 | `pytest huijian_mqtt_broker/tests -q` | **1837 passed**（本批对网关零改动，跑它是为证明没被连带碰红） |
+| lint 闸 | `ruff check --select F821,E9 huijian_voice/` | **All checks passed**（修前 2 条） |
+| 金标（加载项侧） | `_goldtest/gold_retest.py --phase dry`（现网装的是 1.7.6） | **23/23 PASS、0 FAIL**；#23「我家办公室的射灯打开」`source=t0_prefix_strip` → 目标 `light.ban_gong_shi_she_deng`、话术『好的，办公室的射灯打开了』 |
+
+### 五、本版不声称
+
+- 不声称客户可见行为有改善——本批没有任何一条改判据／改正确率。
+- 不声称真机播报臂跑过：Kokoro TTS 模型在本机仍未就绪（金标播报腿自证 `合成 0 条 / 播出 0 条`）。
+- 不声称语音线 lint 已干净：宽口径存量 173 条另立一批（见 §三）。
+- CI 权威数以 `ci-voice` 那次 run 的产物为准，本段不预填我本地数字。
+
 ## [1.7.6] - 2026-10-26 · 属格范围前缀族根修（「我家客厅的灯打开」这类正常说法必被拒）＋ Release 正文截断闸收口
 
 ⚠ **本批改了集成 Python 行为（NLU 解析面 + 级联裁决闸）**：升级加载项后请再重启一次 Home Assistant。

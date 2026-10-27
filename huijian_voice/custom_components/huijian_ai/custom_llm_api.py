@@ -4,11 +4,14 @@
 `_should_include_entity` 的返回注解 `tuple[bool, er.RegistryEntry | None]` 里
 `er` 只在函数内局部 import（懒载纪律），类体求值期无此名 → 无本行则整包
 import 即 NameError（v1.1.27 复查实证；本文件长期无人 import 才未暴露）。
+v1.7.7：`er` 另经下方 `TYPE_CHECKING` 块对**静态检查**可见（消 ruff F821 真阳，
+不在运行时引入 entity_registry）——本行仍是运行时前提，两者不互相替代。
 """
 from __future__ import annotations
 
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from homeassistant.core import HomeAssistant, callback
@@ -18,6 +21,9 @@ from homeassistant.helpers import intent, llm
 
 from .const import DOMAIN
 from .intent_result import fold_action_ok
+
+if TYPE_CHECKING:
+    from homeassistant.helpers import entity_registry as er
 
 _LOGGER = logging.getLogger(__name__)
 

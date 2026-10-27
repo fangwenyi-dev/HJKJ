@@ -333,13 +333,28 @@ class SttTransport(WsTransport):
             return text, None
 
     async def await_message(self, timeout: int = 60):
-        """兼容壳（新链路一律走 recognize；保留仅防第三方直接调用）。"""
+        """兼容壳（新链路一律走 recognize；保留仅防第三方直接调用）。
+
+        v1.7.7（同类第⑤处收口）：旧形把 anyio cancel scope **横跨 `yield`**——与
+        tts_transport v1.0.69 根因①／llm_transport v1.1.27-r2 同型（驱动到首块的
+        任务与收口的任务不同即抛 "cancel scope in a different task"，整轮作废）。
+        现同定案口径：scope 只包单条 receive，yield 点零存活 scope，整轮仍是墙钟
+        deadline。语义不变：超时→error 帧；流先关→安静收口（旧 `async for` 到
+        StopAsyncIteration 也是直接结束）。
+        """
+        deadline = time.monotonic() + max(1, int(timeout))
         try:
-            with anyio.fail_after(timeout):
-                async for data in self._recv_reader:
-                    if data.type in ["stt", "tts"]:
-                        yield data
-                        break
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                with anyio.fail_after(remaining):
+                    data = await self._recv_reader.__anext__()
+                if data.type in ["stt", "tts"]:
+                    yield data
+                    return
+        except StopAsyncIteration:
+            return
         except RuntimeError as exc:
             self.logger.info(str(exc), exc_info=True)
         except TimeoutError:

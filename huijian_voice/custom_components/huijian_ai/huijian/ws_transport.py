@@ -544,11 +544,23 @@ class WsTransport:
         return await self._deliver(self._recv_writer, json_data)
 
     async def await_message(self, timeout: int = 120):
-        """Wait response message"""
+        """Wait response message
+
+        v1.7.7（同类第⑥处收口）：与 stt/llm/tts 三面同口径——scope 只包单条
+        receive、yield 点零存活 scope、整轮走墙钟 deadline。语义不变：超时→error
+        帧；流先关→安静收口（旧 `async for` 到 StopAsyncIteration 也是直接结束）。
+        """
+        deadline = time.monotonic() + max(1, int(timeout))
         try:
-            with anyio.fail_after(timeout):
-                async for data in self._recv_reader:
-                    yield data
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                with anyio.fail_after(remaining):
+                    data = await self._recv_reader.__anext__()
+                yield data
+        except StopAsyncIteration:
+            return
         except TimeoutError:
             yield Dict(error="Response timeout")
 

@@ -891,4 +891,4 @@ def test_version_bearing_sources_agree():
     man = json.loads(_raw("custom_components", "huijian_ai", "manifest.json"))
     wv = json.loads(_raw("www", "version.json"))
     assert ver == man["version"] == wv["addon_version"] == wv["integration_version"],         "面板那枚文件是两个键（addon_version/integration_version），不是 version"
-    assert ver == "1.7.6", "本批的钉与代码同批出版本号（旧号＝钉在测上一版的源码）"
+    assert ver == "1.7.7", "本批的钉与代码同批出版本号（旧号＝钉在测上一版的源码）"
