@@ -932,6 +932,7 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
     async def _healer():
         rounds = 0          # 连续未落地轮数（v1.7.30 ④ 退避基准；任务级局部，
                             # healer 重拉起即复位——重启/重 setup 算新周期）
+        circles = 0         # 常驻通道核验圈数（留痕用；见下方 [通道核验] 那条 INFO）
         capped_warned = False
         try:
             while True:
@@ -979,6 +980,17 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                         _clear_channel_issue(hass)
                     else:
                         await _channel_guard(hass, verdict)
+                    # 2026-10-27 现网教训：修完"常驻任务顶穿启动收尾"后要确证 healer
+                    # 还在巡查，盘上**没有任何一手证据可取**——健康路径一行不打，而"沉默"
+                    # 既可能是健康也可能是任务早已静默死亡（v1.7.61 S2 同族）。所以每圈
+                    # 留一条痕：圈号（数不清=卡在同一圈）、verdict、卡片态、节拍现值。
+                    circles += 1
+                    _LOGGER.info(
+                        "[通道核验] 第 %d 圈：verdict=%s 卡片=%s（节拍 %ds，每圈一条）",
+                        circles, verdict,
+                        "已清" if verdict in ("ok", "no_endpoint") else "在挂",
+                        int(CHANNEL_VERIFY_INTERVAL),
+                    )
                     if not await _interruptible_sleep(hass, CHANNEL_VERIFY_INTERVAL):
                         return
                     continue

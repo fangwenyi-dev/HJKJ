@@ -776,6 +776,21 @@ ARMS = [
      "把扫描宇宙退回非递归＝mqtt_handler/ 整包走出判据底下，下一条 eager 常驻循环"
      "会全绿漏过（本臂改的是判据文件本身，守的是『钉不许被悄悄变窄』）",
      TSTARTUP),
+    # ── 2026-10-28 通道核验留痕批：两条臂各翻一个真实回退形态 ──
+    ("verify_trace_downgraded_to_debug", MB,
+     '                    _LOGGER.info(\n                        "[通道核验] 第 %d 圈',
+     '                    _LOGGER.debug(\n                        "[通道核验] 第 %d 圈',
+     "verify_circle_leaves_one_info_trace or not_emitted_inside_a_sleep_chunk", "red",
+     "留痕降到 DEBUG＝默认日志级别下等于没打，『healer 还在不在巡查』重新变成不可证"
+     "（v1.7.61 S2 巡检静默死亡同族的观测面）",
+     "tests/test_channel_verify_heartbeat.py"),
+    ("verify_trace_interval_hardcoded", MB,
+     'int(CHANNEL_VERIFY_INTERVAL),',
+     'int(1800),',
+     "configured_interval_not_a_hardcoded_number", "red",
+     "节拍写成字面量＝改了 CHANNEL_VERIFY_INTERVAL 后痕里的秒数继续骗人说 30 分钟"
+     "（本仓『文案与取值不同源』的老形态）",
+     "tests/test_channel_verify_heartbeat.py"),
 ]
 
 

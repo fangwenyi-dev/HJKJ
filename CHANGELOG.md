@@ -3,6 +3,118 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.8.10] - 2026-10-28 · 给常驻通道核验加"每圈留痕"（巡查是否还在跑，从日志不可判 → 可判）；并更正上一版一条不存在的代价
+
+⚠ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新
+文件拷进 `/config/custom_components`，已加载的模块不换）。
+
+### 一、这批改的是什么（根因，不是症状）
+
+v1.8.9 修完"常驻任务顶穿 HA 启动收尾"之后，要确证那个每 30 分钟复查 MQTT 通道的 healer
+**还在不在跑**，盘上取不到任何一手证据：健康路径（`verdict=ok`）一行日志都不打，只有判定
+不通才打。于是"沉默"同时兼容两种完全相反的状态——① 通道健康；② 巡检任务早已静默死亡
+（v1.7.61 S2「巡检任务静默死亡」正是本仓反复栽过的形态）。这一格在 v1.8.9 的发版账上被我
+自己写成"未验证项"，根因不是"没造条件验"，而是**产品缺可观测面**：没有留痕，任何一次
+"确证"都只能靠破坏现网通道来做。
+
+修法：`_healer` 的常驻核验分支每跑完一圈出一条 INFO——
+
+    [通道核验] 第 2 圈：verdict=mismatch 卡片=在挂（节拍 1800s，每圈一条）
+
+四个字段都是为"当场判故障"选的：**圈号**（连续两圈号相同＝卡在同一圈；圈号不涨＝任务已死）、
+**verdict**（ok / no_endpoint / endpoint_broken / mismatch / probe_error 五态直接可读）、
+**卡片态**（已清 / 在挂，与 repairs 入口一致）、**节拍现值**（取自 `CHANNEL_VERIFY_INTERVAL`
+而不是字面量，改常量后文案跟着变）。
+
+### 二、更正上一版正文里一条不存在的"代价"
+
+v1.8.9 段末尾我写了"修复卡片与 mDNS 提示的出现时机，从'启动过程中大概已有'变成'启动完成后
+healer 首圈补上'"。**这条是错的**，代码实物是：`_healer` 在**进入 1800s 睡之前**的第一圈就
+执行 `verify_builtin_channel` → `_mdns_guard` → `_channel_guard/_clear_channel_issue`，
+而 `async_create_task` 与 `async_create_background_task` 的 `eager_start` 默认都是 `True`
+（上游 `core.py` 两版一致），协程起点相同 ⇒ **卡片时序没变**。我把"HA 不再等待它"误推成
+"它延后发生"，属发版说明的事实错误。已发布的 v1.8.9 正文不撤不盖（改动已发布正文会让
+两源与商店页分叉），在此更正，并以判据固定住：留痕里的节拍必须是常量现值，文案与取值
+同一条链。
+
+### 三、现网确证（192.168.1.91，升级 1.8.9 后重启，一手日志）
+
+- Supervisor：`Restarting homeassistant` 22:47:02.450 → `Detect a running Home Assistant
+  instance` **22:47:58.922（56.5 秒）**；故障样本（1.8.8）同一序列是 **8 分 55 秒**。
+  `NOT_RUNNING → RUNNING` 由 8'45" 降到 25.0"。
+- HA Core 日志（剥 ANSI 后逐行判）：`Setup timed out for bootstrap` **0**、
+  `Something is blocking Home Assistant from wrapping up the start up phase` **0**、
+  `bootstrap_healer`/`heartbeat_arm` **0**、ERROR 级 **0**。且这两句告警必然出现在 core
+  报 RUNNING **之前**，RUNNING 已在 +56 秒达成 ⇒ 本轮没有发生过 bootstrap 超时。
+- 加项容器日志自己写了 **`[集成] 版本变化: 1.8.8 → 1.8.9，更新集成`**（部署确证到代码层）；
+  23:18–23:38 用户用手机开面板的 20 分钟窗口内 `引导失败` / `entries query failed` /
+  nginx `502` **各 0 命中**，`[发现代理] 已启动 (PID: 223)` 在位。
+
+### 四、两条与慧尖无关但值得记的现场结论（都没动代码）
+
+- `huawei_smarthome` 反复 `MqttConnectionError`：**与我们的端口方案零冲突**——按上游实物
+  （`client.py:713-721`、`const.py:46`）它自带 paho 直连**华为云** `route.smart_home_host:8883`
+  且 `use_tls=True`，不读 HA 的 mqtt 条目、也不需要本地 1883。失败发生在它自己的云侧
+  （账号/路由/TLS），日志里那句 `import paho.mqtt.client as mqtt` 只是 HA
+  `Detected blocking call to open` 的栈回显，**不是**模块缺失（窗口内 ImportError 命中 0）。
+- 语音台架板 `HUIJIAN-51C0 @ 192.168.1.117`：**设备侧离线**（ARP 无条目、20 秒 mDNS 浏览
+  只见同型板 `HUIJIAN-76A8 @ .181`，HA 侧全部 `*51c0*` 实体 unavailable）。若只是换 IP，
+  板子必然在新址重播 mDNS。
+
+### 五、对端义务（本批只记录根因与最小修法，**未动语音侧任何文件**，不随本版出货）
+
+语音线（`huijian_ai`）在本轮日志与源码复核里查出三条，归语音对话框的发版链处置：
+
+1. **一次启动内 17 个 intent 被重复注册（机制已定位，承重项已独立复现）**：
+   `huijian_voice/custom_components/huijian_ai/manifest.json` 的 `dependencies` 里含 `"intent"`，
+   于是 HA 会按官方平台机制自动调一次——上游实物 `homeassistant/components/intent/__init__.py:103`
+   → `:643 await platform.async_setup_intents(hass)`；而本集成又在
+   `__init__.py:223` 的 `async_setup` 里**手调**了同一个 `async_setup_intents(hass)`。
+   两条路各跑一次 ⇒ `intent.py:27-44` 的 17 条 `intent.async_register` 全被注册两遍，
+   与现网 17 条 `Intent … is being overwritten` 严格一一对应（`helpers/intent.py:76-81`
+   同名只 warning 后覆盖，不拦截）。
+   危害定档＝**纯噪音**：17 个 handler 全部无 `__init__`、无实例状态，两份实现等价，
+   覆盖不改变行为；config entry 数量与之无关（`async_setup_entry` 不再调它）。
+   最小修法＝**删掉 `__init__.py:223` 那条手调**（core 的 13 个带 intent 平台的集成无一自调）；
+   代价＝注册时点后移到 `EVENT_COMPONENT_LOADED` 之后，启动瞬间触发的语音自动化存在
+   一个 loop-iteration 级空窗——所以这条要在语音侧自己的一轮金标里做，不宜顺手改。
+2. **卸载不清 intent**：`__init__.py:316-334 async_unload_entry` 只 reset automation/voice_scene，
+   全仓无一处 `intent.async_remove` ⇒ 最后一个条目卸载后 17 个 handler 仍挂在注册表上。
+3. **"换 IP 会自动改写地址"的承诺是条件成立的，文案却写成无条件**：
+   `config_flow.py:863` 丢弃 `_fetch_device_info(...)` 的结果，仅当回读 MAC 相符才置
+   `updates[CONF_HOST]`；新址探测不通时 `updates={}` ⇒ **静默不改写**，而 `manager.py:963`
+   的用户可见文案是"会自动改写地址并重载条目"。修法＝消费返回值 ＋ "看到新址但探测不通"
+   时出一条节流 WARNING ＋ 文案加限定。触发条件＝设备换了 IP 且新地址的 6053 当时连不上
+   （跨 VLAN / 板子刚起 API 未就绪）。
+
+### 六、量具
+
+新增 `tests/test_channel_verify_heartbeat.py` **3 条**：
+
+* 正向：驱满两圈 ⇒ 必须恰有两条痕，且痕里带圈号与 verdict（缺痕＝回到"巡查不可证"的老形态）；
+* 反向：留痕节拍是"一圈一条"——不得落在 sleep 片内或上报路径上（否则每 10s 刷屏）；
+  异常 `verdict` 也必须进痕（只报健康等于把故障时报了个寂寞）；
+* 取值同源：把 `CHANNEL_VERIFY_INTERVAL` 改成 777 ⇒ 痕里的秒数必须跟着变（钉住"文案与取值
+  一条链"，正是本批第二节那条错误的机械化防再犯）。
+
+变异矩阵新增 **2 臂**：留痕降级成 DEBUG 必须红（默认级别下等于没打）、节拍写成字面量
+`int(1800)` 必须红。两条实测转红，基线绿；全仓矩阵从 v1.8.6 的 89 臂增至 94 臂（v1.8.9 +3、本批 +2），静态臂锚点
+唯一性机器自检全部命中。
+
+### 七、门禁读数（我自己跑，未跑逐格点名）
+
+* `python3 -m pytest huijian_mqtt_broker/tests -q` → **1855 passed / 0 failed / 0 skipped**
+  （上一版基线 1852，+3＝本批新增判据）。
+* ruff（逐字取 ci.yaml 那条四段同参命令）→ All checks passed。
+* 锚点唯一性机器自检 88 条静态臂全部命中且唯一；本批 2 条新臂 `--only` 单验各自转红。
+* 跨仓契约真跑 → **113 passed / 0 failed**（下限 110 已自复核）；hub 生命周期真栈 →
+  **35 passed / 0 failed**（下限 35）。两条都走"对端仓可见⇒真跑"那条臂，不是响亮跳过。
+* 变异矩阵整跑 → **94 臂（静态 88＋动态 6），分 12 块跑完，每块含基线绿，失守 0，
+  12/12 块 rc=0**。
+* 未跑（点名）：真机"每圈留痕"要装本版后满一个 30 分钟圈才取到第一条 `第 1 圈`——这一格
+  标为**待复验**，不写成已验。WSL 真栈 e2e 本机本轮未单独重跑，由 CI 的 `E2E real stack`
+  job 复证（v1.8.9 那轮该 job 为 success，本批改动面未碰协议/条目/hub）。
+
 ## [1.8.9] - 2026-10-27 · HA 启动被自己拖慢 9 分钟的根修（常驻任务不再计入启动收尾）
 
 ⚠ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新
