@@ -1019,5 +1019,10 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
             if hass.data.get(DOMAIN) is not None:
                 hass.data[DOMAIN]["_bootstrap_healer"] = None
 
-    runtime["_bootstrap_healer"] = hass.async_create_task(
+    # 常驻任务必须走 background 面：hass.async_create_task 建的是 eager 任务，
+    # 会被 HA 启动收尾 async_block_till_done 等——本任务永不出栈，2026-10-27 在
+    # .91 实测把每次 HA 启动顶到 bootstrap 超时（core 停 NOT_RUNNING 8 分 55 秒）。
+    # 收尾面不变：仍由"停机 / 启用条目清零"自退（HA 停机时 core.py:1177 会 cancel
+    # background 桶），句柄继续留在 runtime["_bootstrap_healer"] 供上面的幂等判活。
+    runtime["_bootstrap_healer"] = hass.async_create_background_task(
         _healer(), name=f"{DOMAIN}_bootstrap_healer")

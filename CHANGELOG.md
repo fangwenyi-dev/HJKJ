@@ -3,6 +3,92 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.8.9] - 2026-10-27 · HA 启动被自己拖慢 9 分钟的根修（常驻任务不再计入启动收尾）
+
+⚠ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新
+文件拷进 `/config/custom_components`，已加载的模块不换）。这次重启本身就能读到收益：
+启动到"就绪"的耗时应恢复到常规量级。
+
+### 现场与根因（192.168.1.91 一手日志，HA Core 2026.10.4）
+
+用户报管理面板里反复出现 `[发现代理] 引导失败（entries query failed），30s 后随下一条上报重试`。
+顺着查，拿到的是 HA Core 自己点名我们的两条 WARNING：
+
+    17:08:07 [homeassistant.bootstrap] Setup timed out for bootstrap waiting on
+             {<Task name='window_controller_gateway_bootstrap_healer' ... mqtt_bootstrap.py:982>}
+    17:08:22 [homeassistant.core] Something is blocking Home Assistant from wrapping up the
+             start up phase ... The system is waiting for tasks: {同一个 task}
+
+根因在我们自己：MQTT 引导自愈那个"每 30 分钟复查一次通道"的常驻任务，是用
+`hass.async_create_task(...)` 创建的。该 API 建的是 **eager 任务**，Home Assistant 收尾启动时
+会以 `async_block_till_done()` 等它跑完——而它按设计永不结束。于是每一次 HA 启动（重启、升级、
+reload）都被它顶到 bootstrap 超时：实测 `core_state=NOT_RUNNING` 持续 8 分 55 秒。这期间
+Supervisor 不转发 HA Core API，现场形态就是面板里凡走 `/api/ha/` 的格子全 502、加载项自己的
+格子全绿，外加上面那条「引导失败」。
+
+该常驻化由 v1.7.63（C-6「healer 真常驻」）引入；当时仓里已把它列为未验边界
+（"C-6 常驻 healer 跑满 1800s"），但没有任何一条门会因为它变红——本批把这条门补上了。
+
+### 改了什么
+
+* `mqtt_bootstrap.py`：常驻的引导自愈任务改由 `hass.async_create_background_task(...)` 创建。
+  HA 对该 API 的实物承诺是"不阻塞启动 / 停机自动取消 / `async_block_till_done` 不等它"
+  （上游 `core.py` 在现网 2026.10.4 与我们声明支持的下限 2024.12.0 上签名与语义一致，两版都逐字核过）。
+* `__init__.py`：同类第二处同改——心跳监听器的"无限期等待 MQTT 就绪再武装"任务
+  （每 120s 催一轮、指数退避封顶 3600s）。加载项重启或首配时 broker 晚于 HA 就绪的现场，
+  原来也会把启动同样拖住。
+* 两处任务的**收尾口径一字未动**：仍由"停机 / 慧尖启用条目清零"自行退出，武装任务句柄继续
+  登记在 `_bg_tasks` 由条目卸载统一取消；`_bootstrap_healer` 句柄仍在原位供幂等判活。
+* 协议面、用户配置、小程序侧零改动。
+
+### 用户可见的变化
+
+* 升级后重启一次 HA：启动到就绪恢复正常时长；面板不再出现成片 502，
+  `[发现代理] 引导失败（entries query failed）` 随同一根因消失。
+* 网关上报、发现卡片、配对与控制流程行为不变。
+
+### 已知代价（写明，不藏）
+
+* 修复入口卡片（设置 → 系统 → 问题）与"第二台 HA 撞名"提示的出现时机，从"启动过程中大概已有"
+  变成"启动完成后 healer 首圈补上"。通道本身不受影响，判据面也没放宽。
+* 真机启动秒数的 A/B 要在装有本版的机器上重启才取得到；本批发版账上如实标注为**待复验**，
+  不写成已验。
+
+### 量具
+
+新增 `tests/test_startup_blocking_resident_task.py` **15 条**：
+
+* 行为臂 1 条：常驻任务在场时 `async_block_till_done()` 必须在有界时间内返回，**且该任务
+  仍在运行**（不许靠"它正好结束了"蒙绿）；替身按上游实物分 eager / background 两个桶。
+* 类级 AST 钉：整个集成（**含子包**）凡"常驻循环被交给 eager 面"一律判红。载体三种
+  （`async_create_task` / `async_add_job` / `async_add_hass_job`——后两者默认落 `_tasks`，
+  按上游实物核过；显式 `background=True` 则不算），常驻形态三种（`while True`；循环里
+  ≥60s 等待；条件变量不在体内赋值且无 break/return 的无出口 while）。
+* 宇宙自检 2 条：扫描必须认出已知的两处常驻创建点（改名/挪走≠没有），且必须覆盖子包
+  （旧写法只吃顶层 glob，`mqtt_handler/` 整包落在判据之外——这是对抗复核抓出来、本批已闭的）。
+* 合成源码正反向臂 10 条：证明上面那条判据真会咬（Attribute 方法形态、`async_add_job`、
+  无出口 while 都判红；只换创建器的等价形态、体内会自清的防抖圈、有界 for、无循环长睡**不**
+  判红——反向半边不齐的判据等于没判据）。
+* 接线钉 1 条：换成 background 面不等于放弃原有收尾记账（`_bg_tasks` 与句柄仍在原位）。
+
+变异矩阵新增 3 臂（两处创建点翻回 eager、一条把扫描宇宙退回非递归），三条实测转红；
+另复跑锚在本批改动文件上的 14 条既有臂，14/14 符合预期，基线绿。85 条静态臂的锚点
+唯一性做了机器自检（防本批改动把别的臂改成"什么都没替换"的空跑）。
+
+### 门禁读数（本轮我自己跑，逐格点名）
+
+* `python3 -m pytest huijian_mqtt_broker/tests -q` → **1852 passed / 0 failed / 0 skipped**
+  （v1.8.8 账上基线 1837，+15＝本批新增判据）。
+* ruff（逐字取 ci.yaml 那条四段同参命令）→ All checks passed。
+* `bash -n run.sh`、`compileall` 递归、`node --check`（huijian.js / starsky.js）→ 全过。
+* `python3 -m pytest huijian_voice/tests -q` → 21 failed / 3474 passed / 11 skipped。
+  失败数与 v1.8.8 账上**同一批既有失败**，本批未触碰语音任何文件；另注：语音有 1 个文件
+  （`test_v122_uplink_opus_settings.py`）因本机缺 gitignored 的 `_winlibs/opus.dll` 无法收集，
+  属既有环境缺口，不是本批引入。
+* 未跑（点名，不写成已过）：①真机启动秒数 A/B——需装本版后重启才取得到；②全量 91 臂矩阵
+  未整跑，只跑了与本批文件相关的 17 臂＋锚点唯一性机器自检；③跨仓契约 110 条与 hub 真栈
+  35 条在 CI 仍走"响亮跳过"（两把只读 deploy key 未配，与 v1.8.8 同状态）。
+
 ## [1.8.8] - 2026-10-26 · 销售面复查批：三处对用户说了做不到的话 + 删除谎报成功的最后一处
 
 ⚠ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件

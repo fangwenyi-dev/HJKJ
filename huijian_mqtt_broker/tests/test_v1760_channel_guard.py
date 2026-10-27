@@ -109,6 +109,10 @@ class _HealHass:
     def async_create_task(self, coro, name=None):
         return asyncio.ensure_future(coro)
 
+    def async_create_background_task(self, coro, name, eager_start=True):
+        # 与真 HA 同签名（name 必需）；桶差异见 test_startup_blocking_resident_task
+        return asyncio.ensure_future(coro)
+
 
 def _run_healer(hass):
     async def main():
@@ -432,6 +436,7 @@ def test_awaiting_entry_loaded_but_deaf_is_loud(tmp_path, monkeypatch, caplog):
         loop=None,
         services=FakeServices(),
         async_create_task=lambda coro, name=None, **kw: asyncio.ensure_future(coro),
+        async_create_background_task=lambda coro, name, **kw: asyncio.ensure_future(coro),
         async_add_executor_job=None,
         config_entries=SimpleNamespace(
             async_entries=lambda dom: [SimpleNamespace(entry_id="EA", data={},

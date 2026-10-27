@@ -33,6 +33,10 @@ class _Hass:
     def async_create_task(self, coro, name=None):
         return asyncio.ensure_future(coro)
 
+    def async_create_background_task(self, coro, name, eager_start=True):
+        # 与真 HA 同签名（name 必需）；桶差异见 test_startup_blocking_resident_task
+        return asyncio.ensure_future(coro)
+
 
 def _mk(monkeypatch, marker_seq, ensure_effects=None):
     """marker_seq：has_bootstrap_marker 逐轮返回；ensure_effects：ensure 逐轮行为。

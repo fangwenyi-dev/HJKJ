@@ -48,6 +48,10 @@ class _Hass:
     def async_create_task(self, coro, name=None):
         return asyncio.ensure_future(coro)
 
+    def async_create_background_task(self, coro, name, eager_start=True):
+        # 与真 HA 同签名（name 必需）；桶差异见 test_startup_blocking_resident_task
+        return asyncio.ensure_future(coro)
+
 
 class _Pub:
     def __init__(self):
@@ -220,6 +224,7 @@ class TestBackoff:
             data={DOMAIN: {}}, is_stopping=False,
             config_entries=SimpleNamespace(async_entries=lambda d: list(entries)),
             async_create_task=lambda coro, name=None: asyncio.ensure_future(coro),
+            async_create_background_task=lambda coro, name, **kw: asyncio.ensure_future(coro),
         )
         markers = [True, True, True, True, True, True, True, True, True, True,
                    True, False]

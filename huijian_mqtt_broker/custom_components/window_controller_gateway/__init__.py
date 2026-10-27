@@ -741,7 +741,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 "127.0.0.1:2022）"
                             )
 
-                _arm_task = hass.async_create_task(
+                # 同 healer：等待面是"每 120s 催一轮、无限期"的常驻循环，用 eager 面
+                # 创建会被 async_block_till_done 计入启动收尾（broker 晚于 HA 就绪的
+                # 现场会把启动拖长）。句柄继续进 _bg_tasks，条目卸载取消口径不变。
+                _arm_task = hass.async_create_background_task(
                     _arm_heartbeat_when_mqtt_ready(),
                     name=f"{DOMAIN}_heartbeat_arm_{entry.entry_id}",
                 )

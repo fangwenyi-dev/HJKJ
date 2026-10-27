@@ -29,6 +29,10 @@ class _Hass:
     def async_create_task(self, coro, name=None):
         return asyncio.ensure_future(coro)
 
+    def async_create_background_task(self, coro, name, eager_start=True):
+        # 与真 HA 同签名（name 必需）；桶差异见 test_startup_blocking_resident_task
+        return asyncio.ensure_future(coro)
+
 
 def _endpoint(tmp_path, content):
     (tmp_path / mb.ENDPOINT_FILENAME).write_text(content, encoding="utf-8")

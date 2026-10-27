@@ -58,6 +58,8 @@ TUTILS = "tests/test_utils.py"
 T1760 = "tests/test_v1760_channel_guard.py"
 T1761AF = "tests/test_v1761_adversarial_followups.py"
 T1763H = "tests/test_v1763_healer_resident.py"
+# 2026-10-27 启动收尾阻塞批的判据文件（eager 面常驻任务的现网实锤）
+TSTARTUP = "tests/test_startup_blocking_resident_task.py"
 # v1.8.4 批次（审计 B-2/B-3 + Gitee 发布腿换载体）的被改文件与判据文件
 CTYPES = "custom_components/window_controller_gateway/mqtt_handler/_ctypes.py"
 CIY = "../.github/workflows/ci.yaml"       # _copy() 把 .github 一起带进副本
@@ -748,6 +750,32 @@ ARMS = [
      "G-4 第二条：无能力机型常态并排『不支持百分比定位』＋『位置: 65%』，"
      "这条矛盾不需要 /states 失败就存在",
      "tests/test_v1721_position_capability.py"),
+    # ── 2026-10-27 现网实锤：常驻任务用 eager 面创建 ⇒ 顶穿 HA 启动收尾 ──
+    # .91 上 HA Core 日志点名 window_controller_gateway_bootstrap_healer 把每次
+    # HA 启动拖到 bootstrap 超时（core 停 NOT_RUNNING 8 分 55 秒 ⇒ 面板 /api/ha/
+    # 全 502、发现代理刷『引导失败』）。两条臂各翻一个创建点，翻回去必须当场红。
+    ("startup_healer_back_to_eager_api", MB,
+     'runtime["_bootstrap_healer"] = hass.async_create_background_task(',
+     'runtime["_bootstrap_healer"] = hass.async_create_task(',
+     "resident_healer or no_resident_loop or background_sites_keep", "red",
+     "healer 是永不出栈的常驻巡查：回到 eager 面＝重新被 async_block_till_done 计入"
+     "启动收尾。行为臂（block_till_done 有界返回）与类级 AST 钉、接线钉三条同批红",
+     TSTARTUP),
+    ("startup_arm_back_to_eager_api", INIT,
+     "_arm_task = hass.async_create_background_task(",
+     "_arm_task = hass.async_create_task(",
+     "no_resident_loop or background_sites_keep", "red",
+     "同类第二处：心跳武装是『每 120s 催一轮、无限期』的等待面，broker 晚于 HA 就绪"
+     "的现场会把启动拖长；且翻回 eager 后 _bg_tasks 的卸载取消口径同批被钉住",
+     TSTARTUP),
+    # 判据自身的加固臂（对抗复核 2026-10-27：宇宙以前只吃顶层 glob，子包整包在判据外）
+    ("startup_judge_universe_narrowed_to_glob", TSTARTUP,
+     'for path in sorted(INTEGRATION.rglob("*.py")):',
+     'for path in sorted(INTEGRATION.glob("*.py")):',
+     "universe_is_recursive", "red",
+     "把扫描宇宙退回非递归＝mqtt_handler/ 整包走出判据底下，下一条 eager 常驻循环"
+     "会全绿漏过（本臂改的是判据文件本身，守的是『钉不许被悄悄变窄』）",
+     TSTARTUP),
 ]
 
 

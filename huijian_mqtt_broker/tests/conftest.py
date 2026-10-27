@@ -142,6 +142,12 @@ class HomeAssistant:
             return _DoneTask(coro)
         return _DoneTask()
 
+    def async_create_background_task(self, coro, name, **kw):
+        # 与真 HA 同签名（name 必需、无默认）；返回面与 async_create_task 同宽
+        if asyncio.iscoroutine(coro):
+            return _DoneTask(coro)
+        return _DoneTask()
+
     def add_job(self, job, *args):
         if callable(job):
             return job(*args)

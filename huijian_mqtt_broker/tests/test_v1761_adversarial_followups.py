@@ -110,6 +110,7 @@ def _arm_hass(tmp_path):
         loop=None,
         services=FakeServices(),
         async_create_task=lambda coro, name=None, **kw: asyncio.ensure_future(coro),
+        async_create_background_task=lambda coro, name, **kw: asyncio.ensure_future(coro),
         async_add_executor_job=None,
         config_entries=SimpleNamespace(
             async_entries=lambda dom: [SimpleNamespace(entry_id="EA", data={},
