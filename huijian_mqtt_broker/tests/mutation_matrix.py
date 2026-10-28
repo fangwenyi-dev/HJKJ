@@ -791,6 +791,32 @@ ARMS = [
      "节拍写成字面量＝改了 CHANNEL_VERIFY_INTERVAL 后痕里的秒数继续骗人说 30 分钟"
      "（本仓『文案与取值不同源』的老形态）",
      "tests/test_channel_verify_heartbeat.py"),
+    # ── 2026-10-28 v1.9.1 巡查面（可查询状态，不是日志级别）──
+    ("verify_phase_label_broken", MB,
+     '_record_channel_verify(hass, "verify", circles, verdict,',
+     '_record_channel_verify(hass, "off", circles, verdict,',
+     "records_queryable_state", "red",
+     "phase 写错＝面板分不清『通道核验圈』与『引导未落地圈』，第 1 条判据按实物相位判",
+     "tests/test_channel_verify_surface.py"),
+    ("verify_view_loses_not_ran_shape", "custom_components/window_controller_gateway/api.py",
+     'return state if isinstance(state, dict) else {"ran": False}',
+     'return state if isinstance(state, dict) else {}',
+     "exposes_channel_verify", "red",
+     "从未巡查时回空对象＝面板拿不到 ran 标志，退回兜底后『未巡查』与『功能没做』同形"
+     "（本批改动的核心承诺就是不许再哑）",
+     "tests/test_channel_verify_surface.py"),
+    ("verify_row_carrier_element_renamed", "www/index.html",
+     'id="hubVerifyTip"',
+     'id="hubVerifyTipX"',
+     "panel_renders_the_row", "red",
+     "删/改承载元素＝那行渲染不出来，视图字段再全也到不了用户眼前（接线半条要单独钉）",
+     "tests/test_channel_verify_surface.py"),
+    ("panel_staleness_hardcoded_seconds", "www/js/huijian.js",
+     "typeof cv.intervalS === 'number' ? cv.intervalS : 0",
+     "1800",
+     "panel_renders_the_row", "red",
+     "超时判定硬编 1800 秒＝服务端改了巡查节拍后面板仍按旧节拍判『正常』（文案与取值分家）",
+     "tests/test_channel_verify_surface.py"),
 ]
 
 

@@ -171,6 +171,18 @@ def _hub_client(hass):
     return domain_data.get(HUB_DATA_KEY)
 
 
+def _channel_verify_view(hass: HomeAssistant) -> dict:
+    """MQTT 通道巡查的正面数据面（healer 每圈写；从未巡查显式回 ran=False）。
+
+    为什么不靠日志：现网实测 `/api/hassio/core/logs` 只回 WARNING 以上，v1.8.10 那条
+    每圈 INFO 留痕在用户与我都能读的通道里不可见 ⇒ 观测面要落在可查询的数据上。
+    缺键会让面板退回兜底、看着像"功能没实现"，所以"没跑过"也要有明确形状。
+    """
+    from .mqtt_bootstrap import CHANNEL_VERIFY_STATE_KEY
+    state = (hass.data.get(DOMAIN) or {}).get(CHANNEL_VERIFY_STATE_KEY)
+    return state if isinstance(state, dict) else {"ran": False}
+
+
 class WindowGatewayHubView(http.HomeAssistantView):
     """v0.1(P0): 慧尖云 hub 绑定状态只读视图——插件页展示"扫码绑定"用。
 
@@ -191,10 +203,13 @@ class WindowGatewayHubView(http.HomeAssistantView):
         hass = request.app["hass"]
         client = _hub_client(hass)
         if client is None:
-            return self.json({"enabled": False})
+            # 无长连也要回巡查面：healer 活在条目 setup 上，与云绑定无关
+            return self.json({"enabled": False,
+                              "channelVerify": _channel_verify_view(hass)})
         await client.maybe_refresh_members()
         view = client.status_view()
         view["enabled"] = True
+        view["channelVerify"] = _channel_verify_view(hass)
         return self.json(view)
 
 

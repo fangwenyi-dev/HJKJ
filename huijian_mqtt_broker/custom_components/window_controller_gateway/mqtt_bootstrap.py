@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from homeassistant.core import HomeAssistant
@@ -907,6 +908,30 @@ def _enabled_huijian_entry_count(hass: HomeAssistant) -> int:
         return 1
 
 
+#: healer 每圈写入的可查询状态键（面板/只读视图消费；见 CHANNEL_ISSUE_ID 那段核验）
+CHANNEL_VERIFY_STATE_KEY = "_channel_verify"
+
+
+def _record_channel_verify(hass: HomeAssistant, phase: str, circles: int,
+                           verdict: Optional[str], card_up: bool,
+                           interval: float) -> None:
+    """把"巡查还在跑"做成**可查询的面**，而不是取决于日志级别的一行字。
+
+    现网实锤（2026-10-28，.91 装 v1.8.10）：`/api/hassio/core/logs` 只回 WARNING 以上
+    （实测级别分布 {WARNING: 37}，HA 启动必打的 INFO 探针 0 命中），所以 v1.8.10 那条
+    每圈 INFO 留痕在用户与我都能读的通道里不可见 ⇒ 观测面必须落到数据上。
+    """
+    hass.data.setdefault(DOMAIN, {})[CHANNEL_VERIFY_STATE_KEY] = {
+        "ran": True,
+        "phase": phase,                     # verify＝通道核验圈；bootstrap＝引导未落地重试圈
+        "circles": circles,                 # 不涨＝巡查死了；同值多时＝卡在同一圈
+        "verdict": verdict,
+        "cardUp": bool(card_up),
+        "intervalS": float(interval),       # 面板据此判"超时未更新"，不硬编秒数
+        "atIso": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
 def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
     """A（用户 2026-09 拍板）：bootstrap 持久自愈。
 
@@ -985,12 +1010,15 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                     # 既可能是健康也可能是任务早已静默死亡（v1.7.61 S2 同族）。所以每圈
                     # 留一条痕：圈号（数不清=卡在同一圈）、verdict、卡片态、节拍现值。
                     circles += 1
+                    _card_ok = verdict in ("ok", "no_endpoint")
                     _LOGGER.info(
                         "[通道核验] 第 %d 圈：verdict=%s 卡片=%s（节拍 %ds，每圈一条）",
                         circles, verdict,
-                        "已清" if verdict in ("ok", "no_endpoint") else "在挂",
+                        "已清" if _card_ok else "在挂",
                         int(CHANNEL_VERIFY_INTERVAL),
                     )
+                    _record_channel_verify(hass, "verify", circles, verdict,
+                                           not _card_ok, CHANNEL_VERIFY_INTERVAL)
                     if not await _interruptible_sleep(hass, CHANNEL_VERIFY_INTERVAL):
                         return
                     continue
@@ -1019,6 +1047,9 @@ def async_start_bootstrap_healer(hass: HomeAssistant) -> None:
                     # 核验分支决定——落地 ≠ 通道健康，不得在此直接退出。
                     continue
                 _report_takeover_issue(hass)
+                # 引导未落地的重试圈同样要可判"巡查活着"（这段周期最长 1h，
+                # 只记 verify 分支就等于把最常见的启动期留成哑的）
+                _record_channel_verify(hass, "bootstrap", rounds, None, True, delay)
                 # v1.7.31（A-1）：单发 sleep(封顶 3600s) 改切片——one-shot
                 # 长睡对停机信号无感，会把 async_stop 各阶段的 block_till_done
                 # 预算顶到超时（真源实证 async_stop 确有 async_timeout 保护，

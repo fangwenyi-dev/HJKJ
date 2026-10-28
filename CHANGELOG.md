@@ -3,6 +3,85 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.9.1] - 2026-10-28 · MQTT 通道巡查改成"可查询的面"（上一版那句"从日志可判"没做到，本版补上）
+
+⚠ **本批改了集成 Python 代码与面板：升级加载项后请再重启一次 Home Assistant**（重启加载项只
+把新文件拷进 `/config/custom_components`，已加载的模块不换）。
+
+### 一、为什么要再发一版：上一版的承诺没兑现
+
+v1.8.10 给常驻通道核验加了"每圈一条 INFO 留痕"，并在发版说明里写"巡查是否还活着，从日志
+可判"。**这句做不到**——升级后实测（192.168.1.91，1.8.10 已在跑，08:40 重启）：
+
+* 那条 `[通道核验]` 留痕在日志里 **0 命中**；
+* 取那 100 行做级别分布统计 = `{WARNING: 37}`，INFO 与 ERROR **各 0**；
+* 阳性对照：HA 每次启动必然打的 `Setting up …`、`Home Assistant 2026`、`Ready` 三条探针
+  **全部 0 命中** ⇒ 不是"那两分钟恰好没有 INFO"，而是
+  `GET /api/hassio/core/logs` 这条通道**只回 WARNING 以上**。
+
+⇒ 用户和运维都能读的那条通道里，INFO 级留痕永远不可见；"从日志可判"是空话。这一格与
+v1.8.9 那条"卡片延后"是同一类错误：**把推断当成了实测**。本版把观测面落到数据上，并在
+判据里把"不许再靠日志级别"钉住。
+
+### 二、改了什么
+
+* `mqtt_bootstrap.py`：healer 每圈把状态写进 `hass.data[DOMAIN]["_channel_verify"]`——
+  `{ran, phase, circles, verdict, cardUp, intervalS, atIso}`。`phase` 分两态：
+  `verify`（通道已落地后的 30 分钟复查圈）与 `bootstrap`（引导未落地期的重试圈，
+  间隔 300s 起指数退避封顶 1h）。**两条分支都记**：只记健康分支就等于把最常见的启动期
+  留成哑的。原来的 INFO 留痕保留，作为人在 HA UI 里想看时的面包屑，级别不动
+  （抬成 WARNING 会变成每天 48 条伪警告，把真告警埋掉——那是更坏的形态）。
+* `api.py`：只读视图 `GET /api/window_controller_gateway/hub` 增加 `channelVerify` 字段，
+  **两条返回路径都带**（无云长连时如实回 `enabled:false` 那条也带——巡查活在条目 setup 上，
+  与云绑定无关）；从未巡查过显式回 `{"ran": false}`，不留空键（缺键会让面板退回兜底，
+  在用户眼里跟"功能没做"同形）。
+* 面板（`www/index.html` + `huijian.js`）：远程控制卡新增一行"巡查状态：第 N 圈 · verdict ·
+  卡片已清/在挂 · X 秒前"；超过**两个节拍**未更新就转灰并提示
+  "⚠ 已超两个节拍未更新，巡查可能已停"。节拍用服务端回的 `intervalS` 现值算，不硬编 1800。
+
+用户可见效果：**MQTT 通道巡查是否还在跑，从此在面板上直接看得见**，不需要翻日志、不需要
+改日志级别、也不需要破坏现网通道去试探。
+
+### 三、顺带确证（同一份现网日志，升级 1.8.10 后的重启）
+
+`Restarting homeassistant` 08:40:17 → `Detect a running Home Assistant instance` 08:41:14
+= **57 秒**（`NOT_RUNNING→RUNNING` 25 秒），与 v1.8.9 那轮的 56.5s / 25.0s 一致；
+故障样本（1.8.8）是 **8 分 55 秒 / 8 分 45 秒**。窗口内 `Setup timed out for bootstrap`、
+`blocking … start up phase`、`bootstrap_healer`、ERROR 级 **全部 0 命中**；加项日志
+`引导失败` / `entries query failed` / `502` **各 0 命中**，且自己写了
+`[集成] 版本变化: 1.8.9 → 1.8.10，更新集成`。⇒ **v1.8.9 那个根修两次独立重启复现成立**。
+
+### 四、已知代价与未做（不藏）
+
+* 巡查状态是**进程内**数据：HA 重启后 `circles` 从 1 重新开始，`ran:false` 会短暂出现到
+  healer 跑完第一圈为止（秒级）。不做持久化是刻意的——持久化会造出"上次巡查是三天前"
+  这种看起来像故障的假象。
+* 面板那一行只在打开"远程控制"卡时随视图刷新，不是实时推送。
+* 本版**未做**：把 2027.8.0 / 2027.10.0 两条弃用告警按类扫全修（`async_get_device` 17 处
+  ＋ `DeviceEntry.config_entries` 读点；下限 2024.12.0 没有新 API，只能做双形态出口，
+  两版各验一臂）。本轮日志再次实测到两条形态都还在。要修请点名，那是另一刀的工程量。
+
+### 五、量具与门禁读数（我自己跑，未跑逐格点名）
+
+新增 `tests/test_channel_verify_surface.py` **5 条**：驱 healer 两圈后状态必须 `circles=2`、
+`verdict` 取最新一圈、`cardUp` 与判定一致、`intervalS` 等于常量现值、`atIso` 可解析；
+引导未落地分支同样必须记（`phase=bootstrap`）；视图两条返回路径都带 `channelVerify`；
+从未巡查必须显式 `ran:false`；面板接线按盘上交付形状判（承载元素、`ran` 两态、超时判定
+取 `intervalS`、"未巡查"文案、渲染单一出口）。
+
+变异矩阵新增 **4 臂**（相位写错、`ran:false` 兜底退化成空对象、承载元素改名、面板硬编
+1800 秒），四条实测各自转红；既有两臂（留痕降级 DEBUG、节拍写字面量）继续红。
+矩阵现 **98 臂**（静态 92＋动态 6），静态臂锚点唯一性机器自检全部命中且唯一。
+
+* `python3 -m pytest huijian_mqtt_broker/tests -q` → **1860 passed / 0 failed / 0 skipped**
+  （v1.8.10 基线 1855，+5＝本批新增判据）。
+* ruff（逐字取 ci.yaml 四段同参）→ All checks passed；`bash -n run.sh`、`compileall` 递归、
+  `node --check` ×3 全过。
+* 跨仓契约真跑 → **113 passed / 0 failed**；hub 生命周期真栈 → **35 passed / 0 failed**。
+* 变异矩阵整跑 → **98 臂、分块跑完、每块含基线绿、失守 0**。
+* 现网面板那一行的实际渲染需装本版后目视（我在 LAN 读不到 ingress 页面本体，端口 10998
+  按设计对 LAN 一律 403）⇒ 这一格发版账上标为**待复验**，不写成已验。
+
 ## [1.8.10] - 2026-10-28 · 给常驻通道核验加"每圈留痕"（巡查是否还在跑，从日志不可判 → 可判）；并更正上一版一条不存在的代价
 
 ⚠ **本批改了集成 Python 代码：升级加载项后请再重启一次 Home Assistant**（重启加载项只把新

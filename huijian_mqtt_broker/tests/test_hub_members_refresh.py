@@ -162,7 +162,9 @@ def test_member_views_pass_through_op_error():
 def test_hub_view_without_client_still_reports_disabled():
     out = {}
     asyncio.run(_view(api.WindowGatewayHubView, out).get(_FakeRequest(_FakeHass())))
-    assert out == {"enabled": False}, out
+    # v1.9.1 起这条路径还要带巡查面（healer 活在条目 setup 上，与云绑定无关）。
+    # 钉仍用**全等**：新增键必须显式过一遍脑子，不许让视图悄悄长字段。
+    assert out == {"enabled": False, "channelVerify": {"ran": False}}, out
 
 
 def test_hub_view_reads_the_singleton():

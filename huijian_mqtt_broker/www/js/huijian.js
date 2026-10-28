@@ -441,6 +441,34 @@
             const expEl = document.getElementById('hubCodeExp');
             const errEl = document.getElementById('hubError');
             if (!dot || !statusEl || !codeEl || !gwEl) return;
+            // v1.9.1：巡查状态走视图字段，不走日志——现网实测 /api/hassio/core/logs 只回
+            // WARNING 以上，每圈 INFO 留痕在用户与我都能读的通道里不可见（判据见
+            // tests/test_channel_verify_surface.py 头注）。"未巡查"必须显式说出来，
+            // 留空与"功能没做"在用户眼里同形。
+            const verifyEl = document.getElementById('hubVerifyTip');
+            if (verifyEl) {
+                const cv = (info && info.channelVerify) || null;
+                if (failed || !info) {
+                    verifyEl.textContent = '巡查状态：未取得（读 /hub 视图失败）';
+                    verifyEl.className = 'hub-code-exp';
+                } else if (!cv || !cv.ran) {
+                    verifyEl.textContent = '巡查状态：未巡查（本进程内 MQTT 通道巡查还没跑过——'
+                        + '刚重启过会在条目加载时跑第一圈）';
+                    verifyEl.className = 'hub-code-exp expired';
+                } else {
+                    const iv = typeof cv.intervalS === 'number' ? cv.intervalS : 0;
+                    const age = cv.atIso
+                        ? Math.max(0, Math.round((Date.now() - new Date(cv.atIso).getTime()) / 1000))
+                        : null;
+                    const stale = iv > 0 && age !== null && age > iv * 2;
+                    verifyEl.textContent = '巡查状态：第 ' + cv.circles + ' 圈 · '
+                        + (cv.verdict || cv.phase || '?') + ' · 卡片'
+                        + (cv.cardUp ? '在挂' : '已清') + ' · '
+                        + (age === null ? '时间未知' : age + ' 秒前')
+                        + (stale ? ' ⚠ 已超两个节拍未更新，巡查可能已停' : '');
+                    verifyEl.className = 'hub-code-exp' + (stale ? ' expired' : '');
+                }
+            }
             if (failed || !info || !info.enabled) {
                 // 读取失败与"未启用"必须分开显示：故障伪装成正常态会让排障从第一步就走错
                 dot.className = 'dot ' + (failed ? 'dot-err' : 'dot-unknown');
