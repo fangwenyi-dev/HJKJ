@@ -6,6 +6,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
+from .utils import get_device_by_sn
 from .const import (
     DOMAIN,
     CONF_GATEWAY_SN,
@@ -91,9 +92,7 @@ async def async_discover_gateway(hass: HomeAssistant, gateway_sn: str, gateway_n
 
     # 4. 检查网关是否已在设备注册表中
     device_registry = dr.async_get(hass)
-    existing_device = device_registry.async_get_device(
-        identifiers={(DOMAIN, gateway_sn)}
-    )
+    existing_device = get_device_by_sn(device_registry, gateway_sn)
     
     if existing_device:
         _LOGGER.debug("网关 %s 已在设备注册表中，跳过发现", gateway_sn)

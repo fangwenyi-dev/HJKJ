@@ -54,6 +54,16 @@ RETRY_HTTP_FAIL = 30.0
 SEED_RETRY_COOLDOWN = 30.0
 
 
+class EntriesQueryFailed(RuntimeError):
+    """读 HA 配置条目列表这一步失败（v1.9.2，与"引导失败"分家）。
+
+    旧实现把它和真引导失败挤进同一句 `引导失败（entries query failed）`：
+    归因错位（那一刻坏的是 REST 读，引导链根本没被尝试），且 list_entries_impl
+    把 URLError/HTTPError/OSError 全吞成 None ⇒ 502 / 拒绝连接 / 缺 token 三种
+    病因在日志里不可区分。本类型的消息**必须带异常类名与摘要**。
+    """
+
+
 def parse_report(raw: str):
     """解析一行 rpt_rsp；返回 (sn, ctype)，非触发报文返回 None。
 
@@ -270,9 +280,17 @@ class DiscoveryProxy:
         # 自动发现静默死亡直到容器重启。domain 判定同步补 state 过滤：
         # 禁用/not_loaded 条目没挂心跳监听器，不算耳朵。改为每条上报实时
         # list（一条 GET/≤10s，代价可忽略），上层 _next_try 冷却限频。
-        entries = self._list()
+        # v1.9.2：读失败按类归口成 EntriesQueryFailed——"读这一步"抛出的
+        # 任意异常（含注入桩回 None、缺 token 的 RuntimeError、未来新形态）
+        # 都不许冒充"引导失败"，否则日志把人引去查根本没坏的自动发现。
+        try:
+            entries = self._list()
+        except EntriesQueryFailed:
+            raise
+        except Exception as e:  # noqa: BLE001 — 归口，不是吞：类名+摘要照抄进消息
+            raise EntriesQueryFailed(f"{type(e).__name__}: {e}") from e
         if entries is None:  # 查询失败 → 不改变结论，走重试退避
-            raise RuntimeError("entries query failed")
+            raise EntriesQueryFailed("未给出原因（注入桩回 None）")
         return any(
             e.get("domain") == DOMAIN
             and (e.get("state") is None or e.get("state") == "loaded")
@@ -373,6 +391,12 @@ class DiscoveryProxy:
                 except Exception:
                     pass
                 self._log("[发现代理] 已重放上报×2，集成内部发现链应弹出网关卡片")
+        except EntriesQueryFailed as e:
+            # v1.9.2：读条目列表失败单独一条分支——本帧连"要不要引导"都还没判出来，
+            # 叫它"引导失败"是错位归因；根因（类名+摘要）必须留在日志里。
+            self._next_try = self._now() + RETRY_HTTP_FAIL
+            self._log(f"[发现代理] 读取 HA 条目列表失败（{e}），本帧未尝试引导；"
+                      f"{int(RETRY_HTTP_FAIL)}s 后随下一条上报重试")
         except Exception as e:
             self._next_try = self._now() + RETRY_HTTP_FAIL
             self._log(f"[发现代理] 引导失败（{e}），{int(RETRY_HTTP_FAIL)}s 后随下一条上报重试")
@@ -428,8 +452,8 @@ def _ack_factory(port, user, password):
 def list_entries_impl():
     try:
         return ha_api("/config/config_entries/entry")
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError):
-        return None
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:
+        raise EntriesQueryFailed(f"{type(e).__name__}: {e}") from e
 
 
 def create_ears_impl():

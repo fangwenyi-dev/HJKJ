@@ -294,8 +294,22 @@ class TestViaDeviceCompat:
             SimpleNamespace(config_entries={"a", "b"})) == {"a", "b"}
         assert gw_utils.get_device_config_entry_ids(
             SimpleNamespace(config_entry_id="c")) == {"c"}
+        # v1.9.2 改判（写明理由防被当"漏删"补回）：旧第三臂断言
+        # `config_entries={"a"} 且 config_entry_id="b" ⇒ {"a","b"}`，但上游逐版
+        # 源码实证**没有任何一代**能让 config_entries 含 config_entry_id 之外的值：
+        #   ≤2026.7.1：只有 attrs 字段 config_entries，无 config_entry_id；
+        #   ≥2026.9.0：config_entry_id 是字段，config_entries 退化成 property、
+        #             非复合设备恒回 {config_entry_id}（读了还吃一条弃用 WARNING）。
+        # ⇒ 那个形态只活在替身里，"并集"判据钉的是我当时的臆测而不是实测事实。
+        # 第三臂换成唯一能让并集真变宽的**可达**形态：restored composite
+        # （迁移前一条标识符属多条目；上游对它不告警，因为并集只有它有）。
         assert gw_utils.get_device_config_entry_ids(
-            SimpleNamespace(config_entries={"a"}, config_entry_id="b")) == {"a", "b"}
+            SimpleNamespace(config_entries={"a", "b"}, config_entry_id="a",
+                            is_composite_device=True)) == {"a", "b"}
+        # 形制优先级臂（真机不可达，只钉"两个面都在时谁说了算"）：非复合设备
+        # 以 config_entry_id 为唯一真值，绝不回读弃用面
+        assert gw_utils.get_device_config_entry_ids(
+            SimpleNamespace(config_entries={"a", "b"}, config_entry_id="a")) == {"a"}
         assert gw_utils.get_device_config_entry_ids(SimpleNamespace()) == set()
 
     @pytest.mark.asyncio

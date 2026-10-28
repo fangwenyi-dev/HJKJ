@@ -25,6 +25,10 @@ from .const import (
     get_device_display_name,
 )
 from .persist import save_persistent_data, take_last_save_error
+# v1.9.2：设备注册表两个弃用面（async_get_device 2027.8.0 停摆、
+# DeviceEntry.config_entries 2027.10.0 停摆）一律经 utils 双形态出口，
+# 调用点直调/直读由 tests/test_device_registry_deprecation_egress AST 钉拦。
+from .utils import get_device_by_sn, get_device_config_entry_ids
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -620,9 +624,7 @@ class WindowControllerDeviceManager:
             try:
                 device_registry = await self._get_device_registry()
                 # 查找设备
-                device = device_registry.async_get_device(
-                    identifiers={(DOMAIN, device_sn)}
-                )
+                device = get_device_by_sn(device_registry, device_sn, self.entry.entry_id)
                 if device:
                     # 检查配置条目是否存在
                     config_entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
@@ -643,7 +645,8 @@ class WindowControllerDeviceManager:
                         )
                         
                         # 验证设备关联是否正确更新
-                        if self.entry.entry_id in updated_device.config_entries:
+                        if (self.entry.entry_id
+                                in get_device_config_entry_ids(updated_device)):
                             _LOGGER.info("设备已成功关联到当前配置条目: %s", device_sn)
                         else:
                             _LOGGER.warning("设备未成功关联到当前配置条目: %s", device_sn)
@@ -654,9 +657,8 @@ class WindowControllerDeviceManager:
                         # 改为解析网关注册表 id 后比对（本方法已确认设备关联成功才到
                         # 这里，属诊断日志修正，不影响功能路径）
                         from .utils import get_via_device_id
-                        gateway_reg_device = device_registry.async_get_device(
-                            identifiers={(DOMAIN, self.gateway_sn)}
-                        )
+                        gateway_reg_device = get_device_by_sn(
+                            device_registry, self.gateway_sn, self.entry.entry_id)
                         via_id = get_via_device_id(updated_device)
                         if gateway_reg_device and via_id == gateway_reg_device.id:
                             _LOGGER.info("设备已成功关联到当前网关: %s", device_sn)
@@ -891,9 +893,7 @@ class WindowControllerDeviceManager:
         try:
             device_registry = await self._get_device_registry()
             # 查找设备
-            device = device_registry.async_get_device(
-                identifiers={(DOMAIN, device_sn)}
-            )
+            device = get_device_by_sn(device_registry, device_sn, self.entry.entry_id)
             if device:
                 from .utils import call_registry_method as _call_reg
                 await _call_reg(device_registry.async_remove_device, device.id)
@@ -1072,9 +1072,7 @@ class WindowControllerDeviceManager:
 
         device_registry = async_get_device_registry(self.hass)
         # 直接通过 identifiers 查找设备，避免遍历整个设备注册表
-        device_entry = device_registry.async_get_device(
-            identifiers={(DOMAIN, device_sn)}
-        )
+        device_entry = get_device_by_sn(device_registry, device_sn, self.entry.entry_id)
         if device_entry:
             await _call_reg(
                 device_registry.async_update_device,
@@ -1233,7 +1231,7 @@ class WindowControllerDeviceManager:
             from .utils import call_registry_method as _call_reg
             entity_registry = await self._get_entity_registry()
             device_registry = await self._get_device_registry()
-            device = device_registry.async_get_device(identifiers={(DOMAIN, device_sn)})
+            device = get_device_by_sn(device_registry, device_sn)
             target_entry = self.hass.config_entries.async_get_entry(target_entry_id)
             
             if device and target_entry:
@@ -1394,14 +1392,10 @@ class WindowControllerDeviceManager:
         entity_registry = await self._get_entity_registry()
         
         # 获取旧网关设备
-        old_gateway_device = device_registry.async_get_device(
-            identifiers={(DOMAIN, old_gateway_sn)}
-        )
+        old_gateway_device = get_device_by_sn(device_registry, old_gateway_sn)
         
         # 获取新网关设备
-        new_gateway_device = device_registry.async_get_device(
-            identifiers={(DOMAIN, new_gateway_sn)}
-        )
+        new_gateway_device = get_device_by_sn(device_registry, new_gateway_sn, self.entry.entry_id)
         
         if not old_gateway_device or not new_gateway_device:
             _LOGGER.error("无法获取网关设备信息")
@@ -1415,9 +1409,7 @@ class WindowControllerDeviceManager:
         
         for device_sn in old_gateway_devices:
             # 查找设备在注册表中的记录
-            device = device_registry.async_get_device(
-                identifiers={(DOMAIN, device_sn)}
-            )
+            device = get_device_by_sn(device_registry, device_sn)
             
             if not device:
                 _LOGGER.warning("设备在注册表中未找到: %s，跳过", device_sn)
@@ -1464,9 +1456,7 @@ class WindowControllerDeviceManager:
         
         for device_sn in migrated_devices:
             # 获取子设备在设备注册表中的设备ID
-            child_device = device_registry.async_get_device(
-                identifiers={(DOMAIN, device_sn)}
-            )
+            child_device = get_device_by_sn(device_registry, device_sn)
             
             if not child_device:
                 _LOGGER.warning("子设备在设备注册表中未找到: %s", device_sn)
@@ -1550,9 +1540,7 @@ class WindowControllerDeviceManager:
                     for device_sn in device_sns:
                         # 边界匹配（device_sn 前后均有下划线），避免 SN 前缀重叠误关联
                         if entity_entry.unique_id and f"_{device_sn}_" in entity_entry.unique_id:
-                            new_device = device_registry.async_get_device(
-                                identifiers={(DOMAIN, device_sn)}
-                            )
+                            new_device = get_device_by_sn(device_registry, device_sn)
                             if new_device and entity_entry.config_entry_id != self.entry.entry_id:
                                 await _call_reg(
                                     entity_registry.async_get_or_create,
@@ -1568,9 +1556,7 @@ class WindowControllerDeviceManager:
                             break
 
         for device_sn in device_sns:
-            device = device_registry.async_get_device(
-                identifiers={(DOMAIN, device_sn)}
-            )
+            device = get_device_by_sn(device_registry, device_sn)
             if device:
                 await self._notify_device_added_callbacks(
                     device_sn, device.name, DEVICE_TYPE_WINDOW_OPENER
@@ -1589,9 +1575,7 @@ class WindowControllerDeviceManager:
         # 均不存在于 DeviceEntry，本函数永远返回空表，迁移快照、转移实体
         # （_transfer_entities_complete 依赖此清单）、跨网关冲突通知的设备
         # 获取全部静默落空。改为解析网关设备 id 后按 via_device_id 比对
-        gateway_reg_device = device_registry.async_get_device(
-            identifiers={(DOMAIN, gateway_sn)}
-        )
+        gateway_reg_device = get_device_by_sn(device_registry, gateway_sn)
         if gateway_reg_device is None:
             _LOGGER.debug("网关 %s 尚无注册表条目，无子设备可查", gateway_sn)
             return gateway_devices
@@ -1745,9 +1729,7 @@ class WindowControllerDeviceManager:
         try:
             from .utils import call_registry_method as _call_reg
             device_registry = await self._get_device_registry()
-            old_gateway_device = device_registry.async_get_device(
-                identifiers={(DOMAIN, old_gateway_sn)}
-            )
+            old_gateway_device = get_device_by_sn(device_registry, old_gateway_sn)
             
             if old_gateway_device:
                 # 从设备注册表中删除旧网关设备（v1.6.3 收口：经 call_registry_method）
@@ -1843,9 +1825,7 @@ class WindowControllerDeviceManager:
 
             for device_sn in old_gateway_devices:
                 # 在注册表中定位该设备（identifiers 精确匹配）
-                device = device_registry.async_get_device(
-                    identifiers={(DOMAIN, device_sn)}
-                )
+                device = get_device_by_sn(device_registry, device_sn)
                 if not device:
                     _LOGGER.warning("回滚时未找到设备 %s，跳过", device_sn)
                     continue

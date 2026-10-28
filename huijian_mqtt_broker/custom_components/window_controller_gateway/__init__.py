@@ -32,7 +32,7 @@ from .api import async_setup_api
 from .hub_client import (HUB_DEFAULT_BASE, HUB_DEFAULT_INSTALL_KEY, HubClient,
                          resolve_hub_base)
 from .utils import (is_mqtt_loaded, iter_devices, async_write_instance_uuid_file,
-                    log_throttled)
+                    get_device_by_sn, log_throttled)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1273,9 +1273,8 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     gateway_device_id = None  # v1.6.12：子设备匹配用（删除前捕获）
     try:
         device_registry = dr.async_get(hass)
-        gateway_device = device_registry.async_get_device(
-            identifiers={(DOMAIN, gateway_sn)}
-        )
+        gateway_device = get_device_by_sn(device_registry, gateway_sn,
+                                          entry.entry_id)
         if gateway_device:
             gateway_device_id = gateway_device.id
             # 仅当该设备只关联到当前（被删除的）配置条目时才整删。

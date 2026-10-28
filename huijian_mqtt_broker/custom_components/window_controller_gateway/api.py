@@ -16,7 +16,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN, HUB_DATA_KEY
-from .utils import iter_devices
+from .utils import get_device_config_entry_ids, iter_devices
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -124,14 +124,10 @@ class WindowGatewayDevicesView(http.HomeAssistantView):
 
         all_devices = []
         for device in iter_devices(registry):  # v1.7.28：双形态兼容遍历（iter_devices 单一出口）
-            # 兼容新旧 HA：config_entries (set) 取代旧版 config_entry_id (str)
-            entry_ids = set()
-            ce = getattr(device, "config_entries", None)
-            if ce:
-                entry_ids.update(ce)
-            ce_id = getattr(device, "config_entry_id", None)
-            if ce_id:
-                entry_ids.add(ce_id)
+            # v1.9.2：两代取值收口进 utils 出口。此处原是第三份"两代都读"的抄本，
+            # 且把弃用面排在前面——新 HA 上每台设备每次视图都读一遍
+            # DeviceEntry.config_entries（现网 Core 日志实锤 WARNING，2027.10.0 停摆）
+            entry_ids = get_device_config_entry_ids(device)
             all_devices.append({
                 "id": device.id,
                 "name": device.name_by_user or device.name or "",

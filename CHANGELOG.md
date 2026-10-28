@@ -3,6 +3,49 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.9.2] - 2026-10-28 · 两类"日志在骗人"的缺陷按类收口（发现代理归因错位 + 设备注册表 2027 停摆面）
+
+本批两处都是**现网实锤**（192.168.1.91，1.9.1 在跑）：①日志把"读不到 HA 条目列表"写成"引导失败"，
+把人引去查根本没坏的自动发现；②HA Core 日志点名本集成两条弃用告警。**无新增用户可见功能；
+本批改了集成 Python 代码，升级加载项后请再重启一次 Home Assistant**（重启加载项只把新文件拷进
+`/config/custom_components`，已加载的模块不换）。
+
+### 一、发现代理：读失败不再冒充"引导失败"，根因不再被吞
+
+`[发现代理] 引导失败（entries query failed）` 这句有两重错：那一刻坏的是**读**这一步（REST 502／
+拒绝连接／缺 token），引导链根本没被尝试；而 `list_entries_impl` 把 URLError/HTTPError/OSError
+全吞成 None ⇒ 三种病因在日志里挤成同一个自造字面量。现在读失败单独成类，日志改成
+`读取 HA 条目列表失败（HTTPError: HTTP Error 502 …），本帧未尝试引导；30s 后随下一条上报重试`；
+过了读之后的真引导失败仍叫"引导失败"（反向臂已钉），30s 退避窗与行为不变。
+
+### 二、设备注册表：两个 2027 停摆面收口到双形态出口
+
+上游 2026.10.4 源码逐字核过：`device_registry.async_get_device` **2027.8.0** 停摆、
+`DeviceEntry.config_entries` **2027.10.0** 停摆，两条 WARNING 都是本集成在打（09:55:29／09:55:51）。
+新增 `utils.get_device_by_sn()` 收口 **17 处**标识符查找；`get_device_config_entry_ids()` 改判取值
+顺序，收口 **3 处**属性直读（含设备视图里那份自己抄的"两代都读"）。分形按**属性存在性**判定：
+新 HA 走 `async_get_device_by_identifier`／`async_get_devices`，manifest 声明下限 2024.12.0 仍走
+当时唯一可用的形态 ⇒ 台架真 HA 2026.1.3 全链路实跑通过。两个等价性细节：条目作用域未命中
+**回退跨条目查询**（迁移／接管现场设备此刻还挂在旧条目上，未命中不许当"设备不存在"）；同一条
+标识符对应多个 split 时保留旧调用，以免把存量自动化／实体引用指到某个 split 的 id 上。
+
+### 三、诚实边界
+
+台架 WSL 是真 HA **2026.1.3**（走旧形态分支），新形态分支本轮只有替身注册表＋现网告警的间接
+证据 ⇒ **升级后请核一件事**：HA Core 日志里点名 `window_controller_gateway` 的那两条 WARNING 应当
+消失（若仍在＝新分支没走到，请回报）。面板「巡查状态」行本批未改代码，已用真实样式在最窄卡片
+（320px 视口→内容 284px）量过四种文案：正常态单行 229px 不溢出，最长两态各占两行，祖先无
+`nowrap`／`overflow` 裁剪，所在卡片从不被 JS 隐藏。
+
+### 四、门禁（本轮当场出数，非引用旧版）
+
+pytest **1889 passed / 0 failed / 0 skipped**；CI 同口径 ruff 全过；`compileall`／`bash -n`（run.sh＋
+10 个 e2e shell）／`node --check` ×3 全过；YAML 门逐字抽 CI 的 run 块真跑 RC=0（57 ✅）；JSON 门
+跟踪树 15/15；跨仓契约钉真跑臂 **113 passed / 0 failed**；hub 生命周期真栈 **35/0**；WSL 真栈 e2e
+`RL_RC=0`（13 条断言通过、0 Traceback、soak ~199/s）；变异矩阵**整跑 110 臂失守 0**（本批新增 12 臂，
+逐条 `--only` 验过转红）。没跑的格子点名：`shellcheck run.sh`（CI 里非阻塞）、CI 的 docker E2E job
+（本机无 docker，已由 WSL run_local 同链替代）。
+
 ## [1.9.1] - 2026-10-28 · MQTT 通道巡查改成"可查询的面"（上一版那句"从日志可判"没做到，本版补上）
 
 ⚠ **本批改了集成 Python 代码与面板：升级加载项后请再重启一次 Home Assistant**（重启加载项只

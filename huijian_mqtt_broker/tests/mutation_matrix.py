@@ -60,6 +60,9 @@ T1761AF = "tests/test_v1761_adversarial_followups.py"
 T1763H = "tests/test_v1763_healer_resident.py"
 # 2026-10-27 启动收尾阻塞批的判据文件（eager 面常驻任务的现网实锤）
 TSTARTUP = "tests/test_startup_blocking_resident_task.py"
+# v1.9.2 设备注册表弃用族双形态出口的判据文件
+TDEP = "tests/test_device_registry_deprecation_egress.py"
+APIF = "custom_components/window_controller_gateway/api.py"
 # v1.8.4 批次（审计 B-2/B-3 + Gitee 发布腿换载体）的被改文件与判据文件
 CTYPES = "custom_components/window_controller_gateway/mqtt_handler/_ctypes.py"
 CIY = "../.github/workflows/ci.yaml"       # _copy() 把 .github 一起带进副本
@@ -817,6 +820,92 @@ ARMS = [
      "panel_renders_the_row", "red",
      "超时判定硬编 1800 秒＝服务端改了巡查节拍后面板仍按旧节拍判『正常』（文案与取值分家）",
      "tests/test_channel_verify_surface.py"),
+    # ---- v1.9.2 ①：读 HA 条目列表失败与"引导失败"分家（归因错位 + 根因被吞）----
+    ("proxy_read_branch_removed_falls_to_generic", PROXY,
+     "        except EntriesQueryFailed as e:\n",
+     "        except ZeroDivisionError as e:\n",
+     "test_read_failure_logged_as_read_not_bootstrap", "red",
+     "去掉专门分支＝读失败被下面的广义 except 抓走、重新打成『引导失败』——原缺陷整形回归",
+     TDP),
+    ("proxy_read_failure_relabelled_as_bootstrap", PROXY,
+     'f"[发现代理] 读取 HA 条目列表失败（{e}），本帧未尝试引导；"',
+     'f"[发现代理] 引导失败（{e}），本帧未尝试引导；"',
+     "test_read_failure_logged_as_read_not_bootstrap", "red",
+     "只改文案的回归（分支还在）：日志是唯一产物，文案错位＝用户按错的方向查自动发现",
+     TDP),
+    ("proxy_read_failure_drops_root_cause", PROXY,
+     "    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:\n"
+     '        raise EntriesQueryFailed(f"{type(e).__name__}: {e}") from e\n',
+     "    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as e:\n"
+     '        raise EntriesQueryFailed("entries query failed") from e\n',
+     "test_real_impl_carries_class_and_summary", "red",
+     "恢复旧字面量＝502/拒绝连接/缺 token 三种病因重新挤成一句，根因在产物里不可区分",
+     TDP),
+    ("proxy_generic_reader_exception_misattributed", PROXY,
+     "        except Exception as e:  # noqa: BLE001 — 归口，不是吞：类名+摘要照抄进消息\n",
+     "        except ZeroDivisionError as e:  # noqa: BLE001\n",
+     "test_any_reader_exception_is_a_read_failure", "red",
+     "按类归口退化成点名捕获：缺 token 这类新形态又会被叫成引导失败（判据要管整类不只两种）",
+     TDP),
+    ("proxy_none_reader_silently_continues", PROXY,
+     'raise EntriesQueryFailed("未给出原因（注入桩回 None）")',
+     "return False",
+     "test_reader_none_is_also_a_read_failure", "red",
+     "读不到当作『没有耳朵』继续建条目＝HA 重启窗口里盲目 POST 建流，且日志一句都不留",
+     TDP),
+    # ---- v1.9.2 ②：设备注册表弃用族（async_get_device / DeviceEntry.config_entries）----
+    # 现网实锤：.91 2026-10-28 Core 日志两条 WARNING 都点名本集成；2027.8.0/
+    # 2027.10.0 分别停摆。下面 7 臂各翻回一种"看起来也修了"的假修形态。
+    ("dep_egress_always_uses_deprecated", UTILS,
+     "    if by_identifier is not None:",
+     "    if False:",
+     "test_new_ha_uses_identifier_api_only", "red",
+     "探测在但整支不走＝新 HA 仍每次直调 async_get_device（告警照刷、2027.8 照停摆）",
+     TDEP),
+    ("dep_egress_drops_entry_scope", UTILS,
+     "        if config_entry_id:",
+     "        if False:",
+     "test_new_ha_uses_identifier_api_only", "red",
+     "条目作用域精确查被摘掉＝出口退化成只会跨条目列表，调用点传的 entry id 成空气",
+     TDEP),
+    ("dep_egress_treats_entry_miss_as_absent", UTILS,
+     "            device = by_identifier((DOMAIN, sn), config_entry_id)\n"
+     "            if device is not None:\n"
+     "                return device\n",
+     "            device = by_identifier((DOMAIN, sn), config_entry_id)\n"
+     "            if True:\n"
+     "                return device\n",
+     "test_entry_scoped_miss_falls_back_to_cross_entry", "red",
+     "条目内未命中就报不存在＝迁移/接管现场（设备还挂旧条目）整条链静默断，比告警严重一级",
+     TDEP),
+    ("dep_egress_composite_guard_removed", UTILS,
+     "        if len(matches) > 1 and None not in splits and len(splits) == 1:",
+     "        if False:",
+     "test_composite_splits_keep_old_lookup", "red",
+     "复合设备保护摘掉＝把老引用指向某个 split 的 id（自动化/实体引用指错设备），等价性承诺破产",
+     TDEP),
+    ("dep_reader_prefers_deprecated_field", UTILS,
+     '    ce_id = getattr(device, "config_entry_id", None)',
+     "    ce_id = None",
+     "test_new_ha_reads_only_config_entry_id", "red",
+     "取值顺序退回『先读弃用面』＝每台设备每次视图都吃一条 WARNING，2027.10.0 起恒空",
+     TDEP),
+    ("dep_site_bypasses_egress", DMGR,
+     "                device = get_device_by_sn(device_registry, device_sn, "
+     "self.entry.entry_id)\n                if device:",
+     "                device = device_registry.async_get_device(\n"
+     "                    identifiers={(DOMAIN, device_sn)}\n"
+     "                )\n                if device:",
+     "test_no_direct_async_get_device_outside_helper", "red",
+     "调用点绕过出口（17 处里的任意一处都算没修）：类面钉必须看见裸调用，"
+     "光有 helper 不等于全收口",
+     TDEP),
+    ("dep_api_view_reads_deprecated", APIF,
+     "            entry_ids = get_device_config_entry_ids(device)",
+     '            entry_ids = set(getattr(device, "config_entries", ()) or ())',
+     "test_no_device_config_entries_read_outside_helper", "red",
+     "视图自己抄一份兼容读法（原缺陷形态）：getattr 名字面量写法也要被类面钉抓住",
+     TDEP),
 ]
 
 

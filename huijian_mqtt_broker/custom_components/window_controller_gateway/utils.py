@@ -502,6 +502,45 @@ def get_via_device_id(device) -> Optional[str]:
     return via
 
 
+def get_device_by_sn(device_registry, sn, config_entry_id=None):
+    """按 (DOMAIN, sn) 取设备的双形态出口（v1.9.2，与 via_device_kwargs 同族）。
+
+    现网实锤（.91 2026-10-28 HA Core 日志）：本集成仍在
+    `calls device_registry.async_get_device` 上吃 WARNING，上游明示
+    breaks_in_ha_version="2027.8.0"——届时整条设备查找链（注册/重命名/迁移/
+    回滚/删除清理 17 处）恒返回 None，设备"消失"且无报错。
+
+    分形按运行时**属性存在性**判定，禁止无条件换新 API：manifest 声明下限
+    2024.12.0 里 `async_get_device_by_identifier` / `async_get_devices` 都不存在
+    （上游该版本源码零命中），盲调即 AttributeError 打死查找。
+
+    语义等价性（不是改名）：
+    - 新 HA 且给了 config_entry_id：先走条目作用域精确查（新模型里一条标识符
+      在单条目内唯一，不存在歧义）；**未命中不许当"设备不存在"**——迁移/接管
+      现场设备此刻还挂在别的条目上，回退跨条目列表，否则迁移链静默断。
+    - 新 HA 但拿不到条目 id（如 resolve_via_device_id）：直接走跨条目列表。
+    - 列表里若全是同一条"迁移前复合设备"的 split，保留旧调用——上游对这种形态
+      返回复合视图（其 id 是存量自动化/实体引用指向的那个），把 id 换成某个
+      split 会指错设备。代价：这一种形态仍有一条弃用告警，是有意的等价取舍。
+    - 独立设备共用一条标识符：取第一个，与上游兜底同形。
+    - 2024.12 下限：唯一形态 `async_get_device(identifiers={(DOMAIN, sn)})`。
+    调用点不得再直调 async_get_device（AST 类面守卫 test_device_registry_
+    deprecation_egress）。
+    """
+    by_identifier = getattr(device_registry, "async_get_device_by_identifier", None)
+    if by_identifier is not None:
+        if config_entry_id:
+            device = by_identifier((DOMAIN, sn), config_entry_id)
+            if device is not None:
+                return device
+        matches = device_registry.async_get_devices(identifiers={(DOMAIN, sn)})
+        splits = {getattr(m, "composite_device_id", None) for m in matches}
+        if len(matches) > 1 and None not in splits and len(splits) == 1:
+            return device_registry.async_get_device(identifiers={(DOMAIN, sn)})
+        return matches[0] if matches else None
+    return device_registry.async_get_device(identifiers={(DOMAIN, sn)})
+
+
 def resolve_via_device_id(device_registry, gateway_sn) -> Optional[str]:
     """写入端解析：网关 (DOMAIN, sn) → 其 DeviceEntry.id（v1.7.31 现场实锤 F-B）。
 
@@ -516,8 +555,7 @@ def resolve_via_device_id(device_registry, gateway_sn) -> Optional[str]:
     单一真源。调用点不直接用本函数出参，须经 ``via_device_kwargs``。
     """
     try:
-        gateway_device = device_registry.async_get_device(
-            identifiers={(DOMAIN, gateway_sn)})
+        gateway_device = get_device_by_sn(device_registry, gateway_sn)
     except Exception:  # noqa: BLE001 — 只读面兜底，宁缺归属不断注册
         return None
     return gateway_device.id if gateway_device else None
@@ -559,19 +597,35 @@ def via_device_kwargs(device_registry, gateway_sn) -> Dict[str, Any]:
 
 
 def get_device_config_entry_ids(device) -> set:
-    """读取设备关联的配置条目 id 集合（跨版本兼容，同 api.py 的双读法）。
+    """读取设备所属配置条目 id 集合（跨版本兼容，v1.9.2 收口为单一出口）。
 
-    新版 HA 是 ``config_entries``（set），旧版是 ``config_entry_id``（str）。
-    ``config_entry_ids`` 这个属性名不存在——v1.6.12 修正 __init__.py 的
-    恒空读取（共享保护死分支）。
+    现网实锤（.91 2026-10-28 HA Core 日志）：本集成在
+    `accesses DeviceEntry.config_entries` 上吃 WARNING，上游明示
+    breaks_in_ha_version="2027.10.0"——届时该属性根本不存在，宿主归属/共享保护
+    判定整段落空。
+
+    取值顺序按"哪一代是真值"定，不是随便换个 getattr：
+    - 新 HA：`config_entry_id` 是**唯一真值**（一台设备只属一个条目），而
+      `config_entries` 只是兼容垫片，其值恒等于 `{config_entry_id}`，读它每次
+      都触发一次 report_usage（日志噪声 + 2027.10 起消失）。
+    - 例外：restored composite（迁移前一条标识符属多条目）的并集**只在**
+      `config_entries` 上给出，且上游对它不告警（源码 :429/:435/:557）——
+      这种形态必须并回来，否则其它条目的宿主关系漏判。
+    - 2024.12 下限（manifest 声明）：DeviceEntry **没有** config_entry_id 字段，
+      `config_entries` 是普通 attrs 字段、读了不告警 ⇒ 唯一形态。
+    `config_entry_ids` 这个属性名不存在（v1.6.12 教训：假 mock 带真机没有的
+    属性会骗过全部测试）。
     """
     ids = set()
-    ce = getattr(device, "config_entries", None)
-    if ce:
-        ids.update(ce)
     ce_id = getattr(device, "config_entry_id", None)
     if ce_id:
         ids.add(ce_id)
+        if getattr(device, "is_composite_device", False):
+            ids.update(getattr(device, "config_entries", None) or ())
+        return ids
+    ce = getattr(device, "config_entries", None)
+    if ce:
+        ids.update(ce)
     return ids
 
 
