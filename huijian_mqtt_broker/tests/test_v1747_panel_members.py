@@ -99,7 +99,11 @@ const cases = [
   [null, '—'],
   [{enabled:false}, '—'],
   [{enabled:true, membersSupported:false}, '云端版本过旧，暂不支持'],
-  [{enabled:true, membersSupported:true, members:[]}, '只有你一人'],
+  [{enabled:true, membersSupported:true, members:[], membersLoadedAt:1}, '只有你一人'],
+  // v1.9.3：本进程从没成功读过成员 ⇒ 空列表的含义是"还不知道"，不是"没人"。
+  // 说成"只有你一人"会诱导用户去解绑重扫（那才是真事故）。
+  [{enabled:true, membersSupported:true, members:[]}, '未同步（连上云端后自动读取）'],
+  [{enabled:true, membersSupported:true, members:[], membersLoadedAt:0}, '未同步（连上云端后自动读取）'],
   [{enabled:true, membersSupported:true, membersMax:8, members:[{openidMasked:'oFa…02',at:1}]}, '1 / 8 人'],
   [{enabled:true, membersSupported:true, membersMax:8, members:Array.from({length:8},(_,i)=>({openidMasked:'o'+i,at:1}))}, '8 / 8 人'],
   // 上限以服务端回的为准（hub 改了上限后，兜底的 8 只是兜底）
@@ -113,7 +117,8 @@ for (const [info, want] of cases) {
   if (got !== want) { console.log('FAIL', JSON.stringify(info), '->', got, 'want', want); process.exit(1) }
 }
 // 成员类的其它错误码（踢人失败等）不该被说成"读取失败"
-if (membersText({enabled:true, membersSupported:true, lastOpError:'member_remove_failed', members:[]}) !== '只有你一人') {
+if (membersText({enabled:true, membersSupported:true, lastOpError:'member_remove_failed',
+                 members:[], membersLoadedAt:1}) !== '只有你一人') {
   console.log('FAIL 非读取类错误不该改成员计数文案'); process.exit(1)
 }
 console.log('OK');
@@ -141,9 +146,9 @@ let bad = 0;
 function want(c, m) { if (!c) { console.log('FAIL ' + m); bad++; } }
 function reset() { for (const k of Object.keys(els)) delete els[k]; }
 
-// ① 只有主人
+// ① 只有主人（**前提是这次真读到过**——membersLoadedAt 没置位时不许这么说）
 reset();
-renderMembers({ enabled: true, membersSupported: true, membersMax: 8, members: [] });
+renderMembers({ enabled: true, membersSupported: true, membersMax: 8, members: [], membersLoadedAt: 1 });
 want(els.hubMembersCount.textContent === '只有你一人', '计数文案: ' + els.hubMembersCount.textContent);
 want(els.hubMembersEmpty.hidden === false, '空态提示应可见');
 want(els.addMemberBtn.disabled === false, '未满员应可点');
@@ -202,6 +207,17 @@ want(/5 分钟有效/.test(els.addMemberBtn.title), 'TTL 应取服务端值: ' +
 reset();
 renderMembers({ enabled: true, membersSupported: true, membersMax: 8, members: [] });
 want(/10 分钟有效/.test(els.addMemberBtn.title), '没给 TTL 才回落字面量: ' + els.addMemberBtn.title);
+
+// ⑧ v1.9.3：从未同步过（本进程一次都没成功读过成员）——不得断言"只有你一人"，
+//    也不得替用户判"云端坏了"（那句归顶部错误行，它手里才有连接类原因）
+reset();
+renderMembers({ enabled: true, membersSupported: true, membersMax: 8, members: [] });
+want(!/只有你一人/.test(els.hubMembersCount.textContent + els.hubMembersEmpty.textContent),
+     '未同步态不得说"只有你一人": ' + els.hubMembersCount.textContent + ' / ' + els.hubMembersEmpty.textContent);
+want(/未同步|还没/.test(els.hubMembersCount.textContent + els.hubMembersEmpty.textContent),
+     '未同步态要说清还不知道: ' + els.hubMembersCount.textContent);
+want(!/不可达|读取失败/.test(els.hubMembersEmpty.textContent),
+     '未同步态不得替用户判云端故障或谎报读取失败: ' + els.hubMembersEmpty.textContent);
 
 if (bad) { console.log(bad + ' 处不符'); process.exit(1) }
 console.log('OK');

@@ -397,6 +397,11 @@ class HubClient:
         self.owner_masked: Optional[str] = None
         self.members_supported: bool = True       # 老 hub 无成员端点时置 False，面板据此禁用成员区
         self.members_max: Optional[int] = None    # hub 回的成员上限（None＝没拿到，回落常量）
+        # v1.9.3：面板那句"只有你一人"是一个**断言**，只有真读到过一次成员才配说。
+        # `members` 的初值 [] 与"这台确实只有主人"在 status_view 里长得一模一样，
+        # 而断连期间点「添加家人」不再顺带刷成员（见 api.py 的换码闸）⇒ 没有这个旗标，
+        # 面板就会把"还不知道"渲染成"没人"，用户据此以为家人没绑上、去重新解绑一次。
+        self.members_loaded_at: float = 0.0       # 最近一次 list_members 成功时刻（0＝本进程从未读到）
         self._members_refresh_at: float = 0.0     # 上一次"GET /hub 顺带刷成员"时刻（节流基准）
         # 成员称呼（v1.7.54）：本机面板侧的标签，键＝hub 的 mid，落 HUB_MEMBER_ALIAS_FILE。
         # 与上面那条"成员关系本地不留副本"不冲突——**关系**仍以 hub 为准，这里存的不是关系。
@@ -970,6 +975,9 @@ class HubClient:
         self.members = list(data.get("members") or [])
         self.owner_masked = data.get("ownerMasked")
         self.members_max = _positive_int(data.get("membersMax")) or None
+        # 旗标只在**这里**置：它是"本进程至少读到过一次云端真相"的唯一凭据。
+        # 放在 try 之外或失败分支里，就等于把"未同步"重新变成会说谎的"只有你一人"。
+        self.members_loaded_at = time.time()
         self._clear_op_error(OP_MEMBERS)
         return True
 
@@ -1117,6 +1125,7 @@ class HubClient:
         self.member_code = None
         self._member_code_at = 0.0
         self.members = []
+        self.members_loaded_at = 0.0   # 成员清单跟着实例作废：旗标不一起清就仍在说"我读到过"
         self.owner_masked = None
         # 落盘失败不得让"内存已清空"半途而废：旧写法 _save_identity 抛出 ⇒ 后面的
         # _rereg_streak/last_error 全不执行，且磁盘仍是刚被 401 拒掉的那张凭据，
@@ -1145,6 +1154,13 @@ class HubClient:
             self.connected = True
             self.last_error = None
             self._rereg_streak = 0        # 连上过＝云端确实认识当前身份，熔断计数归零
+            # v1.9.3：连上即把成员刷新的节流基准归零，让重连后的**第一次** GET /hub 立刻
+            # 补刷一次。这里不清错误槽（test_hub_error_channels 钉住"连上只证明长连通了，
+            # 操作类错误必须由对应操作的成功来清"），错误由这一次真读成功走
+            # _clear_op_error 自己清掉——治的是"重连成功后面板还要挂最多两个节流窗的
+            # 陈旧读取失败"。代价：每次重连多打一次 /agent/members（hub 侧纯内存读），
+            # 只在真连上时发生，断连期间仍然一次不打。
+            self._members_refresh_at = 0.0
             self._logger.info("hub 已连接（instance=%s）", self.instance_id)
             self._state_dirty.set()          # 上线先全量推一次
             # 上线自检的换码挪进保活 task：那是 HTTP，最坏等 HUB_HTTP_TIMEOUT_S=15s，
@@ -1423,5 +1439,7 @@ class HubClient:
             "membersCount": len(members),
             "membersMax": self.members_max or HUB_MEMBERS_MAX,
             "membersSupported": bool(self.members_supported),
+            # 0＝本进程从未成功读到成员 ⇒ 面板不许说"只有你一人"（那是断言，不是空值）
+            "membersLoadedAt": self.members_loaded_at,
             "ownerMasked": self.owner_masked,
         }

@@ -40,7 +40,8 @@ def _body(name):
 
 
 # applyHubStatus 会调到的渲染函数，一个都不能少（少了 node 会 ReferenceError 崩）
-DEPS = ("hubGatewayText", "hubErrorText", "hubOpErrorText", "ttlMinutes", "membersReadFailed",
+DEPS = ("hubGatewayText", "hubErrorText", "hubOpErrorText", "hubOpErrorIsTransient",
+        "hubErrorLine", "ttlMinutes", "membersReadFailed",
         "membersText", "renderMemberQr", "renderMembers")
 
 HARNESS_HEAD = """
@@ -235,6 +236,71 @@ want(els.hubCodeTtl.textContent === '10 分钟', '服务端没给 TTL 才回落�
 want(els.hubMembersCount.textContent === '1 / 6 人',
      '成员上限也要取服务端值（hub 改了上限后 8 就是假话）: ' + els.hubMembersCount.textContent);
 
+// ── v1.9.3 错误行优先级（瞬态类让位连接类）与"未同步"态 ──────────────────
+const NET_RAW = 'Cannot connect to host huijian-hub-x:443 ssl:default [DNS server returned answer with no data]';
+
+// 场景 11（本缺陷主案）：断连 + 粘滞的成员读取失败 ⇒ 主句必须是连接类，
+// 因为唯一说得出"可能是本机网络不通、局域网不受影响、本机会自动重试"的是那一句。
+reset();
+applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                 lastError: NET_RAW, lastOpError: 'members_unavailable',
+                 members: [], membersMax: 8, membersSupported: true }, false);
+want(/本机网络不通/.test(els.hubError.textContent),
+     '断连时主句必须是连接类文案（说得出本机网络不通）: ' + els.hubError.textContent);
+want(!/家庭成员读取失败/.test(els.hubError.textContent),
+     '瞬态成员错误在断连时不得再当主因: ' + els.hubError.textContent);
+want(!/云端暂不可达/.test(els.hubError.textContent),
+     '主句不得把方向指到云端（现网取证过：云端 27 天没重启，坏的是本机解析）');
+
+// 场景 12（反向半条）：同一份 op 值、长连是通的 ⇒ 必须照常显示成员失败，
+// 不许把"让位"做成"断连才管、通则一起藏"之外的第三种（那是把真实错误也藏了）。
+reset();
+applyHubStatus({ enabled: true, connected: true, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                 lastError: null, lastOpError: 'members_unavailable',
+                 members: [], membersMax: 8, membersSupported: true }, false);
+want(/读取失败/.test(els.hubError.textContent),
+     '长连通时成员读取失败仍是主句（错误真实，不许藏）: ' + els.hubError.textContent);
+
+// 场景 13（语义类不许被降级）：断连时 no_owner 仍排第一——重试永远不会成功的话
+// 必须比"本机会自动重试"先说，否则用户会一直点。
+reset();
+applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                 lastError: NET_RAW, lastOpError: 'no_owner',
+                 members: [], membersMax: 8, membersSupported: true }, false);
+want(/还没有主人/.test(els.hubError.textContent),
+     '语义类操作错误在断连时也必须优先: ' + els.hubError.textContent);
+
+// 场景 14（让位不能变成空屏）：退避每一圈开头 lastError 会被清空，此时
+// 瞬态类要顶上来，不能整行隐藏（空屏比一句陈旧文案更糟）。
+reset();
+applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                 lastError: null, lastOpError: 'members_unavailable',
+                 members: [], membersMax: 8, membersSupported: true }, false);
+want(els.hubError.hidden === false && !!els.hubError.textContent,
+     'lastError 为空的退避窗里不得空屏（瞬态类要兜住）');
+
+// 场景 15：从未读到过成员 ≠ 只有你一人。空列表在这里的含义是"还不知道"。
+reset();
+applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                 lastError: NET_RAW, lastOpError: null,
+                 members: [], membersMax: 8, membersSupported: true }, false);
+want(!/只有你一人/.test(els.hubMembersCount.textContent + els.hubMembersEmpty.textContent),
+     '本进程从未成功读过成员时不得断言"只有你一人": ' + els.hubMembersCount.textContent);
+want(/未同步/.test(els.hubMembersCount.textContent),
+     '要说清是还没同步: ' + els.hubMembersCount.textContent);
+reset();
+applyHubStatus({ enabled: true, connected: true, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [], lastError: null,
+                 members: [], membersMax: 8, membersSupported: true,
+                 membersLoadedAt: 1793695483 }, false);
+want(els.hubMembersCount.textContent === '只有你一人',
+     '真读到过一次且确实没人时才配说只有你一人: ' + els.hubMembersCount.textContent);
+
 if (bad) { console.log('applyHubStatus 真跑: ' + bad + ' 处不符'); process.exit(1) }
 console.log('OK');
 """
@@ -252,7 +318,11 @@ def _render_script():
     g = re.search(r"const HUB_CONN_GENERIC_TEXT =([\s\S]*?);", JS)
     assert g, "huijian.js 里找不到 HUB_CONN_GENERIC_TEXT（改名了？harness 要跟着带上）"
     generic = "const HUB_CONN_GENERIC_TEXT =%s;\n" % g.group(1).strip()
-    return (HARNESS_HEAD + const + generic + "\n".join(_body(n) for n in DEPS)
+    # 同理：瞬态类操作码的名单也是出口引用的常量，缺了 node 直接 ReferenceError
+    t = re.search(r"const HUB_TRANSIENT_OP_ERRORS = (\[[^\]]*\]);", JS)
+    assert t, "huijian.js 里找不到 HUB_TRANSIENT_OP_ERRORS（改名了？harness 要跟着带上）"
+    transient = "const HUB_TRANSIENT_OP_ERRORS = %s;\n" % t.group(1)
+    return (HARNESS_HEAD + const + generic + transient + "\n".join(_body(n) for n in DEPS)
             + "\n" + _body("applyHubStatus") + "\n" + HARNESS_TAIL)
 
 

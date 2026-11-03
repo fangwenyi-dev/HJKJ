@@ -83,6 +83,11 @@ PANEL_JS = "www/js/huijian.js"
 T1764 = "tests/test_audit_2026_10_05_round3_fixes.py"
 T1746F = "tests/test_v1746_panel_unique_funcs.py"
 T1765 = "tests/test_audit_2026_10_06_round4_fixes.py"
+# v1.9.3（面板遮蔽连接原因 + 同槽覆写批）新臂的判据文件
+THUBC = "tests/test_hub_client.py"
+T1747API = "tests/test_v1747_hub_members_api.py"
+T1746R = "tests/test_v1746_panel_render.py"
+T1747M = "tests/test_v1747_panel_members.py"
 IGNORE = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
 TIMEOUT = 900
 
@@ -906,6 +911,71 @@ ARMS = [
      "test_no_device_config_entries_read_outside_helper", "red",
      "视图自己抄一份兼容读法（原缺陷形态）：getattr 名字面量写法也要被类面钉抓住",
      TDEP),
+    # ── v1.9.3：面板把症状当病因 + 同一次点击内后写覆掉前写 ──
+    ("mask_demote_ignores_connected", PANEL_JS,
+     "const demote = !info.connected && hubOpErrorIsTransient(info.lastOpError);",
+     "const demote = hubOpErrorIsTransient(info.lastOpError);",
+     "test_unknown_conn_error_still_shows_a_generic_reason", "red",
+     "让位不再看 connected＝长连通着也把用户刚点那一下的结果让给后台状态"
+     "（v1.7.50 拆槽的理由被反着拆掉）",
+     T1746F),
+    ("mask_no_last_resort_fallback", PANEL_JS,
+     "return (demote ? '' : opText) || connText || opText;",
+     "return (demote ? '' : opText) || connText;",
+     "test_apply_hub_status_renders_every_state_in_node", "red",
+     "去掉末级兜底＝退避每一圈开头 lastError 被清空时整行隐藏，用户只剩孤零零一句『未连接』",
+     T1746R),
+    ("mask_transient_list_emptied", PANEL_JS,
+     "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];",
+     "const HUB_TRANSIENT_OP_ERRORS = [];",
+     "test_apply_hub_status_renders_every_state_in_node", "red",
+     "名单清空＝让位永不生效，本批修法静默消失（症状继续压住病因）",
+     T1746R),
+    ("mask_transient_list_absorbs_semantic", PANEL_JS,
+     "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];",
+     "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', "
+     "'member_remove_failed', 'no_owner'];",
+     "test_apply_hub_status_renders_every_state_in_node", "red",
+     "把语义类混进瞬态类＝断连时『先自己扫码成为主人』这种唯一能自救的话被顶掉；"
+     "产生点对账钉同样会红，两条判据不同面",
+     T1746R),
+    ("mask_transient_list_reordered", PANEL_JS,
+     "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];",
+     "const HUB_TRANSIENT_OP_ERRORS = ['member_remove_failed', 'bindcode_failed', 'members_unavailable'];",
+     "test_apply_hub_status_renders_every_state_in_node", "green",
+     "等价臂：indexOf 不看名单顺序，钉不许把无关重排误判成缺陷（反向半条）",
+     T1746R),
+    ("members_text_asserts_alone_always", PANEL_JS,
+     "return info.membersLoadedAt ? '只有你一人' : '未同步（连上云端后自动读取）';",
+     "return '只有你一人';",
+     "test_members_text_really_runs_in_node", "red",
+     "退回无条件断言＝从没读到过成员时面板说家里没人，用户据此解绑重扫（那才是真事故）",
+     T1747M),
+    ("bindcode_post_reads_members_anyway", APIF,
+     '        if kind == "member" and ok:',
+     '        if kind == "member":',
+     "test_member_read_never_follows_a_failed_code_issue", "red",
+     "摘掉 ok 闸＝同一次点击内后写覆掉前写：点『添加家人』失败却看到『成员读取失败』",
+     T1747API),
+    ("reconnect_keeps_member_throttle", HUBC,
+     '            self._members_refresh_at = 0.0\n            self._logger.info("hub 已连接',
+     '            self._logger.info("hub 已连接',
+     "test_connecting_resets_the_member_throttle_without_touching_the_op_slot", "red",
+     "重连不重置节流＝面板还要挂最多两个 120s 窗的陈旧『读取失败』（修法是让下一次真读尽早发生，"
+     "不是把错误抹掉）",
+     THUBC),
+    ("loaded_at_not_set_on_success", HUBC,
+     "        self.members_loaded_at = time.time()\n        self._clear_op_error(OP_MEMBERS)",
+     "        self._clear_op_error(OP_MEMBERS)",
+     "test_members_loaded_at_is_set_only_by_a_successful_read", "red",
+     "成功路径不置位＝面板永远说未同步，真读到过也不肯报人数",
+     THUBC),
+    ("invalidate_leaves_loaded_flag_stale", HUBC,
+     '        self.members_loaded_at = 0.0   # 成员清单跟着实例作废：旗标不一起清就仍在说"我读到过"',
+     "        pass",
+     "test_invalidate_identity_writes_cleared_file", "red",
+     "身份作废只清 members 不清旗标＝新 instance 还没读过，面板却拿着旧凭据断言『只有你一人』",
+     THUBC),
 ]
 
 

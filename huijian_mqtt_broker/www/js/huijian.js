@@ -255,6 +255,38 @@
             }
         }
 
+        /** 操作类错误里"本机这一趟没拿到云端结果"的那一族。
+         *  判据是**产生点**，不是文案长相：这三个值只可能由 hub_client 里
+         *  `except Exception` 的网络/超时降级写下（换码、成员、踢人各一处）。
+         *  为什么要把它们单独分一档：断连的时候这一句必然为真（它是断连的下游症状），
+         *  但它不是"当前原因"——当前原因只有连接类那一句说得出"可能是本机网络不通、
+         *  局域网控制不受影响、本机会自动重试"。让症状压住病因，客户就会干等一个
+         *  不会自己好的东西，然后报障。
+         *  语义类（no_owner / members_full / owner_cannot_leave / bad_body …）不在这里：
+         *  那些是"重试永远不会成功、得先做另一件事"的话，断连时也要先说。 */
+        const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];
+
+        function hubOpErrorIsTransient(opError) {
+            return HUB_TRANSIENT_OP_ERRORS.indexOf(opError) >= 0;
+        }
+
+        /** 顶部错误行的最终文案（纯函数＝渲染出口本身，便于 node 真跑整条优先级）。
+         *  优先级（v1.9.3）：**语义类操作错误 → 连接类（已知码或通用兜底）→ 瞬态类操作错误**。
+         *    语义类仍排第一：no_owner / members_full 那种"重试没用、得先做另一件事"的话，
+         *    断连时也一样要先说，否则用户会一直点。
+         *    瞬态类（本机这一趟没拿到云端结果）在断连时**让位给连接类**：它是断连的下游
+         *    症状，压住病因就变成"叫用户等云端"，而云端好好的——现网取证过一例。
+         *    但它仍排在"什么都不显示"之前：重连退避每一圈开头都会把 lastError 清空再试
+         *    （hub_client 连接主循环），让位不能变成空屏。*/
+        function hubErrorLine(info) {
+            if (!info) return '';
+            const opText = hubOpErrorText(info.lastOpError);
+            const connText = hubErrorText(info.lastError) ||
+                (info.lastError ? HUB_CONN_GENERIC_TEXT : '');
+            const demote = !info.connected && hubOpErrorIsTransient(info.lastOpError);
+            return (demote ? '' : opText) || connText || opText;
+        }
+
         /** 有效期文案的分钟数：优先用服务端回的 TTL 秒数，缺失/非法才回落字面量。
          *  hub 改了有效期之后，硬编的"10 分钟"就是对用户说谎——他会照着去扫一张
          *  云端早已作废的码，然后只看到 code_invalid。*/
@@ -272,10 +304,11 @@
         }
 
         /** 成员区口径文案（纯函数，便于 node 真跑）。
-         *  六种态必须分开：读不到（—）/ 老 hub 不支持（说清是云端版本旧）/ 读取失败且手上
-         *  一条都没有（说清是网络，稍后重试）/ 读取失败但还留着上次成功的列表（照报人数 +
-         *  标注可能过期）/ 只有主人 / N 与上限。
-         *  最后那条是刻意分的：读取失败时 `self.members` 仍是上次成功的值，用"读取失败"把
+         *  七种态必须分开：读不到（—）/ 老 hub 不支持（说清是云端版本旧）/ 读取失败且手上
+         *  一条都没有（说清是没读到，稍后重试）/ 读取失败但还留着上次成功的列表（照报人数 +
+         *  标注可能过期）/ **本进程从未读到过**（还不知道，不许说成"只有你一人"）/
+         *  只有主人 / N 与上限。
+         *  最后两条是刻意分的：读取失败时 `self.members` 仍是上次成功的值，用"读取失败"把
          *  人数顶掉＝把已知信息藏起来，而且下面照常渲染出的成员行会与这句话自相矛盾。*/
         function membersText(info) {
             if (!info || info.enabled === false) return '—';
@@ -285,7 +318,12 @@
             if (membersReadFailed(info)) {
                 return list.length ? (list.length + ' / ' + max + ' 人（列表可能已过期）') : '读取失败，稍后重试';
             }
-            if (!list.length) return '只有你一人';
+            if (!list.length) {
+                // "只有你一人"是一个**断言**，不是空列表的默认读法：本进程从没成功读过成员
+                // （刚重启、或断连期间点过一次「添加家人」）时，空列表的含义是"还不知道"。
+                // 把未知说成没人，用户会去重新解绑再扫一次码——那才是真事故。
+                return info.membersLoadedAt ? '只有你一人' : '未同步（连上云端后自动读取）';
+            }
             return list.length + ' / ' + max + ' 人';
         }
 
@@ -317,14 +355,19 @@
             const usable = !!info && info.enabled !== false;
             const supported = usable && info.membersSupported !== false;
             const readFailed = usable && membersReadFailed(info);
+            // 从未读到过（本进程刚起、或断连期间一次都没成功）——与"读到了，确实没人"分开
+            const neverLoaded = usable && !readFailed && !info.membersLoadedAt;
             const list = (usable && Array.isArray(info.members)) ? info.members : [];
             const max = (usable && info.membersMax) || 8;
             countEl.textContent = membersText(info);
             if (empty) {
+                // 成员区只报"我这一趟读到了什么"，不再替用户判"是云端坏了还是本机不通"——
+                // 那句归顶部错误行（它手里有连接类原因），两处各说各的才不会自相矛盾。
                 empty.textContent = !usable ? '—'
                     : (!supported ? '云端 hub 版本过旧，暂不支持添加家人'
-                        : (readFailed ? '成员列表读取失败（云端暂不可达），稍后自动重试'
-                            : '只有你一人'));
+                        : (readFailed ? '成员列表读取失败，连上云端后自动重试'
+                            : (neverLoaded ? '还没与云端同步过成员列表（连上后自动读取）'
+                                : '只有你一人')));
                 // 占位行只在**真的一条都没有**时出现：读取失败但还留着上次成功的列表时，
                 // 下面照样会渲染出成员行，再叠一句"读取失败"就是同屏自相矛盾（陈旧这件事
                 // 已由 membersText 挂在人数上：「N / 8 人（列表可能已过期）」）。
@@ -509,9 +552,8 @@
             if (errEl) {
                 // 有原因就摆出来（哪怕长连是通的）：换码失败这类问题不会断开长连，
                 // 但用户看到的就是一张扫不出来的死码，此前只能去翻 HA 日志。
-                // **操作类优先**：它是用户刚刚那一下的结果，比后台的连接类状态更要紧。
-                const why = hubOpErrorText(info.lastOpError) || hubErrorText(info.lastError) ||
-                    (info.lastError ? HUB_CONN_GENERIC_TEXT : '');
+                // 整条优先级在 hubErrorLine（唯一渲染出口）里定，本行只负责挂/藏。
+                const why = hubErrorLine(info);
                 errEl.textContent = why;
                 errEl.hidden = !why;
             }

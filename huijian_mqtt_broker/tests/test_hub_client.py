@@ -367,6 +367,70 @@ def test_status_view_exposes_bind_code_but_never_secret(tmp_path):
     assert view["gatewaySn"] == "GW1"                                    # 插件页"本机网关"用
 
 
+def test_connecting_resets_the_member_throttle_without_touching_the_op_slot(tmp_path):
+    """v1.9.3：连上 ⇒ 节流基准归零，让重连后的**第一次** GET /hub 立刻补刷一次成员。
+
+    治的是"重连成功后面板还要挂最多两个 120s 窗的陈旧『读取失败』"。错误槽只能由对应
+    操作的成功来清（test_hub_error_channels 钉着"_session_once 不得顺手清操作类错误"），
+    所以正确的修法是把**下一次真读**尽早安排上，而不是把错误抹掉假装没发生过。
+    """
+    ws = FakeWS(incoming=[], hold=0.2)
+    client, _, _ = make_client(tmp_path, session=FakeSession(ws=ws))
+    client._members_refresh_at = time.time()
+    client._set_op_error(hc.OP_MEMBERS, "members_unavailable")
+    assert asyncio.run(client._session_once()) is True
+    assert client._members_refresh_at == 0.0, "重连没重置节流＝面板继续显示陈旧的读取失败"
+    assert client.last_op_error == "members_unavailable", \
+        "本修法不许改成『重连时清错误』——那会把真实故障一起抹掉"
+
+    calls = []
+
+    async def fake_http(path, payload, timeout_s=None):
+        calls.append(path)
+        return {"ok": True, "members": [], "membersMax": 8, "ownerMasked": None}
+
+    client._http = fake_http
+    client.members_supported = True
+    # _session_once 的 finally 会把 connected 落回 False（会话确实结束了），
+    # 而这里要判的是"重连之后第一次 GET /hub 刷得到"，故按重连后的真实状态补旗标
+    client.connected = True
+    asyncio.run(client.maybe_refresh_members())
+    assert calls == ["/agent/members"], "重置完还是刷不到＝这条修法是空的"
+
+
+def test_members_loaded_at_is_set_only_by_a_successful_read(tmp_path):
+    """"只有你一人"是一个断言，不是空列表的默认读法：旗标只能由真读到过一次来置位。
+
+    断连期间点一次「添加家人」不再顺带刷成员（api 侧的换码闸）之后，这是唯一还能把
+    "还不知道"与"确实没人"分开的信息——没有它，面板会在从没读到过成员时断言家里没人，
+    用户据此解绑重扫，那才是真事故。
+    """
+    client, _, _ = make_client(tmp_path)
+    client.instance_id, client._secret = "inst-1", "sec-1"
+    assert client.status_view()["membersLoadedAt"] == 0.0
+
+    async def boom(path, payload, timeout_s=None):
+        raise RuntimeError("net down")
+
+    client._http = boom
+    assert asyncio.run(client.list_members()) is False
+    assert client.status_view()["membersLoadedAt"] == 0.0, "失败也置位＝把未知洗成断言"
+
+    async def ok(path, payload, timeout_s=None):
+        return {"ok": True, "members": [], "membersMax": 8, "ownerMasked": "oFa…01"}
+
+    client._http = ok
+    assert asyncio.run(client.list_members()) is True
+    assert client.status_view()["membersLoadedAt"] > 0, "读到过却没置位＝面板永远说未同步"
+
+
+def test_hub_view_keeps_reporting_members_loaded_at(tmp_path):
+    """新键必须真的出现在视图里（假件从真实现派生，真实现停发这个键时要当场红）。"""
+    from homeassistant.core import full_status_view
+
+    assert "membersLoadedAt" in full_status_view(), "status_view 停发 membersLoadedAt＝面板退回假断言"
+
+
 def test_status_view_survives_missing_gateway_sn(tmp_path):
     class _Boom:
         @property
@@ -721,10 +785,15 @@ def test_invalidate_identity_writes_cleared_file(tmp_path):
                                      "bindCodeAt": 111.0})
     client, _, _ = make_client(tmp_path)
     client.instance_id, client._secret, client.bind_code, client._bind_code_at = "old", "s" * 32, "123456", 111.0
+    # v1.9.3：成员清单与"读到过"的旗标同属当前这个 instance，一起进清档面
+    client.members = [{"mid": "a" * 12, "openidMasked": "oFa…02", "at": 1}]
+    client.members_loaded_at = time.time()
     asyncio.run(client._invalidate_identity("测试"))
     assert (client.instance_id, client.bind_code, client._bind_code_at) == (None, None, 0.0)
     assert not hc.load_identity(str(tmp_path)).get("instanceId"), "死身份还在盘上＝重启后复活"
     assert client.status_view()["bindCodeExpired"] is False, "无码时不得渲染成『刚过期』"
+    assert client.members == [] and client.status_view()["membersLoadedAt"] == 0.0, \
+        "身份作废后 members_loaded_at 没跟着清＝面板继续拿着旧凭据断言『只有你一人』"
 
 
 def test_identity_io_is_off_the_event_loop(tmp_path):

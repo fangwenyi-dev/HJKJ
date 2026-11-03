@@ -236,7 +236,11 @@ class WindowGatewayHubBindCodeView(http.HomeAssistantView):
             payload = {}
         kind = "member" if isinstance(payload, dict) and payload.get("kind") == "member" else "owner"
         ok = await client.refresh_bind_code(kind)
-        if kind == "member":
+        # v1.9.3：换码失败就到此为止。旧写法不判 ok 照打 list_members，而操作类错误只有
+        # 一个槽（_set_op_error 无条件换族）⇒ 用户点「添加家人」之后看到的最后一句是
+        # "家庭成员读取失败（云端暂不可达）"，他刚那一下的真实原因（bindcode_failed、
+        # no_owner、members_full…）被后写覆写掉。顺带省下一次注定失败的云端调用。
+        if kind == "member" and ok:
             await client.list_members()      # 点「添加家人」后顺手刷新成员列表，省一次往返
         view = client.status_view()
         view["enabled"] = True

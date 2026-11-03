@@ -17,10 +17,11 @@ _NO_BODY = object()
 
 
 class _FakeClient:
-    def __init__(self, remove_ok=True, supported=True):
+    def __init__(self, remove_ok=True, supported=True, bind_ok=True):
         self.calls = []
         self.remove_ok = remove_ok
         self.supported = supported
+        self.bind_ok = bind_ok
         self.members = [{"mid": "a" * 12, "openidMasked": "oFa…02", "at": 1}]
 
     async def list_members(self):
@@ -33,7 +34,7 @@ class _FakeClient:
 
     async def refresh_bind_code(self, kind="owner"):
         self.calls.append(("refresh_bind_code", kind))
-        return True
+        return self.bind_ok
 
     def status_view(self):
         # 审计 2026-09-30 H-6：键集由**真实现**单向决定（手写 dict 会随真实现演进
@@ -164,6 +165,34 @@ def test_bindcode_view_rejects_unknown_kind_silently_as_owner():
     asyncio.run(_view(api.WindowGatewayHubBindCodeView, out).post(
         _FakeRequest(_FakeHass(client), {"kind": "root"})))
     assert ("refresh_bind_code", "owner") in client.calls, "未知 kind 必须回落 owner，不得透传给 hub"
+
+
+def test_member_read_never_follows_a_failed_code_issue():
+    """v1.9.3：换成员码失败后**不许**再顺手拉成员列表。
+
+    操作类错误只有一个槽，`_set_op_error` 无条件换族 ⇒ 旧写法（不判 ok 照打）会让
+    注定失败的那次成员读把 `bindcode_failed` 覆写成 `members_unavailable`：用户点了
+    「添加家人」却没出码，面板告诉他的却是"家庭成员读取失败（云端暂不可达）"——
+    他刚那一下的真实原因（换码失败 / no_owner / members_full）被后写抹掉。
+    现网取证过一例：同一秒内成对出现"换绑定码失败(kind=member)"与"取家庭成员失败"。
+    """
+    client = _FakeClient(bind_ok=False)
+    out = {}
+    asyncio.run(_view(api.WindowGatewayHubBindCodeView, out).post(
+        _FakeRequest(_FakeHass(client), {"kind": "member"})))
+    assert ("refresh_bind_code", "member") in client.calls
+    assert ("list_members",) not in client.calls, \
+        "换码失败仍打成员读＝用后写覆掉真实原因，还白打一次云端: %s" % (client.calls,)
+    assert out["refreshOk"] is False, "换码失败必须如实回 refreshOk=False"
+
+
+def test_member_read_still_follows_a_successful_code_issue():
+    """反向半条：成功换码后仍要顺带刷一次——把闸加成人家"点完看不到家人"就是自伤。"""
+    client = _FakeClient(bind_ok=True)
+    out = {}
+    asyncio.run(_view(api.WindowGatewayHubBindCodeView, out).post(
+        _FakeRequest(_FakeHass(client), {"kind": "member"})))
+    assert ("list_members",) in client.calls, "成功路径的顺带刷新被剪掉了: %s" % (client.calls,)
 
 
 # ── 接线 ────────────────────────────────────────────────────────────

@@ -95,7 +95,7 @@ def test_hub_error_element_wired():
     assert 'id="hubError"' in card, "#hubError 必须在「远程控制（慧尖云）」卡内"
     assert re.search(r"\.hub-err\s*\{", CSS), "缺 .hub-err 样式（显示出来也没排版）"
     body = _single_func_body(JS, "applyHubStatus")
-    assert "hubErrorText(" in body, "统一渲染出口没有渲染故障原因"
+    assert "hubErrorLine(info)" in body, "统一渲染出口没有走错误行出口（v1.9.3 起优先级在 hubErrorLine 里定）"
     assert "errEl.hidden = true" in body, "未启用/读取失败分支必须把原因藏起来（别留旧值）"
 
 
@@ -107,9 +107,18 @@ def test_hub_error_slots_are_split_conn_vs_op():
     渲染时**操作类优先**（那是用户刚点那一下的结果），仍只走唯一出口。
     """
     apply_body = _single_func_body(JS, "applyHubStatus")
-    assert "hubOpErrorText(info.lastOpError)" in apply_body, "统一出口没渲染操作类错误"
-    assert re.search(r"hubOpErrorText\(info\.lastOpError\)\s*\|\|\s*hubErrorText\(info\.lastError\)",
-                     apply_body), "操作类必须优先于连接类（顺序反了＝用户看到的永远是后台状态）"
+    assert "hubErrorLine(info)" in apply_body, "统一出口没走错误行出口（v1.9.3）"
+    line_body = _single_func_body(JS, "hubErrorLine")
+    assert "hubOpErrorText(info.lastOpError)" in line_body, "错误行出口没取操作类文案"
+    assert re.search(r"hubOpErrorText\(info\.lastOpError\)[\s\S]*?hubErrorText\(info\.lastError\)",
+                     line_body), "错误行出口必须同时取操作类与连接类（少一个就是一槽混用的老形态）"
+    # 让位必须**同时**绑在"断连"与"瞬态类"两个条件上：少前者会把语义类一起降级，
+    # 少后者会在断连时把 no_owner/members_full 那种"重试没用"的话藏掉。
+    assert re.search(r"!\s*info\.connected\s*&&\s*hubOpErrorIsTransient\(", line_body), \
+        "让位条件不再是『断连 && 瞬态类』＝语义类会被一起降级，或症状又压住病因"
+    # 三级顺序；最后一级 opText 兜底守的是"让位不许变成空屏"（退避圈首 lastError 被清空）
+    assert re.search(r"return \(demote \? '' : opText\) \|\| connText \|\| opText;", line_body), \
+        "错误行优先级形状变了（行为臂在 test_v1746_panel_render 场景 11-14，改这里必须同批改那几条）"
     conn = _single_func_body(JS, "hubErrorText")
     op = _single_func_body(JS, "hubOpErrorText")
     for code in ("identity_rejected", "identity_rejected_loop"):
@@ -265,19 +274,24 @@ def test_unknown_conn_error_still_shows_a_generic_reason():
     ——接线（第三项在不在、顺序对不对）才是本缺陷的发生地。故从 JS 里抠出
     `const why = …;` 的右值，连同两个真函数体与真常量一起交给 node 跑。
     """
-    m = re.search(r"const why = (hubOpErrorText\(info\.lastOpError\)[\s\S]*?);", JS)
-    assert m, "渲染出口的组合表达式形状变了——本钉要一起改，不许删钉"
-    expr = m.group(1)
     cm = re.search(r"const HUB_CONN_GENERIC_TEXT =([\s\S]*?);", JS)
     assert cm, "缺 HUB_CONN_GENERIC_TEXT 兜底常量"
     generic_src = cm.group(1).strip()
+    tm = re.search(r"const HUB_TRANSIENT_OP_ERRORS = (\[[^\]]*\]);", JS)
+    assert tm, "缺 HUB_TRANSIENT_OP_ERRORS 名单（v1.9.3 的让位判据，本钉要一起改，不许删钉）"
     if shutil.which("node") is None:
         raise AssertionError("node 不可用，无法真跑渲染出口组合")
 
+    # v1.9.3 起直接跑**真出口函数** hubErrorLine，不再从 JS 里抠 `const why = …` 的片段：
+    # 抠出来的那份与真函数体之间会漂移，而本钉要判的正是"接线"（顺序、第三项在不在）。
+    # 现在跑的就是生产里那一颗，比抠片段更严。
     script = (_single_func_body(JS, "hubErrorText") + "\n" +
               _single_func_body(JS, "hubOpErrorText") + "\n" +
+              _single_func_body(JS, "hubOpErrorIsTransient") + "\n" +
+              _single_func_body(JS, "hubErrorLine") + "\n" +
               "const HUB_CONN_GENERIC_TEXT = %s;\n" % generic_src +
-              "const composed = (info) => (%s);\n" % expr + """
+              "const HUB_TRANSIENT_OP_ERRORS = %s;\n" % tm.group(1) +
+              "const composed = (info) => hubErrorLine(info);\n" + """
 const raws = ['RuntimeError', 'ClientConnectorError', 'Timeout context manager should be used',
               'loop_TimeoutError', 'server closed connection at handshake'];
 for (const c of raws) {
@@ -308,6 +322,26 @@ if (composed({lastOpError: 'members_full', lastError: 'identity_rejected_loop'})
 if (!composed({lastOpError: null, lastError: 'identity_rejected'}).includes('重新扫码')) {
   console.log('FAIL 语义连接码必须走自己的专属文案，不许被通用兜底吃掉'); process.exit(1)
 }
+// v1.9.3 主案：断连时"本机这一趟没读到云端"是**症状**，连接类那句才是病因。
+// 现网取证过一例——云端 27 天没重启、坏的是那台机器的 DNS，而主句写的是"云端暂不可达"。
+const demoted = composed({connected: false, lastOpError: 'members_unavailable', lastError: 'ClientConnectorError'});
+if (/家庭成员读取失败/.test(demoted)) { console.log('FAIL 断连时瞬态成员错误不得再当主因:', demoted); process.exit(1) }
+if (!/本机网络不通/.test(demoted)) { console.log('FAIL 断连时主句必须是连接类兜底:', demoted); process.exit(1) }
+// 反向半条：长连是通的时同一份值必须照常显示，否则把真实错误也一起藏了
+const keep = composed({connected: true, lastOpError: 'members_unavailable', lastError: null});
+if (!/家庭成员读取失败/.test(keep)) { console.log('FAIL 连通时成员读取失败必须照常显示:', keep); process.exit(1) }
+// 反向半条之二：长连通着、但 lastError 里还留着上一轮的连接异常 ⇒ 用户刚点那一下
+// 的结果仍要优先（v1.7.50 拆槽的原始理由）。让位只绑"断连"，不绑"lastError 有没有值"。
+const keep2 = composed({connected: true, lastOpError: 'members_unavailable', lastError: 'ClientConnectorError'});
+if (!/家庭成员读取失败/.test(keep2)) {
+  console.log('FAIL 连通时瞬态操作错误不得因为 lastError 非空就让位:', keep2); process.exit(1)
+}
+// 让位不能变成空屏：退避每一圈开头 lastError 会被清空，此时瞬态类要顶上来
+const noBlank = composed({connected: false, lastOpError: 'members_unavailable', lastError: null});
+if (!noBlank) { console.log('FAIL 断连且 lastError 为空时不得空屏'); process.exit(1) }
+// 语义类在断连时不许被降级（否则 no_owner 这种"重试没用"的话会被"本机会自动重试"顶掉）
+const semantic = composed({connected: false, lastOpError: 'no_owner', lastError: 'ClientConnectorError'});
+if (!/成为主人/.test(semantic)) { console.log('FAIL 断连时语义类操作错误仍须优先:', semantic); process.exit(1) }
 console.log('OK');
 """)
     with tempfile.TemporaryDirectory() as d:
