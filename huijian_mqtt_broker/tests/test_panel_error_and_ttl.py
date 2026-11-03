@@ -154,3 +154,18 @@ def test_transient_op_codes_are_all_network_degradation_sites():
         # 方法的 except 会把本方法的正常分支也算成"异常降级"）
         assert any(any("except" in py[j] for j in range(max(0, n - 10), n + 1)) for n in hits), \
             "码 %s 的产生点不在异常处理块里＝它不是网络降级值，不该参与让位" % code
+
+
+def test_panel_never_asserts_the_cloud_is_unreachable():
+    """类面钉：面板全文不许再对用户说"云端暂不可达"那一类断言。
+
+    为什么按类钉而不按条钉：v1.9.3 只改了错误行的**优先级**，三个瞬态码的文案里
+    那句断言原样留着——于是"长连通着但这一次读失败"（现网实测形态：那台机器 DNS 在抖，
+    而 hub 27 天没重启）仍然会对用户喊"云端暂不可达"，让他等一个不会自己好的东西。
+    逐条改必然漏，所以钉**字样本身**：面板 JS 里出现次数必须为 0。
+    判 JS 不判测试——测试注释里为了说明缺陷会引用这句话，那是散文不是产品面。
+    """
+    js = (ROOT / "www" / "js" / "huijian.js").read_text(encoding="utf-8")
+    for phrase in ("云端暂不可达", "云端不可达", "云端挂了"):
+        assert js.count(phrase) == 0, "面板仍在对用户断言「%s」（出现 %d 次）" % (
+            phrase, js.count(phrase))

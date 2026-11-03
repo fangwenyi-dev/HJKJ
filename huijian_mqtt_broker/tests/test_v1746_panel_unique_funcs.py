@@ -116,9 +116,11 @@ def test_hub_error_slots_are_split_conn_vs_op():
     # 少后者会在断连时把 no_owner/members_full 那种"重试没用"的话藏掉。
     assert re.search(r"!\s*info\.connected\s*&&\s*hubOpErrorIsTransient\(", line_body), \
         "让位条件不再是『断连 && 瞬态类』＝语义类会被一起降级，或症状又压住病因"
-    # 三级顺序；最后一级 opText 兜底守的是"让位不许变成空屏"（退避圈首 lastError 被清空）
-    assert re.search(r"return \(demote \? '' : opText\) \|\| connText \|\| opText;", line_body), \
-        "错误行优先级形状变了（行为臂在 test_v1746_panel_render 场景 11-14，改这里必须同批改那几条）"
+    # 三级顺序；末级在断连时兜成连接类文案（v1.9.4），无故障时仍回空串（场景 16 钉着）
+    assert re.search(
+        r"return \(demote \? '' : opText\) \|\| connText \|\|"
+        r" \(demote \? HUB_CONN_GENERIC_TEXT : opText\);", line_body), \
+        "错误行优先级形状变了（行为臂在 test_v1746_panel_render 场景 11/14/16/17，改这里必须同批改那几条）"
     conn = _single_func_body(JS, "hubErrorText")
     op = _single_func_body(JS, "hubOpErrorText")
     for code in ("identity_rejected", "identity_rejected_loop"):
@@ -336,9 +338,24 @@ const keep2 = composed({connected: true, lastOpError: 'members_unavailable', las
 if (!/家庭成员读取失败/.test(keep2)) {
   console.log('FAIL 连通时瞬态操作错误不得因为 lastError 非空就让位:', keep2); process.exit(1)
 }
-// 让位不能变成空屏：退避每一圈开头 lastError 会被清空，此时瞬态类要顶上来
+// v1.9.4：退避每一圈开头 lastError 会被清空。这一窗里既不许空屏，也不许把瞬态类原文
+// 当主句顶上来——主句必须是连接类兜底（它才说得出"本机网络不通/局域网不受影响"）。
 const noBlank = composed({connected: false, lastOpError: 'members_unavailable', lastError: null});
 if (!noBlank) { console.log('FAIL 断连且 lastError 为空时不得空屏'); process.exit(1) }
+if (!/本机网络不通|云端暂时连不上/.test(noBlank)) {
+  console.log('FAIL 该窗主句必须是连接类兜底:', noBlank); process.exit(1)
+}
+if (/家庭成员读取失败/.test(noBlank)) {
+  console.log('FAIL 该窗不得把瞬态类原文当主因:', noBlank); process.exit(1)
+}
+// 反向半条（v1.9.4）：末级兜底是三元而不是无条件——一切正常时必须回空串，
+// 否则"啥事没有"也会挂一行"连不上"（恐慌文案）。
+if (composed({connected: false, lastOpError: null, lastError: null}) !== '') {
+  console.log('FAIL 无故障时错误行必须为空'); process.exit(1)
+}
+if (composed({connected: true, lastOpError: null, lastError: null}) !== '') {
+  console.log('FAIL 连通且无故障时错误行必须为空'); process.exit(1)
+}
 // 语义类在断连时不许被降级（否则 no_owner 这种"重试没用"的话会被"本机会自动重试"顶掉）
 const semantic = composed({connected: false, lastOpError: 'no_owner', lastError: 'ClientConnectorError'});
 if (!/成为主人/.test(semantic)) { console.log('FAIL 断连时语义类操作错误仍须优先:', semantic); process.exit(1) }

@@ -273,15 +273,44 @@ applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeEx
 want(/还没有主人/.test(els.hubError.textContent),
      '语义类操作错误在断连时也必须优先: ' + els.hubError.textContent);
 
-// 场景 14（让位不能变成空屏）：退避每一圈开头 lastError 会被清空，此时
-// 瞬态类要顶上来，不能整行隐藏（空屏比一句陈旧文案更糟）。
+// 场景 14（v1.9.4 收紧）：退避每一圈开头 lastError 会被清空——这一窗里既不能空屏，
+// 也不许把瞬态类原文当主句顶上来（那正是"叫用户等云端"的那句）。主句必须是连接类兜底。
 reset();
 applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
                  bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
                  lastError: null, lastOpError: 'members_unavailable',
                  members: [], membersMax: 8, membersSupported: true }, false);
 want(els.hubError.hidden === false && !!els.hubError.textContent,
-     'lastError 为空的退避窗里不得空屏（瞬态类要兜住）');
+     'lastError 为空的退避窗里不得空屏');
+want(/本机网络不通|云端暂时连不上/.test(els.hubError.textContent),
+     '该窗的主句必须是连接类兜底: ' + els.hubError.textContent);
+want(!/家庭成员读取失败/.test(els.hubError.textContent),
+     '该窗不得把瞬态类原文当主因: ' + els.hubError.textContent);
+
+// 场景 16（v1.9.4 反向半条）：一切正常时不许凭空喊"连不上"。
+// tier3 写成无条件兜底就会在这里挂出一行红字。
+reset();
+applyHubStatus({ enabled: true, connected: false, bindCode: '111111', bindCodeExpiresIn: 60,
+                 bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                 lastError: null, lastOpError: null,
+                 members: [], membersMax: 8, membersSupported: true,
+                 membersLoadedAt: 1793695483 }, false);
+want(els.hubError.hidden === true && els.hubError.textContent === '',
+     '无故障时错误行必须整条隐藏: ' + JSON.stringify(els.hubError.textContent));
+
+// 场景 17（v1.9.4 文案类面）：长连通着时瞬态类照常是主句（错误真实），
+// 但那句话**不许指认云端坏了**——现网取证过云端 27 天没重启、坏的是本机解析。
+for (const op of ['members_unavailable', 'bindcode_failed', 'member_remove_failed']) {
+  reset();
+  applyHubStatus({ enabled: true, connected: true, bindCode: '111111', bindCodeExpiresIn: 60,
+                   bindCodeExpired: false, gatewaySn: 'GW1', gateways: [],
+                   lastError: null, lastOpError: op,
+                   members: [], membersMax: 8, membersSupported: true }, false);
+  want(!!els.hubError.textContent && els.hubError.hidden === false,
+       '连通时瞬态类仍要显示（op=' + op + '）');
+  want(!/不可达|云端坏了|云端暂时/.test(els.hubError.textContent),
+       '瞬态类文案不得指认云端故障（op=' + op + '）: ' + els.hubError.textContent);
+}
 
 // 场景 15：从未读到过成员 ≠ 只有你一人。空列表在这里的含义是"还不知道"。
 reset();

@@ -220,7 +220,11 @@
                 case 'owner_cannot_leave':
                     return '主人不能移除自己（否则这处安装就没人能管成员了）';
                 case 'bindcode_failed':
-                    return '换绑定码失败（云端暂不可达），页面上的码可能已过期';
+                    // 不指认方向：现网取证过"云端 27 天没重启、坏的是用户那台机器的 DNS"，
+                    // 而这一族的产生点只是"本机这趟 HTTP 没拿到结果"——可能是连不上、超时，
+                    // 也可能是云端回了个认不出的状态。把原因写死成"云端坏了"＝推到别人身上，
+                    // 用户就会等一个不会自己好的东西。类面钉：本文件不许再出现那句断言。
+                    return '换绑定码失败（本机这趟没拿到云端的结果），页面上的码可能已过期';
                 case 'bindcode_rejected':
                     return '云端拒绝换绑定码请求，稍后再试或点二维码重试';
                 case 'bindcode_persist_failed':
@@ -229,7 +233,7 @@
                 case 'hub_too_old_for_member_code':
                     return '云端 hub 版本过旧，暂不支持成员码';
                 case 'members_unavailable':
-                    return '家庭成员读取失败（云端暂不可达），请稍后重试';
+                    return '家庭成员读取失败（本机这趟没拿到云端的结果），请稍后重试';
                 case 'bad_body':
                     // v1.7.64（#6）：加载项自己产生的码——hub 回了 200 但响应体不是
                     // 对象（云函数返回空时云托管照样回 200 + null）。未知码走 default
@@ -243,7 +247,7 @@
                 case 'members_rejected':
                     return '云端拒绝读取家庭成员，请稍后重试';
                 case 'member_remove_failed':
-                    return '移除家人失败（云端暂不可达），请稍后重试';
+                    return '移除家人失败（本机这趟没拿到云端的结果），请稍后重试';
                 case 'member_remove_rejected':
                     return '云端拒绝移除这位家人';
                 case 'member_rename_rejected':
@@ -284,7 +288,10 @@
             const connText = hubErrorText(info.lastError) ||
                 (info.lastError ? HUB_CONN_GENERIC_TEXT : '');
             const demote = !info.connected && hubOpErrorIsTransient(info.lastOpError);
-            return (demote ? '' : opText) || connText || opText;
+            // 末级仍是三元而不是无条件兜底：`demote` 只在"断连 且 值属瞬态类"时为真，
+            // 所以"没有故障"（op 为 null、lastError 也为空）时这里回 ''、整行继续隐藏。
+            // 写成无条件 HUB_CONN_GENERIC_TEXT 就会在一切正常时挂一行"连不上"（反向臂已钉）。
+            return (demote ? '' : opText) || connText || (demote ? HUB_CONN_GENERIC_TEXT : opText);
         }
 
         /** 有效期文案的分钟数：优先用服务端回的 TTL 秒数，缺失/非法才回落字面量。

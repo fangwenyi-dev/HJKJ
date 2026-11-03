@@ -88,6 +88,7 @@ THUBC = "tests/test_hub_client.py"
 T1747API = "tests/test_v1747_hub_members_api.py"
 T1746R = "tests/test_v1746_panel_render.py"
 T1747M = "tests/test_v1747_panel_members.py"
+TPE = "tests/test_panel_error_and_ttl.py"
 IGNORE = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
 TIMEOUT = 900
 
@@ -920,11 +921,30 @@ ARMS = [
      "（v1.7.50 拆槽的理由被反着拆掉）",
      T1746F),
     ("mask_no_last_resort_fallback", PANEL_JS,
-     "return (demote ? '' : opText) || connText || opText;",
+     "return (demote ? '' : opText) || connText || (demote ? HUB_CONN_GENERIC_TEXT : opText);",
      "return (demote ? '' : opText) || connText;",
      "test_apply_hub_status_renders_every_state_in_node", "red",
      "去掉末级兜底＝退避每一圈开头 lastError 被清空时整行隐藏，用户只剩孤零零一句『未连接』",
      T1746R),
+    ("mask_fallback_reverts_to_op_text", PANEL_JS,
+     "return (demote ? '' : opText) || connText || (demote ? HUB_CONN_GENERIC_TEXT : opText);",
+     "return (demote ? '' : opText) || connText || opText;",
+     "test_apply_hub_status_renders_every_state_in_node", "red",
+     "v1.9.3 的原形状（末级仍回 opText）：断连且 lastError 为空那一窗里又把症状当主因，"
+     "而这一窗是一整轮连接尝试的时长（上限 15s），面板 30s 轮询撞得进去",
+     T1746R),
+    ("mask_unconditional_generic_fallback", PANEL_JS,
+     "return (demote ? '' : opText) || connText || (demote ? HUB_CONN_GENERIC_TEXT : opText);",
+     "return (demote ? '' : opText) || connText || HUB_CONN_GENERIC_TEXT;",
+     "test_apply_hub_status_renders_every_state_in_node", "red",
+     "末级写成无条件兜底＝一切正常时也挂一行『云端暂时连不上』，恐慌文案（场景 16 的反向半条）",
+     T1746R),
+    ("panel_reasserts_cloud_unreachable", PANEL_JS,
+     "return '家庭成员读取失败（本机这趟没拿到云端的结果），请稍后重试';",
+     "return '家庭成员读取失败（云端暂不可达），请稍后重试';",
+     "test_panel_never_asserts_the_cloud_is_unreachable", "red",
+     "把指认方向的断言改回任何一条瞬态文案＝类面钉当场红（逐条改必然漏，所以钉字样）",
+     TPE),
     ("mask_transient_list_emptied", PANEL_JS,
      "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];",
      "const HUB_TRANSIENT_OP_ERRORS = [];",
