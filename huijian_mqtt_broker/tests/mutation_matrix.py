@@ -89,6 +89,8 @@ T1747API = "tests/test_v1747_hub_members_api.py"
 T1746R = "tests/test_v1746_panel_render.py"
 T1747M = "tests/test_v1747_panel_members.py"
 TPE = "tests/test_panel_error_and_ttl.py"
+TCAP = "tests/test_ws_capacity.py"
+CONSTPY = "custom_components/window_controller_gateway/const.py"
 IGNORE = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
 TIMEOUT = 900
 
@@ -617,7 +619,7 @@ ARMS = [
      "if True:\n                    # 续期点在分派判定",
      "test_one_byte_text_does_not_renew", "red",
      "B-2 原形：续期不看业务帧判据 ⇒ 任意 1 字节 TEXT 与当年 BINARY 等价，"
-     "同网段拿公开令牌即可永久占满 4 槽、把真小程序挤成 503",
+     "同网段拿公开令牌即可永久占满 WS 槽位、把真小程序挤成 503",
      T184R),
     ("v184_renewal_outside_business_guard", WSGW,
      "                business = frame_is_business(msg.data)\n",
@@ -945,6 +947,37 @@ ARMS = [
      "test_panel_never_asserts_the_cloud_is_unreachable", "red",
      "把指认方向的断言改回任何一条瞬态文案＝类面钉当场红（逐条改必然漏，所以钉字样）",
      TPE),
+    # ── v1.9.5：局域网直连槽位与云端成员上限对齐（8）──
+    ("ws_cap_back_to_firmware_four", CONSTPY,
+     "WS_MAX_CLIENTS: Final = 8",
+     "WS_MAX_CLIENTS: Final = 4",
+     "test_ws_capacity_equals_the_cloud_member_cap", "red",
+     "退回抄固件的 4＝5 口之家第 5 个人被 503 拒，而那句解释只躺在 HA 日志里",
+     TCAP),
+    ("ws_gate_off_by_one", WSGW,
+     "        if len(self._clients) + self._pending_handshakes >= WS_MAX_CLIENTS:",
+     "        if len(self._clients) + self._pending_handshakes > WS_MAX_CLIENTS:",
+     "test_full_slots_reject_and_do_not_consume_a_slot", "red",
+     "边界写成 > ⇒ 满员时还放一个人进来，第 9 台手机把上限撑成 9，固件同款语义破了",
+     TCAP),
+    ("ws_gate_ignores_pending", WSGW,
+     "        if len(self._clients) + self._pending_handshakes >= WS_MAX_CLIENTS:",
+     "        if len(self._clients) >= WS_MAX_CLIENTS:",
+     "test_pending_handshakes_count_toward_the_gate", "red",
+     "在途握手不计入闸＝并发握手同时通过检查、瞬时超上限（v1.6.17 逼近固件原子语义那一笔）",
+     TCAP),
+    ("ws_gate_removed", WSGW,
+     "        if len(self._clients) + self._pending_handshakes >= WS_MAX_CLIENTS:",
+     "        if False:",
+     "test_full_slots_reject_and_do_not_consume_a_slot", "red",
+     "容量闸整个摘掉＝无界接受握手，公开令牌下同网段可把加载项拖到 socket 耗尽",
+     TCAP),
+    ("ws_prose_rehardcodes_the_cap", WSGW,
+     "# 挤掉真小程序（占满 WS_MAX_CLIENTS ⇒ 503）。这张表与 handle_json_message 的分派链",
+     "# 挤掉真小程序（WS_MAX_CLIENTS=4 ⇒ 503）。这张表与 handle_json_message 的分派链",
+     "test_no_prose_hardcodes_the_old_four", "red",
+     "数字写进散文＝改了常量注释不跟着改，下一个人拿注释当事实（本次要收口的四处正是这样留下的）",
+     TCAP),
     ("mask_transient_list_emptied", PANEL_JS,
      "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];",
      "const HUB_TRANSIENT_OP_ERRORS = [];",

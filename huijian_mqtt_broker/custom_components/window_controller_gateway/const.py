@@ -238,7 +238,15 @@ WS_TOKEN_MAX_LEN: Final = 63           # 固件判式 strlen >= sizeof(s_ws_toke
 WS_TOKEN_CHARSET: Final = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 )  # 固件 ws_token_charset_ok：仅 [A-Za-z0-9_-]，RFC6455 子协议安全字符集
-WS_MAX_CLIENTS: Final = 4              # 固件 MAX_WS_CLIENTS=4（握手认证成功才占槽）
+# v1.9.5：局域网直连的并发槽位**与云端成员上限对齐**（8），不再抄固件那个 4。
+# 理由：固件的 `MAX_WS_CLIENTS=4` 是 ESP32 侧 `int fds[4]` 这类静态数组的资源约束，
+# 属**容量**不属**协议**；加载项这侧是 aiohttp，多一个槽只是多一条 socket。
+# 而"能绑进这个家庭的成员数"是 HUB_MEMBERS_MAX=8 —— 留着 4 就出现"云端允许 8 人、
+# 局域网只让 4 人同时用"，第 5 个开小程序的人被 503 拒，而那句拒绝只躺在 HA 日志里。
+# 相等关系由 tests/test_ws_capacity.py 机器看守（防再次各自漂移）。
+# ⚠ 已知不对称：小程序这次直连的是**网关固件本体**（9001）时仍受固件的 4 限制——
+# 那是固件侧资源决定，改它要走烧录链，不在本仓范围。别把这条注释当"漏改"补回来。
+WS_MAX_CLIENTS: Final = 8
 WS_MAX_FRAME_BYTES: Final = 1024       # 固件 WS_RX_BUF_SIZE：超长→error+断连
 WS_RECV_TIMEOUT_SECONDS: Final = 300   # 固件 recv_wait_timeout=300s 空闲断连
 # v1.6.17（联审）：小程序 gateway_list 的 online 判定口径。固件以

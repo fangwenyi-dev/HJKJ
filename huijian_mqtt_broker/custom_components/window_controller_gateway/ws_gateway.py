@@ -157,7 +157,7 @@ _MSG_OLD_MISMATCH = "old token mismatch"
 
 # 空闲续期只认这些**已识别的业务命令**（v1.8.4 审计 B-2）。判据不能是"能解析成对象"：
 # 默认令牌公开在本仓，同网段主机发 `{"cmd":"x"}` 这种 12 字节的未知命令也能永久占槽，
-# 挤掉真小程序（WS_MAX_CLIENTS=4 ⇒ 503）。这张表与 handle_json_message 的分派链
+# 挤掉真小程序（占满 WS_MAX_CLIENTS ⇒ 503）。这张表与 handle_json_message 的分派链
 # **必须一致**，由 tests/test_v184_ws_renewal.py 的 AST 双向对账钉住——只改分派链
 # 不改这里，那条钉当场红（既不"静默踢线"，也不"名单空转"）。
 BUSINESS_CMDS = frozenset({
@@ -895,7 +895,7 @@ class WsGatewayServer:
         # 传了会让 aiohttp 在解析层对 >N 帧直接 1009 断连，绕过固件同款
         # "command too long" JSON 错误回包语义。代价有界：分片重组窗口
         # 由 aiohttp 默认 4MiB 兜住，业务层 WS_MAX_FRAME_BYTES 判定后
-        # 断开（最坏 4 槽 ≈16MB 瞬时内存，无功能分歧）。维持现状。
+        # 断开（最坏每槽 4MiB × WS_MAX_CLIENTS=8 ⇒ ≈32MB 瞬时内存，无功能分歧）。维持现状。
         ws = web.WebSocketResponse(
             protocols=protocols,
             autoclose=True,
@@ -903,7 +903,7 @@ class WsGatewayServer:
         )
         # v1.6.17（联审 会话层F4）：固件的"查满→入册"在同一回调内原子，
         # 插件在两者之间有 ws.prepare 挂起点，并发握手可同时通过容量检查
-        # 瞬时超 4。用预约计数把在途握手计入占位，逼近固件原子语义。
+        # 瞬时超上限。用预约计数把在途握手计入占位，逼近固件原子语义。
         self._pending_handshakes += 1
         try:
             # v1.6.19（第六轮审计 A-LOW5）：递减移入 finally——旧写法只在
@@ -957,7 +957,7 @@ class WsGatewayServer:
         `wait_for(ws.receive(), 300)` 重新起表，任何让 receive() 返回的帧
         （含 BINARY/空 TEXT）都复位计时，而 docstring 声称只认业务 TEXT。
         默认令牌公开在本仓，同网段主机握手后每 299s 发 1 字节二进制帧即可
-        永久占槽（WS_MAX_CLIENTS=4 被占满，真小程序恒 503）。改为显式
+        永久占槽（占满 WS_MAX_CLIENTS 后真小程序恒 503）。改为显式
         deadline：只在业务 TEXT 分支续期；`_stopping` 时主动退出。
 
         v1.8.4（审计 B-2）：**那一版只堵了一半**——续期发生在解析与分派**之前**，
