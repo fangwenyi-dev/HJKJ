@@ -3,10 +3,11 @@
 实机背景（用户 2026-09-10 提供）：
 - Apple 窗子磁贴**拖动期持续写** TargetPosition（broker 日志 34→46→47，
   间隔约 250ms），旧实现每条直发 004 → 一次拖动十几条报文全压到 LoRa 空口；
-- 权威机型矩阵：5001/5003/5005/5006/5007 支持百分比；5002 平开窗暂不支持
-  （用户："以后有可能支持"）。对 5002 声明 SET_POSITION 会造成
-  ①"拖了没反应"的假滑块 ②丢失 WindowCoveringBasic 的三段式暂停
-  （上游 homekit/type_covers.py：>70 开 / <30 关 / 中间 stop）。
+- 权威机型矩阵：5001/5003/5005/5006/5007 支持百分比；5002 平开窗当时暂不支持
+  （用户："以后有可能支持"）→ **v1.9.6 用户 2026-11-10 定案纳入**。对无能力
+  机型声明 SET_POSITION 会造成 ①"拖了没反应"的假滑块 ②丢失
+  WindowCoveringBasic 的三段式暂停（上游 homekit/type_covers.py：>70 开 /
+  <30 关 / 中间 stop）——未知前缀仍按这条兜底。
 
 合并语义（用户拍板机制二）：首发立即发（保住 v1.6.9 failfast），
 窗口内只记最后值，静默 POSITION_COALESCE_SECONDS 后补发一条。
@@ -26,7 +27,6 @@ from custom_components.window_controller_gateway.const import (
 )
 
 CAPABLE_MASK = 1 | 2 | 4 | 8   # OPEN | CLOSE | SET_POSITION | STOP
-NO_POSITION_MASK = 1 | 2 | 8   # OPEN | CLOSE | STOP
 
 
 class RecHandler:
@@ -111,14 +111,14 @@ class TestModelCapability:
         """v1.8.6（审计 G-4 第二条）：无能力机型的属性里**不得出现 position**。
 
         旧实现 `cover.py` 无条件写 `attrs["position"]=钳制(r_travel)`，而
-        `current_cover_position`（:267）与 Web 面板都按能力判——于是 5002 这类
-        机型常态并排显示「不支持百分比定位」＋「位置: 65%」，且这条矛盾**不需要
+        `current_cover_position`（:267）与 Web 面板都按能力判——于是未知前缀
+        这类机型常态并排显示「不支持百分比定位」＋「位置: 65%」，且这条矛盾**不需要
         /states 失败**就存在。反向臂（有能力的仍要带 position）是判据另一半：
         只禁无能力侧，改成"谁都不写"也能过。
         """
         capable = _cover("500700000001", status=DEVICE_STATUS_OPEN,
                          attributes={"r_travel": 65, "voltage": 12.0})
-        plain = _cover("500200000001", status=DEVICE_STATUS_OPEN,
+        plain = _cover("599900000001", status=DEVICE_STATUS_OPEN,
                        attributes={"r_travel": 65, "voltage": 12.0})
         assert capable.extra_state_attributes.get("position") == 65, \
             capable.extra_state_attributes
@@ -134,15 +134,24 @@ class TestModelCapability:
         assert feats & 4, f"{prefix} 应声明 SET_POSITION（HomeKit 才有真位置滑块）"
         assert feats == CAPABLE_MASK
 
-    def test_5002_flat_window_has_no_position(self):
-        """5002 平开窗：无百分比硬件 → 不声明 SET_POSITION。
+    def test_5002_flat_window_now_capable(self):
+        """5002 平开窗：v1.9.6（用户 2026-11-10 定案）纳入百分比能力表。
 
-        于是 HomeKit 落回 WindowCoveringBasic（Apple 三段式：>70 开 /
-        <30 关 / 中间停=暂停），不会再出现假滑块。
+        以前这条臂判"不声明 SET_POSITION"。参数化用例遍历能力集合，删掉
+        5002 会连参数一起消失、不会红——所以 5002 必须单独钉一次，
+        防"能力表又被改回去"。
         """
         feats = _cover("500200000001")._attr_supported_features
-        assert not feats & 4
-        assert feats == NO_POSITION_MASK
+        assert feats & 4, "5002 必须在 SET_POSITION 能力表内（v1.9.6 定案）"
+        assert feats == CAPABLE_MASK
+
+    @pytest.mark.asyncio
+    async def test_5002_accepts_position_and_publishes(self):
+        """5002 的位置指令必须真发到 MQTT（不再被能力闸拒）。"""
+        handler = RecHandler()
+        cover = _cover("500200000001", handler=handler, hass=FakeHass())
+        await cover.async_set_cover_position(position=50)
+        assert handler.calls == [("500200000001", "set_position", {"position": 50})]
 
     @pytest.mark.parametrize("sn", ["100020003001", "9999X", "", "5", "500"])
     def test_unknown_prefix_defaults_to_no_position(self, sn):
@@ -153,7 +162,7 @@ class TestModelCapability:
     def test_real_position_only_for_capable(self):
         assert _cover("500700000001", status=DEVICE_STATUS_OPEN,
                       attributes={"r_travel": 65}).current_cover_position == 65
-        assert _cover("500200000001", status=DEVICE_STATUS_OPEN,
+        assert _cover("599900000001", status=DEVICE_STATUS_OPEN,
                       attributes={"r_travel": 65}).current_cover_position is None
 
     def test_endpoint_fallback_only_for_capable(self):
@@ -161,7 +170,7 @@ class TestModelCapability:
         assert _cover("500700000001", status=DEVICE_STATUS_OPEN,
                       attributes={"r_travel": 255}).current_cover_position == 100
         # 无百分比机型恒 None（位置由 Apple 依 state 自行映射）
-        assert _cover("500200000001", status=DEVICE_STATUS_CLOSED,
+        assert _cover("599900000001", status=DEVICE_STATUS_CLOSED,
                       attributes={"r_travel": 255}).current_cover_position is None
 
     @pytest.mark.asyncio
@@ -169,14 +178,15 @@ class TestModelCapability:
         """HA 核心服务层已按 feature 拦截；实体层兜底防内部误用，
         绝不把无效 w_travel 指令打到 LoRa 空口。"""
         handler = RecHandler()
-        cover = _cover("500200000001", handler=handler, hass=FakeHass())
+        cover = _cover("599900000001", handler=handler, hass=FakeHass())
         with pytest.raises(HomeAssistantError):
             await cover.async_set_cover_position(position=50)
         assert handler.calls == []
 
     def test_capability_exposed_in_attributes(self):
         assert _cover("500700000001").extra_state_attributes["position_capable"] is True
-        assert _cover("500200000001").extra_state_attributes["position_capable"] is False
+        assert _cover("500200000001").extra_state_attributes["position_capable"] is True
+        assert _cover("599900000001").extra_state_attributes["position_capable"] is False
 
 
 class TestPositionCoalescing:

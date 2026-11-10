@@ -29,7 +29,8 @@ MQTT_HOST = os.environ.get("E2E_MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("E2E_MQTT_PORT", "2022"))
 GW_SN = "E2EGW0000001"
 DEV_SN = "500700000001"     # v1.7.21：SN 前四位=机型码，5007 支持百分比
-DEV_SN_5002 = "500200000001"  # 5002 平开窗：暂不支持百分比（走三态形态）
+DEV_SN_5002 = "500200000001"  # 5002 平开窗：v1.9.6 起纳入百分比（r_travel=255 未校准形态）
+DEV_SN_UNKNOWN = "599900000001"  # 未知前缀：保守兜底为三态（阴性对照）
 WS_PORT = int(os.environ.get("E2E_WS_PORT", "9001"))
 CLIENT_ID = "https://e2e.local.test/"
 
@@ -211,15 +212,17 @@ time.sleep(1)  # 让 SUB 报文过网再发布，观测才可靠
 
 
 def publish_002(rid, rtravel):
-    # v1.7.21：双机型同报——SN 前四位即机型码，能力逐机型不同。
-    # 5007 后装开窗电机（支持百分比）+ 5002 平开窗（暂不支持，r_travel=255
-    # 即实机"未校准"形态）。两条分支都必须在真栈上被证伪/证实。
+    # v1.7.21：多机型同报——SN 前四位即机型码，能力逐机型不同。
+    # v1.9.6：5002 平开窗纳入百分比（与 5007 同走 Window）；另留一台未知前缀
+    # （5999）作三态阴性对照。两条分支都必须在真栈上被证实/证伪。
     payload = {"head": {"cmdid": "002", "id": rid}, "ctype": "002", "id": rid,
                "sn": GW_SN, "data": {"status": 1, "devices": [
                    {"sn": DEV_SN, "model": "5007", "battery": 1210,
                     "r_travel": rtravel},
                    {"sn": DEV_SN_5002, "model": "5002", "battery": 1200,
-                    "r_travel": 255}]}}
+                    "r_travel": 255},
+                   {"sn": DEV_SN_UNKNOWN, "model": "5999", "battery": 1180,
+                    "r_travel": 60}]}}
     pc.publish("gateway/rpt_rsp", json.dumps(payload)).wait_for_publish(timeout=5)
 
 
@@ -233,10 +236,10 @@ while time.time() < deadline:
     if st == 200 and isinstance(devs, list) and devs:
         online = any(d.get("gateway_online") is True for d in devs)
         # v1.7.21：视图是扁平设备列表（网关 + 各子设备各自一条），
-        # 按 identifiers 取 SN 集合判两台子设备都已注册
+        # 按 identifiers 取 SN 集合判三台子设备都已注册
         _sns = {i[1] for d in devs for i in (d.get("identifiers") or [])
                 if isinstance(i, list) and len(i) > 1}
-        found = DEV_SN in _sns and DEV_SN_5002 in _sns
+        found = DEV_SN in _sns and DEV_SN_5002 in _sns and DEV_SN_UNKNOWN in _sns
         if online and found:
             break
     time.sleep(3)
@@ -274,8 +277,9 @@ def _cover_entities_by_sn(devs):
 _cover_map = _cover_entities_by_sn(devs)
 _eid_5007 = _cover_map.get(DEV_SN)
 _eid_5002 = _cover_map.get(DEV_SN_5002)
-if not _eid_5007 or not _eid_5002:
-    die(f"devices 视图未见两台子设备的 cover 实体（{_cover_map}）")
+_eid_unknown = _cover_map.get(DEV_SN_UNKNOWN)
+if not _eid_5007 or not _eid_5002 or not _eid_unknown:
+    die(f"devices 视图未见三台子设备的 cover 实体（{_cover_map}）")
 
 
 def _state_attrs(eid, want_position=None):
@@ -291,6 +295,24 @@ def _state_attrs(eid, want_position=None):
                 break
         time.sleep(2)
     return attrs, state
+
+
+def _wait_position_ack(sn, want, start, timeout=15):
+    """等 req 主题出现该 SN 的 w_travel=<want> 004（value 线值为字符串）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for raw in acks[start:]:
+            try:
+                j = json.loads(raw)
+            except Exception:
+                continue
+            dat = j.get("data") or {}
+            if (str(dat.get("value")) == str(want)
+                    and dat.get("attribute") == "w_travel"
+                    and dat.get("sn") == sn):
+                return True
+        time.sleep(0.5)
+    return False
 
 
 # --- 支持百分比的机型（5007）：Window 形态三输入 + 004 真发 ---
@@ -312,44 +334,51 @@ st_scp, scp_resp = call("POST", "/api/services/cover/set_cover_position",
                         json_body={"entity_id": _eid_5007, "position": 37})
 if st_scp >= 300:
     die(f"5007 cover.set_cover_position 服务调用失败: HTTP {st_scp} {scp_resp}")
-_pos_seen = False
-_dead = time.time() + 15
-while time.time() < _dead and not _pos_seen:
-    for raw in acks[_n0:]:
-        try:
-            j = json.loads(raw)
-        except Exception:
-            continue
-        dat = j.get("data") or {}
-        if (str(dat.get("value")) == "37"
-                and dat.get("attribute") == "w_travel"
-                and dat.get("sn") == DEV_SN):
-            _pos_seen = True
-            break
-    time.sleep(0.5)
-if not _pos_seen:
-    die("req 主题未捕获 value=37/w_travel 的 004 报文（服务→MQTT 下发链路断）")
+if not _wait_position_ack(DEV_SN, 37, _n0):
+    die("req 主题未捕获 5007 的 value=37/w_travel 004（服务→MQTT 下发链路断）")
 
-# --- 无百分比的机型（5002）：必须落回三态形态，且位置服务被拒 ---
-cov2_attrs, cov2_state = _state_attrs(_eid_5002)
-if cov2_attrs.get("supported_features", 0) & 4:
-    die(f"5002 不应声明 SET_POSITION（={cov2_attrs.get('supported_features')}）——"
-        "否则 HomeKit 出现假滑块且丢失三段式暂停")
-if cov2_attrs.get("position_capable") is not False:
-    die("5002 的 position_capable 属性应为 False")
+# --- 5002（v1.9.6 起纳入百分比）：Window 形态 + 004 真发 ---
+cov2_attrs, cov2_state = _state_attrs(_eid_5002, want_position=True)
+if not cov2_attrs.get("supported_features", 0) & 4:
+    die(f"5002 supported_features 缺 SET_POSITION(4)（={cov2_attrs.get('supported_features')}）"
+        "——v1.9.6 起 5002 应进入 Window 形态")
+if cov2_attrs.get("position_capable") is not True:
+    die("5002 的 position_capable 属性应为 True（v1.9.6 起纳入百分比）")
 if cov2_attrs.get("device_class") != "window":
     die(f"5002 device_class 应仍为 window（={cov2_attrs.get('device_class')}）")
+# r_travel=255（未校准）→ 按开端点近似 100（v1.7.20 方案 a）；同时证明
+# 能力判定接通后位置读数不再是 None。
+if cov2_attrs.get("current_position") != 100:
+    die(f"5002 未校准(255)+open 时 current_position 应为 100"
+        f"（={cov2_attrs.get('current_position')}）")
+_n2 = len(acks)
+st2, resp2 = call("POST", "/api/services/cover/set_cover_position",
+                  json_body={"entity_id": _eid_5002, "position": 37})
+if st2 >= 300:
+    die(f"5002 cover.set_cover_position 服务调用失败: HTTP {st2} {resp2}")
+if not _wait_position_ack(DEV_SN_5002, 37, _n2):
+    die("req 主题未捕获 5002 的 value=37/w_travel 004（能力表纳入后下发链路未通）")
+
+# --- 未知前缀（阴性对照）：必须落回三态形态，且位置服务被拒 ---
+covu_attrs, covu_state = _state_attrs(_eid_unknown)
+if covu_attrs.get("supported_features", 0) & 4:
+    die(f"未知前缀不应声明 SET_POSITION（={covu_attrs.get('supported_features')}）——"
+        "否则 HomeKit 出现假滑块且丢失三段式暂停")
+if covu_attrs.get("position_capable") is not False:
+    die("未知前缀的 position_capable 属性应为 False")
+if covu_attrs.get("device_class") != "window":
+    die(f"未知前缀 device_class 应仍为 window（={covu_attrs.get('device_class')}）")
 st_rej, rej_body = call("POST", "/api/services/cover/set_cover_position",
-                        json_body={"entity_id": _eid_5002, "position": 37})
+                        json_body={"entity_id": _eid_unknown, "position": 37})
 if st_rej < 400:
-    die(f"5002 的位置服务调用应被 HA 拒绝（HTTP {st_rej}）——无百分比硬件不得受理")
+    die(f"未知前缀的位置服务调用应被 HA 拒绝（HTTP {st_rej}）——无百分比硬件不得受理")
 _n1 = len(acks)
 time.sleep(2)
-_leaked = [a for a in acks[_n1:] if DEV_SN_5002 in a and "w_travel" in a]
+_leaked = [a for a in acks[_n1:] if DEV_SN_UNKNOWN in a and "w_travel" in a]
 if _leaked:
-    die(f"5002 的无效位置指令泄漏到 LoRa 空口：{_leaked[:1]}")
-step("H2", "HomeKit 双机型实证：5007 Window(SET_POSITION+position=50+004 真发) / "
-           "5002 三态(无位置位、位置服务被拒、无空口泄漏) ✓")
+    die(f"未知前缀的无效位置指令泄漏到 LoRa 空口：{_leaked[:1]}")
+step("H2", "HomeKit 三机型实证：5007/5002 Window(SET_POSITION + position + 004 真发) / "
+           "5999 未知前缀三态(无位置位、位置服务被拒、无空口泄漏) ✓")
 
 # ---------- K/L 共用助手 ----------
 def _hj_entries():
@@ -710,7 +739,8 @@ if summary:
         f.write("## E2E 真栈结果\n"
                 "- onboarding/config flow/002 上报全链路真栈 ✓\n"
                 f"- gateway_online + 子设备注册 + WS {WS_PORT} 常听 ✓\n"
-                "- HomeKit 双机型：5007 Window(SET_POSITION/position/004 真发)、5002 三态(位置服务被拒) ✓\n"
+                "- HomeKit 三机型：5007/5002 Window(SET_POSITION/position/004 真发)、"
+                "5999 未知前缀三态(位置服务被拒) ✓\n"
                 f"- 首报 001 代答：未配置网关 1 请求 1 答（含 uuid）+ 发现卡挂起 ✓\n"
                 f"- 首台弹卡确认（v1.7.62）：等待条目不被静默填充 → 卡挂起 → "
                 f"REST 确认 → {AUTO_GW} loaded → 子设备 {AUTO_DEV} 注册 → "

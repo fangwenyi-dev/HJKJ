@@ -172,17 +172,17 @@ DEVICE_SN_PREFIX_WIND_LOCK: Final = "5005"  # 支持内倒/平开模式的LoRa�
 # covered by supported_features & SET_POSITION（上游 homekit/accessories.py:
 # window + SET_POSITION → Window 服务；无该位 → WindowCoveringBasic）：
 #   5001 推拉窗            ✓ 百分比
-#   5002 平开窗            ✗ 暂不支持（用户："以后有可能支持"）
+#   5002 平开窗            ✓（v1.9.6 起：用户 2026-11-10 定案纳入）
 #   5003 低功耗窗帘        ✓
 #   5004 指纹锁            — 非开窗器
 #   5005 内开内倒执手电机  ✓（另有内倒/平开模式按钮）
 #   5006 平推主机          ✓
 #   5007 后装开窗电机      ✓
-# 因此 SET_POSITION 只对下表机型声明：5002（及未知前缀）走 HA/Apple 原生
-# 三态语义（WindowCoveringBasic：>70 开 / <30 关 / 中间停=暂停），既不会
-# 出现"拖了没反应"的假滑块，也不会把无效位指令打到 LoRa 空口上。
-# 5002 未来固件支持百分比时：把 "5002" 加进本表即可，无需其他改动。
-POSITION_CAPABLE_SN_PREFIXES: Final = frozenset({"5001", "5003", "5005", "5006", "5007"})
+# 因此 SET_POSITION 只对下表机型声明：未知前缀走 HA/Apple 原生三态语义
+# （WindowCoveringBasic：>70 开 / <30 关 / 中间停=暂停），既不会出现
+# "拖了没反应"的假滑块，也不会把无效位指令打到 LoRa 空口上。
+# 新机型接入百分比时：把机型码加进本表即可，无需其他改动。
+POSITION_CAPABLE_SN_PREFIXES: Final = frozenset({"5001", "5002", "5003", "5005", "5006", "5007"})
 
 # v1.7.21 位置命令合并窗口（机制二：首发立即 + 窗口内只发最终值）。
 # 由来：Apple 窗子磁贴拖动期**持续写** TargetPosition（实机日志 34→46→47

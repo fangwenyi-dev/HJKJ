@@ -24,7 +24,8 @@ from custom_components.window_controller_gateway.services import (
 
 GW_SN = "100122501207"
 DEV_CAPABLE = "500500000001"      # 5005 → 有百分比能力
-DEV_INCAPABLE = "500200000001"    # 5002 → 无百分比能力（const 前缀表外）
+DEV_5002 = "500200000001"         # 5002 → v1.9.6 起纳入百分比能力
+DEV_INCAPABLE = "599900000001"    # 未知前缀 → 保守兜底无百分比能力
 
 
 def _call(**data):
@@ -153,6 +154,14 @@ class TestSetPositionCapabilityGate:
             await handle_set_position(hass, _call(device_id=DEV_INCAPABLE, position=50))
         assert "不支持百分比定位" in str(ei.value)
         assert h.calls == [], "无能力机型绝不允许下发（假成功+空口无效指令）"
+
+    @pytest.mark.asyncio
+    async def test_5002_flat_window_passes_after_v196(self):
+        """v1.9.6（用户 2026-11-10 定案）：5002 纳入百分比表后不得再被闸拒。"""
+        h = _SvcHandler()
+        hass = _svc_hass(DEV_5002, h)
+        await handle_set_position(hass, _call(device_id=DEV_5002, position=50))
+        assert h.calls == [(DEV_5002, "set_position", {"position": 50})]
 
     @pytest.mark.asyncio
     async def test_capable_model_passes_and_publishes(self):

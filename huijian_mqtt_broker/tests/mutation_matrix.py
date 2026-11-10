@@ -978,6 +978,14 @@ ARMS = [
      "test_no_prose_hardcodes_the_old_four", "red",
      "数字写进散文＝改了常量注释不跟着改，下一个人拿注释当事实（本次要收口的四处正是这样留下的）",
      TCAP),
+    # ── v1.9.6：5002 平开窗纳入百分比能力表（用户 2026-11-10 定案）──
+    ("v196_5002_dropped_from_position_table", CONSTPY,
+     'POSITION_CAPABLE_SN_PREFIXES: Final = frozenset({"5001", "5002", "5003", "5005", "5006", "5007"})',
+     'POSITION_CAPABLE_SN_PREFIXES: Final = frozenset({"5001", "5003", "5005", "5006", "5007"})',
+     "test_5002_flat_window_now_capable", "red",
+     "把 5002 从能力表摘掉＝HomeKit 退回三态、面板滑块消失；参数化用例随集合一起缩放"
+     "（删了 5002 就连参数一起不跑），所以 5002 必须有单独正钉",
+     "tests/test_v1721_position_capability.py"),
     ("mask_transient_list_emptied", PANEL_JS,
      "const HUB_TRANSIENT_OP_ERRORS = ['bindcode_failed', 'members_unavailable', 'member_remove_failed'];",
      "const HUB_TRANSIENT_OP_ERRORS = [];",

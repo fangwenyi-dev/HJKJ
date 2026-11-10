@@ -76,9 +76,9 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
         self._attr_name = "开窗器"
         self._entry_id = entry_id
         # v1.7.21（机型能力分流）：SN 前四位即机型码，百分比能力逐机型不同
-        # （5001/5003/5005/5006/5007 支持；5002 平开窗暂不支持——见 const.py
-        # 权威矩阵）。未知前缀一律按"不支持"兜底：宁可退化为三态（功能完整、
-        # 不会假动作），也不能在无百分比硬件上声明 SET_POSITION。
+        # （5001/5002/5003/5005/5006/5007 支持，v1.9.6 起 5002 平开窗纳入
+        # ——见 const.py 权威矩阵）。未知前缀一律按"不支持"兜底：宁可退化为
+        # 三态（功能完整、不会假动作），也不能在无百分比硬件上声明 SET_POSITION。
         self._position_capable = str(device_sn)[:4] in POSITION_CAPABLE_SN_PREFIXES
         self._attr_supported_features = (
             CoverEntityFeature.OPEN |
@@ -260,7 +260,7 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
         常亮——而 HomeKit Window accessory 恰恰**必须**位置能力
         （上游 type_covers.py 实证）。
 
-        v1.7.21：无百分比能力的机型（5002 平开窗等）恒返 None——它走
+        v1.7.21：无百分比能力的机型（未知前缀等）恒返 None——它走
         WindowCoveringBasic 形态，位置由 Apple 依 state 自行映射 0/100，
         我们谎报数值只会让"假滑块"更有迷惑性。
         """
@@ -316,7 +316,7 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
                     raw = int(r_travel)
                     # v1.8.5（审计 G-4）：**只在机型支持百分比定位时**才写 position。
                     # 旧实现无条件写，而 Web 面板按 position_capable 渲染——无能力机型
-                    # （5002 等）于是常态并排显示「不支持百分比定位」＋「位置: 65%」，
+                    # （未知前缀等）于是常态并排显示「不支持百分比定位」＋「位置: 65%」，
                     # 自相矛盾且与 current_cover_position（:267 已按能力恒返 None）口径分裂。
                     # r_travel_raw 仍无条件持久化（v1.6.26 B-2：恢复路径据此区分
                     # "真 100%"与"未校准 255 被钳成 100"，与能力无关）。
@@ -398,7 +398,7 @@ class WindowControllerCover(WindowControllerBaseEntity, RestoreEntity, CoverEnti
         if not 0 <= position_int <= 100:
             raise HomeAssistantError(f"设置位置失败：位置超出范围(0-100): {position_int}")
         if not self._position_capable:
-            # 该机型无百分比硬件（5002 等）：HA 核心服务层本已按
+            # 该机型无百分比硬件（未知前缀等）：HA 核心服务层本已按
             # supported_features 拦截（ServiceValidationError），此处兜底
             # 防内部误用——绝不把无效的 w_travel 指令打到 LoRa 空口上。
             raise HomeAssistantError(
