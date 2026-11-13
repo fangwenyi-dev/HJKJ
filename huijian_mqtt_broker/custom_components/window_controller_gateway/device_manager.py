@@ -1026,7 +1026,40 @@ class WindowControllerDeviceManager:
     def get_device(self, device_sn: str) -> Optional[Dict[str, Any]]:
         """获取设备信息"""
         return self.devices.get(device_sn)
-        
+
+    def get_ha_custom_name(self, device_sn: str) -> str:
+        """取"用户**在 HA 里手动改过**的子设备名"（device registry 的 name_by_user）。
+
+        用户定案（2026-11-13）：小程序子设备名称跟 HA 同步，不再一台一台在小程序里改。
+        加载项只把**手动改过**的名字下发（没改过的不下发）——否则会把默认长名
+        「开窗器 GW尾4-DEV尾4」搬进小程序，比它自己的「开窗器 后四位」更长且没多信息。
+
+        为什么读注册表而不是 ``self.devices[device_sn]["name"]``：
+        · 用户在 HA「设置 → 设备」里重命名时，**只有注册表**变（本集成这条路径不参与）；
+        · 本集成 ``rename_device()`` 两条都写（name_by_user + 内存 devices）；
+        · 内存 devices 的名字**不落盘**（persist.py 只存映射/手动删除表），HA 重启后的
+          回填路径会把名字重置成 ``get_device_display_name()`` 默认值 ⇒ 只有注册表能
+          跨重启保存改名结果。
+
+        只认 name_by_user：注册表里的 ``name`` 是本集成创建时的默认名，用户没改过就
+        不该覆盖小程序的本地命名。返回去空白后的名字；未改名/查不到/任何异常一律回空串
+        （调用方按"没提供"处理，绝不把异常带进状态上行）。
+        """
+        try:
+            device_registry = async_get(self.hass)
+            if device_registry is None:
+                return ""
+            entry_id = getattr(getattr(self, "entry", None), "entry_id", None)
+            device = get_device_by_sn(device_registry, device_sn, entry_id)
+            if device is None:
+                return ""
+            name = getattr(device, "name_by_user", None)
+        except Exception:  # noqa: BLE001 - 名称是可选装饰，读不到不许拖垮状态上行
+            return ""
+        if not isinstance(name, str):
+            return ""
+        return name.strip()
+
     def get_all_devices(self) -> List[Dict[str, Any]]:
         """获取所有设备"""
         # 返回设备列表的深拷贝，attributes 子字典也独立复制，

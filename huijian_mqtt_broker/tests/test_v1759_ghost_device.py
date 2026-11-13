@@ -216,7 +216,7 @@ def test_degraded_batch_warns_once_and_resumes_after_recovery(tmp_path, monkeypa
 
     assert caplog.text.count("状态快照不完整") == 1, "刷屏或一次都不报都不对: %r" % caplog.text
     assert sent == [{"t": "state", "items": [{"sn": "A1B2", "gwSn": "GW1",
-                                               "windLockMode": -1}]}], (
+                                               "windLockMode": -1, "name": ""}]}], (
         "恢复后没接着上行: %s" % sent)
 
 

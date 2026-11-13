@@ -3,6 +3,39 @@
 所有版本变更记录在此文件中。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.9.7] - 2026-11-13 · 小程序子设备名称跟 HA 同步（用户定案：不再一台一台改）
+
+**改了集成 Python 代码（`device_manager.py` / `ws_gateway.py` / `hub_client.py`），升级加载项后请再重启一次 Home Assistant**
+（重启加载项只把新文件拷进 `/config/custom_components`，已加载的模块不换）。
+
+用户 2026-11-13 原话：「小程序 开窗器子设备的名称 还是跟ha同步吧 现在一个一个改好麻烦」。
+此前小程序子设备名只有本地一套（自定义名 → 「开窗器 后四位」），HA 里改了名小程序不知道，
+每加一台就要到小程序里再改一遍。本版让名称从 HA **单向下发**（HA 是唯一改名处）：
+
+### 改了什么
+
+- `device_manager.get_ha_custom_name()`：读 HA 设备注册表的 `name_by_user`，**只认用户手动改过的名**。
+  不读内存 `devices[sn]["name"]`：HA 设备页重命名只写注册表；内存名也不落盘，HA 重启回填会把
+  名字重置成默认值。注册表读不到/抛异常一律回空串（名称是可选装饰，不许拖垮状态上行）。
+- `ws_gateway`：LAN 的 `device_list` / `device_update` 带上可选键 `name`（只对有手动名的设备）。
+  `device_update` 补齐名字后，`rename_device()` 的推送能**立刻**把新名送到小程序
+  （v1.7.33 接好了通知漏斗，但推送里此前根本没有 name 字段，「改名后小程序停在旧名」没修彻底）。
+- `hub_client.build_state_snapshot()`：云快照**始终写 `name` 键**（没改过＝空串）。hub 的
+  `setStates` 按 sn 合并（`Object.assign`），缺键会让"用户在 HA 里清掉改名"后云端永远停在旧名。
+- 三条下发通道统一走 `ha_custom_device_name()`（同源；v1.4.28 的速度/力度就是两处各算一份漂的）。
+- 版本号：`config.yaml` / `manifest.json` / `www/version.json` / 面板 `CURRENT_VERSION` → 1.9.7。
+- 单测：新增 `test_v197_ha_name_sync.py`（12 条——只认 name_by_user、三通道同源、取不到不拖垮上行）；
+  更新 2 条云快照精确断言（`name` 空串键）与注册表出口调用点计数（device_manager 14→15）。
+
+### 配套（跨仓）
+
+- 小程序 v1.4.37：`device_list` / `device_update` / 云 `/state` 都读 `name`；优先级 **HA 名 >
+  本地自定义名 > 「开窗器 后四位」**（旧本地名只在加载项没提供名字时兜底，升级不会让已改的本地名失效）。
+  详情页在 HA 名存在时不再给本地改名入口，改为提示「名称跟随 HA（在 HA 中修改）」。
+- hub：**零改动**（状态条目原样透传并合并，`name` 随之落表）。
+- 发版顺序无约束：加字段不改字段，任一端先上都不会断；老加载项 ⇒ 小程序退回本地命名（与今天一致）。
+- 跨仓契约钉新增 4 条（三通道同源 / 只认 name_by_user / 小程序 LAN+云两侧都读 / 详情页改名入口收口）。
+
 ## [1.9.6] - 2026-11-10 · 5002 平开窗纳入百分比控制：HomeKit 从"覆盖物三态"升级为"窗子滑块"
 
 **改了集成 Python 代码（`const.py`），升级加载项后请再重启一次 Home Assistant**

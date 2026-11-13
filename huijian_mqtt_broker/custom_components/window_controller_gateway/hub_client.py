@@ -1278,6 +1278,13 @@ class HubClient:
         builder = self._resolve_builder()
         if builder is None:
             return [], False
+        # v1.9.7：HA 名与 LAN 侧**同一取值函数**（三条下发通道必须同源）。
+        # 懒 import 理由同 _resolve_builder：模块本体不依赖包内其他文件。
+        try:
+            from .ws_gateway import ha_custom_device_name as _ha_custom_name
+        except Exception:  # noqa: BLE001 - 纯装饰字段，取不到就一律回空串
+            def _ha_custom_name(_manager, _device_sn):
+                return ""
         # v1.8.5（G-2）：期望集判据。hub 的淘汰语义是"本批键集权威"（store.js:755-772），
         # 所以"我只挂上了 N 个 manager"不能推出"世上只有 N 台网关"。期望数由
         # _expected_manager_count() 单一真源给出，取不到一律按 0＝无缺口。
@@ -1302,6 +1309,10 @@ class HubClient:
                         # 状态上行带过去——device_ws_view 是 device_list 项视图（不含它），
                         # 这里补上与 LAN `_device_update_payload` 同源的字段。
                         view["windLockMode"] = _wind_lock_mode(dev)
+                        # HA 名（v1.9.7）：**始终写键**（没改过＝空串）。hub 的 setStates
+                        # 是按 sn 合并（store.js:769 Object.assign）——缺键会保留上一轮的
+                        # 旧名字，用户在 HA 里把名字改回去后云端会永远停在旧名上。
+                        view["name"] = _ha_custom_name(manager, dev_sn)
                 except Exception as e:  # noqa: BLE001
                     self._logger.debug(
                         "hub 设备视图构造失败（%s），按上一轮视图上报：%s",

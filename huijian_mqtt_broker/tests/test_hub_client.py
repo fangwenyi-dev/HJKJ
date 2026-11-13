@@ -242,8 +242,10 @@ def test_state_snapshot_uses_injected_view_and_survives_bad_entries(tmp_path):
     client, _, _ = make_client(tmp_path, manager=manager, view_builder=builder)
     items, _auth = client.build_state_snapshot()
     # 坏条目被跳过、不炸；锁定模式随状态上行带过去（云通道没有 LAN 那路
-    # device_update 实时推送，缺失即小程序永远显示"--"）
-    assert items == [{"sn": "A1B2", "gwSn": "GW1", "position": 30, "windLockMode": 1}]
+    # device_update 实时推送，缺失即小程序永远显示"--"）。
+    # v1.9.7：快照始终带 name 键（空串＝用户没在 HA 里改过名）——hub 的 setStates 是
+    # 按 sn 合并，缺键会保留上一轮旧名字，用户在 HA 里清掉改名后云端会停在旧名。
+    assert items == [{"sn": "A1B2", "gwSn": "GW1", "position": 30, "windLockMode": 1, "name": ""}]
 
 
 def test_state_snapshot_wind_lock_mode_unknown_stays_minus_one(tmp_path):

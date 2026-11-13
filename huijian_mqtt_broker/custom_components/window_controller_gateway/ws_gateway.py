@@ -335,6 +335,28 @@ def device_ws_view(device_sn: str, gateway_sn: str, device: Dict[str, Any]) -> D
     }
 
 
+def ha_custom_device_name(manager: Any, device_sn: str) -> str:
+    """从设备管理器取"用户在 HA 里手动改过的子设备名"（空串＝没改过/取不到）。
+
+    小程序子设备名称跟 HA 同步（2026-11-13 用户定案）。三条下发通道——LAN 的
+    `device_list` / `device_update` 与云通道的状态快照——都经这一个函数取名，
+    保证三条通道同源（v1.4.28 的教训：同一个字段两处各算一遍迟早会漂）。
+
+    `device_ws_view` 刻意保持纯函数（不带 hass 依赖、可单测）：HA 名字是**可选装饰**，
+    所以在视图外面叠加，而不是塞进视图契约的固定键集里。
+    取不到的形态（老管理器替身/测试夹具/注册表异常）一律回空串，由小程序退回
+    它自己的本地命名——绝不把异常带进状态上行。
+    """
+    getter = getattr(manager, "get_ha_custom_name", None)
+    if not callable(getter):
+        return ""
+    try:
+        name = getter(device_sn)
+    except Exception:  # noqa: BLE001 - 名称是可选装饰，读不到不许拖垮状态上行
+        return ""
+    return name if isinstance(name, str) else ""
+
+
 # ==================== 服务器 ====================
 
 class WsGatewayServer:
@@ -529,7 +551,14 @@ class WsGatewayServer:
         for gw, data in self._entries_data():
             manager = data["device_manager"]
             for dev_sn, dev in manager.devices.items():
-                devices.append(device_ws_view(dev_sn, gw, dev))
+                view = device_ws_view(dev_sn, gw, dev)
+                # 用户手动改过的 HA 名（可选键）：没改过**不带这个键**，小程序据此退回
+                # 它自己的本地命名（自定义名 → 开窗器 后四位）；带上默认名会把更长的
+                # 「开窗器 GW尾4-DEV尾4」搬进小程序且没多任何信息（2026-11-13 定案）。
+                name = ha_custom_device_name(manager, dev_sn)
+                if name:
+                    view["name"] = name
+                devices.append(view)
         return {"type": "device_list", "devices": devices}
 
     # ---------- 命令分发（纯 JSON 进出，便于单测直接驱动） ----------
@@ -828,7 +857,7 @@ class WsGatewayServer:
         # v1.7.47 追加 winactSpeed/winactStrength（**加字段不改字段**，老小程序忽略即可）：
         # 推送与列表必须同源，否则"首屏有值、一动就丢"。取值一律走 view，
         # 别在这里再算一遍——两处算法迟早会漂。
-        return {
+        payload = {
             "type": "device_update",
             "gwSn": view["gwSn"],
             "devSn": device_sn,
@@ -839,6 +868,14 @@ class WsGatewayServer:
             "winactSpeed": view["winactSpeed"],
             "winactStrength": view["winactStrength"],
         }
+        # HA 名（v1.9.7，可选键）：只发送用户手动改过的名字；没改过不带这个键。
+        # rename_device() 已走 _notify_status_listeners 漏斗 ⇒ 改名事件会带着新名字
+        # 立刻推给小程序（此前推送里根本没有名字字段，"改名后小程序停在旧名"修不彻底）。
+        name = ha_custom_device_name(data["device_manager"], device_sn)
+        if name:
+            payload["name"] = name
+        return payload
+
 
     async def _broadcast(self, payload: Dict[str, Any]) -> None:
         dead = []

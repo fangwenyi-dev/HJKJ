@@ -26,6 +26,7 @@ HTML="$PLUGIN_REPO/huijian_mqtt_broker/www/index.html"
 PYHUB="$PLUGIN_REPO/huijian_mqtt_broker/custom_components/window_controller_gateway/hub_client.py"
 WSGW="$PLUGIN_REPO/huijian_mqtt_broker/custom_components/window_controller_gateway/ws_gateway.py"
 CONST="$PLUGIN_REPO/huijian_mqtt_broker/custom_components/window_controller_gateway/const.py"
+DEVMGR="$PLUGIN_REPO/huijian_mqtt_broker/custom_components/window_controller_gateway/device_manager.py"
 HUBSRV="$HUB_REPO/src/server.js"
 HUBSTORE="$HUB_REPO/src/store.js"
 HUBREADME="$HUB_REPO/README.md"
@@ -34,8 +35,7 @@ GWR="$MINIPROGRAM_REPO/miniprogram/utils/gw-router.js"
 WSJS="$MINIPROGRAM_REPO/miniprogram/utils/ws-gateway.js"
 PAGE="$MINIPROGRAM_REPO/miniprogram/pages/broker-gateways/broker-gateways.js"
 DEVPAGE="$MINIPROGRAM_REPO/miniprogram/pages/broker-device/broker-device.js"
-for f in "$JS" "$HTML" "$PYHUB" "$WSGW" "$HUBREADME"; do [ -f "$f" ] || { echo "SKIP 对账所需文件缺失: $f"; exit 3; }; done
-
+for f in "$JS" "$HTML" "$PYHUB" "$WSGW" "$DEVMGR" "$HUBREADME"; do [ -f "$f" ] || { echo "SKIP 对账所需文件缺失: $f"; exit 3; }; done
 pass=0; fail=0
 check() {  # check <名称> <shell 命令串>
   local name="$1"; shift
@@ -316,6 +316,22 @@ else
 fi
 check "属性全集双向相等：小程序下发 == 加载项域表键，且两侧各抽到 ≥4 条（$attr_verdict）" \
   "test ok = '$attr_verdict'"
+
+# ㉖ 子设备名称跟 HA 同步（网关 v1.9.7 / 小程序 v1.4.37，2026-11-13 用户定案）。
+#    加载项只下发"用户**在 HA 里手动改过**的名字"（device registry 的 name_by_user）：
+#    没改过的一律不带 name 键，小程序用本地命名兜底。这里钉三件事，任何一件漂移都是
+#    **静默**退化成"名字不同步"（两侧单测各自自洽，谁也不替谁报错）：
+#    ① 发送端三条通道同源（列表/推送/云快照都经 ha_custom_device_name）；
+#    ② 只认 name_by_user（认注册表默认名＝把更长的默认名搬进小程序）；
+#    ③ 消费端 LAN 与云两侧都真读（只加生产侧＝白加一个字段）。
+check "子设备名 name：加载项 device_list/device_update/云快照三通道同源取名" \
+  "grep -qF 'ha_custom_device_name(manager, dev_sn)' '$WSGW' && grep -qF 'ha_custom_device_name(data[\"device_manager\"], device_sn)' '$WSGW' && grep -qF 'from .ws_gateway import ha_custom_device_name' '$PYHUB'"
+check "子设备名 name：只认注册表 name_by_user（未改名不下发默认名）" \
+  "grep -qF 'def get_ha_custom_name' '$DEVMGR' && grep -qF 'name_by_user' '$DEVMGR' && ! grep -qF 'device.get(\"name\")' '$WSGW'"
+check "子设备名 name：小程序 LAN+云两侧都读（含归一与 HA 名优先级）" \
+  "grep -qF 'normalizeHaName' '$WSJS' && grep -qF 'normalizeHaName' '$GWR' && grep -qF 'haName' '$WSJS' && grep -qF 'dev.haName' '$GWR' && grep -qF 'haName' '$DEVPAGE'"
+check "子设备名 name：小程序详情页保留 HA 名时不给本地改名入口（wxml 收口）" \
+  "grep -qF \"device.haName ? '' : ' ✎'\" '$MINIPROGRAM_REPO/miniprogram/pages/broker-device/broker-device.wxml' && grep -qF '名称跟随 HA' '$MINIPROGRAM_REPO/miniprogram/pages/broker-device/broker-device.wxml'"
 
 echo
 echo "跨仓契约: $pass passed, $fail failed"

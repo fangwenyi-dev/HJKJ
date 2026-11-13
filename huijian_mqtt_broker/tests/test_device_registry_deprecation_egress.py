@@ -293,8 +293,10 @@ class TestNoDeprecatedDeviceRegistrySurface:
         """盘上实际交付形状：出口收口后的**调用点**计数（AST 数 Call，不用子串
         ——`def get_device_by_sn(` 那行本身含同名子串，文本数会自己喂绿自己）。
         计数变了说明有人删/加了一处设备查找：删＝功能静默丢失，类面钉看不见。"""
-        expect = {"device_manager.py": 14, "discovery.py": 1, "utils.py": 1,
+        expect = {"device_manager.py": 15, "discovery.py": 1, "utils.py": 1,
                   "__init__.py": 1}
+        # v1.9.7：device_manager 14→15 —— 新增 get_ha_custom_name()（读注册表
+        # name_by_user，供小程序子设备名跟 HA 同步）走同一个双形态出口。
         for name, n in expect.items():
             tree = ast.parse((_PKG_DIR / name).read_text(encoding="utf-8"))
             calls = [x.lineno for x in ast.walk(tree)
