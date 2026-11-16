@@ -53,7 +53,7 @@ def test_refresh_is_throttled_server_side(tmp_path, monkeypatch):
         asyncio.run(client.maybe_refresh_members())
     assert len(calls) == 1, "没有节流＝面板每 30s 刷一次就把云端调用打爆（%d 次）" % len(calls)
 
-    client._members_refresh_at = time.time() - hc.MEMBERS_REFRESH_MIN_INTERVAL_S - 1
+    client._members_refresh_at = time.monotonic() - hc.MEMBERS_REFRESH_MIN_INTERVAL_S - 1
     asyncio.run(client.maybe_refresh_members())
     assert len(calls) == 2, "过了节流窗必须还能再刷（否则一次故障后永久看不到家人）"
 

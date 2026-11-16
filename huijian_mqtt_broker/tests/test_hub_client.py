@@ -378,10 +378,10 @@ def test_connecting_resets_the_member_throttle_without_touching_the_op_slot(tmp_
     """
     ws = FakeWS(incoming=[], hold=0.2)
     client, _, _ = make_client(tmp_path, session=FakeSession(ws=ws))
-    client._members_refresh_at = time.time()
+    client._members_refresh_at = time.monotonic()
     client._set_op_error(hc.OP_MEMBERS, "members_unavailable")
     assert asyncio.run(client._session_once()) is True
-    assert client._members_refresh_at == 0.0, "重连没重置节流＝面板继续显示陈旧的读取失败"
+    assert client._members_refresh_at is None, "重连没重置节流＝面板继续显示陈旧的读取失败"
     assert client.last_op_error == "members_unavailable", \
         "本修法不许改成『重连时清错误』——那会把真实故障一起抹掉"
 
@@ -524,7 +524,7 @@ def test_renew_bind_code_if_stale_only_when_needed(tmp_path, monkeypatch):
 
     # 签发时刻未知＝按过期处理（v1.7.45 起换码尝试有最小间隔，这里要放行才能测到本意）
     client.bind_code, client._bind_code_at = "444444", 0
-    client._bind_renew_at = 0.0
+    client._bind_renew_at = None
     asyncio.run(client._renew_bind_code_if_stale())
     assert len(calls) == 2 and calls[-1] == "/agent/bindcode"
 
@@ -587,7 +587,7 @@ def test_renew_throttles_after_failure(tmp_path):
     asyncio.run(client._renew_bind_code_if_stale())
     assert n["calls"] == 1, "失败后没节流＝对付费端点连击 + 同一条告警刷屏（%d 次）" % n["calls"]
 
-    client._bind_renew_at = time.time() - hc.BIND_CODE_RENEW_MIN_INTERVAL_S - 1
+    client._bind_renew_at = time.monotonic() - hc.BIND_CODE_RENEW_MIN_INTERVAL_S - 1
     asyncio.run(client._renew_bind_code_if_stale())
     assert n["calls"] == 2, "超过最小间隔后必须还能再试（否则一次故障永久废掉补发）"
 
@@ -596,7 +596,7 @@ def test_panel_click_is_not_throttled(tmp_path):
     """节流只管自动补发：用户点二维码是显式意图，必须当场换码（旧码作废是刻意的）。"""
     client, _, _ = make_client(tmp_path)
     client.instance_id, client._secret = "abc", "def"
-    client._bind_renew_at = time.time()          # 刚刚"自动试过"
+    client._bind_renew_at = time.monotonic()     # 刚刚"自动试过"（v2.0.1 起节流基准 monotonic）
     calls = []
 
     async def ok(path, payload, timeout_s=None):

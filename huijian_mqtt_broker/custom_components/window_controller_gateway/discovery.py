@@ -69,9 +69,16 @@ async def async_discover_gateway(hass: HomeAssistant, gateway_sn: str, gateway_n
         return
     
     # 2. 速率限制：检查冷却时间
-    now = time.time()
-    last_time = discovery_data.get("last_discovery_time", {}).get(gateway_key, 0)
-    if now - last_time < _DISCOVERY_COOLDOWN:
+    # v2.0.1（第七轮审计 R-1，即 v1.8.2 B-1 的同族漏网）：冷却基准改 monotonic。
+    # 旧写法用墙钟，NTP 校时/RTC 漂移把钟往回拨后 now-last_time 恒为负 ⇒ 本会话内
+    # 该网关的发现卡不再弹（重启才自愈）——与本仓 v1.8.2 已换齐的超时/冷却同一
+    # 纪律（见 utils.device_is_stale / _lifecycle 的 monotonic 判据）。
+    # **不许只换钟不换哨兵**：Linux 的 monotonic≈开机秒数，缺省若仍是 0，
+    # 开机 60s 内的首次发现会被误判"冷却中"而吞掉（10-08 审计 B-1 修复建议里
+    # 点名的坑）。故缺省改 None＝从未发现过，直接放行。
+    now = time.monotonic()
+    last_time = discovery_data.get("last_discovery_time", {}).get(gateway_key)
+    if last_time is not None and now - last_time < _DISCOVERY_COOLDOWN:
         _LOGGER.debug("网关 %s 发现冷却中（距上次 %.0f 秒），跳过", gateway_sn, now - last_time)
         return
     discovery_data.setdefault("last_discovery_time", {})[gateway_key] = now

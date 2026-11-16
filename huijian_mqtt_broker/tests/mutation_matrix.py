@@ -69,6 +69,9 @@ CIY = "../.github/workflows/ci.yaml"       # _copy() 把 .github 一起带进副
 T184R = "tests/test_v184_ws_renewal.py"
 T184A = "tests/test_v184_ack_failure.py"
 T184G = "tests/test_v184_gitee_leg_carrier.py"
+# v2.0.1 批次（第七轮审计 R-1/R-2：发现冷却与 hub 本地节流改 monotonic+None 哨兵）
+DISC = "custom_components/window_controller_gateway/discovery.py"
+T201 = "tests/test_v201_monotonic_cooldown.py"
 # v1.8.5 批次（审计 G-5/G-6/G-7/G-8）的被改文件与判据文件
 PROTO = "custom_components/window_controller_gateway/mqtt_handler/_protocol.py"
 T186G = "tests/test_v186_g7_sn_format_gate.py"
@@ -1019,7 +1022,7 @@ ARMS = [
      "摘掉 ok 闸＝同一次点击内后写覆掉前写：点『添加家人』失败却看到『成员读取失败』",
      T1747API),
     ("reconnect_keeps_member_throttle", HUBC,
-     '            self._members_refresh_at = 0.0\n            self._logger.info("hub 已连接',
+     '            self._members_refresh_at = None\n            self._logger.info("hub 已连接',
      '            self._logger.info("hub 已连接',
      "test_connecting_resets_the_member_throttle_without_touching_the_op_slot", "red",
      "重连不重置节流＝面板还要挂最多两个 120s 窗的陈旧『读取失败』（修法是让下一次真读尽早发生，"
@@ -1037,6 +1040,38 @@ ARMS = [
      "test_invalidate_identity_writes_cleared_file", "red",
      "身份作废只清 members 不清旗标＝新 instance 还没读过，面板却拿着旧凭据断言『只有你一人』",
      THUBC),
+    # ── v2.0.1（第七轮审计 R-1/R-2）：monotonic + None 哨兵的反向臂 ──
+    ("discovery_cooldown_wallclock_relapse", DISC,
+     "    now = time.monotonic()\n    last_time = discovery_data.get(\"last_discovery_time\", {}).get(gateway_key)\n    if last_time is not None and now - last_time < _DISCOVERY_COOLDOWN:",
+     "    now = time.time()\n    last_time = discovery_data.get(\"last_discovery_time\", {}).get(gateway_key, 0)\n    if now - last_time < _DISCOVERY_COOLDOWN:",
+     "wall_clock_rollback", "red",
+     "发现冷却回潮墙钟＝NTP 回拨后本会话内新网关的发现卡永不弹（R-1 原形）",
+     T201),
+    ("discovery_sentinel_zero_relapse", DISC,
+     "    last_time = discovery_data.get(\"last_discovery_time\", {}).get(gateway_key)\n    if last_time is not None and now - last_time < _DISCOVERY_COOLDOWN:",
+     "    last_time = discovery_data.get(\"last_discovery_time\", {}).get(gateway_key, 0)\n    if now - last_time < _DISCOVERY_COOLDOWN:",
+     "first_discovery_passes_at_boot", "red",
+     "只换钟不换哨兵＝Linux 开机 60s 内首次发现被 0 误判冷却中（10-08 审计点名的坑）",
+     T201),
+    ("members_throttle_wallclock_relapse", HUBC,
+     "        if (self._members_refresh_at is not None\n                and time.monotonic() - self._members_refresh_at < MEMBERS_REFRESH_MIN_INTERVAL_S):\n            return\n        self._members_refresh_at = time.monotonic()",
+     "        if time.time() - self._members_refresh_at < MEMBERS_REFRESH_MIN_INTERVAL_S:\n            return\n        self._members_refresh_at = time.time()",
+     "members_throttle_survives_wall_rollback", "red",
+     "成员刷新节流回潮墙钟＝NTP 回拨后面板每 30s 把云端打爆（R-2 原形①）",
+     T201),
+    ("members_sentinel_zero_relapse", HUBC,
+     "        if (self._members_refresh_at is not None\n                and time.monotonic() - self._members_refresh_at < MEMBERS_REFRESH_MIN_INTERVAL_S):",
+     "        if time.monotonic() - (self._members_refresh_at or 0.0) < MEMBERS_REFRESH_MIN_INTERVAL_S:",
+     "members_first_refresh_passes_at_boot", "red",
+     "None 哨兵回潮 0＝开机 120s 内首次成员刷新被吞，面板两分钟看不到家人",
+     T201),
+    ("renew_throttle_wallclock_relapse", HUBC,
+     "        if (self._bind_renew_at is not None\n                and time.monotonic() - self._bind_renew_at < BIND_CODE_RENEW_MIN_INTERVAL_S):",
+     "        if time.time() - self._bind_renew_at < BIND_CODE_RENEW_MIN_INTERVAL_S:",
+     "renew_throttle_survives_wall_rollback", "red",
+     "换码节流回潮墙钟＝NTP 回拨后对付费端点连击（R-2 原形②；尝试戳仍是 monotonic，"
+     "墙钟减它恒负⇒节流必击穿，行为钉当场红）",
+     T201),
 ]
 
 

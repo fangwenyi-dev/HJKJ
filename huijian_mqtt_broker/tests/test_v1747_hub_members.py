@@ -97,7 +97,7 @@ def test_member_code_never_auto_renews(client):
 def test_member_code_panel_path_is_not_throttled(client):
     """面板显式点「添加家人」不受 BIND_CODE_RENEW_MIN_INTERVAL_S 节流（与点二维码同口径）。"""
     _stub_http(client, {"/agent/bindcode": {"ok": True, "bindCode": "123123", "kind": "member"}})
-    client._bind_renew_at = time.time()                                 # 刚刚才尝试过
+    client._bind_renew_at = time.monotonic()                            # 刚刚才尝试过（v2.0.1 起节流基准 monotonic）
 
     assert asyncio.run(client.refresh_bind_code("member")) is True, "显式请求不得被节流挡掉"
 

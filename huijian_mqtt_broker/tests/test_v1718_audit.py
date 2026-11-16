@@ -211,6 +211,8 @@ class TestUnignoreService:
         hass.data[DOMAIN]["discovery"] = {
             "ignored_gateways": ignored,
             "announced_gateways": {"100122501186"},
+            # v2.0.1 起 last_discovery_time 存 monotonic 时刻（None＝从未发现）；
+            # 1.0 是合法的开机初期时刻，语义＝"冷却中"，与本用例意图一致。
             "last_discovery_time": {"100122501186": 1.0},
         }
         await reg["unignore_gateway"](

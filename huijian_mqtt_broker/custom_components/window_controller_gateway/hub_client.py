@@ -402,12 +402,12 @@ class HubClient:
         # 而断连期间点「添加家人」不再顺带刷成员（见 api.py 的换码闸）⇒ 没有这个旗标，
         # 面板就会把"还不知道"渲染成"没人"，用户据此以为家人没绑上、去重新解绑一次。
         self.members_loaded_at: float = 0.0       # 最近一次 list_members 成功时刻（0＝本进程从未读到）
-        self._members_refresh_at: float = 0.0     # 上一次"GET /hub 顺带刷成员"时刻（节流基准）
+        self._members_refresh_at: Optional[float] = None  # 上一次"GET /hub 顺带刷成员"时刻（节流基准；None＝从未刷过。v2.0.1 起 monotonic，见 maybe_refresh_members 注释）
         # 成员称呼（v1.7.54）：本机面板侧的标签，键＝hub 的 mid，落 HUB_MEMBER_ALIAS_FILE。
         # 与上面那条"成员关系本地不留副本"不冲突——**关系**仍以 hub 为准，这里存的不是关系。
         self.member_aliases: Dict[str, str] = {}
         self._aliases_loaded = False
-        self._bind_renew_at: float = 0.0     # 上一次"换码尝试"时刻（成功失败都记，用于节流）
+        self._bind_renew_at: Optional[float] = None  # 上一次"换码尝试"时刻（成功失败都记，用于节流；None＝从未试过。v2.0.1 起 monotonic）
         self._rereg_streak: int = 0        # 连续【被拒 - 重注册】计数（见 HUB_REREGISTER_FUSE）
         # 审计 2026-09-30 D-2：本机刚被云端拒过身份 ⇒ 磁盘凭据不可信，
         # _ensure_registered 必须跳过"读回旧凭据即复用"的短路（见该方法注释）。
@@ -855,7 +855,7 @@ class HubClient:
         if not (self.instance_id and self._secret):
             return False
         kind = "member" if kind == "member" else "owner"
-        self._bind_renew_at = time.time()     # 成功失败都算一次尝试（自动补发侧的节流基准）
+        self._bind_renew_at = time.monotonic()  # 成功失败都算一次尝试（自动补发侧的节流基准；v2.0.1 起 monotonic，墙钟回拨不再击穿节流）
         try:
             data = await self._http("/agent/bindcode", {
                 "instanceId": self.instance_id,
@@ -993,9 +993,16 @@ class HubClient:
         """
         if not (self.connected and self.members_supported):
             return
-        if time.time() - self._members_refresh_at < MEMBERS_REFRESH_MIN_INTERVAL_S:
+        # v2.0.1（第七轮审计 R-2，B-1 同族）：本地节流基准改 monotonic + None 哨兵。
+        # 这是**本机相对间隔**，不是对云端绝对时间（_bind_code_at 那些 TTL 才必须
+        # 墙钟，勿混改）。旧墙钟写法在 NTP 回拨后 now-last 恒为负 ⇒ 节流被击穿，
+        # 对付费端点连击；前跳则反过来把补发憋死。None＝从未刷过，直接放行
+        # （不许用 0 当哨兵：Linux monotonic≈开机秒数，开机 120s 内首次刷新会被
+        # 误判节流中——与 discovery.py 冷却同一条纪律）。
+        if (self._members_refresh_at is not None
+                and time.monotonic() - self._members_refresh_at < MEMBERS_REFRESH_MIN_INTERVAL_S):
             return
-        self._members_refresh_at = time.time()   # 成败都算一次（并发 GET 不得同时打云端）
+        self._members_refresh_at = time.monotonic()  # 成败都算一次（并发 GET 不得同时打云端）
         await self.list_members()
 
     async def remove_member(self, mid: str) -> bool:
@@ -1038,7 +1045,10 @@ class HubClient:
         """
         if self.bind_code_expires_in() >= BIND_CODE_RENEW_BEFORE_S:
             return
-        if time.time() - self._bind_renew_at < BIND_CODE_RENEW_MIN_INTERVAL_S:
+        # v2.0.1（R-2）：节流基准 monotonic + None 哨兵（同 maybe_refresh_members
+        # 的注释；上面 bind_code_expires_in 的 TTL 是对云端绝对时间，仍是墙钟）。
+        if (self._bind_renew_at is not None
+                and time.monotonic() - self._bind_renew_at < BIND_CODE_RENEW_MIN_INTERVAL_S):
             return
         if await self.refresh_bind_code():
             self._logger.info("绑定码自动补发完成（原码已作废，请以面板显示为准）")
@@ -1160,7 +1170,9 @@ class HubClient:
             # _clear_op_error 自己清掉——治的是"重连成功后面板还要挂最多两个节流窗的
             # 陈旧读取失败"。代价：每次重连多打一次 /agent/members（hub 侧纯内存读），
             # 只在真连上时发生，断连期间仍然一次不打。
-            self._members_refresh_at = 0.0
+            # v2.0.1：归零＝置 None（monotonic 哨兵，0 在开机初期是合法时刻，见
+            # maybe_refresh_members 注释）。
+            self._members_refresh_at = None
             self._logger.info("hub 已连接（instance=%s）", self.instance_id)
             self._state_dirty.set()          # 上线先全量推一次
             # 上线自检的换码挪进保活 task：那是 HTTP，最坏等 HUB_HTTP_TIMEOUT_S=15s，
