@@ -453,13 +453,20 @@ def test_user_interacting_recognises_touch_drag_in_node():
 
 
 def test_every_rendered_slider_is_marked_and_guarded():
-    """覆盖率钉：renderDevice 里每条 `<input type="range">` 的 oninput 都必须先
-    打交互标记，且三处回写都受 userInteracting 保护——漏一条就等于那条滑块
-    仍是"拖动中被覆写"的老形态（v1.7.18 在手机上的原缺陷）。"""
-    body = _js_body("renderDevice")
-    sliders = len(re.findall(r'<input type="range"', body))
-    marked = len(re.findall(r'markUserInput\(this\);', body))
-    assert sliders >= 3, "renderDevice 里的滑块少于 3 条？判据要跟着改"
+    """覆盖率钉：**每个**渲染滑块的 oninput 都必须先打交互标记，且三处回写都
+    受 userInteracting 保护——漏一条就等于那条滑块仍是"拖动中被覆写"的老形态
+    （v1.7.18 在手机上的原缺陷）。
+
+    v1.9.9（用户令）：速度/力度滑块从卡片搬进设置抽屉，滑块渲染点由 1 处变
+    2 处（renderDevice 的位置 + renderDeviceSettings 的速度/力度）。覆盖面
+    **不变**——判据从"只看 renderDevice"改为"两个渲染函数的并集"，总数仍须
+    是位置/速度/力度这 3 条。少看一处（只查卡片）会让抽屉里那两条脱管。"""
+    renderers = ("renderDevice", "renderDeviceSettings")
+    bodies = [_js_body(n) for n in renderers]
+    sliders = sum(len(re.findall(r'<input type="range"', b)) for b in bodies)
+    marked = sum(len(re.findall(r'markUserInput\(this\);', b)) for b in bodies)
+    assert sliders == 3, \
+        "两条渲染路径合计应有位置/速度/力度 3 条滑块，实为 %d（判据要跟着改）" % sliders
     assert marked == sliders, \
         "滑块 %d 条 / 交互标记 %d 处——有滑块没接凭据" % (sliders, marked)
     guarded = len(re.findall(r'!userInteracting\(', JS))

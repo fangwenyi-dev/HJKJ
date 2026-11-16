@@ -456,6 +456,9 @@ body {
     border: 1px solid var(--card-border); animation: fadeUp .35s ease both;
     backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
     min-height: 262px; /* 5005 满控件实测高——所有子设备统一（用户改令 v1.6.29） */
+    /* v1.9.9：状态色左边条（::before）的定位基准 + 裁掉条子溢出圆角。
+       均为新增，未改动上方任何用户令原值。 */
+    position: relative; overflow: hidden;
 }
 .device-item:hover { border-color: rgba(56, 189, 248, .5); box-shadow: var(--shadow-md); transform: translateY(-1px); }
 .device-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
@@ -842,3 +845,189 @@ details[open] > summary.card-title::before {
 }
 .hub-member-note { font-size: 11.5px; color: var(--text-secondary); margin-top: 4px; }
 #hubMemberQr { margin-top: 10px; cursor: default; }
+
+/* ===== v1.9.9 设备设置抽屉 + 卡片参数摘要（用户令） =====
+   用户原话：「速度、力度和模式选择在手机上经常容易误操作，是否可以在"改名"按钮
+   左侧新增一个"设置"按钮…弹出框中来设置…这样以后不容易误操作。」
+   分层口径与米家/华为 AI Life/Apple Home 一致：卡片＝高频主控＋状态，
+   二级抽屉＝低频参数与破坏性动作。 */
+
+/* ── 卡片上的只读参数摘要行（点整行进设置） ──
+   为什么留这一行而不是彻底不显示：三家大厂卡片都保"当前档位"的只读回显——
+   用户要能一眼看到，但不能在滑动页面时把它改掉。
+   margin-top:auto 把它压到卡片底部：v1.6.29 用户令的 min-height 262px 是
+   5005 满控件实测高，控件搬进抽屉后卡片会空出一截，让它吃掉这段空白，
+   而不是把四颗控制键与滑块顶在上半张卡里、下半张空着。 */
+.device-hint {
+    margin-top: auto; display: flex; align-items: center; gap: 6px;
+    width: 100%; padding: 8px 10px; border-radius: 9px; cursor: pointer;
+    background: rgba(255, 255, 255, .03);
+    border: 1px dashed rgba(255, 255, 255, .16);
+    color: var(--text-secondary); font-size: 11px; font-family: inherit;
+    text-align: left; transition: background .15s, border-color .15s;
+}
+.device-hint:hover {
+    background: rgba(255, 255, 255, .07);
+    border-color: rgba(56, 189, 248, .45);
+}
+.device-hint:focus-visible { outline: 2px solid var(--primary-light); outline-offset: 2px; }
+.device-hint-kv b { color: var(--text-primary); font-weight: 700; font-variant-numeric: tabular-nums; }
+.device-hint-sep { opacity: .4; }
+/* 行尾的 ›：把"可点"这件事说清楚（纯文字行在玻璃卡上不像控件） */
+.device-hint-go { margin-left: auto; color: var(--primary-light); font-size: 15px; line-height: 1; }
+
+/* ── 抽屉根节点 ──
+   必须是 body 级单例：`.device-item:hover` 带 transform，会给子元素造新的
+   position:fixed 包含块——抽屉塞在卡片里就会被锁进那一小块并跑到视口外。
+   z-index 9000 < .toast 的 9999：命令回执要压在抽屉之上才看得见。 */
+.sheet-root { display: none; position: fixed; inset: 0; z-index: 9000; }
+.sheet-root.is-open { display: block; }
+body.sheet-locked { overflow: hidden; }
+.sheet-mask {
+    position: absolute; inset: 0;
+    background: rgba(3, 10, 20, .62);
+    -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+    animation: sheetFade .18s ease both;
+}
+@keyframes sheetFade { from { opacity: 0; } to { opacity: 1; } }
+/* 桌面＝居中对话框（鼠标准星距离短，不必从底部飞入） */
+.sheet-panel {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(430px, calc(100vw - 32px)); max-height: 86vh; overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 16px 16px 14px; border-radius: 16px;
+    background: linear-gradient(180deg, #0b1e36 0%, #081627 100%);
+    border: 1px solid rgba(56, 189, 248, .28);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .55), 0 0 0 1px rgba(0, 0, 0, .3);
+    animation: sheetFade .18s ease both;
+}
+.sheet-head {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding-bottom: 10px; margin-bottom: 12px;
+    border-bottom: 1px solid rgba(56, 189, 248, .18);
+}
+.sheet-head-main { flex: 1; min-width: 0; }
+.sheet-title {
+    font-size: 15px; font-weight: 700; color: var(--text-primary);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sheet-sub { font-size: 10.5px; color: var(--text-secondary); font-family: "SF Mono", Consolas, monospace; margin-top: 2px; }
+.sheet-close {
+    flex: 0 0 auto; width: 30px; height: 30px; border-radius: 9px; cursor: pointer;
+    background: rgba(255, 255, 255, .07); border: 1px solid var(--card-border);
+    color: var(--text-secondary); font-size: 14px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .15s, color .15s;
+}
+.sheet-close:hover { background: rgba(255, 255, 255, .14); color: var(--text-primary); }
+.sheet-close:focus-visible { outline: 2px solid var(--primary-light); outline-offset: 2px; }
+.sheet-sec {
+    margin-top: 14px; padding-top: 12px;
+    border-top: 1px dashed rgba(255, 255, 255, .12);
+}
+/* 第一段紧跟标题栏，不重复画分隔线 */
+.sheet-head + .sheet-sec { margin-top: 0; padding-top: 0; border-top: none; }
+.sheet-sec-title {
+    font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    color: var(--primary-light); margin-bottom: 9px;
+}
+.sheet-sec-title::before {
+    content: ''; display: inline-block; width: 3px; height: 11px;
+    background: var(--accent); border-radius: 2px;
+    margin-right: 6px; vertical-align: -1px;
+}
+.sheet-tip { font-size: 11px; color: var(--text-secondary); opacity: .8; margin-top: 7px; line-height: 1.5; }
+.sheet-actions { display: flex; gap: 8px; }
+.sheet-actions .btn { flex: 1; justify-content: center; }
+
+/* 手机＝底部抽屉（拇指从下往上够，二段式面板比居中弹窗好关） */
+@media (max-width: 640px) {
+    .sheet-panel {
+        left: 0; right: 0; top: auto; bottom: 0; transform: none;
+        width: auto; max-height: 92vh;
+        border-radius: 18px 18px 0 0;
+        padding: 16px 16px calc(14px + env(safe-area-inset-bottom, 0px));
+        animation: sheetUp .22s ease both;
+    }
+    @keyframes sheetUp { from { opacity: .4; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+    .sheet-sec { margin-top: 12px; padding-top: 10px; }
+}
+
+/* ===== v1.9.9 开窗模式：选中态（用户定案「默认内倒高亮，按过谁就高亮谁」） =====
+   依据（米家/华为 AI Life/苹果 Home 一致）：二选一的分段控件必须能看出"当前是
+   哪个"。这里只做**视觉选中态**，语义靠 aria-pressed 一并交给读屏。
+   注意：这不是凭空造的假状态——JS 侧取值顺序是「实体真值 → 本机最后下发 →
+   默认内倒」，且文案会标明是"已记录"还是"默认"，用户不会被默认值误导。
+   配色只动描边/底/字三处，不引入新色相（星辰大海方案A 口径）。 */
+.control-row .btn-mode-a.is-active,
+.control-row .btn-mode-b.is-active {
+    background: rgba(56, 189, 248, .16);
+    border-color: var(--primary-light);
+    color: var(--primary-light);
+    box-shadow: inset 0 0 0 1px rgba(56, 189, 248, .35);
+}
+.control-row .btn-mode-a.is-active::after,
+.control-row .btn-mode-b.is-active::after {
+    content: '✓';
+    margin-left: 5px;
+    font-size: 11px;
+    opacity: .9;
+}
+/* 未选中的那颗保持 ghost 静默——两颗都亮会让"当前是哪个"重新变成谜题 */
+.control-row .btn-mode-a:not(.is-active),
+.control-row .btn-mode-b:not(.is-active) {
+    opacity: .72;
+}
+
+/* ===== v1.9.9 卡片状态色（用户令「再次优化开窗器子设备的 UI 设计」） =====
+   依据：米家 / 华为 AI Life / Apple Home 的子设备瓦片都用「状态色」当第一眼
+   信号——开=绿、关=灰、动作中=琥珀呼吸、离线=暗红。用户说的是"优化 UI"，
+   但真正的收益是**减少阅读**：手机上不必去读"状态: 正在打开 | 在线 |
+   电量: 85% | 位置: 65%"这一长串，颜色先给出答案，文字留在原地供确认。
+
+   实现只改"边饰 + 呼吸"，不动交互、不动布局：
+   ① 用 ::before 画 3px 左边条（不占文档流，min-height/max-width 的固定
+      用户令原值一字不改）；
+   ② data-devstate 由 loadDeviceState 写在本卡根节点上，判据与状态点同源，
+      不会出现"绿点配红边"；
+   ③ 只给 moving 一条呼吸动画，并主动在 reduce 块里静止——它是唯一会动的
+      状态色，不能靠全局 * 兜底（那条 .01ms 会让呼吸变成闪烁）。
+
+   为什么不用整卡换色：v1.6.29/v1.7.9 用户令的玻璃拟态底（--bg-card 单层
+   半透明）是面板的视觉统一前提，整卡着色会让一排卡片深浅不一、看起来像
+   不同的组件。边条给出同样的信息量，却保住了"这是同一类卡"。 */
+.device-item::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: transparent; transition: background .3s ease;
+}
+/* 未知态不着色：首屏"还没读到"和"真的离线"必须能分开，
+   把未知画成灰边会与"已关闭"撞脸（v1.8.5 G-4 同族纪律） */
+.device-item[data-devstate="open"]::before { background: var(--green); }
+.device-item[data-devstate="closed"]::before { background: rgba(148, 163, 184, .55); }
+.device-item[data-devstate="moving"]::before {
+    background: var(--yellow);
+    animation: stateBreathing 1.8s ease-in-out infinite;
+}
+.device-item[data-devstate="offline"]::before { background: rgba(248, 113, 113, .5); }
+@keyframes stateBreathing { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* 状态行：把"状态:"这类赘述交给颜色，文字行保持原样但压低视觉权重，
+   让它退成第二层（第一层是设备名与按钮）。 */
+.device-status { font-variant-numeric: tabular-nums; }
+
+/* 控制键补一层"按下去有反馈"：手机上没有 hover，点击后 120ms 的位移是
+   用户唯一能确认"这一下点到了"的信号（三家大厂原生控件都有）。
+   只做 transform + 亮度，不改颜色——ghost 描边是 v1.6.30 用户令。 */
+.control-row .btn-sm:active { transform: scale(.96); filter: brightness(1.25); }
+.device-actions .btn-sm:active { transform: scale(.96); }
+.device-hint:active { transform: scale(.99); }
+
+/* 减弱动画：呼吸必须真的停住。全局 * 规则把 duration 压到 .01ms 并不等于
+   "不动"——1.8s 的 ease-in-out 被压成 .01ms 后仍在无限循环，观感是高频
+   闪烁，反而比原来更晃眼。故显式钉成静态色。 */
+@media (prefers-reduced-motion: reduce) {
+    .device-item[data-devstate="moving"]::before {
+        animation: none !important;
+        opacity: 1;
+    }
+}

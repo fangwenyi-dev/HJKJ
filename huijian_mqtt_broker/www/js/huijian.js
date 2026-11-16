@@ -105,6 +105,17 @@
         const MEMBER_ALIAS_MAX = 12;
         let _bindCode = '';
         let _copyTimer = null;
+        // v1.9.9：设置抽屉的设备上下文登记表（id → {entryId, dev, states, name}）。
+        // renderDevice 每次重渲染时刷新；打开抽屉即从这里取，不必再打一次 /devices，
+        // 既省一次往返，也不会出现"抽屉刚弹出时参数空白、一两秒后才填上"的空窗。
+        const DEVICE_CTX = {};
+        // v1.9.9：开窗模式的"本机最后下发"记忆（id → 'tilt' | 'flat'）。
+        // 存在的理由：wind_lock_tilt / wind_lock_flat 是无状态 button 实体，且
+        // cover.extra_state_attributes 不暴露 wind_lock_mode（该属性只走小程序
+        // 通道），Web 面板读不到真值。用户定案「默认内倒高亮，按过谁就高亮谁」，
+        // 故只能记在本机。**不写 localStorage**：它只是"这次页面会话里我按过
+        // 什么"，跨刷新保留会让用户在另一台窗上看到别台的旧选择。
+        const WIND_LOCK_MEMO = {};
 
         function refreshBindQr() {
             refreshBindCode();   // 点击＝换一个新码（旧码过期后"只读刷新"刷不出可用的码）
@@ -1203,31 +1214,31 @@
             const safeSn = escapeHtml(sn);
             const safeDevId = escapeHtml(devId);
             const safeEntryId = escapeHtml(entryId);
-            let batteryText = '';
-            if (batteryEntity && batteryEntity.state && batteryEntity.state !== 'unknown' && batteryEntity.state !== 'unavailable') {
-                const bUnit = batteryEntity.attributes.unit_of_measurement || 'V';
-                batteryText = escapeHtml(batteryEntity.state + bUnit);
-            }
-            const speedMin = speedEntity && speedEntity.attributes.min !== undefined ? speedEntity.attributes.min : 0;
-            const speedMax = speedEntity && speedEntity.attributes.max !== undefined ? speedEntity.attributes.max : 100;
-            const speedValid = speedEntity && speedEntity.state && speedEntity.state !== 'unknown' && speedEntity.state !== 'unavailable';
-            const speedUnit = (speedEntity && speedEntity.attributes.unit_of_measurement) || '';
-            const strengthMin = strengthEntity && strengthEntity.attributes.min !== undefined ? strengthEntity.attributes.min : 0;
-            const strengthMax = strengthEntity && strengthEntity.attributes.max !== undefined ? strengthEntity.attributes.max : 100;
-            const strengthValid = strengthEntity && strengthEntity.state && strengthEntity.state !== 'unknown' && strengthEntity.state !== 'unavailable';
-            const strengthUnit = (strengthEntity && strengthEntity.attributes.unit_of_measurement) || '';
+            // v1.9.8：首屏占位也显示换算后的百分比。旧版这里把原始伏数直接拼进
+            // 状态串，与刷新后的百分比文案会打架，用户会以为没生效。
+            const batteryText = escapeHtml(batteryTextOf(batteryEntity, coverEntity));
+            // v1.9.9：速度/力度的取值、区间、单位与展示统一收进设置抽屉
+            // （renderDeviceSettings），卡片只留一行只读摘要。
+            // 设备上下文登记：抽屉按 id 反查 entryId/名称/最近一次 states，
+            // 打开即渲染，不必再打一次 /devices（省一次往返，也不会有"刚
+            // 打开时参数是空的、等两秒才出现"的空窗）。
+            DEVICE_CTX[devId] = { entryId: entryId, dev: dev, states: states, name: devName };
 
-            // === 顶部行：设备信息 + 管理按钮（重命名/移除） ===
+            // === 顶部行：设备信息 + 管理按钮（设置/改名） ===
+            // v1.9.9（用户令）：卡片只留高频主操作与状态。速度/力度（装完调一次
+            // 就再也不动的参数）与模式切换移入设置抽屉，"移除"这个破坏性操作
+            // 一并关进去——此前它是卡片右上角一颗红键，离"改名"仅 4px，误触
+            // 即删掉整个子设备。双击名称是给熟手的加速器，不是唯一入口。
             let html = '<div class="device-item" id="dev-' + safeDevId + '">' +
                 '<div class="device-top">' +
-                '<div class="device-info"><div class="device-name dev-name">' +
+                '<div class="device-info"><div class="device-name dev-name" title="双击打开设置" ondblclick="openDeviceSettings(\'' + jsAttr(devId) + '\')">' +
                 '<span class="dev-dot dot-unknown" id="dev-dot-' + safeDevId + '"></span>' +
                 safeName + '</div>' +
                 '<div class="device-sn">SN: ' + safeSn + '</div>' +
-                '<div class="device-status" id="dev-state-' + safeDevId + '">状态: 加载中' + (batteryText ? ' | 电压: ' + batteryText : '') + '</div></div>' +
+                '<div class="device-status" id="dev-state-' + safeDevId + '">状态: 加载中' + (batteryText ? ' | ' + batteryText : '') + '</div></div>' +
                 '<div class="device-actions">' +
+                '<button class="btn btn-slate btn-sm" title="设置：速度 / 力度 / 模式 / 移除" onclick="openDeviceSettings(\'' + jsAttr(devId) + '\')">设置</button>' +
                 '<button class="btn btn-slate btn-sm" onclick="renameDevice(\'' + jsAttr(devId) + '\',\'' + jsAttr(entryId) + '\',\'' + jsAttr(devName) + '\')" title="重命名设备">改名</button>' +
-                '<button class="btn btn-danger btn-sm" title="移除设备" onclick="controlDevice(\'' + jsAttr(devId) + '\',\'remove\',\'' + jsAttr(entryId) + '\')">移除</button>' +
                 '</div></div>';
 
             // === 主控制区：开/关/停（5005 含内倒） ===
@@ -1241,7 +1252,9 @@
             }
             html += '</div>';
 
-            // === 滑块区：位置（按机型能力渲染）/ 速度 / 力度 ===
+            // === 位置滑块（卡片上的唯一主控件，按机型能力渲染） ===
+            // v1.9.9：位置留在卡片——它是开窗器的主控件（同米家窗帘卡片），
+            // 连续量、天天用；速度/力度/模式才进设置抽屉。
             // v1.7.33（全量审计）：位置滑块此前无条件渲染且 min/max 硬编码
             // 0-100，无视 cover.py 自 v1.7.21 起暴露的 attributes.position_capable
             // ——无百分比能力机型（未知前缀等）上滑块可拖、指令打到 LoRa 空口、
@@ -1267,25 +1280,22 @@
                 html += '<div class="slider-row"><span class="slider-label">位置</span>' +
                     '<span class="slider-value position-na" title="该机型不支持百分比定位（position_capable=false）">不支持百分比定位</span></div>';
             }
-            html +=
-                '<div class="slider-row"><span class="slider-label">速度</span>' +
-                '<input type="range" class="speed-slider" min="' + escapeHtml(speedMin) + '" max="' + escapeHtml(speedMax) + '" value="' + escapeHtml(speedValid ? speedEntity.state : speedMin) + '"' +
-                ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value' + (speedUnit ? '+\'' + jsAttr(speedUnit) + '\'' : '') + '"' +
-                ' onchange="controlDevice(\'' + jsAttr(devId) + '\',\'set_speed\',\'' + jsAttr(entryId) + '\', this.value)">' +
-                '<span class="slider-value speed-value">' + (speedValid ? escapeHtml(speedEntity.state + speedUnit) : '--') + '</span></div>' +
-                '<div class="slider-row"><span class="slider-label">力度</span>' +
-                '<input type="range" class="strength-slider" min="' + escapeHtml(strengthMin) + '" max="' + escapeHtml(strengthMax) + '" value="' + escapeHtml(strengthValid ? strengthEntity.state : strengthMin) + '"' +
-                ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value' + (strengthUnit ? '+\'' + jsAttr(strengthUnit) + '\'' : '') + '"' +
-                ' onchange="controlDevice(\'' + jsAttr(devId) + '\',\'set_strength\',\'' + jsAttr(entryId) + '\', this.value)">' +
-                '<span class="slider-value strength-value">' + (strengthValid ? escapeHtml(strengthEntity.state + strengthUnit) : '--') + '</span></div>' +
-                '</div>';
+            // 速度/力度滑块 v1.9.9 移入设置抽屉（见 openDeviceSettings）——卡片上
+            // 只留一行只读摘要，信息不丢，误触面归零。
+            html += '</div>';
 
-            // === 模式切换区（仅 5005）：内倒模式 / 平开模式 ===
-            if (supportsWindLock) {
-                html += '<div class="control-row">' +
-                    '<button class="btn btn-mode-a btn-sm" style="flex:1;" onclick="controlDevice(\'' + jsAttr(devId) + '\',\'wind_lock_tilt\',\'' + jsAttr(entryId) + '\')">内倒模式</button>' +
-                    '<button class="btn btn-mode-b btn-sm" style="flex:1;" onclick="controlDevice(\'' + jsAttr(devId) + '\',\'wind_lock_flat\',\'' + jsAttr(entryId) + '\')">平开模式</button>' +
-                    '</div>';
+            // === 参数摘要行：只读回显速度/力度，点整行进设置 ===
+            // 为什么留这一行而不是彻底不显示：这三家（米家/华为/苹果）的卡片
+            // 也保留"当前档位"的只读回显——用户要能一眼看到状态，但不能在
+            // 滑动页面时把它改掉。判据是 hasSpeedCtl，无实体则整行不出现。
+            const hasSpeedCtl = !!speedEntity || !!strengthEntity;
+            if (hasSpeedCtl) {
+                html += '<button class="device-hint" type="button" title="打开设置：速度 / 力度 / 模式"' +
+                    ' onclick="openDeviceSettings(\'' + jsAttr(devId) + '\')">' +
+                    '<span class="device-hint-kv">速度 <b>' + escapeHtml(paramTextOf(speedEntity)) + '</b></span>' +
+                    '<span class="device-hint-sep">·</span>' +
+                    '<span class="device-hint-kv">力度 <b>' + escapeHtml(paramTextOf(strengthEntity)) + '</b></span>' +
+                    '<span class="device-hint-go">›</span></button>';
             }
 
             html += '</div>'; // close control-section
@@ -1325,31 +1335,54 @@
                 }
                 // 电池电压: sensor.*battery*
                 const batteryEntity = findEntityState(dev, 'sensor', 'battery', states);
+                // v1.9.9：卡片状态色带。米家/华为/苹果的子设备瓦片都用"状态色"
+                // 当第一眼信号（开=绿、关=灰、动作中=琥珀呼吸、离线=暗红）——
+                // 比让人读一行"状态: 正在打开 | 在线 | 电量: 85% | 位置: 65%"
+                // 快得多，尤其在手机上只扫一眼的时候。
+                // 判据与上面那个状态点**同源**，不另算一套：两处若各判一遍，
+                // 迟早出现"绿点配红边"这种自相矛盾的卡（M-2 假绿灯同族）。
+                const cardEl = document.getElementById('dev-' + dev.id);
+                if (cardEl) {
+                    const st = coverEntity ? coverEntity.state : null;
+                    const ds = coverEntity && coverEntity.attributes
+                        ? coverEntity.attributes.device_status : null;
+                    let cardState = 'unknown';
+                    if (dot && dot.className.indexOf('dot-offline') >= 0) {
+                        cardState = 'offline';
+                    } else if (st === 'opening' || st === 'closing') {
+                        cardState = 'moving';
+                    } else if (st === 'open' || ds === 'open') {
+                        cardState = 'open';
+                    } else if (st === 'closed' || st === 'close' || ds === 'closed') {
+                        cardState = 'closed';
+                    }
+                    cardEl.setAttribute('data-devstate', cardState);
+                }
                 // 速度/力度: number.*speed* / number.*strength*
                 const speedEntity = findEntityState(dev, 'number', 'speed', states);
                 const strengthEntity = findEntityState(dev, 'number', 'strength', states);
                 // 更新速度/力度滑块：始终可用（与 HA 集成 number 实体一致），
                 // 有上报数据时回显当前值，无数据时保持默认值 0 且可拖动。
-                const speedSlider = document.querySelector('#dev-' + dev.id + ' .speed-slider');
+                // v1.9.9：两条滑块已移进设置抽屉，作用域不再固定是 `#dev-*`
+                // ——sliderInScope 先查卡片、再查当前打开着的抽屉（抽屉关着就不碰）。
+                const speedSlider = sliderInScope(dev.id, 'speed-slider');
                 if (speedSlider) {
                     speedSlider.disabled = false;
                     if (speedEntity && speedEntity.state !== 'unknown' && speedEntity.state !== 'unavailable'
                             && !userInteracting(speedSlider)) {
-                        const unit = speedEntity.attributes.unit_of_measurement || '';
                         speedSlider.value = speedEntity.state;
-                        const valEl = document.querySelector('#dev-' + dev.id + ' .speed-value');
-                        if (valEl) valEl.textContent = speedEntity.state + unit;
+                        const valEl = sliderInScope(dev.id, 'speed-value');
+                        if (valEl) valEl.textContent = paramTextOf(speedEntity);
                     }
                 }
-                const strengthSlider = document.querySelector('#dev-' + dev.id + ' .strength-slider');
+                const strengthSlider = sliderInScope(dev.id, 'strength-slider');
                 if (strengthSlider) {
                     strengthSlider.disabled = false;
                     if (strengthEntity && strengthEntity.state !== 'unknown' && strengthEntity.state !== 'unavailable'
                             && !userInteracting(strengthSlider)) {
-                        const unit = strengthEntity.attributes.unit_of_measurement || '';
                         strengthSlider.value = strengthEntity.state;
-                        const valEl = document.querySelector('#dev-' + dev.id + ' .strength-value');
-                        if (valEl) valEl.textContent = strengthEntity.state + unit;
+                        const valEl = sliderInScope(dev.id, 'strength-value');
+                        if (valEl) valEl.textContent = paramTextOf(strengthEntity);
                     }
                 }
                 // 状态文本
@@ -1394,12 +1427,11 @@
                     statusText = '状态: 无数据';
                 }
                 if (onlineEntity) statusText += ' | ' + (onlineEntity.state === 'on' ? '在线' : '离线');
-                if (batteryEntity && batteryEntity.state && batteryEntity.state !== 'unknown' && batteryEntity.state !== 'unavailable') {
-                    const bUnit = batteryEntity.attributes.unit_of_measurement || 'V';
-                    statusText += ' | 电压: ' + batteryEntity.state + bUnit;
-                } else if (coverEntity && coverEntity.attributes.voltage) {
-                    statusText += ' | 电压: ' + coverEntity.attributes.voltage + 'V';
-                }
+                // v1.9.8：电池改百分比口径（换算与兜底统一在 batteryTextOf /
+                // batteryPercent 里，面板只此一处出口——旧版这里与首屏占位各拼
+                // 一份"电压: xV"，改口径要改两处，漏一处就两种文案并存）
+                const batteryText = batteryTextOf(batteryEntity, coverEntity);
+                if (batteryText) statusText += ' | ' + batteryText;
                 stateEl.textContent = statusText;
             } catch (e) {
                 stateEl.textContent = '状态: 加载失败';
@@ -1574,6 +1606,10 @@
                     if (btnEntity) {
                         const r = await haApi('/services/button/press', 'POST', { entity_id: btnEntity.entity_id });
                         if (!r.ok) throw new Error(await haErrDetail(r));
+                        // v1.9.9：**成功之后**才记账。放在 press 之前会让失败的下发
+                        // 也改掉高亮——用户看到"已切换"却发现窗没动，比没有高亮更坏。
+                        // 也只记这一台（deviceId 为键），别台的窗不受影响。
+                        WIND_LOCK_MEMO[deviceId] = command === 'wind_lock_tilt' ? 'tilt' : 'flat';
                         showToast('模式切换: ' + (command === 'wind_lock_tilt' ? '内倒' : '平开'), 'ok');
                     } else {
                         showToast('未找到模式按钮实体', 'warn');
@@ -1662,6 +1698,223 @@
             } catch (e) {
                 showToast('位置设置失败: ' + e.message, 'err');
             }
+        }
+
+        // ========== 设备设置抽屉（v1.9.9 用户令） ==========
+        // 用户 2026-11-16 原话：「这个界面中的速度、力度和模式选择在手机上经常
+        // 容易误操作，是否可以在"改名"按钮左侧新增一个"设置"按钮…有个对应设备的
+        // 弹出框中来设置"速度、力度和模式选择"三个参数？这样以后不容易误操作。」
+        //
+        // 分层口径（对标米家 / 华为 AI Life / Apple Home 三家的二级设置页）：
+        // 卡片＝高频主控（开/关/停/内倒/位置）＋ 只读状态；抽屉＝装完调一次就
+        // 不再动的参数（速度/力度/模式）＋ 低频管理动作（改名/移除）。
+        //
+        // 两条硬约束（不是风格偏好，是浏览器规则）：
+        //  ① 抽屉必须是 body 级**单例**，不能塞进 `#dev-*` 里。`.device-item:hover`
+        //     带 `transform: translateY(-1px)`，而 transform 会给子元素造新的
+        //     position:fixed 包含块——抽屉会被锁死在卡片那一小块里（半个面板
+        //     跑到视口外）。同理卡片本身也可能在网格里被裁剪。
+        //  ② 遮罩只绑 onclick：全仓自 v1.7.22 起禁止劫持 touch/pointer 事件
+        //     （误触根因是间距，不是事件），这条约定不因新增抽屉而破例。
+        let _drawerDevId = null;
+
+        // 抽屉骨架建一次复用：反复开关不重排整棵子树，也避免多个残留遮罩
+        // 叠着（toast 那边踩过同款，见 showToast 的先清后追加）。
+        function ensureDeviceDrawer() {
+            const existing = document.getElementById('devSettingsRoot');
+            if (existing) return existing;
+            const root = document.createElement('div');
+            root.id = 'devSettingsRoot';
+            root.className = 'sheet-root';
+            // keydown 只在焦点落在面板内时冒泡到这里——Escape 是桌面端惯例，
+            // 手机上另有右上角 ✕ 与点遮罩两条路径。
+            root.setAttribute('onkeydown', "if(event.key==='Escape'){closeDeviceSettings()}");
+            root.innerHTML = '<div class="sheet-mask" onclick="closeDeviceSettings()"></div>' +
+                '<div class="sheet-panel" id="devSettingsPanel" role="dialog" aria-modal="true"></div>';
+            document.body.appendChild(root);
+            return root;
+        }
+
+        function openDeviceSettings(devId) {
+            // ctx 由 renderDevice 每次渲染时登记。取不到只剩一种可能：卡片被整建
+            // 换掉而这条 id 已不存在（设备刚被移除），照实说，别开一张空面板。
+            const ctx = DEVICE_CTX[devId];
+            if (!ctx) {
+                showToast('设备信息已刷新，请再点一次"设置"', 'warn');
+                return;
+            }
+            _drawerDevId = devId;
+            ensureDeviceDrawer();
+            renderDeviceSettings();
+            const root = document.getElementById('devSettingsRoot');
+            if (root) root.className = 'sheet-root is-open';
+            // 锁滚动：抽屉开着时底下的卡片列表还能滚，手指一滑就滑到面板外
+            document.body.classList.add('sheet-locked');
+            // 焦点搬进面板：否则键盘用户按下"设置"后，焦点还停在卡片那颗按钮
+            // 上——接着敲 Tab 会一路走到底下被遮住的卡片里，Esc 也不响应
+            // （keydown 绑在抽屉根节点上，只接面板内冒泡上来的事件）。
+            const btn = document.querySelector('#devSettingsPanel .sheet-close');
+            if (btn) btn.focus();
+        }
+
+        function closeDeviceSettings() {
+            const root = document.getElementById('devSettingsRoot');
+            // 只摘 is-open（保留节点与内容），下次打开只是换内容＋加回类名
+            if (root) root.className = 'sheet-root';
+            document.body.classList.remove('sheet-locked');
+            // 焦点还给打开它的那颗"设置"按钮：关掉抽屉后焦点掉到 <body>，
+            // 键盘用户就得从头 Tab 一遍才能回到刚才那台设备。
+            const cameFrom = _drawerDevId;
+            _drawerDevId = null;
+            if (cameFrom) {
+                const back = document.querySelector('#dev-' + cameFrom + ' .device-actions .btn');
+                if (back) back.focus();
+            }
+        }
+
+        // 抽屉里的「改名」：renameDevice 成功后 2s 会整卡重建，届时抽屉里挂的还是
+        // 旧名字——改完即关，让用户直接看到卡片上的新名字（取消时关掉一张本来
+        // 就要退出的面板，代价可忽略；换来的是一份不会自相矛盾的界面）。
+        function renameDeviceFromSheet(deviceId, entryId, currentName) {
+            closeDeviceSettings();
+            renameDevice(deviceId, entryId, currentName);
+        }
+
+        // 卡片与抽屉两处作用域取滑块：抽屉打开时元素在面板里，不在 `#dev-*` 内。
+        // 先卡片后抽屉——同一条 cls 永远不会同时存在于两处。
+        function sliderInScope(devId, cls) {
+            const inCard = document.querySelector('#dev-' + devId + ' .' + cls);
+            if (inCard) return inCard;
+            if (_drawerDevId !== devId) return null;
+            return document.querySelector('#devSettingsPanel .' + cls);
+        }
+
+        /** v1.9.9：取该设备"本机最后下发过的模式"。
+         *  无记录（含从未按过、页面刚刷新）返回 null —— 调用方按"默认内倒"处理，
+         *  并在文案里标明是默认而非实测，绝不把默认值伪装成读回来的真值。
+         *  先查实体真值（cover.attributes.wind_lock_mode，0=内倒 1=平开）：当前
+         *  集成的 extra_state_attributes 不写它，但**将来若补上**，这里自动优先
+         *  采用真值，不必再改一次渲染层。 */
+        function windLockModeOf(devId) {
+            const ctx = DEVICE_CTX[devId];
+            const states = (ctx && ctx.states) || [];
+            const dev = ctx && ctx.dev;
+            const coverEntity = dev ? findEntityState(dev, 'cover', 'cover', states) : null;
+            const raw = coverEntity && coverEntity.attributes
+                ? coverEntity.attributes.wind_lock_mode : undefined;
+            if (raw === 0) return 'tilt';
+            if (raw === 1) return 'flat';
+            return WIND_LOCK_MEMO[devId] || null;
+        }
+
+        function renderDeviceSettings() {
+            const panel = document.getElementById('devSettingsPanel');
+            const devId = _drawerDevId;
+            const ctx = devId ? DEVICE_CTX[devId] : null;
+            if (!panel || !ctx) return;
+            const dev = ctx.dev;
+            const entryId = ctx.entryId;
+            const states = ctx.states || [];
+            const devName = ctx.name;
+            const sn = deviceSnOf(dev) || '未知';
+            // 与 renderDevice 同一判据：只有 5005 机型才有内倒/平开模式按键。
+            const supportsWindLock = sn.startsWith('5005');
+            const speedEntity = findEntityState(dev, 'number', 'speed', states);
+            const strengthEntity = findEntityState(dev, 'number', 'strength', states);
+            // 区间与单位仍按实体属性取（set_speed/set_strength 是 0-100 %，但面板
+            // 不把"厂商可能改量程"写死在前端；属性缺失才回落 0/100）。
+            const speedMin = speedEntity && speedEntity.attributes && speedEntity.attributes.min !== undefined
+                ? speedEntity.attributes.min : 0;
+            const speedMax = speedEntity && speedEntity.attributes && speedEntity.attributes.max !== undefined
+                ? speedEntity.attributes.max : 100;
+            const speedUnit = (speedEntity && speedEntity.attributes && speedEntity.attributes.unit_of_measurement) || '';
+            const strengthMin = strengthEntity && strengthEntity.attributes && strengthEntity.attributes.min !== undefined
+                ? strengthEntity.attributes.min : 0;
+            const strengthMax = strengthEntity && strengthEntity.attributes && strengthEntity.attributes.max !== undefined
+                ? strengthEntity.attributes.max : 100;
+            const strengthUnit = (strengthEntity && strengthEntity.attributes && strengthEntity.attributes.unit_of_measurement) || '';
+            // 无实体时给 0 且保持可拖：与 HA 集成一致（number 实体恒存在，
+            // 只是首轮可能还没有上报值），不能把"还没上报"画成"不可用"。
+            // 越界值钳回区间：实体属性若被改成 0-100 之外的量程，直接把上报值
+            // 塞进 input.value 会被浏览器悄悄夹到端点，显示与真值就脱节了。
+            const speedVal = clampSliderValue(speedEntity, speedMin, speedMax);
+            const strengthVal = clampSliderValue(strengthEntity, strengthMin, strengthMax);
+
+            let html = '<div class="sheet-head">' +
+                '<div class="sheet-head-main">' +
+                '<div class="sheet-title">' + escapeHtml(devName) + '</div>' +
+                '<div class="sheet-sub">SN: ' + escapeHtml(sn) + '</div></div>' +
+                '<button class="sheet-close" type="button" onclick="closeDeviceSettings()" aria-label="关闭">✕</button>' +
+                '</div>';
+
+            // ── 运行参数：速度 / 力度 ──
+            // 松手才发（onchange），拖动中只更新数字并用 markUserInput 打上交互
+            // 凭据——30s 无感刷新因此不会在手指底下把滑块拽回去（v1.7.18 原缺陷）。
+            html += '<div class="sheet-sec">' +
+                '<div class="sheet-sec-title">运行参数</div>' +
+                '<div class="slider-group">' +
+                '<div class="slider-row"><span class="slider-label">速度</span>' +
+                '<input type="range" class="speed-slider" min="' + escapeHtml(speedMin) + '" max="' + escapeHtml(speedMax) + '" value="' + escapeHtml(speedVal) + '"' +
+                ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value' + (speedUnit ? '+\'' + jsAttr(speedUnit) + '\'' : '') + '"' +
+                ' onchange="controlDevice(\'' + jsAttr(devId) + '\',\'set_speed\',\'' + jsAttr(entryId) + '\', this.value)">' +
+                '<span class="slider-value speed-value">' + escapeHtml(paramTextOf(speedEntity)) + '</span></div>' +
+                '<div class="slider-row"><span class="slider-label">力度</span>' +
+                '<input type="range" class="strength-slider" min="' + escapeHtml(strengthMin) + '" max="' + escapeHtml(strengthMax) + '" value="' + escapeHtml(strengthVal) + '"' +
+                ' oninput="markUserInput(this);this.nextElementSibling.textContent=this.value' + (strengthUnit ? '+\'' + jsAttr(strengthUnit) + '\'' : '') + '"' +
+                ' onchange="controlDevice(\'' + jsAttr(devId) + '\',\'set_strength\',\'' + jsAttr(entryId) + '\', this.value)">' +
+                '<span class="slider-value strength-value">' + escapeHtml(paramTextOf(strengthEntity)) + '</span></div>' +
+                '</div>' +
+                '<div class="sheet-tip">松手即下发；在此处调整，滑动页面时不会误改。</div>' +
+                '</div>';
+
+            // ── 开窗模式（仅 5005） ──
+            // v1.9.9 用户定案：「只做默认为内开内倒模式，所以默认是内开内倒模式
+            // 高亮，后面按下其他的按钮后，对应的模式为高亮」。
+            //
+            // 为什么是"本地记忆 + 默认内倒"而不是"读实体真实模式"：wind_lock_tilt /
+            // wind_lock_flat 在 HA 侧是无状态 button 实体（点一次发一帧），且
+            // `cover.extra_state_attributes` 并未暴露 wind_lock_mode——该属性只走
+            // 小程序通道（ws_gateway / hub_client 的 rwp_wind_lock_mode）。故 Web 面板
+            // 在**打开抽屉那一刻**拿不到真值，只能：默认内倒（设备上电默认口径），
+            // 之后按本机下发过的最后一次记录高亮。
+            //
+            // 这仍是"可信的近似"而非真值，所以必须**如实标注来源**：按过才显示
+            // "已记录"，否则显示"默认"。用户不会把默认值当成实测值——这正是不做
+            // 无声假高亮的分界线。
+            if (supportsWindLock) {
+                const mode = windLockModeOf(devId);   // 'tilt' | 'flat' | null
+                // 无记录 ⇒ 默认内倒（用户定案：设备上电默认内开内倒，故默认高亮内倒）。
+                // 注意 null 必须在这里落成 'tilt' 再比高亮——否则「没记录」会渲染成
+                // "两颗都不亮"，那是第三种状态，用户读不出当前是哪个。
+                const effectiveMode = mode || 'tilt';
+                const tiltOn = effectiveMode === 'tilt';
+                const flatOn = effectiveMode === 'flat';
+                html += '<div class="sheet-sec">' +
+                    '<div class="sheet-sec-title">开窗模式</div>' +
+                    '<div class="control-row">' +
+                    '<button class="btn btn-mode-a btn-sm' + (tiltOn ? ' is-active' : '') + '"' +
+                    ' aria-pressed="' + (tiltOn ? 'true' : 'false') + '"' +
+                    ' onclick="controlDevice(\'' + jsAttr(devId) + '\',\'wind_lock_tilt\',\'' + jsAttr(entryId) + '\')">内倒</button>' +
+                    '<button class="btn btn-mode-b btn-sm' + (flatOn ? ' is-active' : '') + '"' +
+                    ' aria-pressed="' + (flatOn ? 'true' : 'false') + '"' +
+                    ' onclick="controlDevice(\'' + jsAttr(devId) + '\',\'wind_lock_flat\',\'' + jsAttr(entryId) + '\')">平开</button>' +
+                    '</div>' +
+                    '<div class="sheet-tip">' + (mode ? '已记录的最近一次下发' : '默认内倒（尚未下发过切换）') +
+                    '；真实模式以窗体动作为准。</div>' +
+                    '</div>';
+            }
+
+            // ── 设备管理：改名 / 移除 ──
+            // 移除放在这里而不是卡片右上角：它与"改名"原本只隔 4px，一次误触就是
+            // 整台子设备的实体全灭。破坏性操作必须隔一层，且与主控区分开。
+            html += '<div class="sheet-sec">' +
+                '<div class="sheet-sec-title">设备管理</div>' +
+                '<div class="sheet-actions">' +
+                '<button class="btn btn-slate btn-sm" onclick="renameDeviceFromSheet(\'' + jsAttr(devId) + '\',\'' + jsAttr(entryId) + '\',\'' + jsAttr(devName) + '\')">改名</button>' +
+                '<button class="btn btn-danger btn-sm" onclick="controlDevice(\'' + jsAttr(devId) + '\',\'remove\',\'' + jsAttr(entryId) + '\')">移除设备</button>' +
+                '</div></div>';
+
+            panel.innerHTML = html;
         }
 
         // ========== 检查更新 ==========
@@ -1830,6 +2083,76 @@
         function escapeHtml(text) {
             if (text === null || text === undefined) return '';
             return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+        }
+
+        // ========== 电池电量：电压 → 百分比（v1.9.8 用户令） ==========
+        // 用户 2026-11-16 原话：「开窗器子设备现在显示的是电压数值，应该改成百分比。
+        // 如 10.5v 对应着 0%，12.6v 以上对应 100%，这样以百分比的形式显示剩余电池
+        // 电量，更加容易说明电压状态。」
+        // 锚点取自 12V 锂电工作区间（10.5V 空 ↔ 12.6V 满），区间内线性、区间外钳制：
+        // 满电继续涓流会到 13V+，欠压可能跌到 10V 以下，两端都必须贴边而不是显示
+        // -14% / 119%。
+        // 只改**展示口径**：HA 侧的 sensor 实体仍然是电压（device_class=voltage，
+        // 诊断/自动化要用伏数），不让一块面板的文案需求去改实体语义。
+        const BATTERY_MIN_V = 10.5;
+        const BATTERY_MAX_V = 12.6;
+
+        function batteryPercent(voltage) {
+            // null/undefined/空串先挡掉：Number(null)===0、Number('')===0，
+            // 不挡就会把"没数据"算成 0%（看起来像"电池已耗尽"的告警）。
+            if (voltage === null || voltage === undefined || voltage === '') return null;
+            const v = Number(voltage);
+            // 非数值串（"abc"）→NaN；"1e999"→Infinity（与后端 A-HIGH2 同族输入）。
+            // 一律回 null＝"读不到"，绝不拿 NaN 去拼 "NaN%"。
+            if (!isFinite(v)) return null;
+            const ratio = (v - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V);
+            return Math.max(0, Math.min(100, Math.round(ratio * 100)));
+        }
+
+        // 面板唯一展示出口：电池实体优先，读不到才回落到 cover 的 voltage 属性。
+        // 两条路径都必须过换算——否则"兜底那半条"会把原始伏数漏回用户眼前。
+        function batteryTextOf(batteryEntity, coverEntity) {
+            let raw = null;
+            if (batteryEntity && batteryEntity.state &&
+                    batteryEntity.state !== 'unknown' && batteryEntity.state !== 'unavailable') {
+                raw = batteryEntity.state;
+            } else if (coverEntity && coverEntity.attributes &&
+                    coverEntity.attributes.voltage !== undefined) {
+                raw = coverEntity.attributes.voltage;
+            }
+            const pct = batteryPercent(raw);
+            return pct === null ? '' : '电量: ' + pct + '%';
+        }
+
+        // ========== 速度/力度回显（v1.9.9） ==========
+        // 卡片摘要行与设置抽屉共用同一处出口，避免"卡片显示 45%、抽屉显示 45"
+        // 这类两处各拼一次的老毛病（batteryTextOf 就是为同一理由抽出来的）。
+        // 读不到就回 '--'：绝不把 unknown/unavailable 原样摆到用户面前。
+        function paramTextOf(numberEntity) {
+            if (!numberEntity || !numberEntity.state ||
+                    numberEntity.state === 'unknown' || numberEntity.state === 'unavailable') {
+                return '--';
+            }
+            const unit = (numberEntity.attributes && numberEntity.attributes.unit_of_measurement) || '';
+            return numberEntity.state + unit;
+        }
+
+        // 滑块初值：读不到就落区间起点（number 实体恒存在、只是首轮可能还没
+        // 上报），读得到则钳进 [min, max]。
+        // 必须挡 null/'' —— Number(null)===0、Number('')===0，不挡就会把
+        // "没数据"画成量程起点，看起来像"速度被调成了 0"（batteryPercent 同款坑）。
+        function clampSliderValue(numberEntity, min, max) {
+            const lo = Number(min);
+            const hi = Number(max);
+            const loOk = Number.isFinite(lo) ? lo : 0;
+            const hiOk = Number.isFinite(hi) ? hi : 100;
+            if (!numberEntity || !numberEntity.state ||
+                    numberEntity.state === 'unknown' || numberEntity.state === 'unavailable') {
+                return loOk;
+            }
+            const v = Number(numberEntity.state);
+            if (!Number.isFinite(v)) return loOk;
+            return Math.max(loOk, Math.min(hiOk, v));
         }
 
         // ========== 实体精确定位（2026-08-28 修复） ==========
