@@ -297,17 +297,24 @@ class TestEmptySlotsTransparent:
         assert "grid-column: 1 / -1" in rule
 
     def test_tiles_uniform_5005_height(self):
-        """v1.6.29 用户改令：全部子设备玻璃按 5005 统一高度——行内
-        stretch 拉齐 + min-height:262px（5005 满控件实测高）双保险，
-        作废 v1.6.27 的各自 hug 口径。"""
+        """行内等高：v1.6.29 立「全部子设备玻璃按 5005 统一高度」，
+        v2.0.0 用户令（手机/Web 比例不协调）改判保留**目的**、推翻**手段**。
+
+        原手段 = grid stretch + min-height:262px 双保险。实测代价：每个格子
+        底部 70~75px 纯死白（内容 192px / 卡片 262px，占 27%），桌面与 390px
+        手机同现。新手段 = 只留 grid stretch：同一行仍然自动等高（目的不变），
+        但基准改成该行内容最高的那张卡，不再凭空多出 70px。
+        ⇒ 本断言此后守 stretch 与轨道封顶，不再守固定像素。"""
         grid = self._rule(".device-list")
         assert "align-items: start" not in grid, "hug 口径已作废，不得收缩"
         assert "minmax(280px, 340px)" in grid and "auto-fill" in grid, \
             "v1.7.9 用户令「web 端改回去」：恢复 v1.6.29 轨道封顶（单设备行右侧留空不拉伸）"
         dev = self._rule(".device-item")
-        assert "min-height: 262px" in dev, "5005 统一高度锚"
+        assert "min-height: 0" in dev, "应显式解除--而不是留着--固定高度锚"
+        assert "min-height: 262px" not in dev, \
+            "固定高度锚回潮：底部 70~75px 死白会原样复发（v2.0.0 实测数据）"
         assert "max-width" not in dev, "v1.7.8 的 680 封顶兜底已随回退作废"
-        assert "height" not in dev.replace("min-height", ""), "禁止固定高度"
+        assert re.search(r"^\s*height:", dev, re.M) is None, "禁止固定高度"
 
     def test_reduced_motion_meteor_keeps_flowing(self):
         """v1.6.29 官网同款口径：减弱动画下流星**不停**——官网尾注注入

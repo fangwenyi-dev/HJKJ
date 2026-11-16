@@ -58,6 +58,29 @@
     --shadow-md: 0 1px 0 rgba(255, 255, 255, .05) inset, 0 12px 32px rgba(0, 0, 0, .55);
     --shadow-lg: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 20px 48px rgba(0, 0, 0, .65);
     --glass-blur: saturate(140%) blur(12px);
+
+    /* ===== v2.0.0 统一尺寸标尺（用户令：手机/Web 比例不协调） =====
+       病灶是同一条：此前每个尺寸各写各的绝对像素——卡片被 min-height
+       钉死在 262px（桌面实测内容只占 192px，底部 70px 死白）、滑块轨道
+       6px 却配 36px 的按钮、桌面命中区只有 6px 而触屏另有 30px 一套。
+       没有共同基准，改一处必然和别处打架，比例永远调不齐。
+       下面这组变量是**唯一基准**：所有控件尺寸从它派生，媒体查询只覆盖
+       这几个变量（不再散落覆盖具体宽高），两端就自动成比例。 */
+
+    /* 控件高度阶梯：同一张卡片里的三档，级差 1:1.16:1.29，视觉上成谱 */
+    --ctl-xs: 26px;   /* 状态条（只读） */
+    --ctl-sm: 30px;   /* 设置 / 改名（次级） */
+    --ctl-md: 36px;   /* 开 / 关 / 停 / 内倒（主控） */
+
+    /* 滑块三件套：厚 8 + 命中 32 = 4:1，拇指 22 略大于轨道宽，
+       压缩后仍看得出"可拖"，且命中区 ≥ 32px（Apple HIG 44 的桌面等价） */
+    --slider-track: 8px;
+    --slider-thumb: 22px;
+    --slider-hit: 32px;
+
+    /* 卡片内边距与间隙：与上面台阶对齐（8px 基数） */
+    --pad-card: 12px 14px;
+    --gap-card: 9px;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html { scroll-behavior: smooth; }
@@ -451,11 +474,19 @@ body {
 @keyframes fadeUp { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
 .device-item {
     display: flex; flex-direction: column;
-    padding: 13px 15px; border-radius: var(--radius-sm); background: var(--bg-card);
-    gap: 10px; transition: box-shadow .18s, border-color .18s, transform .18s;
+    padding: var(--pad-card); border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    gap: var(--gap-card); transition: box-shadow .18s, border-color .18s, transform .18s;
     border: 1px solid var(--card-border); animation: fadeUp .35s ease both;
     backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
-    min-height: 262px; /* 5005 满控件实测高——所有子设备统一（用户改令 v1.6.29） */
+    /* v2.0.0（用户令：卡片比例不协调）——v1.6.29 的 min-height:262px 作废。
+       那条令的原意是"无 5005 的行也要和 5005 行齐高"，靠固定高度实现；
+       实测代价是**每个格子底部 70~75px 纯死白**（内容仅 192px，占卡片
+       27%），手机端与 Web 端都出现，正是用户说的"比例不协调"。
+       改用 grid 的默认 stretch：行内各卡自动等高（原意保留），但高度由
+       该行内容最高的那张决定（不再凭空多出 70px），且设备一少也不会撑。
+       —— 此为对 v1.6.29 的显式推翻，非遗漏。 */
+    min-height: 0;
     /* v1.9.9：状态色左边条（::before）的定位基准 + 裁掉条子溢出圆角。
        均为新增，未改动上方任何用户令原值。 */
     position: relative; overflow: hidden;
@@ -468,13 +499,23 @@ body {
 .device-status {
     font-size: 11px; margin-top: 6px; color: var(--text-secondary);
     background: rgba(255, 255, 255, .04); border: 1px solid var(--card-border); border-radius: 7px;
-    padding: 4px 8px; font-variant-numeric: tabular-nums; line-height: 1.5;
+    /* v2.0.0：状态条高度并入党标尺（只读条 = 最小档），
+       line-height 从无单位的 1.5 改成定高内居中，跨端不再随字号漂移 */
+    padding: 0 8px; min-height: var(--ctl-xs); line-height: var(--ctl-xs);
+    font-variant-numeric: tabular-nums;
+    display: flex; align-items: center;
 }
 .device-actions { display: flex; gap: 4px; flex-shrink: 0; }
-.device-actions .btn-sm { padding: 5px 10px; font-size: 11px; min-height: 28px; }
+.device-actions .btn-sm { padding: 0 10px; font-size: 11px; min-height: var(--ctl-sm); }
 .control-section { display: flex; flex-direction: column; gap: 8px; }
 .control-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.control-row .btn-sm { flex: 1; min-width: 58px; text-align: center; justify-content: center; }
+/* v2.0.0：主控键并入党标尺（--ctl-md）。旧版 4 键在手机窄屏被压到
+   min-width:54px 后仍撑满一行，按钮内文字贴着边；现在靠 padding + 定高
+   保证触摸目标，宽度让步给 flex:1 均分。 */
+.control-row .btn-sm {
+    flex: 1; min-width: 56px; text-align: center; justify-content: center;
+    min-height: var(--ctl-md); padding: 0 6px;
+}
 /* v1.6.30 用户令：开/关/停/内倒四键换透明——实心渐变色块改 ghost 描线
    （色彩语义由边框+文字色承载，玻璃层级只留瓷砖本体；hover 轻提亮可点感）。
    作用域限 .control-row，网关区配对/状态等按键不受影响 */
@@ -514,22 +555,37 @@ body {
     color: var(--text-secondary); font-weight: 600; font-size: 10px;
     opacity: .75; font-style: italic;
 }
+/* v2.0.0（用户令：位置滑块过高/易误触，且整体比例不协调）——
+   旧实现的真问题是**命中区与可见轨道混为一谈**：height:6px 既是轨道厚度
+   也是可点高度，桌面端等于要求用户用 6px 的靶心去拖；v1.7.22 给触屏补了
+   30px 命中区，但桌面端仍是 6px（同一控件两套物理行为，这才叫不协调）。
+   现在统一拆成三层，全部由标尺派生：
+     ① 盒子高 = --slider-hit（32px）= 真正可点的竖向范围
+     ② 可见轨道 = --slider-track（8px），居中于盒子，靠 padding + 
+        background-clip: content-box 实现（不是把盒子做厚）
+     ③ 拇指 = --slider-thumb（22px），比轨道大一圈，可拖感来自尺寸对比
+   ⚠ background-clip 必须写在 background **之后**：background 简写会把
+     background-clip 重置成 border-box，写前面会被静默吃掉（v1.9.9 预览
+     阶段实际踩过，轨道渲染成整块色带）。 */
 input[type="range"] {
     -webkit-appearance: none; appearance: none;
-    width: 100%; height: 6px; border-radius: 99px; cursor: pointer;
-    background: rgba(255, 255, 255, .12); color: var(--primary); outline-offset: 4px;
+    width: 100%; height: var(--slider-hit); border-radius: 99px; cursor: pointer;
+    padding: calc((var(--slider-hit) - var(--slider-track)) / 2) 0;
+    background: rgba(255, 255, 255, .12);
+    background-clip: content-box;
+    color: var(--primary); outline-offset: 4px;
 }
 .speed-slider { color: var(--primary-light); }
 .strength-slider { color: var(--accent); }
 input[type="range"]::-webkit-slider-thumb {
     -webkit-appearance: none; appearance: none;
-    width: 19px; height: 19px; border-radius: 50%;
-    background: #fff; border: 2.5px solid currentColor;
+    width: var(--slider-thumb); height: var(--slider-thumb); border-radius: 50%;
+    background: #fff; border: 3px solid currentColor;
     box-shadow: 0 0 8px rgba(125, 211, 252, .5), 0 1px 5px rgba(0, 0, 0, .4); transition: transform .12s, box-shadow .12s;
 }
 input[type="range"]::-moz-range-thumb {
-    width: 15px; height: 15px; border-radius: 50%;
-    background: #fff; border: 2.5px solid currentColor;
+    width: calc(var(--slider-thumb) - 2px); height: calc(var(--slider-thumb) - 2px); border-radius: 50%;
+    background: #fff; border: 3px solid currentColor;
     box-shadow: 0 0 8px rgba(125, 211, 252, .5), 0 1px 5px rgba(0, 0, 0, .4);
 }
 input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.12); }
@@ -666,10 +722,15 @@ input[type="range"]:focus-visible { outline: 2px solid var(--primary-light); }
        （网关卡/连接瓦片/说明框）回归自然撑满内容区，v1.7.5~1.7.7 的
        gateway-item/conn-item/info-box 单独封顶与 calc 抵消全部作废 */
     .card { max-width: 360px; margin-left: auto; margin-right: auto; padding: 16px 2px; }
-    .device-item { padding: 11px 12px; }
-    .control-row { gap: 4px; }
-    .control-row .btn-sm { flex: 1; min-width: 54px; padding: 7px 8px; font-size: 12px; min-height: 32px; }
-    .device-actions .btn-sm { padding: 5px 8px; font-size: 11px; }
+    /* v2.0.0：手机端只覆盖**标尺本身**，不再逐条重写每个宽高——
+       这正是此前"两端比例对不上"的机制成因：桌面在 6 处、手机在 6 处
+       各写一套具体数字，任何一处改了另一处不会跟着动。
+       手机屏窄，主控键升到 44px（Apple HIG 触摸基准），其余等比。 */
+    :root { --ctl-xs: 28px; --ctl-sm: 32px; --ctl-md: 44px;
+            --slider-hit: 40px; --pad-card: 11px 12px; --gap-card: 9px; }
+    .control-row { gap: 5px; }
+    .control-row .btn-sm { font-size: 12px; }
+    .device-actions .btn-sm { font-size: 11px; }
     .slider-row { gap: 6px; }
     .slider-row .slider-label { width: 28px; }
     .gateway-header { flex-wrap: wrap; gap: 8px; }
@@ -691,14 +752,13 @@ input[type="range"]:focus-visible { outline: 2px solid var(--primary-light); }
    "轻碰轨道即跳值"的行为面由 v1.7.21 位置命令合并 + 三滑块均为
    change 提交（松手才发令）兜底，本批为纯 CSS，不动 JS 行为。 */
 @media (hover: none) and (pointer: coarse) {
-    .slider-group { gap: 18px; }
-    input[type="range"] {
-        height: 30px;
-        padding: 12px 0;
-        background-clip: content-box;
-    }
-    input[type="range"]::-webkit-slider-thumb { width: 26px; height: 26px; }
-    input[type="range"]::-moz-range-thumb { width: 22px; height: 22px; }
+    /* v2.0.0：v1.7.22 的"命中区/可见轨道分离"思路**保留并上升为全局**
+       （见 input[type="range"] 主规则），因此这里不再重复声明 30px 高度与
+       padding——只覆盖标尺，把触屏的档位抬到 Apple HIG 的 44px。
+       旧版此处是与桌面重复的第二套几何量，两套并存正是比例漂移的温床。 */
+    .slider-group { gap: 16px; }
+    :root { --slider-hit: 44px; --slider-thumb: 26px;
+            --ctl-md: 44px; --ctl-sm: 34px; }
 }
 @media (prefers-reduced-motion: reduce) {
     /* 标准哲学"运动宁慢勿快"，无障碍场景停掉星空动画与视差 */
@@ -855,11 +915,13 @@ details[open] > summary.card-title::before {
 /* ── 卡片上的只读参数摘要行（点整行进设置） ──
    为什么留这一行而不是彻底不显示：三家大厂卡片都保"当前档位"的只读回显——
    用户要能一眼看到，但不能在滑动页面时把它改掉。
-   margin-top:auto 把它压到卡片底部：v1.6.29 用户令的 min-height 262px 是
-   5005 满控件实测高，控件搬进抽屉后卡片会空出一截，让它吃掉这段空白，
-   而不是把四颗控制键与滑块顶在上半张卡里、下半张空着。 */
+   v2.0.0：margin-top:auto 取消。它存在的唯一理由是 v1.6.29 的
+   min-height:262px 把卡片撑出 70~75px 空白、需要把这行压到底去"填空"。
+   卡片改回内容高度后已无空白可填，auto 只会把摘要条从滑块下方扯开、
+   在它和滑块之间再开一个洞（那正是用户截图里下方那块空白的另一半成因）。
+   现在它紧跟滑块，作为卡片内容的自然结尾。 */
 .device-hint {
-    margin-top: auto; display: flex; align-items: center; gap: 6px;
+    margin-top: 0; display: flex; align-items: center; gap: 6px;
     width: 100%; padding: 8px 10px; border-radius: 9px; cursor: pointer;
     background: rgba(255, 255, 255, .03);
     border: 1px dashed rgba(255, 255, 255, .16);

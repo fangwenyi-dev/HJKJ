@@ -250,7 +250,13 @@ class TestCssForNewHooks:
     def test_device_hint_styles(self):
         rule = self._rule(".device-hint")
         assert "cursor: pointer" in rule, "摘要行不可点，但没给可点感"
-        assert "margin-top: auto" in rule, "摘要行没压到卡底（控件搬走后卡片下半截会空着）"
+        # v2.0.0（用户令）改判：原断言要求 margin-top: auto，那只是为了
+        # 填补 v1.6.29 的 min-height:262px 撑出来的 70~75px 空白。卡片改回
+        # 内容高度后已无空白可填，auto 反而会把摘要条从滑块下方扯开、在
+        # 两者之间再开一个洞。现在要求它紧跟滑块（不吸底）。
+        assert "margin-top: auto" not in rule, \
+            "摘要行又吸底了——卡片已是内容高度，吸底会在中间开洞"
+        assert "margin-top: 0" in rule, "摘要行应紧跟滑块，不留额外顶距"
 
     def test_sheet_root_hidden_by_default(self):
         rule = self._rule(".sheet-root")
@@ -332,13 +338,21 @@ class TestCardStateColor:
         assert "let cardState = 'unknown';" in body, "默认态不是 unknown"
 
     def test_no_layout_pins_regressed(self):
-        """状态色不得动用户令里的布局原值（v1.6.29 / v1.7.9）。"""
+        """布局锚点：v1.7.9 的轨道封顶仍是用户令，v1.6.29 的固定高度已被
+        v2.0.0 用户令显式推翻（见 .device-item 注释与 CHANGELOG）。
+
+        推翻理由留档：min-height:262px 是为"无 5005 的行与 5005 行齐高"而设，
+        实测代价是每个格子底部 70~75px 纯死白（内容仅 192px，占卡片 27%），
+        桌面端与 390px 手机端同时出现——正是用户报的"比例不协调"。
+        齐高原意改由 grid 默认 stretch 承担：行内自动等高，但基准变成该行
+        内容最高的那张卡，不再凭空多出 70px。"""
         dev = re.search(r"\.device-item \{([^}]*)\}", CSS).group(1)
-        assert "min-height: 262px" in dev, "统一高度锚被改了"
+        assert "min-height: 262px" not in dev, \
+            "固定高度锚回潮——底部死白会原样复发"
+        assert "min-height: 0" in dev, "应显式解除 min-height，而非删掉语句"
         assert "max-width" not in dev, "又加回了 max-width 封顶"
-        assert "height" not in dev.replace("min-height", ""), "动了固定高度"
         grid = re.search(r"\.device-list \{([^}]*)\}", CSS).group(1)
-        assert "align-items: start" not in grid, "grid 对齐回潮"
+        assert "align-items: start" not in grid, "grid 对齐回潮（会毁掉等高）"
         assert "minmax(280px, 340px)" in grid and "auto-fill" in grid, "轨道封顶丢失"
 
     def test_breathing_stops_under_reduced_motion(self):
