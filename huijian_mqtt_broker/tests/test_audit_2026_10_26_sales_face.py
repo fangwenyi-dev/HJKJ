@@ -367,6 +367,9 @@ function findRemoveButtonEntity(dev, devices) { return { entity_id: 'button.huij
 function updateGatewayDevices() {}
 const GATEWAY_SN_BY_ENTRY = {};
 const setTimeout = () => {};            // 本轮不验 2s 后的静默刷新
+// v2.0.2 ①：controlDevice 成功后会开"落定期"快刷窗口。本文件只验删除失败的
+// 提示口径，落定期与本轮无关 ⇒ 桩成空函数（不桩会 ReferenceError 假红）。
+function armSettleWindow() {}
 let scenario = [];
 async function haApi(path, method, body) {
   const n = scenario.shift();

@@ -1072,6 +1072,25 @@ ARMS = [
      "换码节流回潮墙钟＝NTP 回拨后对付费端点连击（R-2 原形②；尝试戳仍是 monotonic，"
      "墙钟减它恒负⇒节流必击穿，行为钉当场红）",
      T201),
+    # ── v2.0.2（用户 2026-11-20 令：只修 ①③）刷新节奏的两条反向臂 ──
+    ("settle_window_never_disarmed", "www/js/huijian.js",
+     "            if (!live.length) return;\n", "",
+     "test_settle_tick_skips_hidden_tabs_and_does_not_self_perpetuate", "red",
+     "落定期永不解除＝命令后那个 2s 轮询成为常驻：后台空转纪律（v1.6.3）与"
+     "『静止页面 30s 一格』同时失效，正是 ① 最容易写成的那种假修复",
+     "tests/test_audit_2026_11_20_refresh_cadence_fixes.py"),
+    ("position_command_skips_settle_window", "www/js/huijian.js",
+     "                    armSettleWindow(entryId);\n", "",
+     "test_settle_window_is_armed_on_both_control_paths", "red",
+     "只给开关停武装、漏掉定位路径＝用户拖滑块下发后页面仍一动不动（修复前它"
+     "连一次刷新都没有，是 ① 里最刺眼的一条）",
+     "tests/test_audit_2026_11_20_refresh_cadence_fixes.py"),
+    ("panel_sync_tip_never_marks_stale", "www/js/huijian.js",
+     "            const stale = age > 120;", "            const stale = false;",
+     "test_sync_tip_marks_stale_data_as_expired", "red",
+     "新鲜度提示恒判新鲜＝③ 只补了『切回会刷新』却把『这屏可能是旧的』这条"
+     "可见性抹掉，用户仍分不清实时与陈旧",
+     "tests/test_audit_2026_11_20_refresh_cadence_fixes.py"),
 ]
 
 

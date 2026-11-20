@@ -147,6 +147,10 @@ async function haApi(path) {
 }
 async function checkServiceStatus() {}
 async function loadRemoteControl() {}
+// v2.0.2 ③：silentRefresh 现在会推进/重画面板新鲜度提示。本文件不验那句提示，
+// 只要求它别把被测的回收判定拖进 catch——桩成空函数（真实现只碰 DOM 文本）。
+function renderSyncTip() {}
+function markPanelSynced() {}
 
 // 桩：真实现会按 id 覆写 devices-<entryId>（/devices 读设备注册表，条目禁用
 // 不影响注册表 ⇒ 必有数据），这正是 B-7 的缺陷形态，所以桩也照真实现覆写。

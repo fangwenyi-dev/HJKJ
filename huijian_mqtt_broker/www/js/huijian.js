@@ -116,6 +116,84 @@
         // 故只能记在本机。**不写 localStorage**：它只是"这次页面会话里我按过
         // 什么"，跨刷新保留会让用户在另一台窗上看到别台的旧选择。
         const WIND_LOCK_MEMO = {};
+        // v2.0.2 ①（用户 2026-11-20 令：修「运动过程中刷新明显跟不上」）：
+        // 命令下发后的"落定期"快刷。唯一的轮询是 30s 一圈，而物理行程只有
+        // 10~15s ⇒ 命令后那一次 +2s 采样过去之后，用户最多要等 30s 才看见
+        // 新位置，进度条是一跳一跳的。这里**不动 30s 基准**（后台空转那条
+        // 纪律原样保留），只在"刚下发过命令"的窗口内把内部轮询收紧，窗口
+        // 一到自动停摆，静止页面重新回到 30s 一格。
+        // 为什么锚"命令后"而不是锚 opening/closing：cover.py 把 is_opening /
+        // is_closing 恒钉 False（面板 st === 'opening' 那条分支因此是死码），
+        // 运动态从 HA 侧根本读不到；本机能确知的信号只有"我刚按过"。
+        const SETTLE_STEP_MS = 2000;      // 落定期内部轮询间隔
+        const SETTLE_SPAN_MS = 24000;     // 落定期时长（> 最长物理行程，留余量）
+        const SETTLE_FAST_UNTIL = {};     // entryId → 截止时间戳（ms）
+        let _settleTimer = null;          // 落定期自续 setTimeout 句柄
+        // v2.0.2 ③：面板数据最后一次刷新的时刻（ms），驱动"网关与子设备"标题
+        // 里那句新鲜度提示——后台标签切回来时，用户得先看见"刚才那段是旧的"，
+        // 才不会被一瞬间的旧进度骗过去。
+        let _panelSyncedAt = 0;
+        let _lastKickAt = 0;              // 切回前台的补刷去重（visibilitychange 与 focus 常成对到达）
+
+        function armSettleWindow(entryId) {
+            if (!entryId) return;
+            SETTLE_FAST_UNTIL[entryId] = Date.now() + SETTLE_SPAN_MS;
+            if (_settleTimer === null) _settleTimer = setTimeout(settleTick, SETTLE_STEP_MS);
+        }
+
+        function settleTick() {
+            _settleTimer = null;
+            const now = Date.now();
+            const live = [];
+            for (const id of Object.keys(SETTLE_FAST_UNTIL)) {
+                if (SETTLE_FAST_UNTIL[id] > now) live.push(id);
+                else delete SETTLE_FAST_UNTIL[id];
+            }
+            if (!live.length) return;
+            // 后台标签不空转：窗口到点后不再自续，切回来由 kickOnReturn 补一轮
+            if (document.hidden) return;
+            if (_silentRefreshing) { _settleTimer = setTimeout(settleTick, SETTLE_STEP_MS); return; }
+            // 只刷落定期内的条目，且只走无感路径（不重建 DOM、不整页闪）
+            for (const id of live) updateGatewayDevices(id, GATEWAY_SN_BY_ENTRY[id] || '');
+            _settleTimer = setTimeout(settleTick, SETTLE_STEP_MS);
+        }
+
+        function markPanelSynced() {
+            _panelSyncedAt = Date.now();
+            renderSyncTip();
+        }
+
+        function renderSyncTip() {
+            const el = document.getElementById('panelSyncTip');
+            if (!el) return;
+            if (!_panelSyncedAt) { el.textContent = ''; el.className = 'panel-sync-tip'; return; }
+            const age = Math.max(0, Math.round((Date.now() - _panelSyncedAt) / 1000));
+            const stale = age > 120;
+            const t = new Date(_panelSyncedAt);
+            const pad = (n) => (n < 10 ? '0' + n : String(n));
+            const stamp = pad(t.getHours()) + ':' + pad(t.getMinutes());
+            el.textContent = stale ? '· 更新于 ' + stamp + '（已过期）' : '· 更新于 ' + stamp;
+            el.className = 'panel-sync-tip' + (stale ? ' expired' : '');
+        }
+
+        function kickOnReturn() {
+            if (document.hidden) return;
+            const now = Date.now();
+            if (now - _lastKickAt < 1500) return;   // 同一次切回只补一轮
+            _lastKickAt = now;
+            renderSyncTip();                        // 先把"刚才那段是旧的"摆到用户眼前
+            // 落定期还活着（用户看着窗运动时切走又切回）⇒ 把停掉的自续链接回来，
+            // 否则这一段行程又退回 30s 一格。窗口已过则什么都不做。
+            if (_settleTimer === null) {
+                for (const id of Object.keys(SETTLE_FAST_UNTIL)) {
+                    if (SETTLE_FAST_UNTIL[id] > now) {
+                        _settleTimer = setTimeout(settleTick, SETTLE_STEP_MS);
+                        break;
+                    }
+                }
+            }
+            silentRefresh();
+        }
 
         function refreshBindQr() {
             refreshBindCode();   // 点击＝换一个新码（旧码过期后"只读刷新"刷不出可用的码）
@@ -642,6 +720,10 @@
             if (_silentRefreshing) return;
             _silentRefreshing = true;
             try {
+            // v2.0.2 ③：先把「距上次成功刷新多久了」摆出来——本轮即使拉不动
+            // HA，用户也能看见"这屏是旧的"，而不是把陈旧的进度当成现状。
+            // 成功路径末尾再 markPanelSynced() 把它推成新时间。
+            renderSyncTip();
             await checkServiceStatus();
             // hub 卡也要刷：此前只刷设备 ⇒ 连接状态点、二维码、码倒计时全会陈旧
             // （后台标签的跳过语义在 setInterval 那一侧，这里不再判一次 document.hidden）
@@ -688,6 +770,10 @@
                 const gatewaySn = GATEWAY_SN_BY_ENTRY[entryId] || '';
                 await updateGatewayDevices(entryId, gatewaySn);
             }
+            // v2.0.2 ③：这一轮数据真的落地了 ⇒ 记新鲜度时刻（标题旁那句
+            // 「更新于 hh:mm」跟着走）。放在成功路径末尾而不是开头：失败时
+            // 时间戳不许前进，否则"看起来刚更新过"正是最坏的一种骗。
+            markPanelSynced();
             } finally {
                 _silentRefreshing = false;
             }
@@ -1640,6 +1726,10 @@
                 } else {
                     showToast('未知命令: ' + command, 'warn');
                 }
+                // v2.0.2 ①：命令已下发 ⇒ 开落定期快刷窗口（删除不算——设备
+                // 接下来要消失，没有行程值得看）。窗口内每 2s 取一次位置，
+                // 行程走完自动停摆。
+                if (command !== 'remove') armSettleWindow(entryId);
                 // v1.7.5：控制后走静默更新，理由同状态检查（手机端闪一下修复）；
                 // 设备集合若有增删，updateGatewayDevices 内部自动升级完整重建
                 setTimeout(() => updateGatewayDevices(entryId, GATEWAY_SN_BY_ENTRY[entryId] || ''), 2000);
@@ -1692,6 +1782,10 @@
                         throw new Error(await haErrDetail(r));
                     }
                     showToast('位置设置: ' + pos + '%', 'ok');
+                    // v2.0.2 ①：本函数此前**一次刷新都没有**——下发位置后
+                    // 页面要等 30s 那一格才动，而行程只要 10~15s ⇒ 用户盯着
+                    // 一个不动的滑块。与 controlDevice 同一扇落定期窗口。
+                    armSettleWindow(entryId);
                 } else {
                     showToast('未找到设备 cover 实体', 'warn');
                 }
@@ -2293,3 +2387,11 @@
             if (document.hidden) return;
             silentRefresh();
         }, 30000);
+        // v2.0.2 ③（用户 2026-11-20 令：修「从后台标签切回来没有立即刷新」）：
+        // 后台标签被跳过的那几轮不会自己补上——切回来的第一眼是"上次数分钟前
+        // 的快照"，而它看起来和实时数据一模一样。这里在切回/重新聚焦时补一轮，
+        // 并把「更新于 hh:mm」先摆出来（kickOnReturn 内部先 renderSyncTip 再刷）。
+        // visibilitychange 与 focus 常成对到达，去重交给 kickOnReturn 里的
+        // _lastKickAt 窗口，不在这里判——否则又得维护两套布尔。
+        document.addEventListener('visibilitychange', kickOnReturn);
+        window.addEventListener('focus', kickOnReturn);
